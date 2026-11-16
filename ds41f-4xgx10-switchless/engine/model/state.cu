@@ -43,6 +43,24 @@ size_t page_off(int k, int a) {
 size_t snap_bytes(bool spec) { return kSnapBytes + (spec ? kSpecSnapBytes : 0); }
 size_t end_bytes(bool spec) { return kEndBytes + (spec ? kSpecEndBytes : 0); }
 
+// What a restart needs (serve.cpp choose): the end snapshot at e when the pages hold [0, e) (saved >= e),
+// a window snapshot at s when they hold its restart position q (s, or s - 1 for an odd s; saved >= q).
+// The pages a restart at q reads are the first pages_for(q).
+int pages_for(int q) { return (q + kPagePos - 1) / kPagePos; }
+int snap_q(int s) { return s & 1 ? s - 1 : s; }
+bool end_usable(int end_pos, int saved) { return end_pos >= 0 && end_pos <= saved; }
+bool snap_usable(int s, int saved) { return snap_q(s) <= saved; }
+// The latest position a session holding `saved` positions of pages, the end snapshot at end_pos (-1: none)
+// and window snapshots at the keys of `snaps` can restart from: the end snapshot's, else the latest
+// usable snapshot's q; -1 when there is none.
+template <class M>
+int restart_of(int saved, int end_pos, const M& snaps) {
+  if (end_usable(end_pos, saved)) return end_pos;
+  for (auto i = snaps.rbegin(); i != snaps.rend(); ++i)
+    if (snap_usable(i->first, saved)) return snap_q(i->first);
+  return -1;
+}
+
 // A block's checksum for the disk tier's round trip: every 8-byte word mixed with its index, summed.
 // kSumCtas CTAs each sum a stride of it; the last one to finish adds their partial sums in order and
 // stores the result in *out (pinned memory) as one store, so nothing is zeroed first and the sum does
@@ -345,21 +363,38 @@ void Model::Impl::state_reserve(size_t bytes) {
   s.pool.free.emplace(0, bytes);
 }
 
-// A block for session h. While none is free, the least recently used session that the current command
-// does not use is evicted (every rank evicts the same): spilled to the disk tier, or freed without one;
-// nullptr when none is left to evict.
+// A block for session h. While none is free: first the pages of the least recently used session live in a
+// slot (and not used by the current command) are released, because the slot holds what they hold (the
+// session's persist saves them again from position 0 when its slot is let go); then the least recently
+// used session that the current command does not use and no slot holds is evicted (every rank does the
+// same): spilled to the disk tier, or freed without one; nullptr when none is left.
 uint8_t* Model::Impl::store_alloc(int h, size_t bytes) {
   Store& s = store_of();
+  const auto in = [](const std::vector<int>& v, int k) { return std::find(v.begin(), v.end(), k) != v.end(); };
   for (;;) {
     if (uint8_t* p = s.pool.take(bytes)) {
       s.bytes += Pool::round(bytes);
       return p;
     }
+    int redundant = -1;
+    uint64_t oldest_live = UINT64_MAX;
+    for (const auto& [k, ss] : s.sess)
+      if (k != h && !ss.disk && !ss.pages.empty() && ss.used < oldest_live && in(s.live, k) && !in(s.pinned, k))
+        redundant = k, oldest_live = ss.used;
+    if (redundant >= 0) {
+      Store::Sess& ls = s.sess.at(redundant);
+      if (rank == 0)
+        std::printf("state: session %d is live in a slot: its %zu stored pages (%.1f MiB) released to make room\n",
+                    redundant, ls.pages.size(), ls.pages.size() * Pool::round(kPageBytes) / 1048576.0);
+      for (uint8_t* p : ls.pages) store_release(p, kPageBytes);
+      ls.pages.clear();
+      ls.saved = 0;
+      continue;
+    }
     int victim = -1;
     uint64_t oldest = UINT64_MAX;
     for (const auto& [k, ss] : s.sess)
-      if (k != h && !ss.disk && ss.used < oldest && std::find(s.pinned.begin(), s.pinned.end(), k) == s.pinned.end())
-        victim = k, oldest = ss.used;
+      if (k != h && !ss.disk && ss.used < oldest && !in(s.pinned, k) && !in(s.live, k)) victim = k, oldest = ss.used;
     if (victim < 0) {
       if (rank == 0)
         std::printf("state: no room for %.1f MiB of session %d's state (%.2f of %.2f GiB in use)\n",
@@ -418,6 +453,18 @@ void Model::Impl::state_spill(int h) {
   Store::Sess& ss = it->second;
   const bool sp = spec != nullptr;
   const double t0 = wall_s();
+  if (s.disk) {
+    // A squeezed store leaves a session with blocks no restart can use (an end snapshot or snapshots beyond
+    // its saved pages, pages beyond its latest restart point). They are not written; what goes out is
+    // what the session can restart from, and its saved, end_pos and snapshots say so.
+    if (ss.end && !end_usable(ss.end_pos, ss.saved)) store_release(ss.end, end_bytes(sp)), ss.end = nullptr, ss.end_pos = -1;
+    for (auto i = ss.snaps.begin(); i != ss.snaps.end();)
+      if (snap_usable(i->first, ss.saved)) ++i;
+      else store_release(i->second, snap_bytes(sp)), i = ss.snaps.erase(i);
+    const int keep = std::max(0, restart_of(ss.saved, ss.end ? ss.end_pos : -1, ss.snaps));
+    while ((int)ss.pages.size() > pages_for(keep)) store_release(ss.pages.back(), kPageBytes), ss.pages.pop_back();
+    ss.saved = std::min(ss.saved, (int)ss.pages.size() * kPagePos);
+  }
   std::vector<size_t> dp;
   std::map<int, size_t> ds;
   size_t de = Pool::kNone;
@@ -467,15 +514,19 @@ void Model::Impl::state_spill(int h) {
   ss.dend = de;
   ++tier.spills, tier.spill_bytes += b0 - s.bytes;
   if (rank == 0)
-    std::printf("state: session %d spilled to disk (%.1f MiB; %.2f of %.2f GiB of the file in use; host %.2f ms)\n", h,
-                (b0 - s.bytes) / 1048576.0, s.dbytes / 1073741824.0, s.dpool.size / 1073741824.0,
-                1e3 * (wall_s() - t0));
+    std::printf("state: session %d spilled to disk (%.1f MiB, restart point %d; %.2f of %.2f GiB of the file in use; "
+                "host %.2f ms)\n", h, (b0 - s.bytes) / 1048576.0, restart_of(ss.saved, ss.dend != Pool::kNone ? ss.end_pos : -1, ss.dsnaps),
+                s.dbytes / 1073741824.0, s.dpool.size / 1073741824.0, 1e3 * (wall_s() - t0));
 }
 
-// Session h back from the disk tier (after its writes), as far as the store has room: pages in order
-// (saved shrinks to what came back), the end snapshot, then window snapshots from the latest down; what
-// does not fit is dropped, as a save that finds no room would. Every block that comes back is checked
-// against its checksum from the way out; every rank logs a mismatch, and rank 0 the time it took.
+// Session h back from the disk tier (after its writes), as far as the store has room, taking what gives
+// the latest restart point first. The candidates are the end snapshot and the window snapshots, latest
+// first, each usable when the pages up to its restart position are in the record (end_usable, snap_usable);
+// the first whose block and pages all find room is restored with exactly those pages (saved shrinks to
+// them), then every earlier snapshot those pages serve for as long as room lasts. When no candidate fits,
+// nothing comes back: pages alone restart nothing. Every block that comes back is checked against its
+// checksum from the way out; every rank logs a mismatch, and rank 0 the time it took and the restart
+// point that came back against the one that was spilled.
 void Model::Impl::state_unspill(int h) {
   Store& s = store_of();
   const auto it = s.sess.find(h);
@@ -494,23 +545,60 @@ void Model::Impl::state_unspill(int h) {
     back.push_back(off);
     got += Pool::round(bytes);
   };
+  const int spilled_restart = restart_of(ss.saved, ss.dend != Pool::kNone ? ss.end_pos : -1, ss.dsnaps);
+  struct Cand {
+    int q;       // the restart position
+    int snap;    // the window snapshot's position (-1: the end snapshot)
+  };
+  std::vector<Cand> cand;
+  if (ss.dend != Pool::kNone && end_usable(ss.end_pos, ss.saved)) cand.push_back({ss.end_pos, -1});
+  for (auto i = ss.dsnaps.rbegin(); i != ss.dsnaps.rend(); ++i)
+    if (snap_usable(i->first, ss.saved)) cand.push_back({snap_q(i->first), i->first});
+  std::stable_sort(cand.begin(), cand.end(), [](const Cand& a, const Cand& b) { return a.q > b.q; });
   s.pinned.push_back(h);  // its own blocks' allocations never evict it
-  for (size_t i = 0; i < ss.dpages.size(); ++i) {
-    uint8_t* p = store_alloc(h, kPageBytes);
-    if (!p) break;
-    read(p, kPageBytes, ss.dpages[i]);
-    ss.pages.push_back(p);
+  std::vector<uint8_t*> pg;
+  uint8_t* blk = nullptr;
+  int pick = -1;
+  size_t failed = SIZE_MAX;  // the fewest pages a candidate needed that found no room: it and any needing more fail
+  for (size_t c = 0; c < cand.size() && pick < 0; ++c) {
+    const size_t np = std::min(ss.dpages.size(), (size_t)pages_for(cand[c].q));
+    if (np >= failed) continue;
+    bool ok = (blk = store_alloc(h, cand[c].snap < 0 ? end_bytes(sp) : snap_bytes(sp))) != nullptr;
+    while (ok && pg.size() < np) {
+      uint8_t* p = store_alloc(h, kPageBytes);
+      if (!p) ok = false;
+      else pg.push_back(p);
+    }
+    if (ok) {
+      pick = (int)c;
+    } else {  // a candidate that does not fit whole is given back; a smaller one may
+      for (uint8_t* p : pg) store_release(p, kPageBytes);
+      pg.clear();
+      if (blk) store_release(blk, cand[c].snap < 0 ? end_bytes(sp) : snap_bytes(sp));
+      blk = nullptr;
+      failed = np;
+    }
   }
-  ss.saved = std::min(ss.saved, (int)ss.pages.size() * kPagePos);
-  if (ss.dend != Pool::kNone && ss.end_pos <= ss.saved)
-    if ((ss.end = store_alloc(h, end_bytes(sp)))) read(ss.end, end_bytes(sp), ss.dend);
+  ss.pages.clear();
+  ss.snaps.clear();
+  ss.end = nullptr;
+  if (pick >= 0) {
+    for (size_t i = 0; i < pg.size(); ++i) read(pg[i], kPageBytes, ss.dpages[i]);
+    ss.pages = pg;
+    ss.saved = std::min(ss.saved, (int)pg.size() * kPagePos);
+    if (cand[pick].snap < 0) read(blk, end_bytes(sp), ss.dend), ss.end = blk;
+    else read(blk, snap_bytes(sp), ss.dsnaps.at(cand[pick].snap)), ss.snaps.emplace(cand[pick].snap, blk);
+    for (auto i = ss.dsnaps.rbegin(); i != ss.dsnaps.rend(); ++i) {  // the earlier snapshots these pages serve
+      if (i->first == cand[pick].snap || !snap_usable(i->first, ss.saved)) continue;
+      uint8_t* b = store_alloc(h, snap_bytes(sp));
+      if (!b) break;
+      read(b, snap_bytes(sp), i->second);
+      ss.snaps.emplace(i->first, b);
+    }
+  } else {
+    ss.saved = 0;
+  }
   if (!ss.end) ss.end_pos = -1;
-  for (auto i = ss.dsnaps.rbegin(); i != ss.dsnaps.rend(); ++i) {
-    uint8_t* b = store_alloc(h, snap_bytes(sp));
-    if (!b) break;
-    read(b, snap_bytes(sp), i->second);
-    ss.snaps.emplace(i->first, b);
-  }
   s.pinned.pop_back();
   CUDA_CHECK(cudaStreamSynchronize(st));
   const double t2 = wall_s();
@@ -532,8 +620,9 @@ void Model::Impl::state_unspill(int h) {
   ss.disk = false;
   if (rank == 0)
     std::printf("state: session %d back from disk: %.1f MiB in %.1f ms (%.2f GB/s; %.1f ms waiting for its writes; "
-                "%zu blocks checked, %016llx)\n", h, got / 1048576.0, 1e3 * (t2 - t0), got / std::max(1e-9, t2 - t1) / 1e9,
-                1e3 * (t1 - t0), back.size(), (unsigned long long)fp);
+                "%zu blocks checked, %016llx); restart point %d of the %d spilled\n", h, got / 1048576.0, 1e3 * (t2 - t0),
+                got / std::max(1e-9, t2 - t1) / 1e9, 1e3 * (t1 - t0), back.size(), (unsigned long long)fp,
+                restart_of(ss.saved, ss.end ? ss.end_pos : -1, ss.snaps), spilled_restart);
 }
 
 namespace {
@@ -805,7 +894,11 @@ void Model::Impl::state_drop_snap(int h, int pos) {
 
 void Model::state_reserve(size_t bytes) { d_->state_reserve(bytes); }
 size_t Model::state_capacity() const { return d_->store_s ? d_->store_s->pool.size : 0; }
-void Model::state_pin(const std::vector<int>& h) { d_->store_of().pinned = h; }
+void Model::state_pin(const std::vector<int>& h, const std::vector<int>& live) {
+  auto& s = d_->store_of();
+  s.pinned = h;
+  s.live = live;
+}
 std::vector<int> Model::state_evicted() {
   std::vector<int> v;
   if (d_->store_s) v.swap(d_->store_s->evicted);
@@ -850,6 +943,8 @@ Model::StateInfo Model::state_info(int h) const {
   const bool spec = d_->spec != nullptr;
   r.saved = ss.saved;
   r.on_disk = ss.disk;
+  r.restart = ss.disk ? restart_of(ss.saved, ss.dend != Pool::kNone ? ss.end_pos : -1, ss.dsnaps)
+                      : restart_of(ss.saved, ss.end ? ss.end_pos : -1, ss.snaps);
   if (ss.disk) {
     r.end_pos = ss.dend != Pool::kNone ? ss.end_pos : -1;
     for (const auto& sn : ss.dsnaps) r.snaps.push_back(sn.first);

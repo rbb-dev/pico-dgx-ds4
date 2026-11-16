@@ -12,7 +12,7 @@ use crate::gate::{Gate, Pass, Refused, RETRY_AFTER_S};
 use crate::guard::{LoopGuard, StopMatcher, LINE_WINDOW_TOKENS};
 use crate::protocol::{DoneReason, Submit, FLAG_ABLIT, FLAG_KEEP, FLAG_SEED};
 use crate::pyjson::truthy;
-use crate::session::SessionTable;
+use crate::session::{ImageKey, SessionTable};
 use crate::tokenizer::{StreamDecoder, Tokenizer};
 use axum::body::Bytes;
 use axum::extract::State;
@@ -704,6 +704,8 @@ struct Gen {
     req_id: u64,
     session_id: u64,
     prompt_text: String,
+    /// The prompt's images, for the session table (empty for text).
+    images: Vec<ImageKey>,
     prompt_ids: Vec<u32>,
     rx: mpsc::UnboundedReceiver<EngineEvent>,
     stop_ids: Vec<u32>,
@@ -801,7 +803,7 @@ impl Gen {
                         Some(te) if self.parser_was_thinking() => kept.iter().position(|&x| x == te).unwrap_or(kept.len()),
                         _ => 0,
                     };
-                    self.app.sessions.lock().unwrap().finish(self.session_id, &self.prompt_text, &self.prompt_ids, &self.ids, &self.app.tok);
+                    self.app.sessions.lock().unwrap().finish_images(self.session_id, &self.prompt_text, &self.prompt_ids, &self.ids, &self.app.tok, &self.images);
                     let usage = Usage { prompt: self.prompt_ids.len(), cached: d.cached_tokens, completion: self.kept, reasoning };
                     let total = self.t0.elapsed().as_secs_f64();
                     let ttft = self.first_token.map_or(total, |t| (t - self.t0).as_secs_f64());
@@ -853,7 +855,7 @@ impl Drop for Gen {
             // The client went away mid-request. A cancelled session keeps what it processed, of
             // which what we received is a prefix: still good for the conversation's next turn.
             self.app.engine.cancel(self.req_id);
-            self.app.sessions.lock().unwrap().finish(self.session_id, &self.prompt_text, &self.prompt_ids, &self.ids, &self.app.tok);
+            self.app.sessions.lock().unwrap().finish_images(self.session_id, &self.prompt_text, &self.prompt_ids, &self.ids, &self.app.tok, &self.images);
         }
     }
 }
@@ -926,6 +928,7 @@ async fn start(app: &Arc<App>, p: &Prepared, pass: Pass) -> Result<Gen, ApiError
         req_id,
         session_id: plan.session_id,
         prompt_text: p.prompt.clone(),
+        images: Vec::new(),
         prompt_ids: plan.ids,
         rx,
         stop_ids,
@@ -944,8 +947,9 @@ async fn start(app: &Arc<App>, p: &Prepared, pass: Pass) -> Result<Gen, ApiError
 }
 
 /// A request with images (docs/vision.md): its images through the encoder, the placeholders expanded into
-/// their spans, and a session of its own that the engine frees at the end (no KEEP) and the text table
-/// never sees, so text requests' prefix reuse is untouched.
+/// their spans (in the text as well as in the ids), and then the same session table as a text request, with
+/// each image's content hash in what a session must match (session.rs): a conversation that re-sends its
+/// images continues its session or forks from it, and a changed image is never carried over.
 async fn start_images(app: &Arc<App>, p: &Prepared, pass: Pass, info: crate::protocol::HelloEngine) -> Result<Gen, ApiError> {
     let bad = |msg: String| ApiError(StatusCode::BAD_REQUEST, "invalid_request_error".into(), msg);
     let Some(addr) = app.cfg.vision_addr.clone() else {
@@ -956,63 +960,81 @@ async fn start_images(app: &Arc<App>, p: &Prepared, pass: Pass, info: crate::pro
     let enc = crate::vision::encode(&addr, &p.images, image_timeout, app.cfg.max_image_rows).await.map_err(|e| {
         if crate::vision::is_request_error(&e) { bad(e) } else { ApiError(StatusCode::SERVICE_UNAVAILABLE, "server_error".into(), e) }
     })?;
-    let ids = {
-        let (app2, text) = (app.clone(), p.prompt.clone());
-        tokio::task::spawn_blocking(move || app2.tok.encode_parallel(&text, app2.cfg.tokenize_threads))
-            .await
-            .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "server_error".into(), e.to_string()))?
+    let (text, ats) = crate::vision::expand_text(&p.prompt, &enc.rows).map_err(bad)?;
+    let keys: Vec<ImageKey> = (0..ats.len()).map(|i| ImageKey { at: ats[i], rows: enc.rows[i], hash: enc.hashes[i] }).collect();
+    let ablit = p.ablit.unwrap_or(false);
+    let (plan, released) = {
+        let (app2, text, keys) = (app.clone(), text.clone(), keys.clone());
+        tokio::task::spawn_blocking(move || {
+            let mut t = app2.sessions.lock().unwrap();
+            t.plan_images(&text, &app2.tok, app2.cfg.tokenize_threads, ablit, &keys)
+        })
+        .await
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "server_error".into(), e.to_string()))?
     };
-    let (ids, starts) = crate::vision::expand(&ids, &enc.rows).map_err(bad)?;
     let (n_images, n_rows, encoder_ms) = (enc.rows.len(), enc.rows.iter().sum::<u32>(), enc.ms);
     // the encoder has said what the images really take: hold that, not the estimate
     if let Some(held) = &p.rows_held {
         held.shrink_to(n_rows as usize);
     }
-    let ctx = info.max_context as usize;
-    if ids.len() >= ctx {
-        return Err(bad(format!("the prompt is {} tokens with its images; the context window is {ctx}", ids.len())));
+    for s in released {
+        app.engine.release(s);
     }
-    let max_new = (p.max_tokens as usize).min(ctx - ids.len()) as u32;
+    let ctx = info.max_context as usize;
+    if plan.ids.len() >= ctx {
+        app.sessions.lock().unwrap().abandon(plan.session_id);
+        return Err(bad(format!("the prompt is {} tokens with its images; the context window is {ctx}", plan.ids.len())));
+    }
+    let starts = match crate::vision::span_starts(&plan.ids, &enc.rows) {
+        Ok(s) => s,
+        Err(e) => {
+            app.sessions.lock().unwrap().abandon(plan.session_id);
+            return Err(bad(e));
+        }
+    };
+    let max_new = (p.max_tokens as usize).min(ctx - plan.ids.len()) as u32;
     let mut stop_ids = p.stop_ids.clone();
     if !p.ignore_eos {
         stop_ids.push(info.eos_id);
     }
-    let session_id = (1u64 << 63) | u64::from_str_radix(&app.random_hex(15), 16).unwrap_or(1);
+    // The images' rows go with every request that has them, the reused part's too: the engine restarts
+    // from the latest state it can rebuild at or before the shared prefix, which may lie inside an image.
     let submit = Submit {
         req_id: 0,
         session_id,
-        base_session_id: 0,
+        base_session_id,
         seed: p.seed.unwrap_or(0),
         temperature: p.temperature,
         top_p: p.top_p,
         top_k: p.top_k,
         max_new_tokens: max_new,
-        flags: crate::protocol::FLAG_IMAGES | if p.seed.is_some() { FLAG_SEED } else { 0 } | if p.ablit.unwrap_or(false) { FLAG_ABLIT } else { 0 },
+        flags: FLAG_KEEP
+            | crate::protocol::FLAG_IMAGES
+            | if p.seed.is_some() { FLAG_SEED } else { 0 }
+            | if ablit { FLAG_ABLIT } else { 0 },
         n_top_logprobs: 0,
-        prefix_hint: 0,
+        prefix_hint: plan.reused as u32,
         stop_ids: stop_ids.clone(),
-        prompt: ids.clone(),
+        prompt: plan.ids.clone(),
         images: Some(crate::vision::payload(&starts, enc)), // the encoder's buffer itself, not a copy
     };
-    let meta = ReqMeta {
-        key_label: p.key_label.clone(),
-        ablit: p.ablit.unwrap_or(false),
-        prompt_tokens: ids.len() as u32,
-        endpoint: ENDPOINT,
-        priority: PRIORITY,
+    let meta = ReqMeta { key_label: p.key_label.clone(), ablit, prompt_tokens: plan.ids.len() as u32, endpoint: ENDPOINT, priority: PRIORITY };
+    let (req_id, rx) = match app.engine.submit(submit, meta) {
+        Ok(x) => x,
+        Err(e) => {
+            app.sessions.lock().unwrap().abandon(session_id);
+            return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, "server_error".into(), e));
+        }
     };
-    let (req_id, rx) = app.engine.submit(submit, meta).map_err(|e| ApiError(StatusCode::SERVICE_UNAVAILABLE, "server_error".into(), e))?;
-    eprintln!(
-        "req {req_id} images: {n_images} ({n_rows} rows), encoder {encoder_ms:.0} ms; prompt {} ids; session {session_id} (not kept)",
-        ids.len()
-    );
+    eprintln!("req {req_id} images: {n_images} ({n_rows} rows), encoder {encoder_ms:.0} ms; plan: {describe}");
     Ok(Gen {
         app: app.clone(),
         _pass: pass,
         req_id,
-        session_id,
-        prompt_text: p.prompt.clone(),
-        prompt_ids: ids,
+        session_id: plan.session_id,
+        prompt_text: text,
+        images: keys,
+        prompt_ids: plan.ids,
         rx,
         stop_ids,
         stopper: StopMatcher::new(p.stops.clone()),

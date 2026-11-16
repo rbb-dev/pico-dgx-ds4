@@ -796,8 +796,10 @@ class Server {
     const double t0 = now_s();
     state({{kStUnspill, x->h, 0, 0}});
     m_.drain();
-    std::printf("serve: session %016llx back from disk: %.1f MiB, %zu positions, in %.1f ms\n", (unsigned long long)id,
-                si.disk_bytes / 1048576.0, x->hist.size(), 1e3 * (now_s() - t0));
+    const model::Model::StateInfo back = m_.state_info(x->h);  // what came back: the room decides how much
+    std::printf("serve: session %016llx back from disk: %.1f MiB of %.1f MiB, %zu positions, restart point %d of %d, in %.1f ms\n",
+                (unsigned long long)id, back.bytes / 1048576.0, si.disk_bytes / 1048576.0, x->hist.size(), back.restart,
+                si.restart, 1e3 * (now_s() - t0));
     forget_evicted();
   }
 

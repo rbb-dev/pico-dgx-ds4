@@ -604,10 +604,15 @@ pub mod synthetic {
 
     /// The tokenizer.json text.
     pub fn json() -> String {
+        json_of(&ADDED)
+    }
+
+    /// The tokenizer.json text with `added` as the added tokens (ids from 0, in order).
+    fn json_of(added: &[&str]) -> String {
         let b2u = bytes_to_unicode();
-        let base = ADDED.len();
+        let base = added.len();
         let vocab: Vec<String> = b2u.iter().enumerate().map(|(b, c)| format!("{}:{}", serde_json::to_string(&c.to_string()).unwrap(), base + b)).collect();
-        let added: Vec<String> = ADDED
+        let added: Vec<String> = added
             .iter()
             .enumerate()
             .map(|(i, t)| format!(r#"{{"id":{i},"content":{},"special":true,"normalized":false}}"#, serde_json::to_string(t).unwrap()))
@@ -617,5 +622,12 @@ pub mod synthetic {
 
     pub fn tokenizer() -> Tokenizer {
         Tokenizer::from_json(&json()).expect("synthetic tokenizer")
+    }
+
+    /// The same with the image placeholder (docs/vision.md) as one more added token, id 8 here.
+    pub fn tokenizer_with_images() -> Tokenizer {
+        let mut added = ADDED.to_vec();
+        added.push(crate::encoding::IMAGE_PLACEHOLDER);
+        Tokenizer::from_json(&json_of(&added)).expect("synthetic tokenizer")
     }
 }

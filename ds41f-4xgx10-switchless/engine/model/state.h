@@ -15,7 +15,14 @@
 // a file of the same size on every rank, allocated by the same best fit, so every rank again holds the
 // same blocks at the same offsets. When the file is full, its least recently used sessions are dropped.
 // A spilled session comes back (state_unspill, or any operation that needs its blocks) as far as the
-// store has room.
+// store has room, latest restart point first: the end snapshot with the pages it needs, else the latest
+// window snapshot whose pages fit, then the earlier snapshots those pages serve; never a block no restart
+// can use. A session is spilled as what it can restart from: an end snapshot or window snapshots whose
+// pages are not all saved, and pages beyond its latest restart point, are dropped first (StateInfo::restart).
+//
+// A session live in a slot holds its working state there; its stored pages are redundant while it is live
+// (persist saves what is missing from the slot, from `saved` on). When an allocation finds no room, those
+// pages are released before any session is evicted (saved falls to 0; its snapshots stay).
 //
 // Kept sessions (state.cu): a planned stop keeps the file and writes an index of the sessions in it
 // beside it; the next start that finds both as this run would have left them (the same run id, not too
@@ -98,6 +105,8 @@ struct Store {
   uint64_t loaded_gen = 0;                // the generation this run's store came from (0: none)
   uint64_t clock = 0;
   std::vector<int> pinned;   // the sessions the current command uses: never evicted during it
+  std::vector<int> live;     // the sessions live in the slots: never evicted either, but their compressed-cache
+                             // pages are a second copy of what the slot holds and are the first to go (store_alloc)
   std::vector<int> evicted;  // sessions evicted to make room, since rank 0's server last asked
   Sess& use(int h) {         // session h (made if new), used now
     Sess& s = sess[h];

@@ -80,9 +80,10 @@ void apply_ops(model::Model& m, const Cmd& c) {
     if (c.ops[i].op == kStCopySnaps) pin.push_back(c.ops[i].a);
   }
   if (c.handle >= 0) pin.push_back(c.handle);
+  std::vector<int> live;
   for (const int32_t h : c.live)
-    if (h > 0) pin.push_back(h);
-  m.state_pin(pin);
+    if (h > 0) live.push_back(h);
+  m.state_pin(pin, live);
   for (int i = 0; i < c.n_ops; ++i) apply_state(m, c.ops[i]);
 }
 
@@ -413,14 +414,14 @@ std::vector<BatchEnd> batch_loop(model::Model& m, const Cmd& c, const std::vecto
   std::vector<int> launched(n, 0), last_row(n, -1);
   std::vector<char> live(n, 1), ending(n, 0);
   auto may_run = [&](int k, int j) { return j <= e[k].max_new && e[k].pos0 + j < e[k].limit; };
-  std::vector<int> pin;
+  std::vector<int> pin, live_h;
   for (const int32_t h : c.live)
-    if (h > 0) pin.push_back(h);
+    if (h > 0) live_h.push_back(h);
   for (int k = 0; k < n; ++k) {
     if (e[k].handle >= 0) pin.push_back(e[k].handle);
     if (!may_run(k, 0)) live[k] = 0, end[k].why = e[k].max_new < 1 ? kEndLength : kEndContext;
   }
-  m.state_pin(pin);  // the sessions' stored state, while snapshots make room
+  m.state_pin(pin, live_h);  // the entries' sessions; the other slots' keep their snapshots, and give up their pages first
   struct Step {
     uint64_t id = 0;
     int R = 0;
@@ -596,9 +597,9 @@ std::vector<DecodeEnd> spec_batch_loop(model::Model& m, const Cmd& c, const std:
     int32_t tok[model::ops::kSessTok] = {};
   };
   std::vector<Next> nx(n);
-  std::vector<int> pin;
+  std::vector<int> pin, live_h;
   for (const int32_t h : c.live)
-    if (h > 0) pin.push_back(h);
+    if (h > 0) live_h.push_back(h);
   for (int k = 0; k < n; ++k) {
     const BatchEntry& x = e[k];
     DecodeEnd& d = end[k];
@@ -613,7 +614,7 @@ std::vector<DecodeEnd> spec_batch_loop(model::Model& m, const Cmd& c, const std:
     if (x.handle >= 0) pin.push_back(x.handle);
     if (x.max_new < 1 || x.pos0 >= x.limit) live[k] = 0, d.why = x.max_new < 1 ? kEndLength : kEndContext;
   }
-  m.state_pin(pin);  // the sessions' stored state, while snapshots make room
+  m.state_pin(pin, live_h);  // the entries' sessions; the other slots' keep their snapshots, and give up their pages first
   // entry k's window snapshots up to kv_end (positions below it hold its history's KV; the ring holds
   // s - 128 .. s - 1), in its slot
   auto snaps = [&](int k, int kv_end) {

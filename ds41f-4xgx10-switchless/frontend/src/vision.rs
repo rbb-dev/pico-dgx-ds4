@@ -258,6 +258,53 @@ fn span_table_len(n: usize) -> usize {
     4 + 16 * n
 }
 
+/// The prompt's text with each placeholder written once per row of its image (so that the text spells the
+/// expanded ids), and where each image's run starts in the result (byte offsets).
+pub fn expand_text(text: &str, rows: &[u32]) -> Result<(String, Vec<usize>), String> {
+    let ph = crate::encoding::IMAGE_PLACEHOLDER;
+    let n = text.matches(ph).count();
+    if n != rows.len() {
+        return Err(format!("the prompt has {n} image placeholders for {} images", rows.len()));
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut ats = Vec::with_capacity(n);
+    let mut last = 0;
+    for (k, (i, _)) in text.match_indices(ph).enumerate() {
+        out.push_str(&text[last..i]);
+        ats.push(out.len());
+        for _ in 0..rows[k] {
+            out.push_str(ph);
+        }
+        last = i + ph.len();
+    }
+    out.push_str(&text[last..]);
+    Ok((out, ats))
+}
+
+/// The starts of the image spans in expanded ids: each run of `rows[k]` image ids, in order. An error when
+/// the ids hold other image ids than those spans (the engine refuses such a prompt).
+pub fn span_starts(ids: &[u32], rows: &[u32]) -> Result<Vec<u32>, String> {
+    let mut starts = Vec::with_capacity(rows.len());
+    let mut i = 0;
+    while i < ids.len() {
+        if ids[i] != IMAGE_TOKEN_ID {
+            i += 1;
+            continue;
+        }
+        let Some(&r) = rows.get(starts.len()) else { return Err("the prompt has more image ids than images".into()) };
+        let end = i + r as usize;
+        if end > ids.len() || ids[i..end].iter().any(|&t| t != IMAGE_TOKEN_ID) {
+            return Err("an image's ids are cut short".into());
+        }
+        starts.push(i as u32);
+        i = end;
+    }
+    if starts.len() != rows.len() {
+        return Err(format!("the prompt has {} image spans for {} images", starts.len(), rows.len()));
+    }
+    Ok(starts)
+}
+
 /// The SUBMIT's image part (after prompt[]): u32 n, {u32 start, u32 rows, u64 hash} per image, the rows.
 /// The rows are already in place in `e.data`; this writes the table in front of them and hands the
 /// buffer over, without copying the rows.
@@ -502,5 +549,19 @@ pub(crate) mod tests {
         let gone = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap().to_string();
         let e = encode(&gone, &records(1), T, DEFAULT_MAX_IMAGE_ROWS).await.unwrap_err();
         assert!(e.starts_with("the image encoder is not reachable") && !is_request_error(&e), "{e}");
+    }
+
+    #[test]
+    fn expands_text_and_finds_spans() {
+        let ph = crate::encoding::IMAGE_PLACEHOLDER;
+        let (t, at) = expand_text(&format!("a{ph}b{ph}"), &[3, 4]).unwrap();
+        assert_eq!(t, format!("a{}b{}", ph.repeat(3), ph.repeat(4)));
+        assert_eq!(at, vec![1, 1 + 3 * ph.len() + 1]);
+        assert!(expand_text(ph, &[3, 3]).is_err());
+        let ids = [0, 5, IMAGE_TOKEN_ID, IMAGE_TOKEN_ID, IMAGE_TOKEN_ID, 6, IMAGE_TOKEN_ID, IMAGE_TOKEN_ID, IMAGE_TOKEN_ID, IMAGE_TOKEN_ID, 7];
+        assert_eq!(span_starts(&ids, &[3, 4]).unwrap(), vec![2, 6]);
+        assert!(span_starts(&ids, &[3, 3]).is_err());
+        assert!(span_starts(&ids, &[3]).is_err());
+        assert!(span_starts(&ids, &[4, 4]).is_err());
     }
 }

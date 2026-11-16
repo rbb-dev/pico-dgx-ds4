@@ -8,6 +8,14 @@
 //! A session belongs to the weights path it was created on (`ablit`, protocol flag ABLIT): a request is
 //! matched only against sessions of its own path, so a continuation or a fork never crosses the two.
 //!
+//! An image is a run of placeholder tokens (docs/vision.md): the prompt's text carries each image as its
+//! placeholder written once per row, so the text and its ids still spell each other, and a session records
+//! each image's place and content hash (`ImageKey`). The engine matches a session's history to a prompt by
+//! token id alone, and every image row has the same id, so ids cannot tell one image from another: a
+//! session is a candidate only when the images inside the text it shares with the prompt are the same
+//! images (same place, rows and content hash) on both sides. An image that differs inside the shared text
+//! rules the session out; it is never named as a base, so the engine cannot carry its rows over.
+//!
 //! The table outlives a stop (`save`, `load`; docs/engine.md, "Kept sessions"): the engine keeps its
 //! sessions across a planned stop, and the table is what finds them again. It holds the conversations'
 //! text, so its file is ours alone: mode 0600 in a directory of mode 0700, written whole or not at all.
@@ -25,6 +33,20 @@ const MIN_SHARED: usize = 64;
 /// the session's prompt; the encoding may rewrite the tail of the prompt (`<think>` → `</think>`).
 const PROMPT_SLACK: usize = 16;
 
+/// One image of a prompt: where its run of placeholders starts in the prompt's text (a byte offset), how
+/// many rows it spans, and a hash of the image's bytes (the encoder's).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageKey {
+    pub at: usize,
+    pub rows: u32,
+    pub hash: u64,
+}
+
+/// Whether two prompts' images agree inside their first `n` bytes: the same images, in the same places.
+fn images_agree(a: &[ImageKey], b: &[ImageKey], n: usize) -> bool {
+    a.iter().filter(|k| k.at < n).eq(b.iter().filter(|k| k.at < n))
+}
+
 struct Session {
     text: String,
     ids: Vec<u32>,
@@ -37,6 +59,8 @@ struct Session {
     t_used: u64,
     /// The ablated weights path: its state was computed with the ablation direction applied.
     ablit: bool,
+    /// The images of its prompt, in order.
+    images: Vec<ImageKey>,
 }
 
 pub struct Plan {
@@ -99,6 +123,8 @@ fn unix_now() -> u64 {
 const TABLE_MAGIC: &[u8; 8] = b"DSFT0002";
 const TABLE_MAGIC_V1: &[u8; 8] = b"DSFT0001";
 const TABLE_FLAG_ABLIT: u64 = 1;
+/// The session's ids are followed by its images: u64 count, then (at, rows, hash) as three u64 each.
+const TABLE_FLAG_IMAGES: u64 = 2;
 
 fn fnv(b: &[u8]) -> u64 {
     b.iter().fold(1469598103934665603u64, |h, &x| (h ^ x as u64).wrapping_mul(1099511628211))
@@ -159,13 +185,22 @@ impl SessionTable {
                 continue;
             }
             n += 1;
-            for v in [id, s.last_used, s.t_used, s.prompt_len as u64, s.text.len() as u64, if s.ablit { TABLE_FLAG_ABLIT } else { 0 }] {
+            let flags = (if s.ablit { TABLE_FLAG_ABLIT } else { 0 }) | (if s.images.is_empty() { 0 } else { TABLE_FLAG_IMAGES });
+            for v in [id, s.last_used, s.t_used, s.prompt_len as u64, s.text.len() as u64, flags] {
                 body.extend(v.to_le_bytes());
             }
             body.extend(s.text.as_bytes());
             body.extend((s.ids.len() as u64).to_le_bytes());
             for &x in &s.ids {
                 body.extend(x.to_le_bytes());
+            }
+            if !s.images.is_empty() {
+                body.extend((s.images.len() as u64).to_le_bytes());
+                for k in &s.images {
+                    for v in [k.at as u64, k.rows as u64, k.hash] {
+                        body.extend(v.to_le_bytes());
+                    }
+                }
             }
         }
         let mut f = TABLE_MAGIC.to_vec();
@@ -240,6 +275,13 @@ impl SessionTable {
             let n_ids = r.u64()? as usize;
             let raw = r.take(n_ids.checked_mul(4).ok_or("a bad count")?)?;
             let ids: Vec<u32> = raw.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+            let mut images = Vec::new();
+            if flags & TABLE_FLAG_IMAGES != 0 {
+                for _ in 0..r.u64()? {
+                    let (at, rows, hash) = (r.u64()? as usize, r.u64()?, r.u64()?);
+                    images.push(ImageKey { at, rows: rows as u32, hash });
+                }
+            }
             let Ok(text) = std::str::from_utf8(text) else { continue };
             let vocab = tok.vocab_size() as u32;
             if id == 0 || now.saturating_sub(t_used) > max_age_s || prompt_len > text.len() || ids.iter().any(|&x| x >= vocab) {
@@ -254,8 +296,11 @@ impl SessionTable {
             if at != text.len() || tok.decode_bytes(&ids) != text.as_bytes() {
                 continue; // another tokenizer's ids
             }
+            if images.iter().any(|k| k.at >= text.len() || k.rows < 3) {
+                continue;
+            }
             let ablit = flags & TABLE_FLAG_ABLIT != 0;
-            got.insert(id, Session { text: text.to_string(), ids, ends, prompt_len, busy: false, last_used, t_used, ablit });
+            got.insert(id, Session { text: text.to_string(), ids, ends, prompt_len, busy: false, last_used, t_used, ablit, images });
         }
         if r.at != body.len() {
             return Err("a bad body".into());
@@ -278,6 +323,13 @@ impl SessionTable {
     /// that path are candidates. The chosen session is busy until `finish` or `abandon`. Returns the
     /// plan and the sessions to RELEASE on the engine.
     pub fn plan(&mut self, text: &str, tok: &Tokenizer, threads: usize, ablit: bool) -> (Plan, Vec<u64>) {
+        self.plan_images(text, tok, threads, ablit, &[])
+    }
+
+    /// `plan` for a prompt with images: `text` has each image's placeholder written once per row, and
+    /// `images` says where each run starts in it, how long it is and what the image is. A session whose
+    /// images inside the shared text are not these (see the module comment) is no candidate.
+    pub fn plan_images(&mut self, text: &str, tok: &Tokenizer, threads: usize, ablit: bool, images: &[ImageKey]) -> (Plan, Vec<u64>) {
         self.clock += 1;
         let mut top: Option<(u64, usize)> = None;
         for (&id, s) in &self.sessions {
@@ -285,6 +337,9 @@ impl SessionTable {
                 continue;
             }
             let n = common_prefix(text.as_bytes(), s.text.as_bytes());
+            if !images_agree(&s.images, images, n) {
+                continue;
+            }
             if n > 0 && top.map_or(true, |(_, bn)| n > bn) {
                 top = Some((id, n));
             }
@@ -339,6 +394,7 @@ impl SessionTable {
             last_used: clock,
             t_used: 0,
             ablit,
+            images: Vec::new(),
         });
         s.busy = true;
         s.last_used = clock;
@@ -349,6 +405,11 @@ impl SessionTable {
 
     /// Record what the session holds after a request: the prompt and the generated ids.
     pub fn finish(&mut self, session_id: u64, prompt_text: &str, prompt_ids: &[u32], generated: &[u32], tok: &Tokenizer) {
+        self.finish_images(session_id, prompt_text, prompt_ids, generated, tok, &[]);
+    }
+
+    /// `finish` for a prompt with images (`plan_images`' text and keys).
+    pub fn finish_images(&mut self, session_id: u64, prompt_text: &str, prompt_ids: &[u32], generated: &[u32], tok: &Tokenizer, images: &[ImageKey]) {
         let Some(s) = self.sessions.get_mut(&session_id) else { return };
         let gen_bytes = tok.decode_bytes(generated);
         let mut text = prompt_text.to_string();
@@ -369,6 +430,7 @@ impl SessionTable {
         s.ids = ids;
         s.ends = ends;
         s.prompt_len = prompt_text.len();
+        s.images = images.to_vec();
         s.busy = false;
     }
 
@@ -635,6 +697,117 @@ mod tests {
         assert_eq!(w.load(&path, &tok, 3600), Ok(1));
         let (off, _) = w.plan(&turn(&p1, "more"), &tok, 1, false);
         assert_eq!((off.session_id, off.reused), (77, ids.len()));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    const PH: &str = crate::encoding::IMAGE_PLACEHOLDER;
+
+    /// A prompt with images as the server prepares it: the text with each placeholder written once per
+    /// row, and the images' keys (`hashes` in order, `rows` rows each).
+    fn with_images(raw: &str, rows: u32, hashes: &[u64]) -> (String, Vec<ImageKey>) {
+        let (text, ats) = crate::vision::expand_text(raw, &vec![rows; hashes.len()]).unwrap();
+        let keys = ats.iter().zip(hashes).map(|(&at, &hash)| ImageKey { at, rows, hash }).collect();
+        (text, keys)
+    }
+
+    #[test]
+    fn images_are_matched_by_content() {
+        let tok = crate::tokenizer::synthetic::tokenizer_with_images();
+        let mut t = SessionTable::new(8, 1 << 20);
+        let first = format!("{SYS}<｜User｜>what is on {PH}?<｜Assistant｜></think>");
+        let (x1, k1) = with_images(&first, 3, &[11]);
+        let (p1, _) = t.plan_images(&x1, &tok, 1, false, &k1);
+        assert_eq!((p1.base_session_id, p1.reused), (0, 0));
+        assert_eq!(tok.decode(&p1.ids), x1, "the ids spell the expanded text");
+        assert_eq!(p1.ids.iter().filter(|&&i| i == tok.token_id(PH).unwrap()).count(), 3);
+        let gen = tok.encode("A cat.<｜end▁of▁sentence｜>");
+        t.finish_images(p1.session_id, &x1, &p1.ids, &gen, &tok, &k1);
+        // the client re-sends its history with the same image: the next turn continues the session in place
+        let hist = format!("{first}A cat.<｜end▁of▁sentence｜>");
+        let (x2, k2) = with_images(&turn(&hist, "and its colour?"), 3, &[11]);
+        let (p2, _) = t.plan_images(&x2, &tok, 1, false, &k2);
+        assert_eq!((p2.session_id, p2.base_session_id), (p1.session_id, 0));
+        assert_eq!(p2.reused, p1.ids.len() + gen.len());
+        assert_eq!(tok.decode(&p2.ids), x2);
+        // the same text with another image at that place: the session is no candidate, a cold start
+        let (x3, k3) = with_images(&turn(&hist, "and its colour?"), 3, &[12]);
+        assert_eq!(x3, x2);
+        let (p3, _) = t.plan_images(&x3, &tok, 1, false, &k3);
+        assert_ne!(p3.session_id, p1.session_id);
+        assert_eq!((p3.base_session_id, p3.reused, p3.matched), (0, 0, 0));
+        assert_eq!(p3.ids, p2.ids, "the cold ids are the continued session's");
+    }
+
+    #[test]
+    fn an_image_after_the_shared_text_keeps_the_earlier_turns() {
+        let tok = crate::tokenizer::synthetic::tokenizer_with_images();
+        let mut t = SessionTable::new(8, 1 << 20);
+        let p1 = turn(SYS, "hello");
+        let (plain, _) = t.plan(&p1, &tok, 1, false);
+        let gen = tok.encode("Hi.<｜end▁of▁sentence｜>");
+        t.finish(plain.session_id, &p1, &plain.ids, &gen, &tok);
+        // the second turn brings the first image: it lies after everything the session holds
+        let (x2, k2) = with_images(&turn(&format!("{p1}Hi.<｜end▁of▁sentence｜>"), &format!("see {PH}")), 4, &[7]);
+        let (p2, _) = t.plan_images(&x2, &tok, 1, false, &k2);
+        assert_eq!((p2.session_id, p2.base_session_id), (plain.session_id, 0));
+        assert_eq!(p2.reused, plain.ids.len() + gen.len());
+        assert_eq!(tok.decode(&p2.ids), x2);
+        t.finish_images(p2.session_id, &x2, &p2.ids, &tok.encode("A dog.<｜end▁of▁sentence｜>"), &tok, &k2);
+        // a different conversation with the same system prompt and no image forks the session: its
+        // shared text ends before the image
+        let other = turn(SYS, "something else entirely");
+        let (f, _) = t.plan(&other, &tok, 1, false);
+        assert_eq!(f.base_session_id, plain.session_id);
+        // a conversation that holds the image too, at the same place, forks it with the image
+        let (x4, k4) = with_images(&turn(&format!("{p1}Hi.<｜end▁of▁sentence｜>"), &format!("see {PH} now")), 4, &[7]);
+        let (p4, _) = t.plan_images(&x4, &tok, 1, false, &k4);
+        assert_eq!(p4.base_session_id, plain.session_id);
+        assert!(p4.reused >= plain.ids.len() + gen.len());
+    }
+
+    #[test]
+    fn image_sessions_are_kept_per_weights_path() {
+        let tok = crate::tokenizer::synthetic::tokenizer_with_images();
+        let mut t = SessionTable::new(8, 1 << 20);
+        let raw = format!("{SYS}<｜User｜>what is on {PH}?<｜Assistant｜></think>");
+        let (x, k) = with_images(&raw, 3, &[5]);
+        let (plain, _) = t.plan_images(&x, &tok, 1, false, &k);
+        t.finish_images(plain.session_id, &x, &plain.ids, &tok.encode("Ok.<｜end▁of▁sentence｜>"), &tok, &k);
+        let (abl, _) = t.plan_images(&x, &tok, 1, true, &k);
+        assert_ne!(abl.session_id, plain.session_id);
+        assert_eq!((abl.base_session_id, abl.reused, abl.matched), (0, 0, 0));
+        t.finish_images(abl.session_id, &x, &abl.ids, &tok.encode("Ok.<｜end▁of▁sentence｜>"), &tok, &k);
+        // each path continues its own session
+        let (x2, k2) = with_images(&turn(&format!("{raw}Ok.<｜end▁of▁sentence｜>"), "more"), 3, &[5]);
+        let (a, _) = t.plan_images(&x2, &tok, 1, true, &k2);
+        assert_eq!((a.session_id, a.base_session_id), (abl.session_id, 0));
+        let (b, _) = t.plan_images(&x2, &tok, 1, false, &k2);
+        assert_eq!((b.session_id, b.base_session_id), (plain.session_id, 0));
+    }
+
+    #[test]
+    fn a_saved_table_keeps_its_images() {
+        let tok = crate::tokenizer::synthetic::tokenizer_with_images();
+        let dir = std::env::temp_dir().join(format!("dsfront-images-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("front.table");
+        let mut t = SessionTable::new(8, 1 << 20);
+        let first = format!("{SYS}<｜User｜>what is on {PH}?<｜Assistant｜></think>");
+        let (x1, k1) = with_images(&first, 3, &[11]);
+        let (p1, _) = t.plan_images(&x1, &tok, 1, false, &k1);
+        let gen = tok.encode("A cat.<｜end▁of▁sentence｜>");
+        t.finish_images(p1.session_id, &x1, &p1.ids, &gen, &tok, &k1);
+        assert_eq!(t.save(&path, 3600), Ok(1));
+        let mut u = SessionTable::new(8, 1 << 20);
+        assert_eq!(u.load(&path, &tok, 3600), Ok(1));
+        let hist = format!("{first}A cat.<｜end▁of▁sentence｜>");
+        let (x2, k2) = with_images(&turn(&hist, "and its colour?"), 3, &[11]);
+        let (p2, _) = u.plan_images(&x2, &tok, 1, false, &k2);
+        assert_eq!((p2.session_id, p2.reused), (p1.session_id, p1.ids.len() + gen.len()));
+        let (x3, k3) = with_images(&turn(&hist, "and its colour?"), 3, &[12]);
+        let (p3, _) = u.plan_images(&x3, &tok, 1, false, &k3);
+        assert_eq!((p3.base_session_id, p3.reused), (0, 0));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

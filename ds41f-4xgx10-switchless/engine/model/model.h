@@ -271,7 +271,9 @@ class Model {
   // state_evicted() returns the sessions evicted since it was last called.
   void state_reserve(size_t bytes);
   size_t state_capacity() const;
-  void state_pin(const std::vector<int>& h);
+  // h: the sessions the command uses (never evicted); live: the sessions live in the slots (never evicted, and
+  // their stored pages, which the slots hold too, are released first when the pool is full).
+  void state_pin(const std::vector<int>& h, const std::vector<int>& live = {});
   std::vector<int> state_evicted();
   void state_save(int h, int from, int to);    // compressed caches of positions [from, to) -> session h
   void state_load(int h, int to);              // session h's compressed caches of positions [0, to) -> working
@@ -314,6 +316,7 @@ class Model {
     size_t bytes = 0;        // in the store's device pool
     bool on_disk = false;    // spilled: its blocks are in the disk tier (disk_bytes), none in the pool
     size_t disk_bytes = 0;
+    int restart = -1;        // the latest position it can restart from with what it holds (state.cu restart_of); -1: none
   };
   StateInfo state_info(int h) const;
   size_t state_bytes() const;                  // device memory the store holds
