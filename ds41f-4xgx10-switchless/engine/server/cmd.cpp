@@ -68,6 +68,9 @@ void apply_state(model::Model& m, const StateOp& o) {
     case kStSpill: m.state_spill(o.h); break;
     case kStUnspill: m.state_unspill(o.h); break;
     case kStKeep: m.state_keep((uint64_t)(uint32_t)o.a | (uint64_t)(uint32_t)o.b << 32); break;
+    case kStReserve: m.slot_reserve(o.a, o.b); break;
+    case kStRelease: m.slot_release(o.a); break;
+    case kStPin: break;  // apply_ops pinned its session
     default: die("state: unknown operation %d", o.op);
   }
 }
@@ -683,11 +686,14 @@ std::vector<DecodeEnd> spec_batch_loop(model::Model& m, const Cmd& c, const std:
       if (!b.on[k]) continue;
       b.thresh[k] = rate[k].thresh(c);
       end[k].gate(b.thresh[k]);
-      bound = std::max(bound, ahead ? nx[k].pos0 + nx[k].rows + kD : nx[k].pos0 + nx[k].rows - 1);
+      const int hi = ahead ? nx[k].pos0 + nx[k].rows + kD : nx[k].pos0 + nx[k].rows - 1;  // entry k's rows' last position at most
+      b.bound[k] = std::min(hi, e[k].limit - 1);  // the memory its slot needs mapped (Model::launch_verify_batch)
+      bound = std::max(bound, hi);
       lim = std::min(lim, e[k].limit);
       if (ending[k]) pend[k] = 1;
     }
     b.pos_bound = std::min(bound, lim - 1);
+    b.per_entry_bound = true;
     s.id = given ? m.launch_spec_batch(b) : m.launch_verify_batch(b);
     s.late = !given;  // a given step's rows are the host's: launch_spec_batch looked them up
     q.push_back(s);

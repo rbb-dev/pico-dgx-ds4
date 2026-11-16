@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <memory>
 #include <string>
@@ -21,6 +22,7 @@
 #include "model/ablit.h"
 #include "model/model.h"
 #include "model/ops.h"
+#include "model/vmm.h"
 
 namespace model {
 namespace detail {
@@ -75,18 +77,28 @@ struct LayerW {
   uint32_t* p_hcfn[2] = {};  // hc_fn as dsk::hc_fn_parts
 };
 
+// Bytes per entry of a kv source's four arrays: compressed KV, its scales, index keys, their scales.
+constexpr size_t kKvEntryBytes[4] = {256, 32, 64, 4};
+
 struct KvSrc {  // a kv-source layer's compressed KV, index keys and compressor carry (replicated)
   uint8_t *ckv, *csc, *ik, *iksc;
   int cap;
+  // entries a slot's region spans when the arrays are laid out with padding (the slot memory pool,
+  // vmm.h): a multiple of kStrideEntries, >= cap; 0: cap (the arrays are plain allocations). No kernel
+  // reads cap, so the padding changes the strides only.
+  int stride_cap = 0;
+  // ik's stride is a multiple of kChunk * 16 so that iksc's (ik's / 16, attn_common.cuh check_slots) is one too
+  static constexpr int kStrideEntries = (int)(vmm::kChunk * 16 / kKvEntryBytes[2]);
   float *carry_kv, *carry_sc;
   attn::Compressed compressed() const { return attn::Compressed{ckv, csc, cap}; }
   attn::IndexKeys keys() const { return attn::IndexKeys{ik, iksc, cap}; }
-  // session slots: slot s's buffers are slot 0's + s strides (whole caches of cap entries; the carries' 16
-  // rows of kHead floats)
-  size_t ckv_stride() const { return (size_t)cap * 256; }
-  size_t csc_stride() const { return (size_t)cap * 32; }
-  size_t ik_stride() const { return (size_t)cap * 64; }
-  size_t iksc_stride() const { return (size_t)cap * 4; }
+  // session slots: slot s's buffers are slot 0's + s strides (whole caches of cap entries, or of stride_cap
+  // when padded; the carries' 16 rows of kHead floats)
+  size_t stride_entries() const { return (size_t)(stride_cap ? stride_cap : cap); }
+  size_t ckv_stride() const { return stride_entries() * kKvEntryBytes[0]; }
+  size_t csc_stride() const { return stride_entries() * kKvEntryBytes[1]; }
+  size_t ik_stride() const { return stride_entries() * kKvEntryBytes[2]; }
+  size_t iksc_stride() const { return stride_entries() * kKvEntryBytes[3]; }
   static constexpr size_t kCarryStride = 16 * kHead;  // floats
   KvSrc at(int s) const {
     KvSrc k = *this;
@@ -138,6 +150,11 @@ struct Model::Impl {
   int nslots = 1, cur_slot = 0;  // logical slots (the server's), the current one
   int nunits = 1, cur_unit = 0;  // physical units (config.h kUnitMul): what slot tables and strides index
   int unit_of[kMaxSlots] = {}, slot_ctx_[kMaxSlots] = {};
+  // the slot memory pool (vmm.h; Options::vmm): the kv sources' sixteen arrays are ranges of it, mapped per
+  // slot as its session grows (ensure_mapped): array a of kv source k is the pool's array 4 * k + a
+  // (kKvEntryBytes order); mapped_upto[s]: the position up to which every array of slot s is mapped (-1: none)
+  std::unique_ptr<vmm::Pool> slot_pool;
+  int mapped_upto[kMaxSlots] = {};
   float2 *rope_plain, *rope_yarn;
   int kstride;
 
@@ -265,6 +282,14 @@ struct Model::Impl {
 
   // ---- session slots ------------------------------------------------------------------------
   void use_slot(int s);
+  // The slot memory pool. ensure_mapped: slot s's arrays hold every entry a step or copy reaching position `upto`
+  // (inclusive) touches, called before the work is queued; dies when the pool has no chunk left, which a slot_reserve()d
+  // request cannot reach. slot_release: unmap all of slot s (its session's state is saved and no work for it is queued).
+  void ensure_mapped(int s, int upto);
+  void slot_release(int s);
+  void slot_reserve(int s, int need);
+  int slot_chunks_for(int s, int need) const;
+  void slot_bytes(int s, int upto, size_t bytes[16]) const;
   // A step's view of the state: with one slot, its pointers (the kernels' one-session code, no table); with
   // more, slot 0's and the step's slot table (in_d->slot), so that one captured step serves rows in any slots.
   attn::Window step_win(int L) const;
@@ -354,6 +379,19 @@ struct Model::Impl {
   void state_reserve(size_t bytes);
   uint8_t* store_alloc(int h, size_t bytes);  // a block of the pool for session h (evicting), or nullptr
   void store_release(uint8_t* p, size_t bytes);
+  // The shared budget (Options::vmm: the store's pool is a region of slot_pool; state.cu "the store on the slot
+  // pool"). store_take: a block's range from the allocator with its chunks mapped, nullptr when no free range
+  // fits within the uncommitted chunks (an idle chunk is unmapped first, store_trim). store_evict_step: one step
+  // of making room for session h's block (a live session's redundant pages, else the least recently used
+  // session that nothing pins, spilled), false when there is none. store_trim: idle chunks back to the slots'
+  // free list once every queued copy has finished. store_give_back: for a slot's reservation or a map that
+  // finds the pool short: idle chunks, then sessions, until `fits()` or nothing is left to give.
+  uint8_t* store_take(size_t bytes);
+  bool store_evict_step(int h);
+  size_t store_trim();
+  bool store_give_back(const std::function<bool()>& fits);
+  bool store_shared() const;  // state.cu: the store is a region of slot_pool
+  size_t state_giveable(const std::vector<int>& keep) const;
   uint64_t state_kept_check(const std::string& base, uint64_t run_id, double max_age_s, size_t* bytes, std::string* why);
   void state_disk(const std::string& base, size_t bytes, size_t staging, bool reuse, uint64_t run_id);
   void state_keep(uint64_t gen);

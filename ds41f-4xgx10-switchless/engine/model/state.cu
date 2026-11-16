@@ -114,6 +114,18 @@ size_t Pool::take_off(size_t bytes) {
   return off;
 }
 
+size_t Pool::take_fit(size_t bytes, const std::function<bool(size_t, size_t)>& ok) {
+  const size_t n = round(bytes);
+  for (auto it = free.begin(); it != free.end(); ++it) {
+    if (it->second < n || !ok(it->first, n)) continue;
+    const size_t off = it->first, len = it->second;
+    free.erase(it);
+    if (len > n) free.emplace(off + n, len - n);
+    return off;
+  }
+  return kNone;
+}
+
 uint8_t* Pool::take(size_t bytes) {
   const size_t off = take_off(bytes);
   return off == kNone ? nullptr : base + off;
@@ -356,52 +368,214 @@ void Model::Impl::state_reserve(size_t bytes) {
   if (s.pool.base) die("state: the store's pool is reserved once");
   bytes = bytes / kPoolGrain * kPoolGrain;
   if (!bytes) return;
+  if (slot_pool) {
+    // The store on the slot pool (below): its chunks are made now, once, with the slots', and its pool is a range
+    // of address space over all of them. Every rank is told the same size (main.cpp), so every rank makes the same
+    // number of chunks; one that cannot stops the process, as the plain allocation's CUDA_CHECK did.
+    const size_t want = std::max<size_t>(1, bytes / vmm::kChunk);
+    const auto t0 = std::chrono::steady_clock::now();
+    const size_t made = slot_pool->add_chunks(want);
+    if (made != want || !slot_pool->ok())
+      die("state: the store's %zu chunks: %s (%zu made): lower --session-gib", want, slot_pool->error().c_str(), made);
+    const int r = slot_pool->add_region(slot_pool->total());
+    if (r < 0) die("state: the store's address space: %s", slot_pool->error().c_str());
+    const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    s.region = r;
+    s.share = want * vmm::kChunk;
+    s.pool.base = reinterpret_cast<uint8_t*>(slot_pool->region_base(r));
+    s.pool.size = slot_pool->region_chunks(r) * vmm::kChunk;
+    s.pool.free.emplace(0, s.pool.size);
+    if (rank == 0)
+      std::printf("state: the store shares the slot memory: %zu more chunks (%.2f GiB) made once in %.2f s, %zu chunks (%.2f GiB) "
+                  "in all; a block's chunks are mapped when it is taken and given back to the slots when they need them\n",
+                  made, (double)s.share / 1073741824.0, dt, slot_pool->total(), (double)s.pool.size / 1073741824.0);
+    return;
+  }
   void* p = nullptr;
   CUDA_CHECK(cudaMalloc(&p, bytes));
   s.pool.base = static_cast<uint8_t*>(p);
   s.pool.size = bytes;
   s.pool.free.emplace(0, bytes);
+  s.share = bytes;
 }
 
-// A block for session h. While none is free: first the pages of the least recently used session live in a
-// slot (and not used by the current command) are released, because the slot holds what they hold (the
-// session's persist saves them again from position 0 when its slot is let go); then the least recently
-// used session that the current command does not use and no slot holds is evicted (every rank does the
-// same): spilled to the disk tier, or freed without one; nullptr when none is left.
-uint8_t* Model::Impl::store_alloc(int h, size_t bytes) {
+// ---- the store on the slot pool ---------------------------------------------------------------------
+//
+// With Options::vmm the store has no memory of its own. Its pool (Store::pool, the byte allocator) is a range of
+// address space over every chunk the slot pool made (a vmm region: model/vmm.h), and a block's chunks are mapped
+// when the block is taken (store_take) and counted on every chunk the block overlaps; a chunk no block is left on
+// stays mapped, idle, until store_trim. The store's chunks and the slots' commitments never exceed the pool
+// together (vmm::Pool::uncommitted), so a request inside its commitment still never finds the free list empty,
+// and the store maps only what no slot has committed.
+//
+// Why an idle chunk is not unmapped at once. A block is freed on the host while copies that read it are still
+// queued on the model's stream (a spill's copy to staging is queued, then the block is released; whatever reads
+// or writes a block later is queued after what used it before). Unmapping then would fault those copies. Every
+// device access to a block is queued on that one stream (state.cu copies, the disk tier's staging and read-back
+// copies, the checksum kernels), so a trim waits for it (cudaStreamSynchronize) and then unmaps: slot_release has
+// waited already and trims for free; store_take trims when a block finds no chunk, and store_give_back when a
+// slot's reservation or a map finds the pool short. Reusing an idle chunk needs no wait: the block is queued
+// after what used it.
+//
+// Every rank runs the same operations in the same order, so every rank maps, trims and gives back the same chunks
+// at the same points: the decisions read only the allocator, the reference counts and the slots' commitments, never
+// timing or free memory (the waits change when a call returns, not what it does).
+
+bool Model::Impl::store_shared() const { return store_s && store_s->region >= 0; }
+
+uint8_t* Model::Impl::store_take(size_t bytes) {
+  Store& s = store_of();
+  if (s.region < 0) return s.pool.take(bytes);
+  const size_t n = Pool::round(bytes);
+  for (int pass = 0; pass < 2; ++pass) {
+    // first fit from the bottom, where the block's chunks are mapped already or can be mapped from what no slot has
+    const size_t off = s.pool.take_fit(bytes, [&](size_t o, size_t len) {
+      return slot_pool->region_need(s.region, o, len) <= slot_pool->uncommitted();
+    });
+    if (off != Pool::kNone) {
+      if (!slot_pool->region_acquire(s.region, off, n))
+        die("state: the store's block at %zu (%zu bytes): %s", off, n, slot_pool->error().c_str());
+      return s.pool.base + off;
+    }
+    if (pass == 0 && slot_pool->region_idle(s.region)) store_trim();  // idle chunks are chunks the block may need
+    else break;
+  }
+  return nullptr;
+}
+
+// The idle chunks back to the slots' free list, once every copy queued so far has finished.
+size_t Model::Impl::store_trim() {
+  Store& s = store_of();
+  if (s.region < 0 || !slot_pool->region_idle(s.region)) return 0;
+  CUDA_CHECK(cudaStreamSynchronize(st));  // the copies that read the blocks that were freed
+  const size_t n = slot_pool->region_trim(s.region);
+  ++s.trims, s.trimmed_chunks += n;
+  return n;
+}
+
+// One step of making room for a block of session h: first the compressed-cache pages of the least recently used
+// session live in a slot (and not used by the current command), because the slot holds what they hold (the
+// session's persist saves them again from position 0 when its slot is let go); then the least recently used session
+// that the current command does not use and no slot holds is evicted (every rank does the same): spilled to the
+// disk tier, or freed without one. False when none is left.
+bool Model::Impl::store_evict_step(int h) {
   Store& s = store_of();
   const auto in = [](const std::vector<int>& v, int k) { return std::find(v.begin(), v.end(), k) != v.end(); };
+  int redundant = -1;
+  uint64_t oldest_live = UINT64_MAX;
+  for (const auto& [k, ss] : s.sess)
+    if (k != h && !ss.disk && !ss.pages.empty() && ss.used < oldest_live && in(s.live, k) && !in(s.pinned, k))
+      redundant = k, oldest_live = ss.used;
+  if (redundant >= 0) {
+    Store::Sess& ls = s.sess.at(redundant);
+    if (rank == 0)
+      std::printf("state: session %d is live in a slot: its %zu stored pages (%.1f MiB) released to make room\n",
+                  redundant, ls.pages.size(), ls.pages.size() * Pool::round(kPageBytes) / 1048576.0);
+    for (uint8_t* p : ls.pages) store_release(p, kPageBytes);
+    ls.pages.clear();
+    ls.saved = 0;
+    return true;
+  }
+  int victim = -1;
+  uint64_t oldest = UINT64_MAX;
+  for (const auto& [k, ss] : s.sess)
+    if (k != h && !ss.disk && ss.used < oldest && !in(s.pinned, k) && !in(s.live, k)) victim = k, oldest = ss.used;
+  if (victim < 0) return false;
+  state_spill(victim);
+  return true;
+}
+
+// A slot's reservation (slot_reserve) or a map (ensure_mapped) found the pool short because the store holds chunks:
+// idle chunks go back first, then sessions are made room of one step at a time, until fits() (which tries what
+// was short) or nothing is left to give. The sessions the current command uses and those live in a slot stay.
+bool Model::Impl::store_give_back(const std::function<bool()>& fits) {
+  if (!store_shared()) return fits();
+  Store& s = store_of();
+  const size_t m0 = slot_pool->region_mapped(s.region);
+  const uint64_t spills0 = tier.spills, live0 = s.bytes;
+  int steps = 0;
+  bool ok = false;
   for (;;) {
-    if (uint8_t* p = s.pool.take(bytes)) {
+    if (fits()) {
+      ok = true;
+      break;
+    }
+    if (slot_pool->region_idle(s.region)) {
+      store_trim();
+      if (fits()) {
+        ok = true;
+        break;
+      }
+    }
+    if (!store_evict_step(-1)) break;
+    ++steps;
+  }
+  const size_t m1 = slot_pool->region_mapped(s.region);
+  if (m1 < m0) {
+    ++s.give_backs;
+    if (rank == 0)
+      std::printf("state: the store gives %zu chunks (%.1f MiB) back to the slots: %d eviction steps (%llu sessions spilled), "
+                  "%.1f MiB of blocks left in %zu mapped chunks\n",
+                  m0 - m1, (m0 - m1) * (double)vmm::kChunk / 1048576.0, steps, (unsigned long long)(tier.spills - spills0),
+                  s.bytes / 1048576.0, m1);
+  }
+  (void)live0;
+  return ok;
+}
+
+// The chunks the store would have mapped if it held nothing but the blocks of the sessions in `keep` (those in
+// RAM; a spilled session has none): what the store can give back to the slots without touching them. Counted
+// from the blocks' offsets, so it is the same on every rank.
+size_t Model::Impl::state_giveable(const std::vector<int>& keep) const {
+  if (!store_s || store_s->region < 0) return 0;
+  const Store& s = *store_s;
+  const bool sp = spec != nullptr;
+  std::vector<size_t> held;
+  const auto add = [&](const uint8_t* p, size_t bytes) {
+    if (!p) return;
+    const size_t off = (size_t)(p - s.pool.base), n = Pool::round(bytes);
+    for (size_t i = off / vmm::kChunk; i <= (off + n - 1) / vmm::kChunk; ++i) held.push_back(i);
+  };
+  for (const int h : keep) {
+    const auto it = s.sess.find(h);
+    if (it == s.sess.end() || it->second.disk) continue;
+    for (const uint8_t* p : it->second.pages) add(p, kPageBytes);
+    for (const auto& sn : it->second.snaps) add(sn.second, snap_bytes(sp));
+    add(it->second.end, end_bytes(sp));
+  }
+  std::sort(held.begin(), held.end());
+  const size_t n = (size_t)(std::unique(held.begin(), held.end()) - held.begin());
+  const size_t mapped = slot_pool->region_mapped(s.region);
+  return mapped > n ? mapped - n : 0;
+}
+
+size_t Model::state_restore_chunks(int h) const {
+  if (!d_->store_shared()) return 0;
+  const auto it = d_->store_s->sess.find(h);
+  if (it == d_->store_s->sess.end() || !it->second.disk) return 0;
+  const Store::Sess& ss = it->second;
+  const bool sp = d_->spec != nullptr;
+  const auto c = [](size_t b) { return (Pool::round(b) + vmm::kChunk - 1) / vmm::kChunk + 1; };  // a block maps at most this many
+  return ss.dpages.size() * c(kPageBytes) + ss.dsnaps.size() * c(snap_bytes(sp)) +
+         (ss.dend != Pool::kNone ? c(end_bytes(sp)) : 0);
+}
+
+// A block for session h. While none is free (store_take): make room (store_evict_step); nullptr when none is left.
+uint8_t* Model::Impl::store_alloc(int h, size_t bytes) {
+  Store& s = store_of();
+  for (;;) {
+    if (uint8_t* p = store_take(bytes)) {
       s.bytes += Pool::round(bytes);
       return p;
     }
-    int redundant = -1;
-    uint64_t oldest_live = UINT64_MAX;
-    for (const auto& [k, ss] : s.sess)
-      if (k != h && !ss.disk && !ss.pages.empty() && ss.used < oldest_live && in(s.live, k) && !in(s.pinned, k))
-        redundant = k, oldest_live = ss.used;
-    if (redundant >= 0) {
-      Store::Sess& ls = s.sess.at(redundant);
-      if (rank == 0)
-        std::printf("state: session %d is live in a slot: its %zu stored pages (%.1f MiB) released to make room\n",
-                    redundant, ls.pages.size(), ls.pages.size() * Pool::round(kPageBytes) / 1048576.0);
-      for (uint8_t* p : ls.pages) store_release(p, kPageBytes);
-      ls.pages.clear();
-      ls.saved = 0;
-      continue;
-    }
-    int victim = -1;
-    uint64_t oldest = UINT64_MAX;
-    for (const auto& [k, ss] : s.sess)
-      if (k != h && !ss.disk && ss.used < oldest && !in(s.pinned, k) && !in(s.live, k)) victim = k, oldest = ss.used;
-    if (victim < 0) {
+    if (!store_evict_step(h)) {
+      const size_t cap = s.region >= 0 ? (slot_pool->total() - std::min(slot_pool->total(), slot_pool->committed_total())) * vmm::kChunk
+                                       : s.pool.size;
       if (rank == 0)
         std::printf("state: no room for %.1f MiB of session %d's state (%.2f of %.2f GiB in use)\n",
-                    bytes / 1048576.0, h, s.bytes / 1073741824.0, s.pool.size / 1073741824.0);
+                    bytes / 1048576.0, h, s.bytes / 1073741824.0, cap / 1073741824.0);
       return nullptr;
     }
-    state_spill(victim);
   }
 }
 
@@ -642,6 +816,7 @@ void Model::Impl::store_release(uint8_t* p, size_t bytes) {
   Store& s = store_of();
   s.pool.give(p, bytes);
   s.bytes -= Pool::round(bytes);
+  if (s.region >= 0) slot_pool->region_drop(s.region, (size_t)(p - s.pool.base), Pool::round(bytes));
 }
 
 // Compressed caches of positions [from, to): entries [from / ratio, to / ratio) of every kv source
@@ -656,6 +831,10 @@ void Model::Impl::state_save(int h, int from, int to) {
     ss.pages.push_back(p);
   }
   to = std::min(to, (int)ss.pages.size() * kPagePos);
+  // the copies read the slot's arrays: what the session wrote is mapped (steps map before they run); a slot
+  // released since holds nothing to save
+  if (slot_pool && to > from && mapped_upto[cur_slot] < to - 1)
+    die("state: session %d saves [%d, %d) from slot %d, which is mapped up to %d", h, from, to, cur_slot, mapped_upto[cur_slot]);
   for (int k = 0; k < kKvSlots; ++k) {
     const int ratio = k < 3 ? 2 : 1, E = kPagePos / ratio;
     const KvSrc& src = kvs[k];
@@ -675,6 +854,7 @@ void Model::Impl::state_load(int h, int to) {
   if (!store_of().sess.count(h)) die("state: session %d loads with nothing stored", h);
   Store::Sess& ss = use_blocks(*this, h);
   if (to > ss.saved) die("state: session %d loads %d positions of %d", h, to, ss.saved);
+  ensure_mapped(cur_slot, to);  // the copy-in writes entries [0, to / ratio): mapped first
   for (int k = 0; k < kKvSlots; ++k) {
     const int ratio = k < 3 ? 2 : 1, E = kPagePos / ratio;
     const KvSrc& dst = kvs[k];
@@ -893,7 +1073,22 @@ void Model::Impl::state_drop_snap(int h, int pos) {
 }
 
 void Model::state_reserve(size_t bytes) { d_->state_reserve(bytes); }
-size_t Model::state_capacity() const { return d_->store_s ? d_->store_s->pool.size : 0; }
+size_t Model::state_capacity() const {
+  if (!d_->store_s) return 0;
+  return d_->store_s->region >= 0 ? d_->store_s->share : d_->store_s->pool.size;
+}
+size_t Model::state_ceiling() const { return d_->store_s ? d_->store_s->pool.size : 0; }
+bool Model::state_shared() const { return d_->store_shared(); }
+size_t Model::state_giveable(const std::vector<int>& keep) const { return d_->state_giveable(keep); }
+Model::StoreChunks Model::state_chunks() const {
+  StoreChunks c;
+  if (!d_->store_shared()) return c;
+  const detail::Store& s = *d_->store_s;
+  const vmm::Pool& p = *d_->slot_pool;
+  c.total = p.total(), c.committed = p.committed_total(), c.mapped = p.region_mapped(s.region), c.idle = p.region_idle(s.region);
+  c.live_bytes = s.bytes, c.trimmed = s.trimmed_chunks, c.give_backs = s.give_backs;
+  return c;
+}
 void Model::state_pin(const std::vector<int>& h, const std::vector<int>& live) {
   auto& s = d_->store_of();
   s.pinned = h;
@@ -963,6 +1158,10 @@ Model::TierStats Model::tier_stats() const {
   TierStats t = d_->tier;
   if (const detail::Store* s = d_->store_s.get()) {
     t.store_cap = s->pool.size, t.store_used = s->bytes;
+    if (s->region >= 0) {  // the store may hold what the slots have not committed
+      const size_t total = d_->slot_pool->total(), c = d_->slot_pool->committed_total();
+      t.store_cap = (total > c ? total - c : 0) * vmm::kChunk;
+    }
     for (const auto& kv : s->sess) ++(kv.second.disk ? t.on_disk : t.resident);
     if (s->disk) t.disk_cap = s->dpool.size, t.disk_used = s->dbytes;
   }

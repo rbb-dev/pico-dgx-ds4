@@ -1120,6 +1120,7 @@ uint64_t Model::Impl::launch_spec(int R, int pos0, const int32_t* tokens, const 
     die("model: bad spec step R=%d pos0=%d (at most %d rows: one session's)", R, pos0, kMaxSessRows);
   for (int r = 0; r < R; ++r)
     if (tokens[r] < 0) die("model: launch_spec takes the step's tokens");
+  ensure_mapped(cur_slot, pos_last);
   const uint64_t n = n_steps;
   if (n >= (uint64_t)ops::kInSlots) wait_done(n - ops::kInSlots);
   ops::StepIn& in = next_in(n, R, pos0, tokens, sp);
@@ -1146,6 +1147,7 @@ uint64_t Model::Impl::launch_spec(int R, int pos0, const int32_t* tokens, const 
 uint64_t Model::Impl::launch_verify(const Sampling& sp, const SpecCfg& c, int pos_bound) {
   if (!spec) die("model: launch_verify without bind_spec");
   if (pos_bound < 0) die("model: launch_verify(%d)", pos_bound);
+  ensure_mapped(cur_slot, pos_bound);  // the rows are the device's: pos_bound is the highest position they can reach
   const uint64_t n = n_steps;
   if (n >= (uint64_t)ops::kInSlots) wait_done(n - ops::kInSlots);
   const int32_t none = 0;
@@ -1228,6 +1230,7 @@ uint64_t Model::Impl::launch_spec_batch(const SpecBatch& b) {
     if (!b.on[k]) continue;
     in.tokens[R] = b.token[k], in.pos[R] = b.pos0[k], in.slot[R] = unit_of[b.slot[k]], in.sess[R] = k;
     pos_last = std::max(pos_last, b.pos0[k]);
+    ensure_mapped(b.slot[k], b.pos0[k]);
     ++R;
   }
   for (int r = R; r < kMaxRows; ++r) {  // the entries past R repeat the last row's
@@ -1259,6 +1262,8 @@ uint64_t Model::Impl::launch_spec_batch(const SpecBatch& b) {
 uint64_t Model::Impl::launch_verify_batch(const SpecBatch& b) {
   spec_batch_check(b, false);
   if (b.pos_bound < 0) die("model: launch_verify_batch(%d)", b.pos_bound);
+  for (int k = 0; k < b.n; ++k)  // the rows are the device's: each entry's highest position (SpecBatch::bound), else the step's
+    if (b.on[k]) ensure_mapped(b.slot[k], b.per_entry_bound ? b.bound[k] : b.pos_bound);
   const uint64_t n = n_steps;
   if (n >= (uint64_t)ops::kInSlots) wait_done(n - ops::kInSlots);
   ops::StepIn& in = in_h[n % ops::kInSlots];

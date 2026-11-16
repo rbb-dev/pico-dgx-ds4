@@ -5,7 +5,10 @@
 // draft module's windows (DSpark, spec.cu) are per position mod 256 too and go with the snapshots.
 //
 // The store's device memory is one pool, reserved once at startup (Model::state_reserve) with the same
-// size on every rank, and a best-fit allocator with coalescing hands out its blocks. Every rank runs
+// size on every rank, and a best-fit allocator with coalescing hands out its blocks. With the slot memory
+// pool (model/vmm.h, Options::vmm) the store has no memory of its own: its pool is a range of address space
+// over the slots' 2 MiB chunks (a vmm region), first fit from the bottom, and a chunk is mapped while a block
+// overlaps it (Store::region, Model::Impl::store_take); the store's size is then whatever the slots leave. Every rank runs
 // the same operations in the same order, so every rank holds the same blocks at the same offsets. When
 // the pool is full, the least recently used session that the current command does not use is evicted
 // (the same one on every rank), and an allocation that still finds no room is skipped: a snapshot not
@@ -30,6 +33,7 @@
 // ones until a request reads them back.
 #pragma once
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <string>
@@ -63,6 +67,9 @@ struct Pool {
   bool take_at(size_t off, size_t bytes);  // [off, off + round(bytes)) when it is free (kept sessions)
   void give_off(size_t off, size_t bytes);
   size_t largest() const;
+  // The first free range, lowest offset first, whose start `ok(offset, rounded bytes)` accepts: the block goes at
+  // its start (first fit, so that the blocks stay at the bottom of the range). kNone when there is none.
+  size_t take_fit(size_t bytes, const std::function<bool(size_t, size_t)>& ok);
 };
 
 class SpillFile;
@@ -94,6 +101,11 @@ struct Store {
   };
   std::map<int, Sess> sess;
   Pool pool;
+  // The shared budget (model/vmm.h regions): the id of the vmm region the pool's range is, -1 for a plain
+  // allocation (--no-vmm); the store's size at the start, and what it handed back to the slots since.
+  int region = -1;
+  size_t share = 0;
+  uint64_t trims = 0, trimmed_chunks = 0, give_backs = 0;
   size_t bytes = 0;          // the pool's bytes in sessions' blocks
   std::unique_ptr<SpillFile> disk;  // the disk tier (none: evicted sessions are freed)
   Pool dpool;                       // its file's offsets

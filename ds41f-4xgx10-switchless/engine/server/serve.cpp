@@ -494,7 +494,8 @@ class Server {
         Request rq = std::move(ready_.front());
         ready_.pop_front();
         admit(std::move(rq));
-      } else if (!wait_.empty() && pick_slot({}, need_clamped(wait_.front())) >= 0) {
+      } else if (!wait_.empty() &&
+                 pick_slot({}, need_clamped(wait_.front()), wait_.front().h.session_id, wait_.front().h.base_session_id) >= 0) {
         Request rq = std::move(wait_.front());
         wait_.pop_front();
         admit(std::move(rq));
@@ -705,16 +706,17 @@ class Server {
   }
   // Slot s's session's state into the store, in a command of its own acting on s; `free`: the slot is let
   // go (its session then lives in the store only).
-  void persist_slot(int s, bool free) {
+  void persist_slot(int s, bool free, const std::vector<int>& hold = {}) {
     Session* x = slot_[s] ? find(slot_[s]) : nullptr;
     if (free) {
       slot_[s] = 0;
       if (x) x->slot = -1;
     }
-    if (!x) return;
     std::vector<StateOp> v;
-    persist_ops(*x, v);
+    if (x) persist_ops(*x, v);
+    if (free) v.push_back({kStRelease, 0, s, 0});  // the slot's memory back to the pool, once its state is saved
     if (v.empty()) return;
+    for (const int h : hold) v.push_back({kStPin, h, 0, 0});  // the store leaves these sessions alone while it makes room for this one's
     Cmd c{};
     c.op = kCmdState;
     c.slot = s;
@@ -725,8 +727,9 @@ class Server {
   void release(uint64_t id) {
     const auto it = sess_.find(id);
     if (it == sess_.end()) return;
-    state({{kStFree, it->second.h, 0, 0}});
-    if (it->second.slot >= 0) slot_[it->second.slot] = 0;
+    std::vector<StateOp> v{{kStFree, it->second.h, 0, 0}};
+    if (it->second.slot >= 0) v.push_back({kStRelease, 0, it->second.slot, 0}), slot_[it->second.slot] = 0;
+    state(v);
     sess_.erase(it);
   }
   // Session s's window snapshots that keep_snap no longer keeps at its history's end, dropped (not the
@@ -743,14 +746,16 @@ class Server {
   }
   // Sessions the store evicted to make room (an operation found its pool full) are gone here too.
   void forget_evicted() {
+    std::vector<StateOp> v;
     for (const int h : m_.state_evicted())
       for (auto it = sess_.begin(); it != sess_.end(); ++it)
         if (it->second.h == h) {
           std::printf("serve: session %016llx evicted to make room\n", (unsigned long long)it->first);
-          if (it->second.slot >= 0) slot_[it->second.slot] = 0;
+          if (it->second.slot >= 0) v.push_back({kStRelease, 0, it->second.slot, 0}), slot_[it->second.slot] = 0;
           sess_.erase(it);
           break;
         }
+    if (!v.empty()) state(v);  // a live session's slot memory goes back with it
   }
   // Least recently used sessions out until the store fits the budget: spilled to the disk tier (one live
   // in a slot saved first, and the slot let go), or freed without one. Sessions in flight stay.
@@ -778,7 +783,7 @@ class Server {
         continue;
       }
       v.push_back({kStFree, victim->second.h, 0, 0});
-      if (victim->second.slot >= 0) slot_[victim->second.slot] = 0;
+      if (victim->second.slot >= 0) v.push_back({kStRelease, 0, victim->second.slot, 0}), slot_[victim->second.slot] = 0;
       sess_.erase(victim);
     }
     if (!v.empty()) state(v);
@@ -890,7 +895,9 @@ class Server {
     if (flying_.count(rq.h.session_id)) return held_.push_back(std::move(rq));
     const auto it = sess_.find(rq.h.session_id);
     const int need = need_clamped(rq);
-    if ((it == sess_.end() || it->second.slot < 0 || !fits(it->second.slot, need)) && pick_slot({}, need) < 0)
+    const uint64_t sid = rq.h.session_id, base = rq.h.base_session_id;
+    if ((it == sess_.end() || it->second.slot < 0 || !fits(it->second.slot, need) || !mem_ok(it->second.slot, need, {}, sid, base)) &&
+        pick_slot({}, need, sid, base) < 0)
       return wait_.push_back(std::move(rq));
     start(std::move(rq));
   }
@@ -973,16 +980,26 @@ class Server {
     // the session's own slot. A fork takes its base's when no request of the base is in flight: the base's
     // state goes to the store, and the fork goes on from it in place. A base in flight keeps its slot; its
     // state goes to the store, and the fork starts from there in a slot of its own.
+    // With the pool, a slot is taken only when mem_ok() says the pool can hold the request there, with the same
+    // `keep` admit() and run() checked: a slot that cannot is left (the session's state to the store), and
+    // pick_slot() gives one that can, so make_room() below always finds the memory.
     const int need = need_clamped(f.rq);
+    const uint64_t sid = h.session_id, base = h.base_session_id;
     int s = S ? S->slot : -1;
-    if (s >= 0 && !fits(s, need)) persist_slot(s, true), s = -1;  // a small slot: the session moves to a big one
+    if (s >= 0 && (!fits(s, need) || !mem_ok(s, need, keep, sid, base)))
+      persist_slot(s, true, holds(sid, base)), s = -1;  // a small slot (the session moves to a big one), or memory only another slot has
     if (!S && src && src->slot >= 0) {
-      if (!flying_.count(src_id) && fits(src->slot, need)) s = src->slot;
-      else persist_slot(src->slot, false);
+      if (!flying_.count(src_id) && fits(src->slot, need) && mem_ok(src->slot, need, keep, sid, base)) s = src->slot;
+      else persist_slot(src->slot, false, holds(sid, base));
     }
-    if (s < 0) s = pick_slot(keep, need);
+    if (s < 0) s = pick_slot(keep, need, sid, base);
     if (s < 0) die("serve: no slot for request %llu", (unsigned long long)h.req_id);  // admit() saw one
     const bool src_live = src && src->slot == s;
+    // With the store on the slot pool, the state of the session that holds slot s (unless it is the fork's own base,
+    // which goes on in place) goes to the store in a command of its own before the slot is asked for: its pages are
+    // then blocks no command pins, which the reservation below can ask the store to give back
+    if (m_.state_shared() && slot_[s] && slot_[s] != sid && !src_live) persist_slot(s, true, holds(sid, base));
+    make_room(s, need, keep, sid, base);
     const int p = src ? std::min(lcp(src->hist, prompt), n - 1) : 0;
     const Plan pl = src ? choose(*src, src_live, p, n) : Plan{};
     const int q = pl.q;
@@ -1013,14 +1030,21 @@ class Server {
       }
       std::printf("serve: req %llu restart: %s; reused %d (%s)\n", (unsigned long long)h.req_id, from, q, kHow[pl.how]);
     }
-    std::vector<StateOp> v;
+    std::vector<StateOp> v, pv;  // pv: a fork's base's state in place, after the reservation (shared store)
     if (slot_[s] && slot_[s] != h.session_id) {  // the slot's session (a fork's base too) keeps its state in the store
       if (Session* y = find(slot_[s])) {
-        persist_ops(*y, v);
+        // in place the slot keeps its memory, so the reservation (which the store gives chunks back for) comes first and
+        // the base's state goes into what the store has left: a block with no room is skipped, as in a full store
+        persist_ops(*y, m_.state_shared() && src_live ? pv : v);
         y->slot = -1;
       }
+      // its memory back to the pool: the new session maps what it needs. A fork that goes on from its base's
+      // state in place keeps the slot's memory as it is: that memory is the state it goes on from.
+      if (!src_live) v.push_back({kStRelease, 0, s, 0});
       slot_[s] = 0;
     }
+    v.push_back({kStReserve, 0, s, need});  // the request's prompt and every token it may generate are committed
+    v.insert(v.end(), pv.begin(), pv.end());
     if (!S) {
       Session ns;
       ns.h = next_h_++;
@@ -1217,20 +1241,127 @@ class Server {
   int need_clamped(const Request& rq) const { return std::min(need_of(rq), o_.max_ctx);
   }
   bool fits(int s, int need) const { return need <= m_.slot_ctx(s); }
+  // The sessions the store leaves alone for a request of session `sid` (forking from `base`): theirs, and those of the
+  // slots in `keep` or in flight (all_live: of every slot, which is what Model::slot_reserve leaves alone), as handles.
+  std::vector<int> pins(uint64_t sid, uint64_t base, const std::set<uint64_t>* keep = nullptr, bool all_live = false) const {
+    std::vector<int> v;
+    for (const uint64_t id : {sid, base}) {
+      const auto it = id ? sess_.find(id) : sess_.end();
+      if (it != sess_.end()) v.push_back(it->second.h);
+    }
+    if (keep)
+      for (const uint64_t id : slot_) {
+        if (!id || (!all_live && idle_id(id, *keep, sid, base, paused_too))) continue;
+        const auto it = sess_.find(id);
+        if (it != sess_.end()) v.push_back(it->second.h);
+      }
+    return v;
+  }
+  // Chunks the store holds that it can give back to the slots for this request (Model::state_giveable): all but those
+  // under the blocks of the sessions in pins(). Zero when the store has a pool of its own.
+  int64_t giveable(const std::set<uint64_t>& keep, uint64_t sid, uint64_t base, bool all_live) const {
+    return m_.state_shared() ? (int64_t)m_.state_giveable(pins(sid, base, &keep, all_live)) : 0;
+  }
+  // What persist_slot's commands name for the store to leave alone: with the store on the pool, the request's own session
+  // and its base; nothing otherwise (a store of its own is as it was)
+  std::vector<int> holds(uint64_t sid, uint64_t base) const {
+    return m_.state_shared() ? pins(sid, base) : std::vector<int>{};
+  }
+  // A session paused between turns (time-slicing): in the turns' queue, not in the run being built. Its slot can be
+  // taken: the session's state goes to the store, and it resumes in a slot of its own when its turn comes (go with
+  // resume). Without turns (--slice 0) a paused request keeps its slot.
+  bool paused(uint64_t id) const {
+    if (o_.slice <= 0) return false;
+    for (const Flight& f : rot_)
+      if (f.rq.h.session_id == id) return true;
+    return false;
+  }
+  // A session whose slot memory the request may take (make_room, mem_ok): not the request's own or its base, not in the
+  // run (`keep`), and with no request in flight, or paused between turns. Counting paused ones keeps every admitted
+  // request able to run: a flight that lost its slot finds one when its turn comes.
+  bool idle_id(uint64_t id, const std::set<uint64_t>& keep, uint64_t sid, uint64_t base) const {
+    return id != sid && id != base && !keep.count(id) && (!flying_.count(id) || paused(id));
+  }
+  // A slot whose session no request uses and the request does not need: its memory can be given back (make_room)
+  bool idle_slot(int t, const std::set<uint64_t>& keep, uint64_t sid, uint64_t base) const {
+    return idle_id(slot_[t], keep, sid, base);
+  }
+  // Chunks go() will map before it decides the slot: it brings the request's session (or its fork's base) back from the
+  // disk tier first (unspill). An upper bound (Model::state_restore_chunks: every block of the record), counted in
+  // mem_ok's want so that an admitted request finds its slot after the restore.
+  int64_t restore_extra(uint64_t sid, uint64_t base) const {
+    int64_t n = 0;
+    for (const uint64_t id : {sid, base}) {
+      const auto it = id ? sess_.find(id) : sess_.end();
+      if (it != sess_.end()) n += (int64_t)m_.state_restore_chunks(it->second.h);
+    }
+    return n;
+  }
+  // What one admission pass reads once (pick_slot asks mem_ok for many slots in turn; the state does not change inside it)
+  struct MemCache {
+    bool ex = false, gv = false;
+    RestoreAsk ask;
+    int64_t img = 0, giveable = 0;
+  };
+  // Whether the pool (Model::slot_*, Options::vmm) can hold `need` positions in slot s: s's own commitment is replaced
+  // by the request's; what is uncommitted plus what can be given back (idle slots' memory and, with the store on the
+  // pool, what the store holds under unused sessions: make_room, Model::slot_reserve) must cover it. The request's own
+  // session and base on disk count as restored first (restore_extra). Without the pool: always.
+  bool mem_ok(int s, int need, const std::set<uint64_t>& keep, uint64_t sid = 0, uint64_t base = 0,
+              MemCache* mc = nullptr) const {
+    if (!m_.slot_vmm()) return true;
+    MemCache tmp;
+    MemCache& c = mc ? *mc : tmp;
+    if (!c.ex) c.extra = restore_extra(sid, base), c.ex = true;
+    const int64_t want = (int64_t)m_.slot_chunks_for(s, need) + c.extra;
+    int64_t have = (int64_t)m_.slot_uncommitted() + m_.slot_committed(s);
+    for (int t = 0; t < (int)slot_.size() && have < want; ++t)
+      if (t != s && idle_slot(t, keep, sid, base)) have += m_.slot_committed(t);
+    if (have < want) {
+      if (!c.gv) c.giveable = giveable(keep, sid, base, false), c.gv = true;
+      have += c.giveable;
+    }
+    return have >= want;
+  }
+  // Slot memory for a request of `need` positions in slot s: the least recently used sessions with no request in
+  // flight leave their slots (their state saved to the store, their chunks back to the pool) until the pool can
+  // commit it, counting what the store will give back at the reservation (giveable, with every slot's session left
+  // alone: what Model::slot_reserve does). go() took slot s only where mem_ok() said it can, with the same `keep`:
+  // running out here is a broken count, which stops the engine rather than run a request on memory it does not hold.
+  void make_room(int s, int need, const std::set<uint64_t>& keep, uint64_t sid = 0, uint64_t base = 0) {
+    if (!m_.slot_vmm()) return;
+    const int want = m_.slot_chunks_for(s, need);
+    while ((int64_t)m_.slot_uncommitted() + m_.slot_committed(s) + giveable(keep, sid, base, true) < want) {
+      int best = -1;
+      uint64_t used = UINT64_MAX;
+      for (int t = 0; t < (int)slot_.size(); ++t) {
+        if (t == s || !m_.slot_committed(t) || !idle_slot(t, keep, sid, base)) continue;
+        const auto it = sess_.find(slot_[t]);
+        const uint64_t u = it == sess_.end() ? 0 : it->second.used;
+        if (u < used) best = t, used = u;
+      }
+      if (best < 0) die("serve: no slot memory for %d positions in slot %d (%d chunks wanted)", need, s, want);
+      std::printf("serve: slot %d (session %016llx) gives its %d chunks back to the pool for a request of %d positions\n", best,
+                  (unsigned long long)slot_[best], m_.slot_committed(best), need);
+      persist_slot(best, true, holds(sid, base));
+    }
+  }
   // A slot for a session that holds none, among those that hold `need` positions (with big slots, the small
   // ones first): a free one; else the least recently used one whose session no request uses (its state goes
   // to the store); else, with time-slicing, the slot of the paused request whose turn comes last. Never the
-  // slot of a session in `keep`. -1: none.
-  int pick_slot(const std::set<uint64_t>& keep, int need = 0) const {
+  // slot of a session in `keep`. -1: none. (sid, base: the request's session and its base, whose stored state the
+  // store keeps.)
+  int pick_slot(const std::set<uint64_t>& keep, int need = 0, uint64_t sid = 0, uint64_t base = 0) const {
     const int ns = (int)slot_.size();
     const int big = m_.slot_ctx(0);
+    MemCache mc;
     for (int pass = 0; pass < 2; ++pass)  // small slots first (big_slots), so that the big ones stay for long requests
       for (int s = 0; s < ns; ++s)
-        if (!slot_[s] && fits(s, need) && (pass == 1 || m_.slot_ctx(s) < big)) return s;
+        if (!slot_[s] && fits(s, need) && (pass == 1 || m_.slot_ctx(s) < big) && mem_ok(s, need, keep, sid, base, &mc, pr)) return s;
     int best = -1;
     uint64_t used = UINT64_MAX;
     for (int s = 0; s < ns; ++s) {
-      if (!fits(s, need) || flying_.count(slot_[s]) || keep.count(slot_[s])) continue;
+      if (!fits(s, need) || flying_.count(slot_[s]) || keep.count(slot_[s]) || !mem_ok(s, need, keep, sid, base, &mc)) continue;
       const auto it = sess_.find(slot_[s]);
       const uint64_t u = it == sess_.end() ? 0 : it->second.used;
       if (u < used) best = s, used = u;
@@ -1238,7 +1369,8 @@ class Server {
     if (best >= 0 || o_.slice <= 0) return best;
     for (auto it = rot_.rbegin(); it != rot_.rend(); ++it) {
       const auto x = sess_.find(it->rq.h.session_id);
-      if (x != sess_.end() && x->second.slot >= 0 && !keep.count(x->first) && fits(x->second.slot, need))
+      if (x != sess_.end() && x->second.slot >= 0 && !keep.count(x->first) && fits(x->second.slot, need) &&
+          mem_ok(x->second.slot, need, keep, sid, base, &mc, pr))
         return x->second.slot;
     }
     return -1;
@@ -1264,7 +1396,7 @@ class Server {
       const auto it = sess_.find(f.rq.h.session_id);
       const int need = need_clamped(f.rq);
       const bool live = it != sess_.end() && it->second.slot >= 0 && fits(it->second.slot, need);
-      if (!live && pick_slot(keep, need) < 0) {
+      if (!live && pick_slot(keep, need, f.rq.h.session_id, f.rq.h.base_session_id) < 0) {
         later.push_back(std::move(f));
         continue;
       }
@@ -1599,6 +1731,14 @@ class Server {
                 "%.1f ms\n",
                 (unsigned long long)h.req_id, u.ops_ms, u.ops_gpu_ms, u.chunks, u.pf[0], u.pf[1], u.pf[2], u.pf[3],
                 u.rows_ms, u.tail_ms, u.dec1_ms);
+    if (m_.state_shared()) {  // the store and the slots on one pool: what the store has mapped against what its blocks hold
+      const model::Model::StoreChunks c = m_.state_chunks();
+      std::printf("serve: req %llu pool: store %llu chunks mapped (%.1f MiB, %llu idle) under %.1f MiB of blocks; slots committed "
+                  "%llu of %llu chunks; the store has given back %llu chunks in %llu times\n",
+                  (unsigned long long)h.req_id, (unsigned long long)c.mapped, c.mapped * 2.0, (unsigned long long)c.idle,
+                  c.live_bytes / 1048576.0, (unsigned long long)c.committed, (unsigned long long)c.total,
+                  (unsigned long long)c.trimmed, (unsigned long long)c.give_backs);
+    }
     if (!S) release(h.session_id);
     for (auto it = held_.begin(); it != held_.end();)  // the session's held requests go on, in order
       if (it->h.session_id == h.session_id) ready_.push_back(std::move(*it)), it = held_.erase(it);
@@ -1642,7 +1782,10 @@ int serve(model::Model& m, comm::Ring& ring, Watchdog& wd, const ServeOptions& o
   hi.eos_id = 1;
   // between requests the store keeps at most its pool less room for one long request (a 64k-position
   // one holds ~0.25 GiB); a request that needs more evicts in the store (model.h state_reserve)
-  const size_t cap = std::min(o.budget, m.state_capacity()), room = std::max<size_t>(256ull << 20, cap / 16);
+  // On the slot pool the store may grow into every chunk the slots have not committed, so its budget is the pool's:
+  // what a request needs is taken back from it when the request comes (Model::slot_reserve), not kept in advance.
+  const size_t cap = m.state_shared() ? m.state_ceiling() : std::min(o.budget, m.state_capacity()),
+               room = std::max<size_t>(256ull << 20, cap / 16);
   const size_t budget = cap > room ? cap - room : 0;
   hi.max_sessions = (uint32_t)std::max<size_t>(1, budget / (64ull << 20));
   hi.name_len = (uint32_t)o.name.size();

@@ -684,6 +684,7 @@ uint64_t Model::Impl::prefill(int a, int M, const Sampling* sp, int handle, cons
   prefill_alloc();
   Prefill& p = *pf;
   if (M < 1 || M > p.cap || a < 0 || a + M > slot_ctx_[cur_slot]) die("model: bad prefill [%d, +%d) in slot %d", a, M, cur_slot);
+  ensure_mapped(cur_slot, a + M - 1);  // the chunk's entries and the Reindex layers' over-read, before any work is queued
   if ((int)hist.size() < a + M) die("model: prefill [%d, %d) with %zu tokens", a, a + M, hist.size());
   if (opt.first_layer != 0 || opt.n_layers != kLayers) die("model: prefill runs the whole model");
   if (ced && sp && a + M < kReplay) die("model: CED prefill ending at %d (the replay needs %d positions)", a + M, kReplay);

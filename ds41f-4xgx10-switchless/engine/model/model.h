@@ -74,6 +74,10 @@ struct SpecBatch {
   Sampling sp[ops::kMaxSess];
   SpecCfg cfg;
   int pos_bound = 0;  // launch_verify_batch: the rows' last position at most (the context bucket)
+  // launch_verify_batch: with per_entry_bound, entry k's rows' last position at most is bound[k] (the slot
+  // memory it needs mapped, Options::vmm); else every entry's slot is mapped up to pos_bound
+  bool per_entry_bound = false;
+  int32_t bound[ops::kMaxSess] = {};
   int budget = 0;     // night T2/T4: > 0: the next step's rows across the entries, at most (StepIn::rbudget)
 };
 
@@ -132,6 +136,13 @@ struct Options {
                             // kMaxSlots; ~240 MB a slot at 262,144 positions
   int big_slots = 0;        // with 0 < big_slots < slots: slots [0, big_slots) cover max_ctx, the others
                             // max_ctx / kUnitMul (slot_ctx); 0: every slot covers max_ctx
+  // The kv sources' arrays (compressed KV, index keys and their scales) as one pool of 2 MiB chunks made at
+  // the start, mapped into a slot's range of each array as its session grows and unmapped when it leaves
+  // (model/vmm.h, docs/engine.md "Session slots mapped on demand"). The pool holds what the slots would take
+  // whole, or slot_gib GiB of it (> 0): slots then hold only what their sessions use, and how many can be
+  // live is bounded by the pool. false: one plain allocation per array, every slot whole (the earlier layout).
+  bool vmm = true;
+  double slot_gib = 0;
   int bgraph_bodies = 0;    // DIAGNOSTICS (spec.cu, 2026-10-13): the batch spec graph's switch bodies (0: kMaxRows)
   bool bgraph_noif = false; // DIAGNOSTICS: the entries' accepts at the top level, without if nodes
   bool bgraph_check = false;  // DIAGNOSTICS (B3 phase 2a): after the batch step's draft pass over the entries, every
@@ -174,6 +185,22 @@ class Model {
   int slot() const;
   int slots() const;
   int slot_ctx(int s) const;  // positions slot s holds (Options::big_slots)
+  // Slot memory (Options::vmm; every call is a no-op or zero without it). Every launch and copy maps what it
+  // needs itself; these let the server keep admission inside the pool. A chunk is vmm::kChunk bytes.
+  //  slot_reserve: commit the chunks a request of `need` positions (its prompt and every token it may
+  //    generate) can use in slot s, replacing slot s's earlier reservation; dies when the pool's other
+  //    commitments leave too little (check slot_chunks_for against slot_uncommitted + slot_committed first).
+  //  slot_release: slot s's session has left: its state is saved, nothing is queued for it; every chunk
+  //    goes back to the free list. Waits for the work queued.
+  bool slot_vmm() const;
+  int slot_chunks_for(int s, int need) const;  // chunks slot s needs from empty to hold `need` positions
+  int slot_committed(int s) const;             // chunks slot s holds or has reserved, whichever is more
+  int slot_mapped(int s) const;                // chunks mapped in slot s
+  int slot_uncommitted() const;                // chunks no slot holds or has reserved
+  int slot_chunks_total() const;               // chunks the pool made
+  int slot_chunks_peak() const;                // most chunks mapped at once
+  void slot_reserve(int s, int need);
+  void slot_release(int s);
 
   // Queue one step of R rows at positions pos0 .. pos0 + R - 1 on every rank, without waiting for it;
   // returns its number. tokens[r] >= 0 is the token; -1 - j stands for row j of the previous step's
@@ -265,12 +292,31 @@ class Model {
   // positions [pos - 128, pos) of every layer) and an end snapshot (the whole ring and the compressor
   // carries). Copies are queued on the model's stream, in order with the steps.
   // The store's memory is a pool of `bytes` (state_reserve, once, the same on every rank; none: nothing
-  // is kept). An operation that finds it full evicts the least recently used session that the current
+  // is kept). With the slot memory pool (Options::vmm) the store shares it: state_reserve makes `bytes` more
+  // chunks (the pool then holds the slots' and the store's), the store's blocks are mapped chunk by chunk
+  // where they lie and the chunks given back to the slots when a reservation or a map finds the pool short
+  // (state.cu "the store on the slot pool"; model/vmm.h regions): an idle machine's memory is the store's,
+  // a busy one's the slots'. The sessions the store gives up for the slots go to the disk tier, as when it
+  // is full. state_capacity() is then the store's size at the start, state_ceiling() all of the pool, and
+  // tier_stats().store_cap what the slots have not committed. An operation that finds it full evicts the least recently used session that the current
   // command does not use (state_pin: its operations' sessions and its handle), the same on every rank,
   // and skips what still does not fit: a snapshot not taken, pages saved only as far as they go.
   // state_evicted() returns the sessions evicted since it was last called.
   void state_reserve(size_t bytes);
   size_t state_capacity() const;
+  bool state_shared() const;     // the store shares the slot memory pool
+  size_t state_ceiling() const;  // the most the store could hold: its pool (shared: every chunk of the slot pool)
+  // Chunks the store could give back to the slots without touching the sessions in `keep` (handles): the chunks
+  // it has mapped less those under their blocks in RAM. 0 when it does not share the pool.
+  size_t state_giveable(const std::vector<int>& keep) const;
+  // An upper bound of the chunks bringing session h back from the disk tier can map (0: it is not there, or the store
+  // has a pool of its own): each block of its record maps at most ceil(bytes / chunk) + 1 chunks.
+  size_t state_restore_chunks(int h) const;
+  struct StoreChunks {  // the shared budget (zero without it)
+    uint64_t total = 0, committed = 0, mapped = 0, idle = 0, live_bytes = 0, trimmed = 0, give_backs = 0;
+  };
+  StoreChunks state_chunks() const;  // the pool's chunks; the slots' commitments; the store's mapped and idle; the
+                                     // bytes of its blocks; the chunks it handed back since the start; how many times
   // h: the sessions the command uses (never evicted); live: the sessions live in the slots (never evicted, and
   // their stored pages, which the slots hold too, are released first when the pool is full).
   void state_pin(const std::vector<int>& h, const std::vector<int>& live = {});

@@ -4,6 +4,7 @@
 #include "model/model.h"
 
 #include <algorithm>
+#include <chrono>
 #include <climits>
 #include <cmath>
 #include <cstdio>
@@ -94,15 +95,70 @@ Model::Impl::Impl(int r, const Options& op) : rank(r), opt(op) {
     ring_kv0[L] = dalloc<uint8_t>(nunits * kRingKvBytes);
     ring_sc0[L] = dalloc<uint8_t>(nunits * kRingScBytes);
   }
-  for (int L : {2, 8, 14, 20}) {
-    KvSrc& k = kvs0[kv_slot(L)];
-    k.cap = unit_ctx / ratio_of(L) + 64;  // a big slot: kUnitMul of these end to end (>= max_ctx / ratio + 64)
-    k.ckv = dalloc<uint8_t>(nunits * k.ckv_stride());
-    k.csc = dalloc<uint8_t>(nunits * k.csc_stride());
-    k.ik = dalloc<uint8_t>(nunits * k.ik_stride());
-    k.iksc = dalloc<uint8_t>(nunits * k.iksc_stride());
-    k.carry_kv = dalloc<float>(nunits * KvSrc::kCarryStride);
-    k.carry_sc = dalloc<float>(nunits * KvSrc::kCarryStride);
+  for (int s = 0; s < nslots; ++s) mapped_upto[s] = -1;
+  if (opt.vmm) {
+    // the kv sources' arrays are virtual ranges backed by chunks made now, once (vmm.h): a slot maps chunks as
+    // its session grows. The pool holds what the slots would take whole (each array's cap entries, rounded up
+    // to chunks, summed over the slots), or --slot-gib of it
+    size_t full = 0, biggest = 0;
+    for (int s = 0; s < nslots; ++s) {
+      const int units = (s + 1 < nslots ? unit_of[s + 1] : nunits) - unit_of[s];
+      size_t c = 0;
+      for (int L : {2, 8, 14, 20})
+        for (const size_t eb : kKvEntryBytes)
+          c += ((size_t)units * (unit_ctx / ratio_of(L) + 64) * eb + vmm::kChunk - 1) / vmm::kChunk;
+      full += c, biggest = std::max(biggest, c);
+    }
+    size_t chunks = full;
+    if (opt.slot_gib > 0) chunks = std::min(full, (size_t)(opt.slot_gib * 1073741824.0) / vmm::kChunk);
+    if (chunks < biggest)
+      die("model: slot memory of %zu chunks (%.2f GiB) cannot hold one slot of %d positions (%zu chunks): raise --slot-gib",
+          chunks, (double)chunks * vmm::kChunk / 1073741824.0, opt.max_ctx, biggest);
+    std::string err;
+    std::unique_ptr<vmm::Backend> be = vmm::make_cuda_backend(&err);
+    if (!be) die("model: slot memory: %s", err.c_str());
+    const auto t0 = std::chrono::steady_clock::now();
+    slot_pool = std::make_unique<vmm::Pool>(std::move(be), chunks);
+    if (!slot_pool->ok())
+      die("model: slot memory: %s (%zu of %zu chunks made): lower --slot-gib, --slots or --session-gib", slot_pool->error().c_str(),
+          slot_pool->created(), chunks);
+    const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    const char* pz = getenv("DSGB10_VMM_POISON");
+    slot_pool->set_poison(pz && std::atoi(pz) > 0);  // debug: every chunk mapped is filled with 0xFF first
+    for (int L : {2, 8, 14, 20}) {
+      KvSrc& k = kvs0[kv_slot(L)];
+      k.cap = unit_ctx / ratio_of(L) + 64;  // a big slot: kUnitMul of these end to end (>= max_ctx / ratio + 64)
+      k.stride_cap = (k.cap + KvSrc::kStrideEntries - 1) / KvSrc::kStrideEntries * KvSrc::kStrideEntries;
+      uint8_t** arr[4] = {&k.ckv, &k.csc, &k.ik, &k.iksc};
+      for (int a = 0; a < 4; ++a) {
+        const int id = slot_pool->add_array(k.stride_entries() * kKvEntryBytes[a], nunits);
+        if (id != kv_slot(L) * 4 + a) die("model: slot memory: array %d of kv source %d: %s", a, kv_slot(L), slot_pool->error().c_str());
+        *arr[a] = reinterpret_cast<uint8_t*>(slot_pool->base(id));
+      }
+      k.carry_kv = dalloc<float>(nunits * KvSrc::kCarryStride);
+      k.carry_sc = dalloc<float>(nunits * KvSrc::kCarryStride);
+    }
+    for (int s = 0; s < nslots; ++s) {
+      const int units = (s + 1 < nslots ? unit_of[s + 1] : nunits) - unit_of[s];
+      if (slot_pool->add_slot(unit_of[s], units) != s) die("model: slot memory: slot %d", s);
+    }
+    if (rank == 0)
+      std::printf("model: slot memory: %zu chunks of %zu MiB (%.2f GiB; the %d slots whole would take %.2f GiB) made once in %.2f s "
+                  "(%.1f ms a GiB), 16 arrays reserved, mapped per slot as its session grows\n",
+                  chunks, vmm::kChunk >> 20, (double)chunks * vmm::kChunk / 1073741824.0, nslots,
+                  (double)full * vmm::kChunk / 1073741824.0, dt,
+                  1e3 * dt / std::max(1e-9, (double)chunks * vmm::kChunk / 1073741824.0));
+  } else {
+    for (int L : {2, 8, 14, 20}) {
+      KvSrc& k = kvs0[kv_slot(L)];
+      k.cap = unit_ctx / ratio_of(L) + 64;  // a big slot: kUnitMul of these end to end (>= max_ctx / ratio + 64)
+      k.ckv = dalloc<uint8_t>(nunits * k.ckv_stride());
+      k.csc = dalloc<uint8_t>(nunits * k.csc_stride());
+      k.ik = dalloc<uint8_t>(nunits * k.ik_stride());
+      k.iksc = dalloc<uint8_t>(nunits * k.iksc_stride());
+      k.carry_kv = dalloc<float>(nunits * KvSrc::kCarryStride);
+      k.carry_sc = dalloc<float>(nunits * KvSrc::kCarryStride);
+    }
   }
   if (rank == 0 && nunits != nslots)
     std::printf("model: %d session slots, %d of %d positions and %d of %d (%d units)\n", nslots, nbig, opt.max_ctx,
@@ -440,6 +496,88 @@ void Model::Impl::use_slot(int s) {
   for (int L = 0; L < kLayers; ++L) ring_kv[L] = ring_kv0[L] + u * kRingKvBytes, ring_sc[L] = ring_sc0[L] + u * kRingScBytes;
   for (int k = 0; k < kKvSlots; ++k) kvs[k] = kvs0[k].at(u);
   spec_use_slot(u);  // the draft module's windows, once bound
+}
+
+// ---- session slot memory ------------------------------------------------------------------------------
+//
+// A step or copy reaching position P touches entries [0, P / ratio + 1 + kMapSlackEntries) of every kv source; layer
+// 20's block-list scan loads whole 8-entry blocks up to entry P + 7 (indexer.cu load_tile). A chunk is not cleared when
+// mapped: whatever a kernel reads was written, and over-read entries only feed rows it masks. DSGB10_VMM_POISON=1
+// fills every chunk with 0xFF, which turns any other read into different tokens.
+
+namespace {
+constexpr int kMapSlackEntries = 64;  // entries past the position's own (layer 20's block over-read needs 7)
+constexpr int kMapLookahead = 4096;   // positions mapped beyond what a step needs: a map in the host gap, not every step
+}  // namespace
+
+void Model::Impl::slot_bytes(int s, int upto, size_t bytes[16]) const {
+  const int units = (s + 1 < nslots ? unit_of[s + 1] : nunits) - unit_of[s];
+  upto = std::max(0, std::min(upto, slot_ctx_[s] - 1));
+  for (int k = 0; k < kKvSlots; ++k) {
+    const int ratio = k < 3 ? 2 : 1;
+    const size_t entries = std::min((size_t)(upto / ratio + 1 + kMapSlackEntries), (size_t)units * kvs0[k].cap);
+    for (int a = 0; a < 4; ++a) bytes[k * 4 + a] = entries * kKvEntryBytes[a];
+  }
+}
+
+void Model::Impl::ensure_mapped(int s, int upto) {
+  if (!slot_pool) return;
+  if (s < 0 || s >= nslots) die("model: ensure_mapped in slot %d of %d", s, nslots);
+  upto = std::max(0, std::min(upto, slot_ctx_[s] - 1));
+  if (upto <= mapped_upto[s]) return;  // the whole check of a step that needs nothing new
+  size_t bytes[16];
+  int got = std::min(upto + kMapLookahead, slot_ctx_[s] - 1);
+  slot_bytes(s, got, bytes);
+  if (!slot_pool->ensure(s, bytes)) {  // no room for the lookahead: what the step needs
+    got = upto;
+    slot_bytes(s, got, bytes);
+    // a slot inside its reservation finds a chunk; one that does not (a map nothing reserved) asks the store for chunks
+    if (!slot_pool->ensure(s, bytes) &&
+        !(store_shared() && store_give_back([&] { return slot_pool->ensure(s, bytes); })))
+      die("model: slot %d cannot map positions up to %d: %s (%zu of %zu chunks free, %zu mapped in the slot, %zu by the store)", s,
+          upto, slot_pool->error().c_str(), slot_pool->free_chunks(), slot_pool->total(), slot_pool->mapped(s),
+          slot_pool->regions_mapped());
+  }
+  mapped_upto[s] = got;
+}
+
+int Model::Impl::slot_chunks_for(int s, int need) const {
+  if (!slot_pool) return 0;
+  size_t bytes[16];
+  // the request's last position, the lookahead past it and the drafts' rows (a verify step's bound)
+  slot_bytes(s, need - 1 + kMapLookahead + kMapSlackEntries, bytes);
+  size_t n = 0;
+  for (const size_t b : bytes) n += (b + vmm::kChunk - 1) / vmm::kChunk;
+  return (int)n;
+}
+
+void Model::Impl::slot_reserve(int s, int need) {
+  if (!slot_pool) return;
+  if (s < 0 || s >= nslots) die("model: slot_reserve in slot %d of %d", s, nslots);
+  const size_t chunks = (size_t)slot_chunks_for(s, need);
+  bool ok = slot_pool->reserve(s, chunks);
+  // the store holds chunks no slot has committed: it gives them back (idle ones, then sessions to the disk tier)
+  // until the reservation fits. The server counted them before it asked (serve.cpp mem_ok, make_room).
+  if (!ok && store_shared()) ok = store_give_back([&] { return slot_pool->reserve(s, chunks); });
+  if (!ok)
+    die("model: slot %d: %zu chunks for %d positions do not fit the pool (%zu chunks, %zu committed to other slots, %zu mapped "
+        "by the store)", s, chunks, need, slot_pool->total(), slot_pool->committed_total() - slot_pool->committed(s),
+        slot_pool->regions_mapped());
+}
+
+void Model::Impl::slot_release(int s) {
+  if (!slot_pool) return;
+  if (s < 0 || s >= nslots) die("model: slot_release of slot %d of %d", s, nslots);
+  // every launched step has ended and every stream that can touch a slot's arrays has caught up (the side
+  // streams join the main one in each step; the copies of state_save are on it): nothing reads the chunks
+  drain();
+  CUDA_CHECK(cudaStreamSynchronize(sa));
+  CUDA_CHECK(cudaStreamSynchronize(sb));
+  if (sc) CUDA_CHECK(cudaStreamSynchronize(sc));
+  slot_pool->release(s);
+  mapped_upto[s] = -1;
+  // the store's idle chunks too: the stream has just been waited for (drain), so nothing queued reads them
+  if (store_shared()) store_trim();
 }
 
 attn::Window Model::Impl::step_win(int L) const {
@@ -803,6 +941,7 @@ uint64_t Model::Impl::launch(int R, int pos0, const int32_t* tokens, const Sampl
   if (R < 1 || R > kMaxRows || pos0 < 0 || pos_last >= slot_ctx_[cur_slot] ||
       pos_last - (R - 1) / pos_group * pos_stride - (R - 1) % pos_group < 0)
     die("model: bad step R=%d pos0=%d", R, pos0);
+  ensure_mapped(cur_slot, pos_last);
   if (opt.first_layer > 0 && !(flags & kFlagInject) && (flags & (kFlagDump | kFlagLogits)))
     die("model: starting at layer %d needs golden injection", opt.first_layer);
   bool device_tokens = false;
@@ -853,6 +992,7 @@ uint64_t Model::Impl::launch_batch(const Batch& b) {
     device_tokens |= b.tokens[r] < 0;
     pos_last = std::max(pos_last, b.pos[r]);
   }
+  for (int r = 0; r < R; ++r) ensure_mapped(b.slot[r], b.pos[r]);  // every row's slot, before any work is queued
   if (device_tokens && (b.flags & ~kFlagProfile)) die("model: golden checks need the batch step's tokens");
   const uint64_t n = n_steps;
   if (n >= (uint64_t)ops::kInSlots) wait_done(n - ops::kInSlots);  // its StepIn slot has been read
@@ -1233,6 +1373,15 @@ void Model::use_slot(int s) { d_->use_slot(s); }
 int Model::slot() const { return d_->cur_slot; }
 int Model::slots() const { return d_->nslots; }
 int Model::slot_ctx(int s) const { return d_->slot_ctx_[s]; }
+bool Model::slot_vmm() const { return d_->slot_pool != nullptr; }
+int Model::slot_chunks_for(int s, int need) const { return d_->slot_chunks_for(s, need); }
+int Model::slot_committed(int s) const { return d_->slot_pool ? (int)d_->slot_pool->committed(s) : 0; }
+int Model::slot_mapped(int s) const { return d_->slot_pool ? (int)d_->slot_pool->mapped(s) : 0; }
+int Model::slot_uncommitted() const { return d_->slot_pool ? (int)d_->slot_pool->uncommitted() : 0; }
+int Model::slot_chunks_total() const { return d_->slot_pool ? (int)d_->slot_pool->total() : 0; }
+int Model::slot_chunks_peak() const { return d_->slot_pool ? (int)d_->slot_pool->peak_used() : 0; }
+void Model::slot_reserve(int s, int need) { d_->slot_reserve(s, need); }
+void Model::slot_release(int s) { d_->slot_release(s); }
 void Model::set_engram(const engram::HashMap* map, engram::Store* store) {
   d_->emap = map;
   d_->store = store;

@@ -55,7 +55,13 @@
 //                together, a row each per step (one alone: with drafts). --slice N: a request that
 //                comes while others decode pauses them and is prefilled; while more requests decode
 //                than there are slots, they take turns of N tokens (default 64; 0: no turns, and a
-//                request that would need the slot of another in flight waits for one to free)
+//                request that would need the slot of another in flight waits for one to free).
+//                The slots' compressed caches and index keys are one pool of 2 MiB chunks made at the
+//                start and mapped per slot as its session grows (model/vmm.h): the pool holds what the
+//                slots would take whole, or --slot-gib G of it, plus --session-gib: the session store is a
+//                range of the same chunks (mapped where its blocks lie, handed back to the slots when a request
+//                needs them, its sessions spilled to the disk tier then); requests are admitted against it. --no-vmm:
+//                every slot's arrays whole, allocated at the start (the earlier layout)
 //   generate --loop: the generation runs through the decode loop (same tokens as without)
 //   --spec: DSpark drafts (mtp.* loaded) in the decode loop (decode, generate --loop; serve runs them
 //     unless --no-spec: they change the speed, never the tokens), at most
@@ -298,6 +304,8 @@ struct Args {
   double keep_gib = 0, keep_days = 7;  // kept sessions: written at a planned stop, at most; their age
   int snap_every = 1024, small_rows = 8;
   int slots = 1, slot = 0;
+  double slot_gib = 0;  // --slot-gib G: the slot memory pool's size, at most what the slots would take whole (0: all of it)
+  bool no_vmm = false;  // --no-vmm: every slot's arrays whole, allocated at the start (the layout before the slot memory pool)
   int big_slots = 0;  // --big-slots B: slots [0, B) hold --max-ctx, the others --max-ctx / 8 (model::Options::big_slots)  // session slots (model::Options::slots); the golden modes' slot
   int bgraph_bodies = 0;      // DIAGNOSTICS (spec.cu, the batch graph): switch bodies to capture (0: kMaxRows)
   bool bgraph_noif = false;   // DIAGNOSTICS: the entries' accepts without if nodes
@@ -394,6 +402,8 @@ Args parse(int argc, char** argv) {
     else if (s == "--snap-every") a.snap_every = std::atoi(val().c_str());
     else if (s == "--slots") a.slots = std::atoi(val().c_str());
     else if (s == "--big-slots") a.big_slots = std::atoi(val().c_str());
+    else if (s == "--slot-gib") a.slot_gib = std::atof(val().c_str());
+    else if (s == "--no-vmm") a.no_vmm = true;
     else if (s == "--bgraph-bodies") a.bgraph_bodies = std::atoi(val().c_str());
     else if (s == "--bgraph-noif") a.bgraph_noif = true;
     else if (s == "--bgraph-check") a.bgraph_check = true;
@@ -610,6 +620,8 @@ int main(int argc, char** argv) {
   mo.tree_probe = !a.tree_probe.empty();
   mo.slots = a.slots;
   mo.big_slots = a.big_slots;
+  mo.vmm = !a.no_vmm;
+  mo.slot_gib = a.slot_gib;
   mo.bgraph_bodies = a.bgraph_bodies, mo.bgraph_noif = a.bgraph_noif, mo.bgraph_check = a.bgraph_check;
   mo.l2pf = !a.no_l2pf;
   model::Model m(a.rank, mo);

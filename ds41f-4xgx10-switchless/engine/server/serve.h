@@ -19,7 +19,8 @@ struct ServeOptions {
   bool snap_thin = true;           // keep them dense near a session's end only (serve.cpp keep_snap); false
                                    // (--snap-all): every one kept
   size_t budget = 12ull << 30;     // --session-gib: at most this much of the store's pool (main.cpp reserves
-                                   // it, model.h state_reserve) holds sessions' saved state; LRU eviction
+                                   // it, model.h state_reserve) holds sessions' saved state (on the slot pool, the store's
+                                   // share at the start: serve() holds the store to the whole pool); LRU eviction
   bool ced = true;                 // CED prefill (docs/ced.md) for turns of at least 128 new positions
   int slice = 64;                  // time-slicing (docs/batching.md, B1): a new request pauses the requests
                                    // decoding and is prefilled; while more of them decode than there are
