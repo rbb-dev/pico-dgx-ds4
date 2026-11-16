@@ -118,9 +118,9 @@ nav.sections button[aria-current="page"] { background: transparent; color: var(-
 
 
 /* LINES */
-/* the rows' spacing: 16 seats on this engine (its compact rows): 11 px, line-height 1.1,
-   no padding, 4 px apart */
-.lgrid { display: flex; flex-direction: column; gap: 4px; }
+/* the rows' spacing, the same at 16, 32 or 64 lines (the box grows, the rows do not): 11 px,
+   line-height 1.1, no padding, 2 px apart */
+.lgrid { display: flex; flex-direction: column; gap: 2px; }
 .lrow { display: grid; grid-template-columns: 22px 60px minmax(40px, 1fr) 72px 58px 84px 54px 56px 64px 48px; gap: 0 10px; align-items: center; font-family: var(--mono); font-size: 11px; color: var(--t2); line-height: 1.1; padding: 0; border-bottom: 1px solid #14181a; font-variant-numeric: tabular-nums; }
 .lrow > span { white-space: nowrap; overflow: hidden; }
 .lrow > span:nth-child(n+4) { text-align: right; }

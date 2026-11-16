@@ -411,6 +411,8 @@ std::vector<BatchEnd> batch_loop(model::Model& m, const Cmd& c, const std::vecto
                                  const OnBatch& on) {
   g_t_wait.clear(), g_t_late.clear(), g_t_launch.clear();
   const int n = (int)e.size(), slot0 = m.slot();
+  static_assert(model::ops::kMaxSess < 31, "the cancel bits are the entries' (bit 31 is kCtlPause)");
+  if (n < 1 || n > model::ops::kMaxSess) die("batch: %d entries (1..%d)", n, model::ops::kMaxSess);
   std::vector<BatchEnd> end(n);
   // per entry: its steps launched, its row in the last step launched, sampling (live) or with its last
   // row still queued (ending)
@@ -496,7 +498,7 @@ std::vector<BatchEnd> batch_loop(model::Model& m, const Cmd& c, const std::vecto
       const int32_t t = o.row[r].token;
       if (on) on(k, o, r);
       ++x.sampled;
-      if (o.ctl & (1u << e[k].slot)) stop(k, kEndCancel);
+      if (o.ctl & (1u << k)) stop(k, kEndCancel);
       else if (std::find(e[k].stop, e[k].stop + e[k].n_stop, t) != e[k].stop + e[k].n_stop) stop(k, kEndStop);
       else if (x.sampled >= e[k].max_new) stop(k, kEndLength);
       else if (o.ctl & kCtlPause) stop(k, kEndPause);           // one that ends here ends, not pauses
@@ -762,7 +764,7 @@ std::vector<DecodeEnd> spec_batch_loop(model::Model& m, const Cmd& c, const std:
         if (on) on(k, o, r);
         ++d.sampled, ++u, ++stats.emitted;
         toks[k].push_back(t);
-        if (o.ctl & (1u << e[k].slot)) stop = true, d.why = kEndCancel;
+        if (o.ctl & (1u << k)) stop = true, d.why = kEndCancel;
         for (int q2 = 0; !stop && q2 < e[k].n_stop; ++q2)
           if (t == e[k].stop[q2]) stop = true, d.why = kEndStop;
         if (!stop && d.sampled >= e[k].max_new) stop = true, d.why = kEndLength;

@@ -2,7 +2,7 @@
 //! (reporting cached_tokens from the longest common prefix), and streams scripted text.
 //!
 //! PROGRESS goes out after each prefill chunk of 4096 tokens, and STATS answers a STATS_REQ with plausible
-//! numbers (a disk tier, 16 slots) that move with the requests served.
+//! numbers (a disk tier, 32 lines) that move with the requests served.
 //!
 //! A request with the ABLIT flag gets `[ablit] ` before its answer, so a test sees the flag arrive.
 //!
@@ -140,14 +140,14 @@ async fn connection(stream: UnixStream, cfg: MockConfig, sessions: Sessions) {
     eprintln!("mock engine: front-end disconnected");
 }
 
-/// Plausible numbers: 16 slots (two with the whole context), a 256 GiB disk tier holding half the sessions.
+/// Plausible numbers: 32 slots (two with the whole context), a 256 GiB disk tier holding half the sessions.
 fn stats(cfg: &MockConfig, sessions: &Sessions) -> EngineStats {
     let (n, held) = {
         let ss = sessions.lock().unwrap();
         (ss.len() as u64, ss.values().map(|h| h.0.len() as u64).sum::<u64>())
     };
     let (finished, computed) = (FINISHED.load(Ordering::Relaxed), COMPUTED.load(Ordering::Relaxed));
-    let (slots_total, slots_big, slot_ctx_big, slot_ctx_small) = (16u64, 2u64, cfg.max_context as u64, 65_536u64);
+    let (slots_total, slots_big, slot_ctx_big, slot_ctx_small) = (32u64, 2u64, cfg.max_context as u64, 65_536u64);
     let positions = slots_big * slot_ctx_big + (slots_total - slots_big) * slot_ctx_small;
     EngineStats {
         store_cap_bytes: positions * BYTES_PER_POSITION,

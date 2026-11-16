@@ -263,8 +263,8 @@ def main():
     check(all(k in t0 for k in ("stored_bytes", "cap_bytes", "points", "writes_committed", "written_bytes", "writes_pending")), "prompt_cache.spill[0] keys")
     check(all(k in pc for k in ("restores_begun", "disk_hits", "restored_tokens", "restore_waits", "restore_wait_ns", "restore_wait_max_ns")), "prompt_cache counters")
     ss = s["sessions"]
-    want = 2 * 1048576 + 14 * 65536
-    check(ss["slots"] == 16 and ss["slots_big"] == 2 and ss["positions"] == want and ss["usable_window"] == 1048576, f"sessions map the slots: {ss['positions']}")
+    want = 2 * 1048576 + 30 * 65536
+    check(ss["slots"] == 32 and ss["slots_big"] == 2 and ss["positions"] == want and ss["usable_window"] == 1048576, f"sessions map the slots: {ss['positions']}")
     check(ss["store_cap_bytes"] == want * 890 and "bytes_per_token" not in ss and ss["sessions_resident"] >= 0, "sessions carry the store as its own bytes")
 
     # node health, polled while watched

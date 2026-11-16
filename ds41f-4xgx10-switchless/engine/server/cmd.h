@@ -176,7 +176,8 @@ struct SpecRate {
 // tok_j at pos0 + j (tok_0 = token) and samples tok_{j+1}; as in decode_loop, the next step is queued
 // before a step ends, with its tokens left to the device, and a session that ends keeps its row in the
 // step already queued, which only adds the KV of its last sampled token.
-// Rank 0's control word: bit s ends the session in slot s after the step that reads it (a cancel);
+// Rank 0's control word: bit k ends entry k (its place in this run, below kMaxSess = 16, never its slot: slots go to 64
+// and bit 31 is kCtlPause) after the step that reads it (a cancel);
 // kCtlPause ends every session there that its stop ids and max_new do not end (kEndPause), and with
 // kBatchSolo the last session decoding pauses too (for the speculative loop). A paused session's row in
 // the queued step is sampled too, within max_new: its tok_sampled, not fed yet, is the next to feed, at

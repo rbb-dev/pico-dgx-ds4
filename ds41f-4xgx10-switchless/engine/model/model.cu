@@ -76,7 +76,9 @@ Model::Impl::Impl(int r, const Options& op) : rank(r), opt(op) {
   for (auto& e : ev_join) CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
   c8k.tiled = c8.tiled = true;
   const int R = kMaxRows;
-  if (opt.slots < 1 || opt.slots > kMaxSlots) die("model: %d session slots (1..%d)", opt.slots, kMaxSlots);
+  const int max_slots = opt.vmm ? kMaxSlots : kMaxSlotsPhys;
+  if (opt.slots < 1 || opt.slots > max_slots)
+    die("model: %d session slots (1..%d%s)", opt.slots, max_slots, opt.vmm ? "" : " without the slot memory pool: more need it, not --no-vmm");
   nslots = opt.slots;
   // big slots (Options::big_slots): kUnitMul units each, the small ones one unit of max_ctx / kUnitMul
   const int nbig = opt.big_slots > 0 && opt.big_slots < nslots ? opt.big_slots : nslots;
@@ -89,7 +91,8 @@ Model::Impl::Impl(int r, const Options& op) : rank(r), opt(op) {
     slot_ctx_[s] = s < nbig ? opt.max_ctx : unit_ctx;
     nunits += s < nbig ? mul : 1;
   }
-  if (nunits > kMaxUnits) die("model: %d session units (at most %d)", nunits, kMaxUnits);
+  const int max_units = opt.vmm ? kMaxUnits : kMaxUnitsPhys;
+  if (nunits > max_units) die("model: %d session units (at most %d)", nunits, max_units);
   // per-layer window rings, and the kv sources' caches, keys and carries: one of each per unit
   for (int L = 0; L < kLayers; ++L) {
     ring_kv0[L] = dalloc<uint8_t>(nunits * kRingKvBytes);

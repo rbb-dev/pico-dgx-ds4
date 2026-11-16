@@ -503,8 +503,10 @@ Args parse(int argc, char** argv) {
   if (a.mode == "serve") a.draft_fp8 = !a.draft_bf16;  // nor does the drafter's FP8 head
   if (a.draft_fp8 && a.draft_bf16) die("--draft-fp8 or --draft-bf16");
   if (a.draft_head4 && a.draft_bf16) die("--draft-head4 or --draft-bf16");
-  if (a.slots < 1 || a.slots > model::kMaxSlots || a.slot < 0 || a.slot >= a.slots)
-    die("--slots %d --slot %d: 1 to %d slots, a slot below their number", a.slots, a.slot, model::kMaxSlots);
+  const int max_slots = a.no_vmm ? model::kMaxSlotsPhys : model::kMaxSlots;
+  if (a.slots < 1 || a.slots > max_slots || a.slot < 0 || a.slot >= a.slots)
+    die("--slots %d --slot %d: 1 to %d slots%s, a slot below their number", a.slots, a.slot, max_slots,
+        a.no_vmm ? " with --no-vmm" : "");
   if (a.mode == "spectf") a.spec = true;
   if ((!a.tree_probe.empty() || a.tree_sib) && (a.mode != "spectf" || a.tree_probe.empty() || a.tree_sib < 0))
     die("--tree-probe FILE [--tree-sib N]: --mode spectf only");

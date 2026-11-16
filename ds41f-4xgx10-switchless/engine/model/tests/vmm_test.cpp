@@ -173,6 +173,33 @@ void regions_do_not_overlap() {
 }
 
 
+// 32 and 64 slots on one pool (--slots 32 / 64): every slot owns its unit's range, the commitments of all of them
+// stay inside the pool, and a slot far from the first maps and releases like any other
+void many_slots_share_one_pool() {
+  for (const int n : {32, 64}) {
+    Rig r(100);  // 100 chunks for n slots of 2 arrays x 4 chunks whole: far less than they would take
+    check(r.pool->add_array(4 * kChunk, n) == 0 && r.pool->add_array(4 * kChunk, n) == 1, "two arrays of n units");
+    bool ok = true;
+    for (int s = 0; s < n; ++s) ok &= r.pool->add_slot(s, 1) == s;
+    check(ok && r.pool->slots() == n, "n slots, one unit each");
+    int reserved = 0;
+    for (int s = 0; s < n; ++s) reserved += r.pool->reserve(s, 4) ? 1 : 0;
+    check(reserved == 25 && r.pool->uncommitted() == 0, "25 slots of 4 chunks fill the pool, the others are refused");
+    const int last = n - 1;
+    check(!r.pool->reserve(last, 1), "the last slot cannot commit one more");
+    r.pool->release(0);
+    r.pool->release(1);
+    check(r.pool->reserve(last, 4) && r.pool->committed(last) == 4, "slots released: the last slot's 4 chunks commit");
+    const size_t need[2] = {2 * kChunk, 2 * kChunk};
+    check(r.pool->ensure(last, need), "the last slot maps its 4 chunks");
+    check(r.fb->touch(r.pool->base(0) + (size_t)last * 4 * kChunk, 2 * kChunk), "at its unit's offset in array 0");
+    check(!r.fb->touch(r.pool->base(0) + (size_t)(last - 1) * 4 * kChunk, 1), "and not at the slot before it");
+    check(r.pool->slot_capacity(last, 1) == 4 * kChunk, "its capacity is its unit's stride");
+    r.pool->release(last);
+    check(r.pool->mapped(last) == 0 && r.pool->committed_total() <= 100, "released: nothing mapped in it");
+  }
+}
+
 // ---- regions: the session store on the slot pool -----------------------------------------------------
 
 // two slots of two arrays (4 chunks each) on 8 chunks, then 4 more for the store, and a region over all 12
@@ -332,6 +359,7 @@ int main() {
   commitments_never_exceed_the_pool();
   chunks_are_poisoned_when_mapped();
   regions_do_not_overlap();
+  many_slots_share_one_pool();
   store_blocks_map_the_chunks_they_overlap();
   an_idle_chunk_stays_mapped_until_the_trim();
   the_store_maps_only_what_no_slot_committed();

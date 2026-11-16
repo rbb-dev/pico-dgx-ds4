@@ -1381,7 +1381,8 @@ class Server {
 
   static constexpr uint32_t kPaused = ~0u, kTurn = ~0u - 1;  // a run's ends that are not the request's
 
-  // A run: the requests at the front of the turns, as many as there are slots, each with its session live
+  // A run: the requests at the front of the turns, as many as there are slots (at most a batch step's entries,
+  // model::ops::kMaxSess; with more slots the rest take turns, --slice), each with its session live
   // in its slot (one that lost its slot resumes first, in a slot taken from a request further back), decode
   // together (batch_loop, a row of each per step) or one alone (the speculative loop, with drafts). Each runs
   // to its end, or until a new request that can have a slot pauses them all (prefill first), or, while
@@ -1391,7 +1392,10 @@ class Server {
     std::vector<Flight> fl;
     std::set<uint64_t> keep;
     std::deque<Flight> later;  // big_slots: flights that need a big slot while every one is in this run
-    while (fl.size() < slot_.size() && !rot_.empty()) {
+    // a run holds what one batch step takes (kMaxSess entries) and what the slots hold, whichever is less; the others
+    // wait in rot_ and, with time-slicing, take their turn when this run's turns end (each turn goes to the back)
+    const size_t cap = std::min<size_t>(slot_.size(), model::ops::kMaxSess);
+    while (fl.size() < cap && !rot_.empty()) {
       Flight f = std::move(rot_.front());
       rot_.pop_front();
       const auto it = sess_.find(f.rq.h.session_id);
@@ -1550,9 +1554,9 @@ class Server {
       samples[k].push_back(o.row[row].token);
       if (f.tu.dec1_ms < 0) f.tu.dec1_ms = 1e3 * (now_s() - t_dec);
       if (cancel[k] || ended[k]) return;
-      if (Io::cancelled(f.rq)) {  // its slot's bit: it ends after the step that reads it
+      if (Io::cancelled(f.rq)) {  // its entry's bit: it ends after the step that reads it
         cancel[k] = 1;
-        m_.set_ctl(ctl |= 1u << e[k].slot);
+        m_.set_ctl(ctl |= 1u << k);
         return;
       }
       const int32_t t = o.row[row].token;

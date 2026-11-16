@@ -22,7 +22,12 @@ constexpr int kMaxRows = 64;
 // kDecodeRows + 1 .. kMaxRows rows (several sessions' rows, launch_batch) run the wide body: the dense projections as
 // prefill GEMMs, the MoE as moe_prefill, the attention side in groups of kDecodeRows rows.
 constexpr int kDecodeRows = 16;
-constexpr int kMaxSlots = 16;               // session slots (Options::slots): live sessions' states, at most
+// Session slots (Options::slots): live sessions' states, at most. With the slot memory pool (Options::vmm) a slot costs
+// real memory only for its window rings, carries and draft windows (~5.8 MiB a rank: docs/engine.md), its kv arrays being
+// address space mapped as its session grows; without it (--no-vmm) every slot's arrays are allocated whole, and the
+// physical limits stay as before.
+constexpr int kMaxSlots = 64;
+constexpr int kMaxSlotsPhys = 16;
 // Rows of one session in a step, at most, whatever kMaxRows is: the attention kernels' contract for a
 // step's slot table. attn::decode_prep's fused compressor emit and carry race across CTAs at 16 rows of
 // one session (the step runs kv_write and compressor_emit, safe at 16, but the contract holds for any
@@ -35,7 +40,10 @@ constexpr int kMaxSpecEnts = 8;
 // Physical session units (Options::big_slots): a slot of the full context is kUnitMul units of the small
 // slots' size laid end to end, so every kernel's slot * stride addressing stays uniform (a slot table holds
 // units, the server's slots stay logical: cancel bits, Cmd::live).
-constexpr int kMaxUnits = 64;
+// kMaxUnits: with the pool; kMaxUnitsPhys: without it. Every slot is at least one unit, so 64 slots of the full context
+// (--big-slots 0) are 64 units; mixed big and small slots count kUnitMul for a big one.
+constexpr int kMaxUnits = 128;
+constexpr int kMaxUnitsPhys = 64;
 constexpr int kUnitMul = 8;
 
 // attention, per rank
