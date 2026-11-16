@@ -11,10 +11,13 @@
 #include <vector>
 
 #include "kernels/dsk.h"
+#include "kernels/prefill_attn.h"
 #include "kernels/tests/npy.h"
 
 static std::string g_dir;
 #include <functional>
+#include <sys/wait.h>
+#include <unistd.h>
 static std::function<void(int, int, float, float)> g_detail;  // called for elements >1 ulp off
 #include "kernels/tests/small_gemms.h"
 static int g_fail = 0;
@@ -980,6 +983,61 @@ static void test_prefill_16() {
   }
 }
 
+// DSGB10_PF_TUNE: the text is read as written (items, defaults, the cap on hc) and a wrong item stops the start
+static void test_pf_tune_env() {
+  printf("DSGB10_PF_TUNE\n");
+  auto child = [](const char* text, std::string* err) {  // a start that must die, in a child: exit status and its stderr
+    int pp[2];
+    if (pipe(pp)) return -1;
+    const pid_t pid = fork();
+    if (pid == 0) {
+      dup2(pp[1], 2), close(pp[0]), close(pp[1]);
+      setenv("DSGB10_PF_TUNE", text, 1);
+      dsk::prefill_tune_env(0);
+      _exit(0);
+    }
+    close(pp[1]);
+    char buf[512];
+    ssize_t n;
+    while ((n = read(pp[0], buf, sizeof buf)) > 0) err->append(buf, (size_t)n);
+    close(pp[0]);
+    int st = 0;
+    waitpid(pid, &st, 0);
+    return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+  };
+  auto here = [](const char* text, std::string* err) {  // a start that must succeed (it allocates: not after a fork)
+    fflush(stderr);
+    FILE* f = tmpfile();
+    const int keep = dup(2);
+    dup2(fileno(f), 2);
+    setenv("DSGB10_PF_TUNE", text, 1);
+    dsk::prefill_tune_env(0);
+    fflush(stderr);
+    dup2(keep, 2), close(keep);
+    char buf[512];
+    rewind(f);
+    size_t n;
+    while ((n = fread(buf, 1, sizeof buf, f)) > 0) err->append(buf, n);
+    fclose(f);
+    dsk::prefill_tuning(dsk::PrefillTuning{});
+    dsk::hc_boundary_split(0);
+    return 0;
+  };
+  auto expect = [&](const char* text, bool dies, const char* line) {
+    std::string err;
+    const int rc = dies ? child(text, &err) : here(text, &err);
+    const bool ok = (rc != 0) == dies && err.find(line) != std::string::npos;
+    g_fail += !ok;
+    printf("  %-28s %s\n", text, ok ? "ok  " : "FAIL");
+    if (!ok) printf("    exit %d, stderr: %s\n", rc, err.c_str());
+  };
+  expect("hc,small,down", false, "prefill tuning hc 344 gate 256 sh 256 down 4096");
+  expect("hc=128,gate=64,sh=32,down=2048", false, "prefill tuning hc 128 gate 64 sh 32 down 2048");
+  expect("small=100", false, "prefill tuning hc 0 gate 100 sh 100 down 0");
+  expect("bogus", true, "DSGB10_PF_TUNE: unknown item 'bogus' (hc, gate, sh, small, down)");
+  expect("hc=513", true, "DSGB10_PF_TUNE: hc=513 (at most 512 rows a rank)");
+}
+
 static void test_prefill_moe() {
   Npy x = L("p_moe_x"), sel = L("p_moe_sel"), rw = L("p_moe_rw"), yr = L("p_moe_y_routed"), ysh = L("p_moe_y_shared");
   Npy w1 = L("moe_w1"), s1 = L("moe_s1"), w3 = L("moe_w3"), s3 = L("moe_s3"), w2 = L("moe_w2"), s2 = L("moe_s2");
@@ -1057,6 +1115,15 @@ static void test_prefill_moe() {
       dsk::PrefillTuning v;
       v.down = fz;
       const char* comb = fz == 2 ? ", fused" : "";
+      {  // DSGB10_PF_TUNE down: dgrp 10 and tile order 1 from down_m rows, set by the threshold alone
+        dsk::PrefillTuning t2 = v;
+        t2.down_m = 1;
+        snprintf(what, sizeof what, "PF_TUNE down_m 1%s: same", comb);
+        variant(what, t2);
+        t2.down_m = M + 1;  // above this chunk: the default tiles
+        snprintf(what, sizeof what, "PF_TUNE down_m %d%s: same", M + 1, comb);
+        variant(what, t2);
+      }
       for (int G : {1, 3, 10, 40})  // the down kernel a CTA per (tile, G column blocks)
         for (int ring : {3, 9}) {
           v.l2 = G == 3 ? 0 : 7, v.dgrp = G, v.dring = ring;
@@ -1857,6 +1924,7 @@ int main(int argc, char** argv) {
   if (only.empty() || only == "prefill" || only == "p_fp8" || only == "p_small") g_fail += small_gemms::run(false);
   if (only.empty() || only == "prefill" || only == "p_16") test_prefill_16();
   if (only.empty() || only == "prefill" || only == "p_moe") test_prefill_moe();
+  if (only.empty() || only == "prefill" || only == "p_tune") test_pf_tune_env();
   printf(g_fail ? "%d FAILED\n" : "all passed\n", g_fail);
   return g_fail != 0;
 }

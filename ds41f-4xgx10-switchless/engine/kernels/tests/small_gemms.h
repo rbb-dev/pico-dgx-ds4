@@ -121,9 +121,10 @@ inline int run(bool timing) {
     }
     if (which == 5) dsk::gemm_woa_p(xo, M, woa, soa, 2048, 4096, 1024, nullptr, oq, os, 0);
   };
-  auto tune = [](int small) {
+  auto tune = [](int small) {  // 1, 2: the small tiles; 3: DSGB10_PF_TUNE's row thresholds (gate, sh) at 256 rows
     dsk::PrefillTuning t;
-    t.small = small;
+    if (small == 3) t.gate_m = t.sh_m = 256;
+    else t.small = small;
     dsk::prefill_tuning(t);
   };
   auto grab = [&](const G& g, int M) {
@@ -164,10 +165,10 @@ inline int run(bool timing) {
       gemm(w, M);
       cudaDeviceSynchronize();
       const std::vector<uint8_t> ref = grab(g, M);
-      double t[3] = {0, 0, 0};
+      double t[4] = {0, 0, 0, 0};
       if (timing) t[0] = time_us(w, M);
       std::string res;
-      for (int s = 1; s <= 2; ++s) {
+      for (int s = 1; s <= 3; ++s) {
         tune(s);
         for (const Out& o : g.outs) cudaMemset(const_cast<void*>(o.p), 0xA5, o.row * M);
         gemm(w, M);
@@ -183,7 +184,7 @@ inline int run(bool timing) {
                     g.name, M, t[0], g.wbytes / t[0] * 1e-3, t[1], g.wbytes / t[1] * 1e-3, t[2], g.wbytes / t[2] * 1e-3,
                     res.c_str());
       else
-        std::printf("  %-26s M %4d: small 1, 2 against the default:%s %s\n", g.name, M, res.c_str(),
+        std::printf("  %-26s M %4d: small 1, 2, thresholds against the default:%s %s\n", g.name, M, res.c_str(),
                     res.find('D') == std::string::npos && res.find('E') == std::string::npos ? "ok" : "FAIL");
     }
   }
