@@ -1,6 +1,7 @@
 //! Client side of the rank-0 socket: one connection, many requests multiplexed by req_id.
 //! Reconnects with backoff; requests in flight when the connection drops end with an error.
 
+use crate::dashboard::{ReqLive, ReqMeta, Telemetry};
 use crate::protocol::{read_frame, Done, DoneReason, Frame, HelloEngine, Submit, Tokens, VERSION};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -20,6 +21,7 @@ pub enum Event {
 struct Pending {
     tx: mpsc::UnboundedSender<Event>,
     n_top: u32,
+    live: Arc<ReqLive>,
 }
 
 #[derive(Default)]
@@ -33,6 +35,7 @@ struct Inner {
     conn: Mutex<Conn>,
     next_req: AtomicU64,
     info: watch::Sender<Option<HelloEngine>>,
+    telemetry: Arc<Telemetry>,
 }
 
 #[derive(Clone)]
@@ -44,7 +47,7 @@ impl EngineClient {
     /// Start connecting to the engine socket (in the background, forever).
     pub fn start(path: PathBuf) -> EngineClient {
         let (info, _) = watch::channel(None);
-        let inner = Arc::new(Inner { path, conn: Mutex::new(Conn::default()), next_req: AtomicU64::new(1), info });
+        let inner = Arc::new(Inner { path, conn: Mutex::new(Conn::default()), next_req: AtomicU64::new(1), info, telemetry: Arc::new(Telemetry::new()) });
         tokio::spawn(run(inner.clone()));
         EngineClient { inner }
     }
@@ -60,22 +63,44 @@ impl EngineClient {
         self.info()
     }
 
+    /// What the dashboard knows of the engine and its requests (dashboard.rs).
+    pub fn telemetry(&self) -> &Arc<Telemetry> {
+        &self.inner.telemetry
+    }
+
     /// Send a request (its req_id is assigned here). Events arrive on the receiver; the last one is
-    /// always Done.
-    pub fn submit(&self, mut s: Submit) -> Result<(u64, mpsc::UnboundedReceiver<Event>), String> {
+    /// always Done. `meta` is what the dashboard shows of it.
+    pub fn submit(&self, mut s: Submit, meta: ReqMeta) -> Result<(u64, mpsc::UnboundedReceiver<Event>), String> {
         s.req_id = self.inner.next_req.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::unbounded_channel();
         let mut c = self.inner.conn.lock().unwrap();
         let wtx = c.tx.clone().ok_or("engine not connected")?;
         let req_id = s.req_id;
-        c.pending.insert(req_id, Pending { tx, n_top: if s.flags & crate::protocol::FLAG_LOGPROBS != 0 { s.n_top_logprobs } else { 0 } });
+        let live = self.inner.telemetry.register(req_id, meta);
+        c.pending.insert(req_id, Pending { tx, n_top: if s.flags & crate::protocol::FLAG_LOGPROBS != 0 { s.n_top_logprobs } else { 0 }, live });
         // encoded from the request itself, which is dropped with it: a request with images carries their
         // rows (10 KiB each), and a clone here was one more copy of them
         if wtx.send(Frame::Submit(s).encode()).is_err() {
             c.pending.remove(&req_id);
+            self.inner.telemetry.finish(&Done {
+                req_id,
+                reason: DoneReason::Error,
+                prompt_tokens: 0,
+                cached_tokens: 0,
+                completion_tokens: 0,
+                queue_us: 0,
+                prefill_us: 0,
+                decode_us: 0,
+                error: String::new(),
+            });
             return Err("engine not connected".into());
         }
         Ok((req_id, rx))
+    }
+
+    /// Ask rank 0 for a STATS frame (the answer lands in the telemetry).
+    pub fn request_stats(&self) {
+        self.send(Frame::StatsReq);
     }
 
     pub fn cancel(&self, req_id: u64) {
@@ -111,6 +136,7 @@ async fn run(inner: Arc<Inner>) {
                     c.tx = None;
                     std::mem::take(&mut c.pending)
                 };
+                inner.telemetry.clear_live();
                 for (req_id, p) in pending {
                     let _ = p.tx.send(Event::Done(Done {
                         req_id,
@@ -181,12 +207,21 @@ async fn connection(inner: &Arc<Inner>, stream: UnixStream) -> Result<(), String
             Ok(Frame::Tokens(t)) => {
                 let c = inner.conn.lock().unwrap();
                 if let Some(p) = c.pending.get(&t.req_id) {
+                    inner.telemetry.tokens(&p.live, t.ids.len());
                     let _ = p.tx.send(Event::Tokens(t));
                 }
             }
+            Ok(Frame::Progress { req_id, computed, total }) => {
+                let c = inner.conn.lock().unwrap();
+                if let Some(p) = c.pending.get(&req_id) {
+                    inner.telemetry.progress(&p.live, computed, total);
+                }
+            }
+            Ok(Frame::Stats(s)) => inner.telemetry.set_stats(s),
             Ok(Frame::Done(d)) => {
                 let p = inner.conn.lock().unwrap().pending.remove(&d.req_id);
                 if let Some(p) = p {
+                    inner.telemetry.finish(&d);
                     let _ = p.tx.send(Event::Done(d));
                 }
             }

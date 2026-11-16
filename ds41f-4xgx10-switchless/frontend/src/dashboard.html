@@ -1,0 +1,930 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>Dashboard</title>
+<link rel="icon" href="data:,">
+<style>
+:root {
+  color-scheme: dark;
+  --bg: #0b0d0e; --head: #0e1011; --panel: #101314; --well: #0d1011; --raise: #1a1f22; --raise2: #1f262a;
+  --line: #1e2224; --line2: #2a3033; --rule: #1a1e20;
+  --t1: #f1f3f4; --t2: #e8eaec; --t3: #c3c8cb; --t4: #a7aeb2; --t5: #8b9296;
+  --link: #a9c1d8; --ok: #8fd6ad; --ok-dot: #5cc28a; --ok-line: #24443a; --ok-bg: #112019;
+  --warn: #e6c27a; --warn-dot: #d9a441; --warn-bg: #2a2412; --bad: #f0a497; --bad-dot: #e0705f;
+  --weights: #3f7fc4; --work: #c8782c; --kv: #9b7fd6; --prompt: #9b7fd6; --gen: #3f7fc4;
+  --focus: #ffd866;
+  --mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  --sans: 'IBM Plex Sans', system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+* { box-sizing: border-box; }
+html { background: var(--bg); }
+body { margin: 0; background: var(--bg); color: var(--t2); font: 14px/1.45 var(--sans); }
+a { color: var(--link); text-decoration: none; }
+a:hover { color: #dbe7f2; }
+button, input, select { font: inherit; color: inherit; }
+button { cursor: pointer; }
+:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+h1, h2, h3 { margin: 0; }
+h1 { font-size: 22px; font-weight: 600; letter-spacing: -.01em; }
+h2 { font-size: 15px; font-weight: 600; color: var(--t2); }
+p { margin: 0; }
+.mono { font-family: var(--mono); }
+.dim { color: var(--t4); }
+.faint { color: var(--t5); }
+.num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+.plain { padding: 16px; }
+.label { font-family: var(--mono); font-size: 11px; letter-spacing: .12em; color: var(--t5); text-transform: uppercase; }
+.err { color: var(--bad); }
+.okc { color: var(--ok); }
+
+/* header */
+.top { border-bottom: 1px solid var(--line); background: var(--head); }
+.top > div { max-width: 1440px; margin: 0 auto; padding: 14px 24px; display: flex; flex-wrap: wrap; align-items: center; gap: 12px 28px; }
+.brand { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
+.word { font-family: var(--mono); font-size: 15px; font-weight: 700; letter-spacing: .16em; color: var(--t2); }
+.sub { font-family: var(--mono); font-size: 12px; color: var(--t5); }
+nav.sections { display: flex; flex-wrap: wrap; gap: 4px; flex: 1 1 auto; }
+nav.sections button { padding: 7px 14px; border-radius: 6px; border: 0; background: transparent; color: var(--t4); }
+nav.sections button:hover { color: var(--t2); }
+nav.sections button[aria-current="page"] { background: var(--raise); color: var(--t2); font-weight: 500; }
+.facts { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 18px; font-family: var(--mono); font-size: 12px; color: var(--t4); }
+.pill { display: inline-flex; align-items: center; gap: 7px; padding: 4px 10px; border: 1px solid var(--ok-line); background: var(--ok-bg); border-radius: 999px; color: var(--ok); }
+.pill i { width: 8px; height: 8px; border-radius: 50%; background: var(--ok-dot); }
+.pill.warm { border-color: #4a3e24; background: var(--warn-bg); color: var(--warn); }
+.pill.warm i { background: var(--warn-dot); }
+.pill.down { border-color: #5a2d27; background: #251513; color: var(--bad); }
+.pill.down i { background: var(--bad-dot); }
+.linkbtn { border: 0; background: none; padding: 0; color: var(--link); font-size: 13px; }
+
+.bar { max-width: 1440px; margin: 12px auto 0; padding: 8px 24px; font-size: 13px; }
+.bar.blind { color: var(--bad); border-left: 3px solid var(--bad-dot); background: #251513; margin: 12px 24px 0; max-width: none; }
+.bar.ro { color: var(--warn); }
+main#view { max-width: 1440px; margin: 0 auto; padding: 24px; display: flex; flex-direction: column; gap: 16px; }
+main#view:focus { outline: none; }
+.stale .card { opacity: .6; }
+[hidden] { display: none !important; }
+/* ---- the Overview: a status board's front page (its colours, type and density) ---- */
+/* the board: the ENGINE box across the top; LINES beside DECODE over PREFILL (the charts take the LINES height); NODE HEALTH
+   across */
+.board { display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(0, 1fr); grid-template-areas: "engine engine" "lines plots" "health health"; gap: 12px; align-items: stretch; }
+.board > [data-box="lines"] { grid-area: lines; }
+.board > [data-box="health"] { grid-area: health; }
+.board > [data-box="engine"] { grid-area: engine; }
+.plots { grid-area: plots; display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.plots > .plotbox { flex: 1; display: flex; flex-direction: column; }
+.plots .pbox { flex: 1; }
+.plots .pbody { flex: 1; min-height: 110px; }
+.plots .gutter, .plots .plot { height: auto; }
+.box { background: var(--panel); border: 1px solid var(--line); padding: 14px 16px; display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.box.plotbox { padding: 11px 13px; }
+.bhead { display: flex; align-items: baseline; justify-content: space-between; gap: 14px; }
+.bt { font-family: var(--mono); font-size: 11px; letter-spacing: .14em; color: var(--t3); white-space: nowrap; }
+.bsub, .bright { font-family: var(--mono); font-size: 10px; color: var(--t5); white-space: nowrap; }
+.bright.warn, .bright.warn .bsub { color: var(--warn); }
+main#view.stale .box { opacity: .6; }
+main#view { max-width: 1900px; padding: 12px; gap: 12px; }
+
+/* the header strip */
+.top { background: #0b0d0e; }
+.top > div { max-width: 1900px; padding: 6px 12px; gap: 6px 24px; }
+.word { font-size: 16px; letter-spacing: .12em; }
+nav.sections button { border-radius: 0; padding: 5px 12px; font-family: var(--mono); font-size: 11px; letter-spacing: .1em; text-transform: uppercase; }
+nav.sections button[aria-current="page"] { background: transparent; color: var(--t1); box-shadow: inset 0 -2px 0 #8fa8c0; }
+.tiles { display: flex; flex-wrap: wrap; align-items: stretch; gap: 8px 0; margin-left: auto; }
+.htile { display: flex; flex-direction: column; gap: 2px; padding: 0 14px; border-left: 1px solid var(--line); min-width: 96px; justify-content: center; }
+.htile .k { font-family: var(--mono); font-size: 9px; letter-spacing: .14em; color: #5a6165; white-space: nowrap; }
+.htile .v { font-family: var(--mono); font-size: 14px; font-weight: 500; color: var(--t2); font-variant-numeric: tabular-nums; white-space: nowrap; display: flex; align-items: center; }
+.htile .q { font-family: var(--mono); font-size: 10px; color: var(--t5); white-space: nowrap; display: flex; align-items: center; gap: 6px; }
+.htile .v { color: #4ec9a0; }
+.htile.warm .v { color: var(--warn); } .htile.bad .v { color: #ff6b5e; }
+.htile[data-tile="key"] .v, .htile[data-tile="local"] .v, .htile[data-tile="turbo"] .v, .htile[data-tile="balance"] .v { color: var(--t2); }
+.htile .qt.warn, .qt.warn { color: var(--warn); }
+.tiles.stale .htile .v { opacity: .6; }
+.vbtn { font: inherit; color: inherit; background: transparent; border: 1px solid #2a3033; padding: 0 8px; height: 22px; line-height: 20px; cursor: pointer; font-family: var(--mono); font-size: 13px; }
+.vsel { font-family: var(--mono); font-size: 13px; color: var(--t2); background: #0b0d0e; border: 1px solid #2a3033; height: 22px; padding: 0 4px; cursor: pointer; }
+.vsel:disabled { opacity: .5; cursor: default; }
+.htile .btn.go, #hdrApply { align-self: center; margin-left: 14px; height: 32px; }
+.tray p.warn { color: var(--warn); margin: 4px 0; }
+.vbtn.on { border-color: #4ec9a0; color: #4ec9a0; }
+.vbtn:disabled { opacity: .5; cursor: default; }
+.mini { font-family: var(--mono); font-size: 10px; background: transparent; border: 1px solid #2a3033; color: var(--t3); padding: 1px 6px; height: 18px; cursor: pointer; }
+.mini.go { border-color: #4ec9a0; color: #4ec9a0; }
+.htile input[type="range"] { width: 96px; height: 22px; accent-color: #9d8bd0; margin: 0; }
+.linkbtn { font-family: var(--mono); font-size: 10px; }
+
+
+/* LINES */
+/* the rows' spacing: 16 seats on this engine (its compact rows): 11 px, line-height 1.1,
+   no padding, 4 px apart */
+.lgrid { display: flex; flex-direction: column; gap: 4px; }
+.lrow { display: grid; grid-template-columns: 22px 60px minmax(40px, 1fr) 72px 58px 84px 54px 56px 64px 48px; gap: 0 10px; align-items: center; font-family: var(--mono); font-size: 11px; color: var(--t2); line-height: 1.1; padding: 0; border-bottom: 1px solid #14181a; font-variant-numeric: tabular-nums; }
+.lrow > span { white-space: nowrap; overflow: hidden; }
+.lrow > span:nth-child(n+4) { text-align: right; }
+.lrow > span:first-child { color: #5a6165; }
+.lrow > span:nth-child(2) { font-size: 10px; font-weight: 700; letter-spacing: .06em; }
+.lrow.lhead { font-size: 9px; letter-spacing: .12em; color: #5a6165; padding: 0 0 5px; border-bottom-color: #1a1e1f; }
+.lrow.lhead > span { cursor: help; }
+.lrow.idle { color: #5a6165; }
+.stg { height: 7px; background: #131718; display: flex; align-items: stretch; }
+.stg i { display: block; width: 0; }
+.stg .pre { background: #7d6bb0; } .stg .dec { background: #e8eaec; }
+
+/* ENGINE: the Rate, Sessions and SSD tier cards (the node cards' build), three in a row */
+/* the cards follow the ENGINE box's own width: three in a row from about 640 px, one in a row below (never two and one) */
+[data-box="engine"] { container-type: inline-size; }
+.vrow { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; }
+@container (min-width: 640px) { .vrow { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+.vcard { align-content: start; }
+.role.warn { color: #e0a33e; }
+.srows > .sfbody { padding: 12px 18px; margin-top: 0; }
+
+/* NODE HEALTH */
+/* one table row a Spark, the columns in groups with the units in their heads; a narrow screen scrolls it sideways */
+.tscroll { overflow-x: auto; }
+.ncard { background: var(--well); border: 1px solid var(--line); padding: 10px 12px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; min-width: 0; }
+.ntab { width: max-content; --npad: 0px; border-collapse: collapse; font-family: var(--mono); font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ntab th, .ntab td { padding: 4px calc(4px + var(--npad)); text-align: right; border-bottom: 1px solid #14181a; }
+.ntab th:first-child, .ntab td:first-child { text-align: left; }
+.ntab thead .grp th { font-size: 9px; letter-spacing: .12em; color: var(--t5); font-weight: 400; border-bottom: 1px solid var(--line); padding-top: 0; padding-bottom: 2px; text-align: center; }
+.ntab thead .col th { font-size: 10px; color: var(--t4); font-weight: 400; border-bottom: 1px solid var(--line2); cursor: help; vertical-align: bottom; padding-top: 2px; padding-bottom: 3px; }
+.ntab thead .unit { color: var(--t5); }
+.ntab .gs { border-left: 1px solid var(--line); }
+.ntab td { color: var(--t2); cursor: help; }
+.ntab td.who { cursor: default; }
+.ntab td.who > span { display: block; }
+.ntab td .rail { display: inline-block; min-width: 14ch; text-align: right; }
+.ntab tr.old td:not(.who), .ntab td.old { opacity: .5; }
+[data-box="health"] { padding: 8px 12px; gap: 1px; }
+@container (max-width: 1400px) { .ntab thead .col th { white-space: normal; } }
+[data-box="health"] { container-type: inline-size; }
+.nhead { grid-column: 1 / -1; display: flex; justify-content: space-between; align-items: baseline; border-bottom: 1px solid #1a1e1f; padding-bottom: 5px; }
+.nn { font-family: var(--mono); font-size: 12px; letter-spacing: .1em; color: var(--t2); }
+.nr { display: flex; gap: 8px; align-items: baseline; }
+.role { font-family: var(--mono); font-size: 10px; color: var(--t5); }
+.age { font-family: var(--mono); font-size: 10px; color: #ff6b5e; font-weight: 700; }
+.ngroup { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.ngroup.wide { grid-column: 1 / -1; }
+.gt { font-family: var(--mono); font-size: 9px; letter-spacing: .14em; color: #5a6165; }
+.gtrow { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.gl { font-family: var(--mono); font-size: 9px; letter-spacing: .06em; color: #5a6165; white-space: nowrap; }
+.num.mw { color: var(--weights); } .num.mm { color: var(--work); } .num.mk { color: var(--kv); }
+.nrow { display: flex; justify-content: space-between; gap: 10px; font-family: var(--mono); font-size: 12px; cursor: help; }
+.nl { color: var(--t5); white-space: nowrap; }
+.nv { display: flex; gap: 10px; color: var(--t2); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.nv .sep { margin: 0 -3px; }
+.stack { display: flex; gap: 2px; height: 8px; margin: 2px 0; }
+.stack div { min-width: 0; width: 0; } .stack .w { background: var(--weights); } .stack .m { background: var(--work); } .stack .k { background: var(--kv); }
+.stack .f { flex: 1 1 auto; background: #1a1f21; width: auto; }
+
+/* SPEED FEATURES */
+.sfbody { display: flex; flex-direction: column; gap: 2px; margin-top: 8px; }
+.sfbody .gt { margin-top: 6px; }
+.srow2 { display: flex; justify-content: space-between; gap: 12px; font-family: var(--mono); font-size: 12px; padding: 2px 0; border-bottom: 1px solid #14181a; cursor: help; }
+.srow2 .sl { color: var(--t3); }
+.chipx { color: #4ec9a0; font-size: 10px; letter-spacing: .08em; white-space: nowrap; }
+.srow2.off { background: var(--warn-bg); } .srow2.off .chipx, .srow2.off .sl { color: var(--warn); }
+.srow2.chosen .chipx { color: var(--t5); }
+.trows { display: flex; flex-direction: column; gap: 2px; }
+
+/* plots */
+.pbox { display: flex; flex-direction: column; gap: 6px; }
+.phead { display: flex; justify-content: space-between; align-items: baseline; }
+.pl { font-family: var(--mono); font-size: 10px; letter-spacing: .13em; color: var(--t5); }
+.pn { font-family: var(--mono); font-size: 11px; color: #f2f4f5; }
+.pbody { display: flex; gap: 5px; }
+.gutter { position: relative; width: 38px; flex: none; font-family: var(--mono); font-size: 9px; color: #5a6165; height: 110px; }
+.gutter .g { position: absolute; right: 0; transform: translateY(-50%); white-space: nowrap; }
+.plot { position: relative; flex: 1; height: 110px; background: #0c0f10; cursor: crosshair; touch-action: pan-y; }
+.plot svg { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+.plot .hair { position: absolute; top: 0; bottom: 0; width: 1px; background: #5b6468; }
+.plot .dot { position: absolute; width: 8px; height: 8px; margin: -4px 0 0 -4px; border-radius: 50%; }
+.plot .tip { position: absolute; top: 4px; transform: translateX(-50%); background: var(--raise); border: 1px solid #2c3438; padding: 5px 9px; font-family: var(--mono); font-size: 11px; white-space: nowrap; pointer-events: none; z-index: 2; }
+.pfoot { display: flex; gap: 5px; }
+.pfoot > span { width: 38px; flex: none; }
+.xlab { flex: 1; display: flex; justify-content: space-between; font-family: var(--mono); font-size: 9px; color: #5a6165; }
+
+@media (max-width: 1099px) { .board { grid-template-columns: minmax(0, 1fr); grid-template-areas: "engine" "lines" "plots" "health"; } .tiles { margin-left: 0; } }
+@media (max-width: 720px) { .lrow { grid-template-columns: 18px 56px minmax(30px, 1fr) 62px 52px 70px; } .lrow > span:nth-child(n+7) { display: none; } }
+
+/* the served names in the header */
+.htile[data-tile="served"] .v { color: var(--t2); }
+
+/* sign-in (the API key, kept in this browser until Sign out) */
+.signin { position: fixed; inset: 0; background: rgba(5, 7, 8, .94); display: flex; align-items: center; justify-content: center; z-index: 50; }
+.signin form { background: var(--panel); border: 1px solid var(--line2); padding: 20px 22px; display: flex; flex-direction: column; gap: 10px; width: min(360px, calc(100vw - 32px)); }
+.signin .t { font-family: var(--mono); font-size: 12px; letter-spacing: .1em; color: var(--t2); }
+.signin .m { font-size: 13px; color: var(--t4); }
+.signin input { background: var(--well); border: 1px solid var(--line2); padding: 8px 10px; font-family: var(--mono); }
+.signin button, button.signout { background: var(--raise); border: 1px solid var(--line2); padding: 5px 9px; }
+button.signout { font-family: var(--mono); font-size: 11px; letter-spacing: .08em; margin-left: 12px; color: var(--t4); }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<noscript><p class="plain">This page needs JavaScript: it draws the engine's status from the dashboard API.</p></noscript>
+<script>
+// The dashboard page of dsfront: lines, node health, the engine's rates, sessions and SSD tier, the decode and prefill charts, the long-prompt and SSD settings and the cooling and clock box,
+// reading /dashboard/api/v1/*. All text reaches the page through textContent or setAttribute, never as markup.
+const SVGNS = 'http://www.w3.org/2000/svg';
+// ---- element helpers: attributes and text only, never markup
+function h(tag, props, ...kids) {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(props || {})) {
+    if (v == null || v === false) continue;
+    if (k === 'class') el.className = v;
+    else if (k === 'text') el.textContent = v;
+    else if (k.startsWith('on')) el.addEventListener(k.slice(2), v);
+    else el.setAttribute(k, v === true ? '' : v);
+  }
+  for (const kid of kids.flat()) if (kid != null && kid !== false) el.append(kid instanceof Node ? kid : document.createTextNode(String(kid)));
+  return el;
+}
+function svg(tag, attrs) {
+  const el = document.createElementNS(SVGNS, tag);
+  for (const [k, v] of Object.entries(attrs || {})) el.setAttribute(k, v);
+  return el;
+}
+function clear(el) { el.replaceChildren(); return el; }
+// ---- formatting: whole numbers with thousands separators, never "6.5k"
+const whole = new Intl.NumberFormat('en-AU', { maximumFractionDigits: 0 });
+const one = new Intl.NumberFormat('en-AU', { minimumFractionDigits: 1, maximumFractionDigits: 1 });
+const two = new Intl.NumberFormat('en-AU', { minimumSignificantDigits: 2, maximumSignificantDigits: 2 });
+const loose = new Intl.NumberFormat('en-AU', { maximumFractionDigits: 3 });
+const dayTime = new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+const hm = new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit', hour12: false });
+const dayName = new Intl.DateTimeFormat(undefined, { day: 'numeric', month: 'short' });
+const dayKey = new Intl.DateTimeFormat('en-CA');
+const none = (x) => x == null || (typeof x === 'number' && !Number.isFinite(x));
+const fmt = (x) => (none(x) ? '0' : whole.format(Number(x)));
+const gib = (b) => (none(b) ? one.format(0) : one.format(Number(b) / 2 ** 30));
+function dur(s) {
+  if (none(s)) return '0 s';
+  s = Math.floor(s);
+  const d = Math.floor(s / 86400), hh = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
+  return d ? `${d} d ${hh} h` : hh ? `${hh} h ${m} min` : m ? `${m} min ${s % 60} s` : `${s} s`;
+}
+function setText(el, text) { const t = String(text); if (el.textContent !== t) el.textContent = t; }
+function setTip(el, text) { const t = text || ''; if (el.getAttribute('title') !== t) { if (t) el.setAttribute('title', t); else el.removeAttribute('title'); } }
+function setColor(el, color) { if (el.style.color !== color) el.style.color = color; }
+function setWidth(el, pct) { const w = Math.max(0, Math.min(100, pct)).toFixed(1) + '%'; if (el.style.width !== w) el.style.width = w; }
+// ---- the board's plots: a label and the value now, a gutter of axis numbers, a plot of fixed-bucket points. The engine gives fixed
+// buckets (a bucket keeps its value as the window moves) with the mean and the peak of each. Zero sits inside the plot; the scale
+// fits the data (the window's top + 10 %, rounded up to 1, 1.5, 2, 3, 4, 5, 6 or 8 times a power of ten); no text over the plot.
+const PLOT_PAD = 4; // of 100: the room above the top and below zero
+function niceTop(x) {
+  if (!(x > 0)) return 1;
+  const mag = 10 ** Math.floor(Math.log10(x));
+  for (const s of [1, 1.5, 2, 3, 4, 5, 6, 8, 10]) if (s * mag >= x) return s * mag;
+  return 10 * mag;
+}
+// A thin smooth path through points [x, y] (monotone cubic: it never overshoots a peak or dips below a flat run). `pts` run left to right.
+function smoothPath(pts) {
+  const n = pts.length;
+  if (!n) return '';
+  const q = (v) => v.toFixed(1);
+  if (n === 1) return `M${q(pts[0][0])},${q(pts[0][1])}`;
+  const dx = [], sl = [];
+  for (let i = 0; i < n - 1; i++) { dx.push(pts[i + 1][0] - pts[i][0]); sl.push((pts[i + 1][1] - pts[i][1]) / dx[i]); }
+  const m = new Array(n);
+  m[0] = sl[0]; m[n - 1] = sl[n - 2];
+  for (let i = 1; i < n - 1; i++) m[i] = sl[i - 1] * sl[i] <= 0 ? 0 : (sl[i - 1] + sl[i]) / 2;
+  for (let i = 0; i < n - 1; i++) {
+    if (sl[i] === 0) { m[i] = 0; m[i + 1] = 0; continue; }
+    const a = m[i] / sl[i], b = m[i + 1] / sl[i], r = a * a + b * b;
+    if (r > 9) { const t = 3 / Math.sqrt(r); m[i] = t * a * sl[i]; m[i + 1] = t * b * sl[i]; }
+  }
+  let d = `M${q(pts[0][0])},${q(pts[0][1])}`;
+  for (let i = 0; i < n - 1; i++) {
+    const w = dx[i] / 3;
+    d += ` C${q(pts[i][0] + w)},${q(pts[i][1] + m[i] * w)} ${q(pts[i + 1][0] - w)},${q(pts[i + 1][1] - m[i + 1] * w)} ${q(pts[i + 1][0])},${q(pts[i + 1][1])}`;
+  }
+  return d;
+}
+const plotY = (frac) => 100 - PLOT_PAD - Math.min(1, Math.max(0, frac)) * (100 - 2 * PLOT_PAD);
+function plotShell(label, tip, aria) {
+  const now = h('span', { class: 'pn num', text: '0' });
+  const g = [h('span', { class: 'g top' }), h('span', { class: 'g mid' }), h('span', { class: 'g zero', text: '0' })];
+  g[0].style.top = (PLOT_PAD) + '%'; g[1].style.top = '50%'; g[2].style.top = (100 - PLOT_PAD) + '%';
+  const gutter = h('div', { class: 'gutter', title: tip || null }, ...g);
+  const plotSvg = svg('svg', { 'aria-hidden': 'true', viewBox: '0 0 600 100', preserveAspectRatio: 'none' });
+  for (const f of [0, 0.5, 1]) plotSvg.append(svg('line', { x1: '0', x2: '600', y1: String(plotY(f)), y2: String(plotY(f)), stroke: f === 0 ? '#2a3033' : '#1a1e1f', 'stroke-width': '1', 'stroke-dasharray': f === 0 ? '' : '3 3', 'vector-effect': 'non-scaling-stroke' }));
+  const hair = h('div', { class: 'hair', 'aria-hidden': 'true', hidden: true });
+  const tipBox = h('div', { class: 'tip', 'aria-hidden': 'true', hidden: true });
+  const plot = h('div', { class: 'plot', role: 'img', 'aria-label': aria }, plotSvg, hair, tipBox);
+  const xlab = h('div', { class: 'xlab', 'aria-hidden': 'true' });
+  const el = h('div', { class: 'pbox' }, h('div', { class: 'phead' }, h('span', { class: 'pl', text: label, title: tip || null }), now), h('div', { class: 'pbody' }, gutter, plot), h('div', { class: 'pfoot' }, h('span'), xlab));
+  return { el, now, g, plotSvg, hair, tipBox, plot, xlab };
+}
+function hoverIndex(plot, n, e) {
+  const r = plot.getBoundingClientRect();
+  return Math.round(Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)) * (n - 1));
+}
+function xlabels(xlab, t0, stepMs, n) {
+  const want = [0, 1, 2, 3, 4].map((k) => hm.format(new Date(t0 + (n - 1) * stepMs * k / 4)));
+  while (xlab.children.length < 5) xlab.append(h('span'));
+  want.forEach((w, i) => setText(xlab.children[i], w));
+}
+function chart(label, tip, color, unit, name) {
+  const s = plotShell(label, tip, label);
+  const area = svg('path', { fill: color, 'fill-opacity': '0.10', stroke: 'none' });
+  const line = svg('path', { fill: 'none', stroke: color, 'stroke-width': '2', 'stroke-linejoin': 'round', 'stroke-linecap': 'round', 'vector-effect': 'non-scaling-stroke' });
+  const goalLine = svg('line', { x1: '0', x2: '600', y1: '-10', y2: '-10', stroke: '#e0a33e', 'stroke-width': '1.2', 'stroke-dasharray': '6 4', 'vector-effect': 'non-scaling-stroke' });
+  s.plotSvg.append(area, line, goalLine);
+  const dot = h('div', { class: 'dot', 'aria-hidden': 'true', hidden: true });
+  dot.style.background = color;
+  s.plot.append(dot);
+  const state = { pts: [], peaks: [], t0: 0, step: 1, top: 1 };
+  s.plot.addEventListener('pointermove', (e) => {
+    const n = state.pts.length;
+    if (n < 2) return;
+    const i = hoverIndex(s.plot, n, e), v = state.pts[i], pk = state.peaks[i];
+    const end = state.t0 + i * state.step * 1000;
+    s.hair.hidden = s.tipBox.hidden = false;
+    s.hair.style.left = (i / (n - 1) * 100) + '%';
+    s.tipBox.style.left = Math.min(88, Math.max(12, i / (n - 1) * 100)) + '%';
+    dot.hidden = v == null;
+    if (v != null) { dot.style.left = (i / (n - 1) * 100) + '%'; dot.style.top = plotY(v / state.top) + '%'; }
+    clear(s.tipBox).append(h('div', { class: 'dim', text: `${dayTime.format(new Date(end - state.step * 1000))} to ${dayTime.format(new Date(end))}` }), h('div', { class: 'num', text: v == null ? 'no reading' : `${fmt(v)} ${unit}${state.step > 1 ? ' average' : ''}` }), pk != null && state.step > 1 ? h('div', { class: 'num dim', text: `peak ${fmt(pk)} ${unit}` }) : null);
+  });
+  s.plot.addEventListener('pointerleave', () => { s.hair.hidden = dot.hidden = s.tipBox.hidden = true; });
+  return {
+    el: s.el, name,
+    setNow(v) { setText(s.now, `${fmt(v)} ${unit}`); },
+    draw(body, atMs, goal) {
+      const pts = body.points.map((p) => (p == null ? null : Number(p)));
+      const peaks = (body.peaks || []).map((p) => (p == null ? null : Number(p)));
+      const n = pts.length;
+      const real = pts.filter((p) => p != null);
+      const top = niceTop(Math.max(0, goal || 0, ...peaks.filter((p) => p != null), ...real) * 1.1);
+      const lastMs = body.last_ms != null ? Number(body.last_ms) : atMs;
+      Object.assign(state, { pts, peaks, top, step: body.step_s, t0: lastMs - (n - 1) * body.step_s * 1000 });
+      let d = '', a = '', run = [];
+      const base = plotY(0).toFixed(1);
+      const flush = () => {
+        if (run.length) {
+          d += (d ? ' ' : '') + smoothPath(run);
+          a += `${a ? ' ' : ''}${smoothPath(run)} L${run[run.length - 1][0].toFixed(1)},${base} L${run[0][0].toFixed(1)},${base} Z`;
+        }
+        run = [];
+      };
+      pts.forEach((p, i) => { if (p == null) { flush(); return; } run.push([i / Math.max(1, n - 1) * 600, plotY(p / top)]); });
+      flush();
+      line.setAttribute('d', d);
+      area.setAttribute('d', a);
+      const gy = goal ? plotY(goal / top).toFixed(1) : '-10';
+      goalLine.setAttribute('y1', gy); goalLine.setAttribute('y2', gy);
+      setText(s.g[0], loose.format(top)); setText(s.g[1], loose.format(top / 2));  // 1.5 and 0.5 as such, never rounded to 2 and 1
+      xlabels(s.xlab, state.t0, body.step_s * 1000, n);
+      s.plot.setAttribute('aria-label', `${label}, last ${Math.round(n * body.step_s / 60)} minutes, ${real.length ? 'highest ' + whole.format(Math.max(...real)) + ' ' + unit : 'no readings yet'}`);
+    },
+  };
+}
+
+// ---- temperatures: one fixed colour scale, green at 45 °C or under through yellow (65) and orange (80) to bright red at 90 and over.
+// The zones' own critical trip is 104 °C. A reading the host did not give has no colour.
+const TEMP_STOPS = [[45, [78, 201, 160]], [65, [230, 194, 122]], [80, [232, 135, 58]], [90, [255, 59, 48]]];
+const TEMP_TRIP_C = 104;
+function tempColor(c) {
+  if (none(c)) return '';
+  const x = Number(c);
+  if (x <= TEMP_STOPS[0][0]) return `rgb(${TEMP_STOPS[0][1].join(',')})`;
+  for (let i = 1; i < TEMP_STOPS.length; i++) {
+    if (x <= TEMP_STOPS[i][0]) {
+      const [t0, c0] = TEMP_STOPS[i - 1], [t1, c1] = TEMP_STOPS[i], f = (x - t0) / (t1 - t0);
+      return `rgb(${c0.map((v, k) => Math.round(v + (c1[k] - v) * f)).join(',')})`;
+    }
+  }
+  return `rgb(${TEMP_STOPS[TEMP_STOPS.length - 1][1].join(',')})`;
+}
+const NVME_TIP = `The NVMe drive's wear, per cent of its rated life used (the SMART page, as the sampler reports it).`;
+const SPACE_TIP = `Free space of this Spark's / file system (free to a user) of its total, in TB (as the sampler reports it).`;
+const TEMP_TIP = `Colour: green at 45 °C or under, yellow near 65, orange near 80, bright red at 90 and over; the zones trip at ${TEMP_TRIP_C} °C.`;
+
+// ---- NODE HEALTH: one table row a Spark, its figures in groups of columns with the units in the column heads. Each rank's sampler
+// answers the front-end's poll; a row shows the last answer and, when it is late, its age. A figure the host did not give reads 0,
+// never a dash (a dash flipping with 0 is noise). The GPU clock is shown with the limit NVML names and the reasons it gives for
+// holding it down; the clock limit is set from the COOLING AND CLOCK box, not from a row.
+const RAIL_TIP = [
+  `The first RoCE port function (mlx5_0): bits per second in and out, from its port counters between two reports, both in the larger value's unit (bps, Kbps, Mbps or Gbps; decimal: 1 Gbps = 10^9 bits per second).`,
+  `The second RoCE port function (mlx5_2): bits per second in and out, from its port counters between two reports, both in the larger value's unit (bps, Kbps, Mbps or Gbps).`,
+];
+// the columns: key, group, head, unit, tip, and whether the temperature colour scale paints the value
+const NODE_COLS = [
+  ['mem', 'MEMORY', 'Free / total', 'GiB', `Memory this Spark has free now (MemAvailable) of its total, in GiB. From /proc/meminfo on this Spark, as it last reported it.`],
+  ['split', 'MEMORY', 'Weights · work · KV', 'GiB', `How the memory was divided when the engine started, in GiB: the model weights, the engine's working memory (the slots among it), the session store (as the sampler reports it).`],
+  ['tz', 'TEMP.', 'Hot', '°C', `The hottest of this Spark's ACPI thermal zones, in °C (/sys/class/thermal). ${TEMP_TIP}`, true],
+  ['tg', 'TEMP.', 'GPU', '°C', `The GPU die temperature in °C (NVML). ${TEMP_TIP}`, true],
+  ['gb', 'GPU', 'Busy', '%', `GPU utilisation in per cent over NVML's last sample window.`],
+  ['gc', 'GPU', 'Clock', 'MHz', `The GPU's current clock and the highest clock NVML names, in MHz. The limit is set in COOLING AND CLOCK. The reasons NVML gives for holding it down show here when any is set.`],
+  ['gp', 'GPU', 'Power', 'W', `GPU power draw in watts (NVML).`],
+  ['cl', 'CPU', 'Load', '', `One-minute load average over the CPU count (/proc/loadavg).`],
+  ['cb', 'CPU', 'Busy', '%', `CPU busy time in per cent over all CPUs since the last report (/proc/stat).`],
+  ['tn', 'NVMe', 'Temp', '°C', `The NVMe drive's temperature in °C (the SMART page's composite). ${TEMP_TIP}`, true],
+  ['nw', 'NVMe', 'Wear', '%', NVME_TIP],
+  ['ns', 'NVMe', 'Space', 'TB', SPACE_TIP],
+  ['ra', 'RAILS IN/OUT', 'Rail A', '', RAIL_TIP[0]],
+  ['rb', 'RAILS IN/OUT', 'Rail B', '', RAIL_TIP[1]],
+];
+const GROUP_START = new Set(NODE_COLS.filter((c, i) => i === 0 || NODE_COLS[i - 1][1] !== c[1]).map((c) => c[0]));
+// each column's width in characters, room for its widest value: a reading that changes moves no other column; the two
+// rails cells each hold a box of 14 characters (99.9/99.9 Gbps); the box's width left over is shared equally between the
+// columns' sides (healthBox's fit)
+const NODE_W = { mem: 12, split: 18, tz: 5, tg: 5, gb: 3, gc: 13, gp: 5, cl: 9, cb: 5, tn: 5,
+  nw: 3, ns: 9 };
+function nodeRow(rank) {
+  const f1 = (x) => one.format(none(x) ? 0 : Number(x));
+  const f0 = (x) => whole.format(none(x) ? 0 : Number(x));
+  const td = {};
+  for (const [key, , , , tip] of NODE_COLS) td[key] = h('td', { 'data-row': key, class: GROUP_START.has(key) ? 'gs' : null, title: tip, text: '0', style: NODE_W[key] ? `width: ${NODE_W[key]}ch` : null });
+  const rail = { ra: h('span', { class: 'rail', text: '0' }), rb: h('span', { class: 'rail', text: '0' }) };
+  td.ra.replaceChildren(rail.ra); td.rb.replaceChildren(rail.rb);
+  // the memory split: each number in its own colour (weights, working memory, conversation memory)
+  const wN = h('span', { class: 'num mw', text: '0' }), mN = h('span', { class: 'num mm', text: '0' }), kN = h('span', { class: 'num mk', text: '0' });
+  td.split.replaceChildren(wN, ' / ', mN, ' / ', kN);
+  const ageEl = h('span', { class: 'age', 'data-age': '', hidden: true });
+  const el = h('tr', { 'data-node': String(rank) },
+    h('td', { class: 'who', style: 'width: 11ch' }, h('span', { class: 'nn', text: 'SPARK ' + (rank + 1) }), h('span', { class: 'role', text: rank === 0 ? 'rank 0 · API' : 'rank ' + rank }), ageEl),
+    NODE_COLS.map(([key]) => td[key]));
+  let prev = null;
+  // each rail's last rate in and out: a status poll that brings no new report shows it again, since a poll between two reports
+  // computes no rate; before the first two reports it is 0
+  const held = [[0, 0], [0, 0]];
+  const bps = (now, before, dt) => (before == null || now == null || dt <= 0 || Number(now) < Number(before) ? null : (Number(now) - Number(before)) * 8 / dt);
+  const paintTemp = (cell, c) => { setColor(cell, tempColor(c)); setText(cell, f1(c)); };
+  return {
+    el,
+    update(r, nh, ledger) {
+      const have = r && r.age_ms != null;
+      const old = have && (S.fails > 0 || r.age_ms > 6000);
+      el.classList.toggle('old', !!old || !have);
+      ageEl.hidden = !(old || (r && !have));
+      if (!ageEl.hidden) setText(ageEl, have ? `no report ${Math.round(r.age_ms / 1000)} s` : 'no report');
+      const led = ledger && ledger.get(rank);
+      if (led) {
+        setText(wN, gib(led.w)); setText(mN, gib(led.m)); setText(kN, gib(led.k));
+        setTip(td.split, `How the memory was divided when the engine started: the model weights ${gib(led.w)} GiB, the engine's working memory ${gib(led.m)} GiB, the session store ${gib(led.k)} GiB.`);
+      }
+      if (!have) return;
+      const gpu = r.gpu || {}, nv = r.nvme || {};
+      const zs = (r.zones_c || []).filter((z) => z != null);
+      const zoneTip = (r.zones_c || []).map((z, i) => (z == null ? null : `${(nh.zone_names && nh.zone_names[i]) || 'zone ' + i}: ${one.format(z)} °C`)).filter(Boolean).join('\n');
+      setText(td.mem, `${gib(r.mem_available_bytes)} / ${gib(r.mem_total_bytes)}`);
+      paintTemp(td.tz, zs.length ? Math.max(...zs) : null);
+      setTip(td.tz, `The hottest of this Spark's ACPI thermal zones, in °C (/sys/class/thermal). ${TEMP_TIP}${zoneTip ? '\n' + zoneTip : ''}`);
+      paintTemp(td.tg, gpu.temp_c); paintTemp(td.tn, nv.temp_c);
+      setText(td.gb, f0(gpu.util_pct));
+      setText(td.gc, f0(gpu.clock_mhz) + (gpu.clock_max_mhz == null ? '' : ' / ' + f0(gpu.clock_max_mhz)));
+      setColor(td.gc, gpu.reasons && gpu.reasons.length ? '#e0a33e' : '');
+      setTip(td.gc, `The GPU's current clock and the highest clock NVML names, in MHz. The limit is set in COOLING AND CLOCK.` + (gpu.reasons && gpu.reasons.length ? `\nHeld down by: ${gpu.reasons.join(', ')}` : '\nNo clock limit event is set.'));
+      setText(td.gp, f1(gpu.power_w));
+      setText(td.cl, f1(r.load1) + (r.cpus > 0 ? ' / ' + r.cpus : ''));
+      setText(td.cb, f1(r.cpu_busy_pct));
+      setText(td.nw, f0(nv.wear_pct));
+      setText(td.ns, `${tb(nv.root_free_bytes)} / ${tb(nv.root_total_bytes)}`);
+      // the rest of the SMART page the Spark carried, in the cell's tip
+      const warn = Number(nv.critical_warning);
+      setTip(td.nw, NVME_TIP + (none(nv.media_errors) && none(nv.available_spare_pct) ? '' : [
+        '',
+        `Available spare: ${f0(nv.available_spare_pct)} % (below ${f0(nv.spare_threshold_pct)} % the drive warns)`,
+        `Media errors: ${f0(nv.media_errors)}`,
+        `Critical warning: ${warn > 0 ? '0x' + warn.toString(16) : 'none'}`,
+        `Data written: ${one.format(Number(nv.data_units_written || 0) * Number(nv.data_unit_bytes || 512000) / 1e12)} TB`,
+        `Power-on hours: ${f0(nv.power_on_hours)}`,
+        `Unsafe shutdowns: ${f0(nv.unsafe_shutdowns)}`,
+      ].join('\n')));
+      // a reading is known by its own time (at_ms): the same reading on the next poll is not new, so it never reads 0
+      const at = r.at_ms != null ? Number(r.at_ms) : S.statusAt - r.age_ms, fresh = !prev || at > prev.at, dt = prev && at > prev.at ? (at - prev.at) / 1000 : 0;
+      [['ra', 0], ['rb', 1]].forEach(([k, i]) => {
+        const rl = (r.rails || [])[i] || {}, bf = prev && prev.rails[i];
+        if (fresh) {
+          const rx = bps(rl.rx_bytes, bf && bf.rx_bytes, dt), tx = bps(rl.tx_bytes, bf && bf.tx_bytes, dt);
+          if (rx != null) held[i][0] = rx;
+          if (tx != null) held[i][1] = tx;
+        }
+        setText(rail[k], fmtPair(held[i][0], held[i][1]));
+        setTip(td[k], `${RAIL_TIP[i]}\n${f0(Number(rl.errors || 0) + Number(rl.discards || 0))} errors and discards since boot.`);
+      });
+      if (fresh) prev = { at, rails: r.rails || [] };
+    },
+  };
+  // in/out in bits per second, one unit for both: the larger value's, scaled to it (decimal, as link speeds are named: the
+  // rails are 200 Gbps ports); a value under one unit keeps two significant digits (1.1/0.85 Gbps), zero reads 0
+  function fmtPair(a, b) {
+    a = none(a) ? 0 : Number(a); b = none(b) ? 0 : Number(b);
+    const big = Math.max(a, b);
+    const [d, u] = big >= 1e9 ? [1e9, 'Gbps'] : big >= 1e6 ? [1e6, 'Mbps'] : big >= 1e3 ? [1e3, 'Kbps'] : [1, 'bps'];
+    const f = (x) => (u === 'bps' ? f0(x) : x === 0 ? '0' : x / d >= 1 ? one.format(x / d) : two.format(x / d));
+    return `${f(a)}/${f(b)} ${u}`;
+  }
+}
+
+// ---- the Overview: fed only by the dashboard API. Built once; `update` writes into the boxes.
+const posFmt = (v) => (none(v) ? '0' : v >= 1e6 ? (v / 1e6).toFixed(2) + ' M' : v >= 1e3 ? (v / 1e3).toFixed(0) + ' K' : whole.format(v));
+// a request's age as m:ss, or h:mm:ss past an hour (the lines' column is narrow and the digits do not jump)
+function clockText(s) { s = Math.max(0, Math.floor(s)); const hh = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), ss = String(s % 60).padStart(2, '0'); return hh ? `${hh}:${String(m).padStart(2, '0')}:${ss}` : `${m}:${ss}`; }
+const secFmt = (s) => (none(s) ? '0' : s >= 100 ? whole.format(s) : s >= 10 ? one.format(s) : (Math.round(s * 100) / 100).toFixed(2));
+function box(name, title, tip, ...kids) {
+  const right = h('span', { class: 'bright' });
+  const head = h('div', { class: 'bhead' }, h('span', { class: 'bt', text: title, title: tip || null }), right);
+  return { el: h('section', { class: 'box', 'data-box': name, 'aria-label': title }, head, ...kids), right };
+}
+const quantile = (arr, p) => { if (!arr.length) return null; const a = arr.slice().sort((x, y) => x - y); return a[Math.min(a.length - 1, Math.floor(p * a.length))]; };
+
+function linesBox() {
+  const COLS = [['#', 'Requests in flight, oldest first: the number is the request\'s place in that order (the engine does not report which line serves it).'], ['PHASE', 'DECODE: generating its output. PREFILL: its prompt is being processed (the engine has reported progress on it; two long prompts can be processed at once). QUEUED: submitted, no progress reported yet.'],
+    ['STAGE', 'The request\'s context: the purple part is its prompt, the white part the output so far. A prefilling request shows how much of the prompt it has to compute is done.'], ['PROMPT tok', 'Prompt tokens of the request.'], ['OUT tok', 'Output tokens so far.'],
+    ['WHO', 'The user field of the request, or api when it has none.'], ['CACHED', 'Prompt tokens reused from a session or restored from the disk: the prompt less what the engine reports it has to compute (all of it when nothing is computed); - until the engine reports.'],
+    ['TOK/S', 'Output tokens a second for this request, from the change in its token count between two readings (smoothed). For a prefilling request, its prompt tokens computed a second, measured the same way.'], ['WAIT', 'About how long it waited before its first token (read once per second, so ±1 s; 0 for a request this page first saw already generating). A queued or prefilling request shows how long it has waited so far.'], ['TOTAL', 'How long the request has been in the engine.']];
+  const sub = h('span', { class: 'bsub' });
+  const grid = h('div', { class: 'lgrid' });
+  const headRow = h('div', { class: 'lrow lhead' }, COLS.map(([c, tip]) => h('span', { text: c, title: tip })));
+  const b = box('lines', 'LINES', 'Every line the engine has, always shown: what each one is doing, its stage, its speed and its tokens.', headRow, grid);
+  b.right.append(sub);
+  const rows = [];
+  const mkRow = (i) => {
+    const bar = h('span', { class: 'stg' }, h('i', { class: 'pre' }), h('i', { class: 'dec' }));
+    const c = COLS.map(() => h('span'));
+    c[2] = bar;
+    const el = h('div', { class: 'lrow', 'data-line': String(i) }, c);
+    setText(c[0], i + 1);
+    return { el, c, pre: bar.children[0], dec: bar.children[1] };
+  };
+  return {
+    el: b.el,
+    update(st, inflight, seen) {
+      // one line per slot: the requests the engine runs at once (HELLO's max_sessions is what the store can keep, not lines)
+      const max = st.sessions ? Number(st.sessions.slots) : null;
+      const used = inflight.length;
+      const n = Math.max(none(max) ? 0 : max, used);
+      while (rows.length < n) { const r = mkRow(rows.length); rows.push(r); grid.append(r.el); }
+      while (rows.length > n) rows.pop().el.remove();
+      setText(sub, none(max) ? `${used} in use` : `${used} of ${max} in use`);
+      rows.forEach((r, i) => {
+        const x = inflight[i];
+        const c = r.c;
+        r.el.classList.toggle('idle', !x);
+        if (!x) {
+          setText(c[1], 'idle'); setColor(c[1], '#5a6165'); setWidth(r.pre, 0); setWidth(r.dec, 0);
+          for (const k of [3, 4, 5, 6, 7, 8, 9]) setText(c[k], '');
+          return;
+        }
+        const m = seen.get(x.id) || {};
+        const dec = x.state === 'decode';
+        const filling = x.state === 'prefill';  // each request's own state: two long prompts can be processed at once
+        setText(c[1], dec ? 'DECODE' : filling ? 'PREFILL' : 'QUEUED');
+        setColor(c[1], dec ? '#e8eaec' : filling ? '#9d8bd0' : '#e0a33e');
+        const ctx = Math.max(1, Number(x.prompt_tokens) + Number(x.generated_tokens));
+        if (filling) { setWidth(r.pre, 100 * Number(x.computed) / Math.max(1, Number(x.to_compute))); setWidth(r.dec, 0); } else if (dec) { setWidth(r.pre, 100 * x.prompt_tokens / ctx); setWidth(r.dec, 100 * x.generated_tokens / ctx); } else { setWidth(r.pre, 0); setWidth(r.dec, 0); }
+        setText(c[3], whole.format(x.prompt_tokens));
+        setText(c[4], whole.format(x.generated_tokens));
+        setText(c[5], x.key_label);
+        setText(c[6], none(x.cached_tokens) ? '-' : whole.format(x.cached_tokens));
+        setText(c[7], dec ? one.format(m.tps == null ? 0 : m.tps) : whole.format(filling && m.ptps != null ? m.ptps : 0));
+        setText(c[8], dec ? `~${one.format(m.waitS == null ? 0 : m.waitS)} s` : `${one.format(x.age_s)} s`);
+        setText(c[9], clockText(x.age_s));
+        setTip(r.el, `Seat ${i + 1}: ${x.endpoint}, ${x.priority}, key ${x.key_label}; holds ${whole.format(x.kv_tokens)} KV positions.`);
+      });
+    },
+  };
+}
+
+function healthBox() {
+  const rows = new Map();
+  const groups = [];
+  for (const [, g] of NODE_COLS) { const last = groups[groups.length - 1]; if (last && last.g === g) last.n++; else groups.push({ g, n: 1 }); }
+  const tbody = h('tbody');
+  const table = h('table', { class: 'ntab' },
+    h('thead', null,
+      h('tr', { class: 'grp' }, h('th'), groups.map(({ g, n }) => h('th', { class: 'gs', colspan: String(n), text: g }))),
+      h('tr', { class: 'col' }, h('th', { text: 'Spark' }), NODE_COLS.map(([key, , label, unit, tip]) => h('th', { class: GROUP_START.has(key) ? 'gs' : null, title: tip }, label, unit ? h('span', { class: 'unit', text: ' ' + unit }) : null)))),
+    tbody);
+  const none_ = h('p', { class: 'dim', text: 'not reported by this engine', hidden: true });
+  const wrap = h('div', { class: 'tscroll' }, table);
+  const b = box('health', 'NODE HEALTH', 'Each Spark\'s health as its sampler last answered: polled every 2 s while this page is open. Hover a figure for its detail.', wrap, none_);
+  // the columns' widths are fixed (NODE_W), so the table's own width changes only with its rows, the fans columns or the
+  // fonts: the box's width left over is shared equally between every column's sides, measured again only then or when the
+  // box resizes, never on a new reading
+  const fit = () => {
+    table.style.setProperty('--npad', '0px');
+    const cols = [...table.querySelectorAll('thead tr.col th')].filter((th) => th.offsetParent).length;
+    if (!cols || !wrap.clientWidth || table.hidden) return;
+    table.style.setProperty('--npad', Math.max(0, Math.floor((wrap.clientWidth - table.offsetWidth) / (2 * cols) * 10) / 10) + 'px');
+  };
+  new ResizeObserver(fit).observe(wrap);
+  if (document.fonts) document.fonts.ready.then(fit);
+  let lastShape = '';
+  return {
+    el: b.el,
+    update(st, ledger) {
+      const nh = st.node_health, list = nh && nh.ranks ? nh.ranks : [];
+      b.el.hidden = false;
+      none_.hidden = list.length > 0;
+      const shape = `${list.length}`;
+      table.hidden = !list.length;
+      for (const r of list) {
+        if (!rows.has(r.rank)) { const c = nodeRow(r.rank); rows.set(r.rank, c); tbody.append(c.el); }
+        rows.get(r.rank).update(r, nh, ledger);
+      }
+      if (shape !== lastShape) { lastShape = shape; fit(); }
+    },
+  };
+}
+
+// ---- the ENGINE box's cards: the node cards' build (a head, then groups of label / value rows, each row with its tip)
+// The TP=4 engine: the four Sparks hold the same chunk pool and the same disk tier, so the cluster's memory is four
+// times one Spark's.
+const SPARKS = 4;
+function vcard(name, title, groups) {
+  const v = {};
+  const sub = h('span', { class: 'role' });
+  const el = h('div', { class: 'ncard vcard', 'data-card': name },
+    h('div', { class: 'nhead' }, h('span', { class: 'nn', text: title }), h('span', { class: 'nr' }, sub)),
+    ...groups.map(([gt, rows, extra]) => h('div', { class: 'ngroup' }, h('span', { class: 'gt', text: gt }),
+      ...rows.map(([key, label, tip]) => { const c = h('span', { class: 'num', text: '0' }); v[key] = c; return h('div', { class: 'nrow', 'data-row': key, title: tip }, h('span', { class: 'nl', text: label }), h('span', { class: 'nv' }, c)); }),
+      ...(extra ? [extra] : []))));
+  return { el, sub, set(key, text, tip) { setText(v[key], text); if (tip) setTip(v[key].closest('.nrow'), tip); } };
+}
+function rateCard() {
+  const c = vcard('rate', 'RATE', [
+    ['DECODE', [['decode', 'Total', 'Tokens a second the engine generates for all streams together (token ids received over the last 3 s).'],
+      ['streams', 'Users generating', 'The users whose replies are being written now.'],
+      ['user', 'Per user', 'The decode rate divided by the streams generating: what one user gets on average.'],
+      ['gap', 'Time per token', 'The mean time between two tokens of one stream: 1000 over the per-stream rate.']]],
+    ['PREFILL', [['prefill', 'Speed now', 'Prompt tokens a second NOW: the tokens the prefill chunks finished over the last 3 s (the engine\'s progress reports).'],
+      ['pass', 'This prompt', 'While a prompt is processed: that prompt\'s average since it began, which stays higher than the speed now as a long prompt slows.']]],
+    ['TTFT', [['p50', 'Median', 'Time to first token: the median over the last finished requests the front-end remembers (a prompt of any length).'],
+      ['p99', 'Slowest 1 %', 'Time to first token: the 99th percentile over the last finished requests the front-end remembers.']]],
+  ]);
+  return {
+    el: c.el,
+    update(st, recent) {
+      const live = (st.health || {}).live || {};
+      const running = none(live.connections) ? 0 : live.connections - (live.waiting || 0);
+      const dec = live.decode_tokens_per_second, per = running > 0 && !none(dec) ? dec / running : null;
+      const ttfts = (recent || []).map((x) => x.ttft_s).filter((x) => !none(x));
+      const pp = live.prompt_pass, ppAvg = pp && pp.seconds > 0 && pp.computed > 0 ? pp.computed / pp.seconds : null;
+      c.set('decode', fmt(dec) + ' t/s');
+      c.set('streams', String(running));
+      c.set('user', one.format(none(per) ? 0 : per) + ' t/s');
+      c.set('gap', whole.format(none(per) || per <= 0 ? 0 : 1000 / per) + ' ms');
+      c.set('prefill', fmt(live.prefill_tokens_per_second) + ' t/s');
+      c.set('pass', pp ? (none(ppAvg) ? 'running' : `avg ${whole.format(ppAvg)} t/s`) : 'none now');
+      c.set('p50', ttfts.length ? secFmt(quantile(ttfts, 0.5)) + ' s' : '0', `Time to first token: the median over the last ${ttfts.length} finished requests (a prompt of any length).`);
+      c.set('p99', ttfts.length ? secFmt(quantile(ttfts, 0.99)) + ' s' : '0', `Time to first token: the 99th percentile over the last ${ttfts.length} finished requests.`);
+    },
+  };
+}
+function sessionsCard() {
+  const fill = h('div', { class: 'fill' }), meter = h('div', { class: 'meter vmeter', role: 'img' }, fill);
+  const c = vcard('kv', 'CONVERSATION MEMORY', [
+    ['SLOTS', [['slots', 'Slots', 'Requests the engine runs at once: each holds one slot for its whole context, reserved when the engine starts.'],
+      ['long', 'Long', 'The slots that take a context up to the full window; the others take shorter ones.'],
+      ['positions', 'Positions', 'The positions (tokens) all the slots hold together.'],
+      ['window', 'Window', 'The longest context one request may use.']]],
+    ['IN USE', [['busy', 'Busy', 'The slots the requests in flight hold.'], ['use', 'Held', 'The positions the requests in flight hold (their prompt and the output so far).'],
+      ['pct', 'Of slots', 'The share of all the slots\' positions the requests in flight hold.']], meter],
+    ['STORE', [['store', 'Store', 'Finished sessions kept in memory for their next turn, of the space the store may use on each Spark (its own memory, not the slots\').'],
+      ['kept', 'Sessions', 'The sessions the store keeps in memory now; older ones move to the SSD tier.']]],
+  ]);
+  return {
+    el: c.el,
+    update(st, inflight) {
+      const ss = st.sessions;
+      c.el.hidden = !ss;
+      if (!ss) return;
+      const tot = Number(ss.positions), slots = Number(ss.slots), big = Number(ss.slots_big);
+      const used = inflight.reduce((a, x) => a + Number(x.kv_tokens), 0), pct = 100 * used / Math.max(1, tot);
+      setText(c.sub, 'fixed slots');
+      c.set('slots', whole.format(slots), `${whole.format(slots)} requests run at once; a request beyond them waits for a slot of its size.`);
+      c.set('long', `${whole.format(big)} × ${posFmt(Number(ss.ctx_big))}`, `${whole.format(big)} slots of ${whole.format(Number(ss.ctx_big))} positions and ${whole.format(slots - big)} of ${whole.format(Number(ss.ctx_small))}: at most ${whole.format(big)} contexts longer than ${whole.format(Number(ss.ctx_small))} run at once.`);
+      c.set('positions', posFmt(tot), `The slots hold ${whole.format(tot)} positions together.`);
+      c.set('window', posFmt(ss.usable_window), `The longest context one request may use: ${whole.format(ss.usable_window)} tokens.`);
+      c.set('busy', `${whole.format(inflight.length)} of ${whole.format(slots)}`);
+      c.set('use', posFmt(used), `The requests in flight hold ${whole.format(used)} positions (their prompt and the output so far).`);
+      c.set('pct', one.format(pct) + ' %');
+      c.set('store', `${gib(ss.store_used_bytes)} of ${gib(ss.store_cap_bytes)} GiB`, `The session store holds ${gib(ss.store_used_bytes)} GiB of ${gib(ss.store_cap_bytes)} GiB on each Spark.`);
+      c.set('kept', whole.format(Number(ss.sessions_resident)));
+      setWidth(fill, pct);
+      meter.setAttribute('aria-label', `${one.format(pct)} % of the slots' positions in use`);
+    },
+  };
+}
+function tierCard() {
+  const c = vcard('tier', 'SSD CACHE', [
+    ['DISK', [['stored', 'Used', 'The bytes the saved prompt states take on the four Sparks\' SSDs together (each Spark keeps the same copy), of the space the cache may use there.'],
+      ['records', 'Save points', 'The published prompt states (points) in the tier\'s index.'],
+      ['writes', 'Saved', 'Prompt states written and published since the engine started.'],
+      ['pending', 'Waiting to save', 'Prompt states queued for writing, not yet published.']]],
+    ['RESTORES', [['restores', 'Read-backs', 'Disk restores begun since the engine started.'],
+      ['hits', 'Found on SSD', 'Lookups that found a state on disk longer than memory had.'],
+      ['restored', 'Tokens not recomputed', 'Prompt tokens restored from disk instead of computed, since the engine started.'],
+      ['wait', 'Average wait', 'The average time a request waited for a restore.']]],
+  ]);
+  return {
+    el: c.el,
+    update(st) {
+      const hh = st.health || {}, pc = hh.prompt_cache, sp = hh.spill, t = pc && pc.spill && pc.spill[0];
+      c.el.hidden = !sp;
+      if (!sp) return;
+      setText(c.sub, sp.state === 'on' ? 'Enabled' : sp.state === 'off' ? 'Disabled' : sp.state);
+      c.sub.classList.toggle('warn', sp.state !== 'on');
+      if (!t || !pc) { for (const k of ['stored', 'records', 'writes', 'pending', 'restores', 'hits', 'restored', 'wait']) c.set(k, '0'); return; }
+      const avgMs = pc.restore_waits > 0 ? pc.restore_wait_ns / pc.restore_waits / 1e6 : 0;
+      c.set('stored', `${gib(SPARKS * Number(t.stored_bytes))} of ${whole.format(SPARKS * Number(t.cap_bytes) / 2 ** 30)} GiB`);
+      c.set('records', whole.format(t.points));
+      c.set('writes', whole.format(t.writes_committed), `Prompt states written and published since the engine started: ${gib(t.written_bytes)} GiB written.`);
+      c.set('pending', whole.format(t.writes_pending));
+      c.set('restores', whole.format(pc.restores_begun));
+      c.set('hits', whole.format(pc.disk_hits));
+      c.set('restored', posFmt(pc.restored_tokens) + ' tok');
+      c.set('wait', whole.format(avgMs) + ' ms', `The average time a request waited for a restore (${whole.format(pc.restore_waits)} waits, the longest ${whole.format((pc.restore_wait_max_ns || 0) / 1e6)} ms).`);
+    },
+  };
+}
+
+
+
+function overview() {
+  const lines = linesBox(), health = healthBox(), rate = rateCard(), kv = sessionsCard(), tier = tierCard();
+  const cd = chart('DECODE', 'Tokens a second the engine generates, all streams, the last 15 minutes. Fixed 10-second buckets: a bucket keeps its value as the window moves; hover for the bucket\'s mean and peak.', '#e8eaec', 'tok/s', 'decode_tps');
+  const cp = chart('PREFILL', 'Prompt tokens a second of the prompt passes as they ran (the speed now, sampled every second), the last 15 minutes. Fixed 10-second buckets; hover for the mean and peak.', '#9d8bd0', 'tok/s', 'prefill_tps');
+  const wrap = (name, c) => h('section', { class: 'box plotbox', 'data-box': name }, c.el);
+  // the board: the ENGINE box across the top, LINES beside DECODE over PREFILL, NODE HEALTH across
+  refs.main.append(h('div', { class: 'board' },
+    box('engine', 'ENGINE', 'The rates, the sessions and the SSD tier, as the engine reports them. Hover a row for its detail.', h('div', { class: 'vrow' }, rate.el, kv.el, tier.el)).el,
+    lines.el,
+    h('div', { class: 'plots' }, wrap('decode', cd), wrap('prefill', cp)),
+    health.el));
+  const seen = new Map(); // request id -> { gen, at, tps, waitS }
+  let inflight = [], recent = [], ledger = null, alive = true;
+  const track = (body, at) => {
+    inflight = body.in_flight.slice().sort((a, b) => b.age_s - a.age_s);
+    recent = body.recent.slice(0, 50);
+    const ids = new Set(inflight.map((x) => x.id));
+    for (const id of [...seen.keys()]) if (!ids.has(id)) seen.delete(id);
+    for (const x of inflight) {
+      const m = seen.get(x.id) || { gen: Number(x.generated_tokens), at, tps: null, waitS: null, early: Number(x.generated_tokens) === 0 };
+      const dt = (at - m.at) / 1000;
+      if (dt >= 0.5 && Number(x.generated_tokens) >= m.gen) {
+        const inst = (Number(x.generated_tokens) - m.gen) / dt;
+        m.tps = m.tps == null ? inst : 0.6 * m.tps + 0.4 * inst;
+        m.gen = Number(x.generated_tokens); m.at = at;
+      }
+      if (m.early && m.waitS == null && Number(x.generated_tokens) > 0) m.waitS = Number(x.age_s);
+      // a prefilling request's own rate: the change in its computed prompt tokens between two readings (smoothed)
+      if (x.state === 'prefill') {
+        if (m.pc == null) { m.pc = Number(x.computed); m.pat = at; }
+        const pdt = (at - m.pat) / 1000;
+        if (pdt >= 0.5 && Number(x.computed) > m.pc) {
+          const inst = (Number(x.computed) - m.pc) / pdt;
+          m.ptps = m.ptps == null ? inst : 0.6 * m.ptps + 0.4 * inst;
+          m.pc = Number(x.computed); m.pat = at;
+        }
+      }
+      seen.set(x.id, m);
+    }
+  };
+  refs.pull = async (tick) => {
+    const names = ROUTE_NAMES();
+    if (names.has('requests')) { const r = await api('requests'); if (alive && r.ok) track(r.body, Date.now()); }
+    if (!names.has('series') || (tick % 5 !== 1 && S.chartsDrawn)) return;
+    const [d, p] = await Promise.all(['decode_tps', 'prefill_tps'].map((n) => api('series', `name=${n}&seconds=900&step=10`)));
+    if (!alive) return;
+    const at = S.status && S.status.at_ms ? Number(S.status.at_ms) : Date.now();
+    if (d.ok) cd.draw(d.body, at);
+    if (p.ok) cp.draw(p.body, at);
+    S.chartsDrawn = true;
+    if (names.has('ledger') && (!ledger || tick % 30 === 1)) {
+      const l = await api('ledger');
+      if (alive && l.ok && l.body.ranks && l.body.ranks.length) {
+        const by = new Map();
+        for (const e of l.body.entries) {
+          if (!by.has(e.rank)) by.set(e.rank, { w: 0, k: 0, m: 0, total: 1 });
+          const b = by.get(e.rank), v = Number(e.device_bytes);
+          if (e.feature_id === 'weights') b.w += v; else if (e.feature_id === 'store') b.k += v; else b.m += v;
+        }
+        for (const rk of l.body.ranks) if (by.has(rk.rank)) by.get(rk.rank).total = Number(rk.device_bytes) || 1;
+        ledger = by;
+      }
+    }
+  };
+  refs.update = (stale) => {
+    refs.main.classList.toggle('stale', stale);
+    const st = S.status; if (!st) return;
+    lines.update(st, inflight, seen);
+    health.update(st, ledger);
+    kv.update(st, inflight);
+    tier.update(st);
+    rate.update(st, recent);
+    const live = (st.health || {}).live || {};
+    cd.setNow(live.decode_tokens_per_second);
+    cp.setNow(live.prefill_tokens_per_second);
+  };
+  S.chartsDrawn = false;
+  refs.update(false);
+  return () => { alive = false; refs.update = null; refs.pull = null; };
+}
+
+
+// ---- the page: the API key (asked once, kept in this browser), the first screen. One poll loop: the status and the requests every second, the series every five
+// seconds, the memory record every thirty (overview's refs.pull). The header names what is served.
+const base = location.pathname.replace(/\/+$/, '') + '/api/v1/';
+// the API key: asked once, kept in this browser until Sign out (no timeout); every request of the page carries it
+const KEY_NAME = 'dsfront.dashboard.key';
+let KEY = (() => { try { return localStorage.getItem(KEY_NAME) || ''; } catch (e) { return ''; } })();
+function keepKey(k) { KEY = k; try { if (k) localStorage.setItem(KEY_NAME, k); else localStorage.removeItem(KEY_NAME); } catch (e) { /* this session only */ } }
+let signinEl = null;
+function showSignIn(msg) {
+  if (!signinEl) {
+    const input = h('input', { type: 'password', autocomplete: 'current-password', placeholder: 'API key', 'aria-label': 'API key' });
+    const m = h('div', { class: 'm' });
+    const form = h('form', { onsubmit: (e) => { e.preventDefault(); if (!input.value.trim()) return; keepKey(input.value.trim()); input.value = ''; signinEl.hidden = true; poll(); } },
+      h('div', { class: 't', text: 'DSFRONT DASHBOARD' }), m, input, h('button', { type: 'submit', text: 'Sign in' }));
+    signinEl = h('div', { class: 'signin', role: 'dialog', 'aria-label': 'Sign in' }, form);
+    signinEl.m = m, signinEl.input = input;
+    document.body.append(signinEl);
+  }
+  setText(signinEl.m, msg || 'Sign in with the API key; this browser keeps it until you sign out.');
+  signinEl.hidden = false;
+  signinEl.input.focus();
+}
+const ROUTE_NAMES = () => new Set(['status', 'requests', 'series', 'ledger']);
+const STALE_MS = 5000;
+const S = { tick: 0, status: null, statusAt: 0, fails: 0, chartsDrawn: false };
+let refs = {};
+async function api(name, query, init) {
+  const headers = Object.assign({}, (init && init.headers) || {}, KEY ? { Authorization: 'Bearer ' + KEY } : {});
+  const res = await fetch(base + name + (query ? '?' + query : ''), { cache: 'no-store', ...init, headers });
+  let body = null;
+  try { body = await res.json(); } catch (e) { body = null; }
+  if (res.status === 401) showSignIn(KEY ? 'That key was not accepted. Sign in with the API key.' : null);
+  return { ok: res.ok, status: res.status, body };
+}
+function strip(label, tip) {
+  const v = h('span', { class: 'v' }), q = h('span', { class: 'q' });
+  return { el: h('div', { class: 'htile', 'data-tile': label.toLowerCase().split(' ')[0] }, h('span', { class: 'k', text: label, title: tip || null }), v, q), v, q };
+}
+function headerTiles() {
+  const eng = strip('ENGINE', 'Whether the front-end is connected to rank 0 and for how long the front-end has been up.');
+  const names = strip('SERVED AS', 'The model names the API serves. A request naming the second one runs on the ablated weights path; any other name runs on the plain path.');
+  const el = h('div', { class: 'tiles' }, eng.el, names.el);
+  function update(st, stale) {
+    if (!st) return;
+    const en = st.engine || {};
+    const down = S.fails > 0 || en.connected === false;
+    eng.el.classList.toggle('bad', down);
+    setText(eng.v, S.fails > 0 ? 'Not answering' : en.connected === false ? 'Not connected' : 'Serving');
+    setText(eng.q, 'front-end up ' + dur(en.uptime_s));
+    setText(names.v, st.model_name || '');
+    const alias = st.ablit && st.ablit.alias;
+    setText(names.q, alias || 'no ablit name');
+    el.classList.toggle('stale', stale);
+  }
+  return { el, update };
+}
+function onStatus() {
+  const st = S.status;
+  const stale = !st || Date.now() - S.statusAt > STALE_MS || S.fails > 0;
+  refs.blind.hidden = !(S.fails > 0);
+  if (S.fails > 0) setText(refs.blind, `The front-end has not answered for ${Math.round((Date.now() - S.statusAt) / 1000)} s: what is shown is the last good reading, dimmed.`);
+  if (st) setText(refs.sub, [st.model_name, st.sessions && st.sessions.slots ? `${st.sessions.slots} lines` : null].filter(Boolean).join(' · '));
+  refs.head(st, stale);
+  if (refs.update) refs.update(stale);
+}
+let pollTimer = 0;
+async function poll() {
+  clearTimeout(pollTimer);
+  if (document.hidden) { pollTimer = setTimeout(poll, 1000); return; }
+  try {
+    const r = await api('status');
+    if (r.status === 401) return;  // the sign-in box asks for the key; signing in polls again
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    S.status = r.body;
+    S.statusAt = Date.now();
+    S.fails = 0;
+    S.tick++;
+    if (refs.pull) { try { await refs.pull(S.tick); } catch (e) { /* a failed side read leaves its box as it was */ } }
+  } catch (e) {
+    S.fails++;
+  }
+  onStatus();
+  pollTimer = setTimeout(poll, S.fails ? Math.min(15000, 1000 * 2 ** (S.fails - 1)) : 1000);
+}
+addEventListener('visibilitychange', () => { if (!document.hidden) poll(); });
+const app = document.getElementById('app');
+refs.blind = h('div', { class: 'bar blind', role: 'alert', hidden: true });
+refs.main = h('main', { id: 'view', tabindex: '-1' });
+const head = headerTiles();
+refs.head = head.update;
+const signout = h('button', { class: 'signout', text: 'SIGN OUT', title: 'Forget the API key in this browser', onclick: () => { keepKey(''); showSignIn('Signed out.'); } });
+app.append(h('header', { class: 'top' }, h('div', {}, h('div', { class: 'brand' }, h('span', { class: 'word', text: 'DSFRONT' }), refs.sub, signout), head.el)), refs.blind, refs.main);
+overview();
+poll();
+
+</script>
+</body>
+</html>

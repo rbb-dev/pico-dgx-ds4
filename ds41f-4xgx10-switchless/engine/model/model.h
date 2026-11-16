@@ -317,6 +317,13 @@ class Model {
   };
   StateInfo state_info(int h) const;
   size_t state_bytes() const;                  // device memory the store holds
+  // The store and its disk tier for rank 0's dashboard (serve.cpp STATS), with their counters since the start: sessions
+  // written to the disk tier and read back, the positions restored, the time requests waited for them.
+  struct TierStats {
+    uint64_t store_cap = 0, store_used = 0, resident = 0, on_disk = 0, disk_cap = 0, disk_used = 0;
+    uint64_t spills = 0, spill_bytes = 0, restores = 0, restore_bytes = 0, restored_pos = 0, wait_ns = 0, wait_max_ns = 0;
+  };
+  TierStats tier_stats() const;
   // Wait for everything queued.
   void drain();
 

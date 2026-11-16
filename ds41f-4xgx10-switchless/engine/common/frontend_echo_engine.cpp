@@ -102,6 +102,8 @@ void serve(int fd) {
         if (!done(fd, s.req_id, fe::kError, s.n_prompt, 0, "bad request")) return;
         continue;
       }
+      fe::Progress prog{s.req_id, s.n_prompt, s.n_prompt};  // the whole prompt in one chunk
+      if (!Out(fe::kProgress).add(&prog).send(fd)) return;
       std::vector<uint32_t> out;
       for (size_t i = 0; i < 8 && i < prompt.size(); i++) out.push_back(prompt[prompt.size() - 1 - i]);
       out.push_back(kEos);
@@ -120,6 +122,15 @@ void serve(int fd) {
         }
       }
       if (!done(fd, s.req_id, reason, s.n_prompt, sent)) return;
+    } else if (h.type == fe::kStatsReq) {
+      // no store, no disk tier: one slot of the whole context
+      fe::StatsFrame st{};
+      st.version = fe::kStatsVersion;
+      st.n_fields = fe::kStatsFields;
+      st.store_cap_bytes = uint64_t(hello.max_context) * 890;
+      st.slots_total = st.slots_big = 1;
+      st.slot_ctx_big = hello.max_context;
+      if (!Out(fe::kStats).add(&st).send(fd)) return;
     }  // CANCEL and RELEASE: nothing is in flight between frames and no session is kept
   }
 }

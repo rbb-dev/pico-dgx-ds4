@@ -212,6 +212,12 @@ class Io {
       if (!e.release && !e.rq.conn->dead) return true;
     return false;
   }
+  // The dashboard's STATS (docs/dashboard.md): the main loop publishes a frame, the reader answers each StatsReq with the
+  // latest one at once, so the reader never touches the model
+  void publish_stats(std::vector<char> f) {
+    std::lock_guard<std::mutex> l(smu_);
+    stats_ = std::move(f);
+  }
   void send(const ConnP& c, std::vector<char> f) {
     if (c->dead) return;
     {
@@ -305,6 +311,13 @@ class Io {
       e.release = true;
       e.session = x.session_id;
       push(std::move(e));
+    } else if (h.type == fe::kStatsReq) {
+      std::vector<char> f;
+      {
+        std::lock_guard<std::mutex> l(smu_);
+        f = stats_;
+      }
+      if (!f.empty()) send(c, std::move(f));
     }  // other types are skipped
     return true;
   }
@@ -355,6 +368,8 @@ class Io {
   std::condition_variable cv_;
   std::deque<Event> ev_;
   std::mutex wmu_;
+  std::mutex smu_;
+  std::vector<char> stats_;  // the latest STATS frame (publish_stats)
   std::condition_variable wcv_;
   std::deque<std::pair<ConnP, std::vector<char>>> out_;
   std::thread rd_, wr_;
@@ -472,6 +487,7 @@ class Server {
   // one is there), then the front-end's frames, then a run of the requests decoding (run).
   void loop() {
     while (!g_stop) {
+      publish();
       sweep();
       Event e;
       if (!ready_.empty()) {
@@ -1116,6 +1132,11 @@ class Server {
       wd_.started = 0;
       S->hist.insert(S->hist.end(), prompt.begin() + pos, prompt.begin() + pos + R);
       pos += R;
+      if (!resume) {  // the dashboard: this request's prompt tokens computed, of those it computes (after the reuse)
+        const fe::Progress pr{h.req_id, (uint32_t)(pos - q), (uint32_t)(n - q)};
+        io_.send(f.rq.conn, Frame(fe::kProgress).add(&pr).take());
+      }
+      publish();
     }
     if (!f.rq.spans.empty()) {  // vision: the spans are for this prompt's chunks only
       Cmd c{};
@@ -1471,6 +1492,44 @@ class Server {
 
   // Paused requests that their client cancelled, or that the server's stop ends, end now, not at their
   // turn; so do requests waiting for a slot.
+  // The dashboard's STATS frame (docs/dashboard.md), at most every half second, from this thread, the only one that
+  // touches the model: the store, its disk tier and their counters since the start, the slots. The reader answers the
+  // front-end's StatsReq with the latest one.
+  void publish() {
+    const double t = now_s();
+    if (t - published_ < 0.5) return;
+    published_ = t;
+    const model::Model::TierStats ts = m_.tier_stats();
+    fe::StatsFrame sf{};
+    sf.version = fe::kStatsVersion, sf.n_fields = fe::kStatsFields;
+    sf.store_cap_bytes = ts.store_cap, sf.store_used_bytes = ts.store_used;
+    sf.sessions_resident = ts.resident, sf.sessions_on_disk = ts.on_disk;
+    sf.disk_cap_bytes = ts.disk_cap, sf.disk_used_bytes = ts.disk_used;
+    sf.spills_total = ts.spills, sf.spill_bytes_total = ts.spill_bytes;
+    sf.spills_pending = 0;  // a spill's writes are queued at once and waited for by the next reader; not counted
+    sf.restores_total = ts.restores, sf.restore_bytes_total = ts.restore_bytes, sf.restored_tokens_total = ts.restored_pos;
+    sf.restore_wait_ns_total = ts.wait_ns, sf.restore_wait_max_ns = ts.wait_max_ns;
+    const int ns = m_.slots();
+    uint64_t big = 0, cbig = 0, csmall = 0;
+    for (int s = 0; s < ns; ++s) cbig = std::max<uint64_t>(cbig, (uint64_t)m_.slot_ctx(s));
+    for (int s = 0; s < ns; ++s) {
+      const uint64_t c = (uint64_t)m_.slot_ctx(s);
+      if (c == cbig) ++big;
+      else csmall = c;
+    }
+    sf.slots_total = (uint64_t)ns, sf.slots_big = big, sf.slot_ctx_big = cbig;
+    sf.slot_ctx_small = big == (uint64_t)ns ? cbig : csmall;
+    sf.positions_held = 0;  // the dashboard sums the requests' own positions
+    if (model::copy::mode() & model::copy::kAdapt) {
+      sf.copy_adapt = 1, sf.copy_proposals_total = copy_proposals_total_, sf.copy_scored_total = copy_scored_total_;
+      sf.copy_first_right_total = copy_first_right_total_, sf.copy_rows_verified_total = copy_rows_verified_total_;
+      sf.copy_rows_accepted_total = copy_rows_accepted_total_, sf.copy_failing_requests_total = copy_failing_total_;
+      for (int b = 0; b < 4; ++b) sf.copy_chance_pm[b] = ((uint64_t)copy_chance_[b] * 1000 + 32767) / 65535;
+    }
+    io_.publish_stats(Frame(fe::kStats).add(&sf).take());
+  }
+  double published_ = 0;
+
   void sweep() {
     for (auto it = wait_.begin(); it != wait_.end();) {
       if (!Io::cancelled(*it)) {

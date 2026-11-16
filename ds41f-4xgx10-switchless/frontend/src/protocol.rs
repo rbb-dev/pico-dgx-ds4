@@ -4,7 +4,7 @@
 
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 pub const DEFAULT_SOCKET: &str = "/tmp/dsgb10-engine.sock";
 /// Up to 100 image spans, plus room for a 1M-token prompt and framing.
 pub const MAX_FRAME: usize = crate::vision::MAX_IMAGES * crate::vision::MAX_IMAGE_ROWS * crate::vision::IMAGE_DIM * 2 + (8 << 20);
@@ -16,9 +16,12 @@ pub const T_HELLO: u16 = 0x01;
 pub const T_SUBMIT: u16 = 0x02;
 pub const T_CANCEL: u16 = 0x03;
 pub const T_RELEASE: u16 = 0x04;
+pub const T_STATS_REQ: u16 = 0x05;
 pub const T_HELLO_ENGINE: u16 = 0x81;
 pub const T_TOKENS: u16 = 0x82;
 pub const T_DONE: u16 = 0x83;
+pub const T_PROGRESS: u16 = 0x84;
+pub const T_STATS: u16 = 0x85;
 
 pub const FLAG_SEED: u32 = 1;
 pub const FLAG_KEEP: u32 = 2;
@@ -127,6 +130,98 @@ pub struct Done {
     pub error: String,
 }
 
+/// The fields of a STATS frame, in wire order (docs/protocol.md, "The dashboard's frames").
+pub const STATS_VERSION: u32 = 1;
+pub const STATS_FIELDS: usize = 19;
+
+/// The engine's own counters for the dashboard. Byte counts are rank 0's store; counters count from the
+/// engine's start.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EngineStats {
+    pub store_cap_bytes: u64,
+    pub store_used_bytes: u64,
+    pub sessions_resident: u64,
+    pub sessions_on_disk: u64,
+    pub disk_cap_bytes: u64,
+    pub disk_used_bytes: u64,
+    pub spills_total: u64,
+    pub spill_bytes_total: u64,
+    pub spills_pending: u64,
+    pub restores_total: u64,
+    pub restore_bytes_total: u64,
+    pub restored_tokens_total: u64,
+    pub restore_wait_ns_total: u64,
+    pub restore_wait_max_ns: u64,
+    pub slots_total: u64,
+    pub slots_big: u64,
+    pub slot_ctx_big: u64,
+    pub slot_ctx_small: u64,
+    pub positions_held: u64,
+}
+
+impl EngineStats {
+    fn fields(&self) -> [u64; STATS_FIELDS] {
+        [
+            self.store_cap_bytes,
+            self.store_used_bytes,
+            self.sessions_resident,
+            self.sessions_on_disk,
+            self.disk_cap_bytes,
+            self.disk_used_bytes,
+            self.spills_total,
+            self.spill_bytes_total,
+            self.spills_pending,
+            self.restores_total,
+            self.restore_bytes_total,
+            self.restored_tokens_total,
+            self.restore_wait_ns_total,
+            self.restore_wait_max_ns,
+            self.slots_total,
+            self.slots_big,
+            self.slot_ctx_big,
+            self.slot_ctx_small,
+            self.positions_held,
+            self.copy_adapt,
+            self.copy_proposals_total,
+            self.copy_scored_total,
+            self.copy_first_right_total,
+            self.copy_rows_verified_total,
+            self.copy_rows_accepted_total,
+            self.copy_chance_pm[0],
+            self.copy_chance_pm[1],
+            self.copy_chance_pm[2],
+            self.copy_chance_pm[3],
+            self.copy_failing_requests_total,
+        ]
+    }
+
+    /// Fields beyond those given are 0; extra ones are ignored.
+    fn from_fields(v: &[u64]) -> EngineStats {
+        let f = |i: usize| v.get(i).copied().unwrap_or(0);
+        EngineStats {
+            store_cap_bytes: f(0),
+            store_used_bytes: f(1),
+            sessions_resident: f(2),
+            sessions_on_disk: f(3),
+            disk_cap_bytes: f(4),
+            disk_used_bytes: f(5),
+            spills_total: f(6),
+            spill_bytes_total: f(7),
+            spills_pending: f(8),
+            restores_total: f(9),
+            restore_bytes_total: f(10),
+            restored_tokens_total: f(11),
+            restore_wait_ns_total: f(12),
+            restore_wait_max_ns: f(13),
+            slots_total: f(14),
+            slots_big: f(15),
+            slot_ctx_big: f(16),
+            slot_ctx_small: f(17),
+            positions_held: f(18),
+        }
+    }
+}
+
 /// A decoded frame, either direction.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Frame {
@@ -137,6 +232,11 @@ pub enum Frame {
     HelloEngine(HelloEngine),
     Tokens(Tokens),
     Done(Done),
+    /// Prefill progress of one request: prompt tokens computed so far, of those it has to compute.
+    Progress { req_id: u64, computed: u32, total: u32 },
+    /// Front-end to rank 0: send one STATS frame.
+    StatsReq,
+    Stats(EngineStats),
 }
 
 // ------------------------------------------------------------------ encoding
@@ -207,6 +307,24 @@ impl Frame {
             Frame::Release { session_id } => {
                 let mut w = W::new(T_RELEASE);
                 w.u64(*session_id);
+                w.finish()
+            }
+            Frame::Progress { req_id, computed, total } => {
+                let mut w = W::new(T_PROGRESS);
+                w.u64(*req_id).u32(*computed).u32(*total);
+                w.finish()
+            }
+            Frame::StatsReq => {
+                let mut w = W::new(T_STATS_REQ);
+                w.u32(0).u32(0);
+                w.finish()
+            }
+            Frame::Stats(st) => {
+                let mut w = W::new(T_STATS);
+                w.u32(STATS_VERSION).u32(STATS_FIELDS as u32);
+                for x in st.fields() {
+                    w.u64(x);
+                }
                 w.finish()
             }
             Frame::HelloEngine(h) => {
@@ -348,6 +466,24 @@ impl Frame {
                 r.u32()?;
                 let error = String::from_utf8_lossy(r.bytes(n)?).into_owned();
                 Frame::Done(Done { req_id, reason, prompt_tokens, cached_tokens, completion_tokens, queue_us, prefill_us, decode_us, error })
+            }
+            T_PROGRESS => Frame::Progress { req_id: r.u64()?, computed: r.u32()?, total: r.u32()? },
+            T_STATS_REQ => {
+                r.u32()?;
+                r.u32()?;
+                Frame::StatsReq
+            }
+            T_STATS => {
+                let version = r.u32()?;
+                let n = r.u32()? as usize;
+                if version != STATS_VERSION {
+                    return Err(format!("STATS version {version}, expected {STATS_VERSION}"));
+                }
+                if n > 4096 {
+                    return Err(format!("STATS with {n} fields"));
+                }
+                let v = (0..n).map(|_| r.u64()).collect::<Result<Vec<_>, _>>()?;
+                Frame::Stats(EngineStats::from_fields(&v))
             }
             _ => return Err(format!("unknown frame type {ty:#x}")),
         };
@@ -522,6 +658,33 @@ mod tests {
         let b = Frame::Done(d.clone()).encode();
         assert_eq!(b.len(), 8 + 56 + 1);
         assert_eq!(Frame::decode(T_DONE, &b[8..], |_| 0).unwrap(), Frame::Done(d));
+        // the dashboard's frames
+        let b = Frame::Progress { req_id: 9, computed: 4096, total: 20000 }.encode();
+        assert_eq!(b.len(), 8 + 16);
+        assert_eq!(u16::from_le_bytes(b[4..6].try_into().unwrap()), 0x84);
+        assert_eq!(Frame::decode(T_PROGRESS, &b[8..], |_| 0).unwrap(), Frame::Progress { req_id: 9, computed: 4096, total: 20000 });
+        let b = Frame::StatsReq.encode();
+        assert_eq!((b.len(), u16::from_le_bytes(b[4..6].try_into().unwrap())), (8 + 8, 0x05));
+        assert_eq!(Frame::decode(T_STATS_REQ, &b[8..], |_| 0).unwrap(), Frame::StatsReq);
+        let st = EngineStats { store_cap_bytes: 1 << 40, sessions_on_disk: 3, restore_wait_max_ns: 7, slots_big: 2, positions_held: 99, ..Default::default() };
+        let b = Frame::Stats(st).encode();
+        assert_eq!(b.len(), 8 + 8 + 8 * 19);
+        assert_eq!(u32::from_le_bytes(b[12..16].try_into().unwrap()), 19, "n_fields after the version");
+        assert_eq!(u64::from_le_bytes(b[16..24].try_into().unwrap()), 1 << 40, "store_cap_bytes is the first field");
+        assert_eq!(u64::from_le_bytes(b[b.len() - 8..].try_into().unwrap()), 99, "positions_held is the last");
+        assert_eq!(Frame::decode(T_STATS, &b[8..], |_| 0).unwrap(), Frame::Stats(st));
+        // a shorter or a longer field list: missing fields are 0, extra ones ignored
+        let mut short = Frame::Stats(st).encode();
+        short.truncate(8 + 8 + 8 * 4);
+        short[12..16].copy_from_slice(&4u32.to_le_bytes());
+        let Frame::Stats(got) = Frame::decode(T_STATS, &short[8..], |_| 0).unwrap() else { panic!() };
+        assert_eq!((got.store_cap_bytes, got.sessions_on_disk, got.positions_held), (1 << 40, 3, 0));
+        let mut long = Frame::Stats(st).encode();
+        long.extend(5u64.to_le_bytes());
+        long[12..16].copy_from_slice(&20u32.to_le_bytes());
+        assert_eq!(Frame::decode(T_STATS, &long[8..], |_| 0).unwrap(), Frame::Stats(st));
+        long[8..12].copy_from_slice(&2u32.to_le_bytes());
+        assert!(Frame::decode(T_STATS, &long[8..], |_| 0).is_err(), "another version");
         let t = Tokens { req_id: 2, ids: vec![5, 6], logprobs: Some(vec![-0.5, -1.0]), top: Some(vec![(5, -0.5), (6, -1.0)]) };
         let b = Frame::Tokens(t.clone()).encode();
         assert_eq!(Frame::decode(T_TOKENS, &b[8..], |_| 1).unwrap(), Frame::Tokens(t));

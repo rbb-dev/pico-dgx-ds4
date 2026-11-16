@@ -35,6 +35,10 @@ fn usage() -> ! {
                                 start (mode 600, in a directory of mode 700; it holds the
                                 conversations' text), so that the engine's kept sessions are found again
       --table-days N            sessions unused for longer are not kept: 7
+      --node-stats HOST:PORT,... each rank's sampler, in rank order (docs/dashboard.md): the dashboard at
+                                /dashboard polls them while it is open; without them its NODE HEALTH is empty
+      --dashboard-host NAME     a host name the dashboard also answers (repeat it), e.g. a proxy's; it always
+                                answers localhost and the listen addresses, and refuses every other Host
       --vision-addr HOST:PORT   accept image_url / image parts: the image encoder (tools/vision) turns
                                 them into embedding rows (docs/vision.md); without it images are refused
       --max-body-mb N           the largest request body taken, in MiB: 64; a larger one is answered
@@ -56,6 +60,7 @@ fn usage() -> ! {
       --delay-ms N              per generated token: 5
       --prefill-tps N           simulated prefill tokens/s: 20000
       --max-context N           1048576
+  dsfront mock-node-stats --port P --rank R           a rank's sampler stand-in on 127.0.0.1:P (docs/dashboard.md)
   dsfront tokcheck <cases.jsonl>                      compare against reference ids ({{\"text\",\"ids\"}} per line)
   dsfront enccheck <cases.jsonl> [--encoding E]       compare the chat encoding with encoding.py's (tools/gen_encoding_cases.py)
   dsfront tokenize <file>                             print ids of a file's text
@@ -123,7 +128,11 @@ fn serve(args: &[String]) {
     if api_key.is_none() {
         eprintln!("warning: no --api-key-file, requests are not authenticated");
     }
+    let mut dashboard_hosts: Vec<String> = vec!["localhost".into()];
+    dashboard_hosts.extend(listen.iter().map(|a| a.ip().to_string()));
+    dashboard_hosts.extend(opts(args, "--dashboard-host").into_iter().map(|h| h.to_ascii_lowercase()));
     let cfg = ServerConfig {
+        dashboard_hosts,
         model_name: opt(args, "--model-name").unwrap_or_else(|| "deepseek-v4.1-flash-uncensored".into()),
         ablit_alias: !args.iter().any(|a| a == "--no-ablit-alias"),
         api_key,
@@ -142,6 +151,7 @@ fn serve(args: &[String]) {
         max_body_bytes: max_body_bytes(args),
         max_image_rows_in_flight: max_image_rows_in_flight(args),
     };
+    let node_stats: Vec<String> = opt(args, "--node-stats").map_or(Vec::new(), |v| v.split(',').map(|a| a.trim().to_string()).filter(|a| !a.is_empty()).collect());
     let admin = opt(args, "--admin-socket");
     let table = opt(args, "--table-file").map(std::path::PathBuf::from);
     let table_age_s = (parse_opt(args, "--table-days", 7f64) * 86400.0) as u64;
@@ -150,6 +160,7 @@ fn serve(args: &[String]) {
     runtime().block_on(async move {
         let engine = dsfront::engine::EngineClient::start(socket.into());
         let app = App::new(cfg, tok, engine);
+        dsfront::dashboard::spawn(app.clone(), node_stats);
         if let Some(t) = &table {
             eprintln!("{}", app.load_sessions(t, table_age_s));
         }
@@ -262,6 +273,14 @@ fn mock_engine(args: &[String]) {
 /// default out; when both are given, the later one wins.
 fn default_thinking(args: &[String]) -> bool {
     args.iter().rev().find(|a| *a == "--thinking" || *a == "--no-thinking").is_some_and(|a| a == "--thinking")
+}
+
+fn mock_node_stats(args: &[String]) {
+    let (port, rank) = (parse_opt(args, "--port", 9760u16), parse_opt(args, "--rank", 0u32));
+    if let Err(e) = runtime().block_on(dsfront::dashboard::mock_node_stats(port, rank)) {
+        eprintln!("mock node sampler: {e}");
+        std::process::exit(1);
+    }
 }
 
 fn opt(args: &[String], name: &str) -> Option<String> {
@@ -528,6 +547,7 @@ fn main() {
         Some("enccheck") => enccheck(&args),
         Some("serve") => serve(&args),
         Some("mock-engine") => mock_engine(&args),
+        Some("mock-node-stats") => mock_node_stats(&args),
         Some("admin") => admin(&args),
         Some("tokenize") => {
             let path = args.get(2).unwrap_or_else(|| usage());

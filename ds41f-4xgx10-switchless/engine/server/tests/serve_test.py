@@ -47,7 +47,7 @@ class Engine:
         assert t == HELLO_E, t
         ver, self.max_ctx, vocab, eos, max_sess, nl = struct.unpack('<6I', p[:24])
         self.name = p[24:24 + nl].decode()
-        self.send(HELLO, struct.pack('<II', 2, 0))
+        self.send(HELLO, struct.pack('<II', 3, 0))
         self.next_id = 1
 
     def send(self, t, payload):

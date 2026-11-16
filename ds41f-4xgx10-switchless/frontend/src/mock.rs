@@ -1,6 +1,9 @@
 //! A rank-0 stand-in for testing the front-end end to end: speaks the protocol, keeps sessions
 //! (reporting cached_tokens from the longest common prefix), and streams scripted text.
 //!
+//! PROGRESS goes out after each prefill chunk of 4096 tokens, and STATS answers a STATS_REQ with plausible
+//! numbers (a disk tier, 16 slots) that move with the requests served.
+//!
 //! A request with the ABLIT flag gets `[ablit] ` before its answer, so a test sees the flag arrive.
 //!
 //! Script, from the decoded prompt: reasoning if the prompt ends in `<think>`; then, for the last
@@ -9,12 +12,12 @@
 //! quoting it, anything else → a reply quoting the user.
 
 use crate::encoding::{render_tool_calls, ASSISTANT_SP, THINK_END, THINK_START, USER_SP};
-use crate::protocol::{read_frame, Done, DoneReason, Frame, HelloEngine, Submit, Tokens, FLAG_ABLIT, FLAG_KEEP, FLAG_LOGPROBS, VERSION};
+use crate::protocol::{read_frame, Done, DoneReason, EngineStats, Frame, HelloEngine, Submit, Tokens, FLAG_ABLIT, FLAG_KEEP, FLAG_LOGPROBS, VERSION};
 use crate::tokenizer::Tokenizer;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
@@ -31,6 +34,14 @@ pub struct MockConfig {
     pub prefill_tok_per_s: f64,
     pub max_context: u32,
 }
+
+/// Requests finished and prompt tokens computed by every mock engine in the process: the STATS counters.
+static FINISHED: AtomicU64 = AtomicU64::new(0);
+static COMPUTED: AtomicU64 = AtomicU64::new(0);
+/// Prefill chunk of the mock: PROGRESS goes out after each.
+const CHUNK: usize = 4096;
+/// Bytes of KV the mock claims per position.
+const BYTES_PER_POSITION: u64 = 890;
 
 /// session id -> (its history, whether it was made on the ablit path)
 type Sessions = Arc<Mutex<HashMap<u64, (Vec<u32>, bool)>>>;
@@ -114,6 +125,9 @@ async fn connection(stream: UnixStream, cfg: MockConfig, sessions: Sessions) {
             Frame::Release { session_id } => {
                 sessions.lock().unwrap().remove(&session_id);
             }
+            Frame::StatsReq => {
+                let _ = tx.send(Frame::Stats(stats(&cfg, &sessions)).encode());
+            }
             f => {
                 eprintln!("mock engine: unexpected frame {f:?}");
                 break;
@@ -124,6 +138,38 @@ async fn connection(stream: UnixStream, cfg: MockConfig, sessions: Sessions) {
         f.store(true, Ordering::Relaxed);
     }
     eprintln!("mock engine: front-end disconnected");
+}
+
+/// Plausible numbers: 16 slots (two with the whole context), a 256 GiB disk tier holding half the sessions.
+fn stats(cfg: &MockConfig, sessions: &Sessions) -> EngineStats {
+    let (n, held) = {
+        let ss = sessions.lock().unwrap();
+        (ss.len() as u64, ss.values().map(|h| h.0.len() as u64).sum::<u64>())
+    };
+    let (finished, computed) = (FINISHED.load(Ordering::Relaxed), COMPUTED.load(Ordering::Relaxed));
+    let (slots_total, slots_big, slot_ctx_big, slot_ctx_small) = (16u64, 2u64, cfg.max_context as u64, 65_536u64);
+    let positions = slots_big * slot_ctx_big + (slots_total - slots_big) * slot_ctx_small;
+    EngineStats {
+        store_cap_bytes: positions * BYTES_PER_POSITION,
+        store_used_bytes: held * BYTES_PER_POSITION,
+        sessions_resident: n - n / 2,
+        sessions_on_disk: n / 2,
+        disk_cap_bytes: 256 << 30,
+        disk_used_bytes: (n / 2) * (100 << 20),
+        spills_total: finished,
+        spill_bytes_total: computed * BYTES_PER_POSITION,
+        spills_pending: 0,
+        restores_total: finished / 4,
+        restore_bytes_total: computed / 4 * BYTES_PER_POSITION,
+        restored_tokens_total: computed / 4,
+        restore_wait_ns_total: finished / 4 * 12_000_000,
+        restore_wait_max_ns: if finished >= 4 { 35_000_000 } else { 0 },
+        slots_total,
+        slots_big,
+        slot_ctx_big,
+        slot_ctx_small,
+        positions_held: held,
+    }
 }
 
 fn lcp(a: &[u32], b: &[u32]) -> usize {
@@ -171,9 +217,19 @@ async fn generate(s: Submit, cancel: Arc<AtomicBool>, tx: &mpsc::UnboundedSender
     };
     done.cached_tokens = cached as u32;
     let todo = s.prompt.len() - cached;
-    if cfg.prefill_tok_per_s > 0.0 {
-        tokio::time::sleep(Duration::from_secs_f64(todo as f64 / cfg.prefill_tok_per_s)).await;
+    let mut computed = 0usize;
+    while computed < todo {
+        let n = (todo - computed).min(CHUNK);
+        if cfg.prefill_tok_per_s > 0.0 {
+            tokio::time::sleep(Duration::from_secs_f64(n as f64 / cfg.prefill_tok_per_s)).await;
+        }
+        computed += n;
+        let _ = tx.send(Frame::Progress { req_id: s.req_id, computed: computed as u32, total: todo as u32 }.encode());
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
     }
+    COMPUTED.fetch_add(computed as u64, Ordering::Relaxed);
     let t_first = Instant::now();
     done.prefill_us = (t_first - t0).as_micros() as u64;
 
@@ -224,6 +280,7 @@ async fn generate(s: Submit, cancel: Arc<AtomicBool>, tx: &mpsc::UnboundedSender
     } else {
         sessions.lock().unwrap().remove(&s.session_id);
     }
+    FINISHED.fetch_add(1, Ordering::Relaxed);
     let _ = tx.send(Frame::Done(done).encode());
 }
 

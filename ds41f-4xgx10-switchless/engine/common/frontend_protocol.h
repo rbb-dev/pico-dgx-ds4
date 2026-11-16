@@ -7,7 +7,7 @@
 
 namespace fe {
 
-constexpr uint32_t kVersion = 2;
+constexpr uint32_t kVersion = 3;
 constexpr const char* kDefaultSocket = "/tmp/dsgb10-engine.sock";
 
 enum MsgType : uint16_t {
@@ -16,10 +16,13 @@ enum MsgType : uint16_t {
   kSubmit = 0x02,   // SubmitHeader, uint32 stop_ids[n_stop_ids], uint32 prompt[n_prompt]
   kCancel = 0x03,   // Cancel
   kRelease = 0x04,  // Release
+  kStatsReq = 0x05, // StatsReq: ask for one Stats frame (the dashboard is being watched)
   // rank 0 -> front-end
   kHelloEngine = 0x81,  // HelloEngine, char name[name_len]
   kTokens = 0x82,       // TokensHeader, uint32 ids[n], [float logprob[n]], [TopLogprob top[n * n_top]]
   kDone = 0x83,         // DoneHeader, char error[error_len]
+  kProgress = 0x84,     // Progress: after each prefill chunk of a request
+  kStats = 0x85,        // StatsFrame: the answer to a StatsReq
 };
 
 struct FrameHeader {
@@ -129,6 +132,49 @@ struct DoneHeader {
   uint32_t reserved;
 };
 
+// Prefill progress of one request, sent after each prefill chunk (and so also after the last one): the
+// prompt tokens computed so far, of the tokens this request has to compute (the prompt without the
+// positions reused from a session or the disk tier).
+struct Progress {
+  uint64_t req_id;
+  uint32_t computed;
+  uint32_t total;
+};
+
+struct StatsReq {
+  uint32_t reserved0;  // 0
+  uint32_t reserved1;  // 0
+};
+
+// The engine's own counters for the dashboard: version, the number of u64 fields that follow, then the
+// fields in this order. A front-end reads min(n_fields, kStatsFields) of them; a field it does not get
+// is 0. Byte counts are per rank 0's own store; the counters count from the engine's start.
+constexpr uint32_t kStatsVersion = 1;
+constexpr uint32_t kStatsFields = 19;
+struct StatsFrame {
+  uint32_t version;   // kStatsVersion
+  uint32_t n_fields;  // kStatsFields
+  uint64_t store_cap_bytes;         // device memory the session store may use (the KV pool)
+  uint64_t store_used_bytes;
+  uint64_t sessions_resident;       // sessions held in device memory
+  uint64_t sessions_on_disk;        // session states in the disk tier
+  uint64_t disk_cap_bytes;          // 0: no disk tier
+  uint64_t disk_used_bytes;
+  uint64_t spills_total;            // session states written to disk
+  uint64_t spill_bytes_total;
+  uint64_t spills_pending;          // queued for writing, not yet committed
+  uint64_t restores_total;          // states read back from disk
+  uint64_t restore_bytes_total;
+  uint64_t restored_tokens_total;   // prompt tokens restored from disk instead of computed
+  uint64_t restore_wait_ns_total;   // time requests waited for restores
+  uint64_t restore_wait_max_ns;     // the longest single wait
+  uint64_t slots_total;             // sequences the engine decodes at once
+  uint64_t slots_big;               // of them with a context of slot_ctx_big
+  uint64_t slot_ctx_big;            // positions of a big slot
+  uint64_t slot_ctx_small;          // positions of each other slot
+  uint64_t positions_held;          // positions the resident sessions hold
+};
+
 static_assert(sizeof(FrameHeader) == 8);
 static_assert(sizeof(HelloFe) == 8);
 static_assert(sizeof(SubmitHeader) == 72);
@@ -140,5 +186,10 @@ static_assert(sizeof(TopLogprob) == 8);
 static_assert(sizeof(ImageSpan) == 16);
 static_assert(sizeof(DoneHeader) == 56);
 static_assert(offsetof(DoneHeader, queue_us) == 24);
+static_assert(sizeof(Progress) == 16);
+static_assert(sizeof(StatsReq) == 8);
+static_assert(sizeof(StatsFrame) == 8 + 8 * kStatsFields);
+static_assert(offsetof(StatsFrame, store_cap_bytes) == 8);
+static_assert(offsetof(StatsFrame, positions_held) == 8 + 8 * (kStatsFields - 1));
 
 }  // namespace fe

@@ -465,6 +465,7 @@ void Model::Impl::state_spill(int h) {
   ss.dpages = std::move(dp);
   ss.dsnaps = std::move(ds);
   ss.dend = de;
+  ++tier.spills, tier.spill_bytes += b0 - s.bytes;
   if (rank == 0)
     std::printf("state: session %d spilled to disk (%.1f MiB; %.2f of %.2f GiB of the file in use; host %.2f ms)\n", h,
                 (b0 - s.bytes) / 1048576.0, s.dbytes / 1073741824.0, s.dpool.size / 1073741824.0,
@@ -513,6 +514,11 @@ void Model::Impl::state_unspill(int h) {
   s.pinned.pop_back();
   CUDA_CHECK(cudaStreamSynchronize(st));
   const double t2 = wall_s();
+  {
+    const uint64_t w = (uint64_t)((t2 - t0) * 1e9);
+    ++tier.restores, tier.restore_bytes += got, tier.restored_pos += (uint64_t)std::max(ss.saved, 0);
+    tier.wait_ns += w, tier.wait_max_ns = std::max(tier.wait_max_ns, w);
+  }
   size_t bad = 0;
   uint64_t fp = 0;  // the checksums' xor, logged: a check that compared nothing would show as 0
   for (const size_t o : back) bad += *s.disk->sum(o, false) != *s.disk->sum(o, true), fp ^= *s.disk->sum(o, true);
@@ -858,6 +864,15 @@ Model::StateInfo Model::state_info(int h) const {
   return r;
 }
 size_t Model::state_bytes() const { return d_->store_s ? d_->store_s->bytes : 0; }
+Model::TierStats Model::tier_stats() const {
+  TierStats t = d_->tier;
+  if (const detail::Store* s = d_->store_s.get()) {
+    t.store_cap = s->pool.size, t.store_used = s->bytes;
+    for (const auto& kv : s->sess) ++(kv.second.disk ? t.on_disk : t.resident);
+    if (s->disk) t.disk_cap = s->dpool.size, t.disk_used = s->dbytes;
+  }
+  return t;
+}
 void Model::drain() { d_->drain(); }
 
 }  // namespace model

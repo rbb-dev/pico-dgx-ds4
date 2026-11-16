@@ -71,6 +71,8 @@
 //     serve's default, --draft-bf16 opts out); --draft-head4: that head as MXFP4 instead (made from the FP8
 //     copy, which goes), --draft-markov8: the Markov head as FP8 (docs/engine.md, "The draft pass's
 //     approximations": bundle B's formats, the study's simulated drafts bit for bit; off by default)
+//   --node-stats-port N (serve; 9760): the dashboard's node sampler (server/node_stats.h) on this rank's first link
+//     address (the fleet's NEXT_IP0): asleep until rank 0's front-end asks; 0: none
 //   --ablit FILE: the runtime abliteration (model/ablit.h, made by tools/ablit/make_ablit.py; every rank reads the same
 //     file): a request whose SUBMIT carries the ablit flag runs with the edit on its rows; the others are untouched
 //   --tree-probe FILE (spectf; EXPERIMENT, docs/engine.md "Draft trees"): each step also runs the drafter's
@@ -128,6 +130,7 @@
 #include "dspark/dspark.h"
 #include "engram/engram.h"
 #include "model/model.h"
+#include "server/node_stats.h"
 #include "server/cmd.h"
 #include "server/golden.h"
 #include "server/serve.h"
@@ -307,6 +310,8 @@ struct Args {
   bool head_raw = false, no_l2pf = false;
   std::string draft_weights;  // --draft-weights FILE: the drafter (mtp.*) from this rank file instead of --weights
   std::string ablit;          // --ablit FILE: the runtime abliteration (model/ablit.h); requests opt in per request
+  int node_stats_port = 9760;  // serve: the dashboard's node sampler on this rank's first link address (0: none)
+  std::string node_stats_addr, node_stats_rails[2];  // from the fleet file: that address, the rails' devices
   int spec_drafts = 5;
   float spec_thresh = -1.f;
   float spec_cost[3] = {19.4f, 3.6f, 3.3f};
@@ -407,6 +412,7 @@ Args parse(int argc, char** argv) {
     else if (s == "--draft-head4") a.draft_head4 = true;
     else if (s == "--draft-markov8") a.draft_markov8 = true;
     else if (s == "--ablit") a.ablit = val();
+    else if (s == "--node-stats-port") a.node_stats_port = std::atoi(val().c_str());
     else if (s == "--tree-probe") a.tree_probe = val();
     else if (s == "--tree-sib") a.tree_sib = std::atoi(val().c_str());
     else if (s == "--seq-list") a.seq_list = val();
@@ -457,6 +463,7 @@ Args parse(int argc, char** argv) {
         fl.file.c_str());
   if (a.rank > 3) die("--rank %d: the ring's ranks are 0-3", a.rank);
   const comm::RankAddr& me = fl.rank[a.rank];
+  a.node_stats_addr = me.next_ip[0], a.node_stats_rails[0] = fl.next_dev[0], a.node_stats_rails[1] = fl.next_dev[1];
   const std::string r = std::to_string(a.rank);
   // a path flag's value, else the fleet's: {rank} is this rank, a leading ~/ this box's home (the same
   // arguments then name each rank's own files)
@@ -757,6 +764,19 @@ int main(int argc, char** argv) {
     }
   }
   ring.barrier();
+  if (a.mode == "serve" && a.node_stats_port > 0) {  // the dashboard's node sampler (server/node_stats.h)
+    size_t dfree = 0, dtotal = 0;
+    CUDA_CHECK(cudaMemGetInfo(&dfree, &dtotal));
+    node_stats::Memory nm;
+    std::error_code ec;
+    nm.device_bytes = dtotal;
+    nm.weights_bytes = std::filesystem::file_size(a.weights, ec);
+    if (ec) nm.weights_bytes = 0;
+    nm.kv_bytes = m.state_capacity();
+    const uint64_t used = dtotal - dfree;
+    nm.work_bytes = used > nm.weights_bytes + nm.kv_bytes ? used - nm.weights_bytes - nm.kv_bytes : 0;
+    node_stats::start(a.rank, a.node_stats_addr, a.node_stats_port, nm, a.node_stats_rails);
+  }
   pin_self(15);
   mem_report(a.rank, ("ready after " + std::to_string((int)(now_s() - t0)) + " s").c_str());
 

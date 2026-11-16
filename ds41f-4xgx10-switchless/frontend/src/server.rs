@@ -6,6 +6,7 @@
 //! for stop strings and loops, and parsed into reasoning, content and tool calls.
 
 use crate::encoding::{api_tool_name, encode_messages, Delta, EncodeOptions, Encoding, StreamParser, ThinkingMode};
+use crate::dashboard::ReqMeta;
 use crate::engine::{EngineClient, Event as EngineEvent};
 use crate::gate::{Gate, Pass, Refused, RETRY_AFTER_S};
 use crate::guard::{LoopGuard, StopMatcher, LINE_WINDOW_TOKENS};
@@ -27,11 +28,18 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
+/// What the dashboard shows as a request's endpoint and priority: there is one endpoint and the engine has no priorities.
+const ENDPOINT: &str = "/v1/chat/completions";
+const PRIORITY: &str = "normal";
+
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
     pub model_name: String,
     /// Also serve `{model_name}-ablit`: a request naming it runs on the ablated weights path.
     pub ablit_alias: bool,
+    /// The host names the dashboard answers (its requests' Host): the listen addresses, localhost, and --dashboard-host's.
+    /// A request naming another host is refused, so a page that rebinds a name of its own to this address gets nothing.
+    pub dashboard_hosts: Vec<String>,
     pub api_key: Option<String>,
     /// Default and cap for max_tokens (the kit's DSV41_MAX_NEW_TOKENS).
     pub max_tokens_cap: u32,
@@ -168,7 +176,11 @@ impl App {
 
 pub fn router(app: Arc<App>) -> Router {
     let max_body = app.cfg.max_body_bytes;
-    let routes = Router::new().route("/health", get(health)).route("/v1/models", get(models)).route("/v1/chat/completions", post(chat));
+    let routes = Router::new()
+        .route("/health", get(health))
+        .route("/v1/models", get(models))
+        .route("/v1/chat/completions", post(chat))
+        .merge(crate::dashboard::routes());
     body_limit(routes, max_body).with_state(app)
 }
 
@@ -258,7 +270,7 @@ fn bad_request(msg: impl Into<String>) -> Response {
     error(StatusCode::BAD_REQUEST, "invalid_request_error", msg)
 }
 
-fn check_auth(app: &App, headers: &HeaderMap) -> Result<(), Response> {
+pub(crate) fn check_auth(app: &App, headers: &HeaderMap) -> Result<(), Box<Response>> {
     let Some(key) = &app.cfg.api_key else { return Ok(()) };
     let got = headers
         .get("authorization")
@@ -324,6 +336,8 @@ pub struct Prepared {
     pub rows_held: Option<crate::vision::RowsHeld>,
     /// The served name the request asked for, which the response's `model` echoes.
     pub model: String,
+    /// What the dashboard calls the request's key: the request's `user` field, else `api`.
+    pub key_label: String,
     /// `Some(true)`: the request named the ablit name; None: it follows the default.
     pub ablit: Option<bool>,
 }
@@ -334,6 +348,16 @@ pub fn resolve_model(cfg: &ServerConfig, model: Option<&Value>) -> (String, Opti
     match model.and_then(Value::as_str) {
         Some(m) if cfg.ablit_alias && m == format!("{}-ablit", cfg.model_name) => (m.to_string(), Some(true)),
         _ => (cfg.model_name.clone(), None),
+    }
+}
+
+/// The `user` field as the dashboard's key label: printable characters, at most 32; `api` when there is none.
+fn key_label(user: Option<&Value>) -> String {
+    let u: String = user.and_then(Value::as_str).unwrap_or("").chars().filter(|c| !c.is_control()).take(32).collect();
+    if u.trim().is_empty() {
+        "api".into()
+    } else {
+        u
     }
 }
 
@@ -613,6 +637,7 @@ pub fn prepare(cfg: &ServerConfig, req: &Value) -> Result<Prepared, String> {
     let ignore_eos = truthy(r.get("ignore_eos"));
     let stream = truthy(r.get("stream"));
     let (model, ablit) = resolve_model(cfg, r.get("model"));
+    let key_label = key_label(r.get("user"));
     let include_usage = truthy(r.get("stream_options").and_then(|s| s.get("include_usage")));
     Ok(Prepared {
         prompt,
@@ -631,6 +656,7 @@ pub fn prepare(cfg: &ServerConfig, req: &Value) -> Result<Prepared, String> {
         images,
         rows_held: None,
         model,
+        key_label,
         ablit,
     })
 }
@@ -884,7 +910,8 @@ async fn start(app: &Arc<App>, p: &Prepared, pass: Pass) -> Result<Gen, ApiError
         prompt: plan.ids.clone(),
         images: None,
     };
-    let (req_id, rx) = match app.engine.submit(submit) {
+    let meta = ReqMeta { key_label: p.key_label.clone(), ablit, prompt_tokens: plan.ids.len() as u32, endpoint: ENDPOINT, priority: PRIORITY };
+    let (req_id, rx) = match app.engine.submit(submit, meta) {
         Ok(x) => x,
         Err(e) => {
             app.sessions.lock().unwrap().abandon(plan.session_id);
@@ -967,7 +994,14 @@ async fn start_images(app: &Arc<App>, p: &Prepared, pass: Pass, info: crate::pro
         prompt: ids.clone(),
         images: Some(crate::vision::payload(&starts, enc)), // the encoder's buffer itself, not a copy
     };
-    let (req_id, rx) = app.engine.submit(submit).map_err(|e| ApiError(StatusCode::SERVICE_UNAVAILABLE, "server_error".into(), e))?;
+    let meta = ReqMeta {
+        key_label: p.key_label.clone(),
+        ablit: p.ablit.unwrap_or(false),
+        prompt_tokens: ids.len() as u32,
+        endpoint: ENDPOINT,
+        priority: PRIORITY,
+    };
+    let (req_id, rx) = app.engine.submit(submit, meta).map_err(|e| ApiError(StatusCode::SERVICE_UNAVAILABLE, "server_error".into(), e))?;
     eprintln!(
         "req {req_id} images: {n_images} ({n_rows} rows), encoder {encoder_ms:.0} ms; prompt {} ids; session {session_id} (not kept)",
         ids.len()
@@ -1179,6 +1213,7 @@ pub(crate) mod tests {
         ServerConfig {
             model_name: "m".into(),
             ablit_alias: true,
+            dashboard_hosts: vec!["localhost".into(), "127.0.0.1".into()],
             api_key: None,
             max_tokens_cap: 32768,
             default_effort: 75,
