@@ -94,7 +94,8 @@ __device__ __forceinline__ uint4 ldg_bf16x(uint32_t h, const uint8_t* r, const u
 // (lane t: k = 16t..16t+15, one 32-block). The k order inside an MMA is permuted identically for A and B.
 // RB: the rows it is built for, 8 (k_gemv16) or 16 (k_gemv16_r16: rows 8..15 in the MMAs' upper half,
 // lane group g has rows g and g + 8; the same weight loads and MMAs).
-template <int FMT, int MT, bool CC, bool NORM, int RB>
+// PRE (pre2_mask(), dsk.h): the second weight batch is requested before the wait too.
+template <int FMT, int MT, bool CC, bool NORM, int RB, bool PRE = false>
 __device__ __forceinline__ void gemv16_body(const __nv_bfloat16* __restrict__ x, int M, const uint8_t* __restrict__ W,
                                             const uint8_t* __restrict__ S, int N, int K, int group_rows,
                                             float* __restrict__ yf, __nv_bfloat16* __restrict__ yb,
@@ -280,6 +281,8 @@ __device__ __forceinline__ void gemv16_body(const __nv_bfloat16* __restrict__ x,
   };
 
   load(ba, sa, p0);
+  const bool pre2 = PRE && p0 + KU < p1;
+  if (pre2) load(bb, sb, p0 + KU);
   pdl_launch_dependents();
   pdl_wait();
   if constexpr (kSx) {
@@ -296,7 +299,7 @@ __device__ __forceinline__ void gemv16_body(const __nv_bfloat16* __restrict__ x,
     __syncthreads();  // read before the partial sums reuse red
   }
   for (int p = p0; p < p1; p += 2 * KU) {
-    if (p + KU < p1) load(bb, sb, p + KU);
+    if (p + KU < p1 && !(pre2 && p == p0)) load(bb, sb, p + KU);
     comp(ba, sa, p);
     if (p + KU >= p1) break;
     if (p + 2 * KU < p1) load(ba, sa, p + 2 * KU);
@@ -356,13 +359,13 @@ __device__ __forceinline__ void gemv16_body(const __nv_bfloat16* __restrict__ x,
   }
 }
 
-template <int FMT, int MT, bool CC, bool NORM>
+template <int FMT, int MT, bool CC, bool NORM, bool PRE = false>
 __global__ void __launch_bounds__(512) k_gemv16(const __nv_bfloat16* __restrict__ x, int M, const uint8_t* __restrict__ W,
                                                  const uint8_t* __restrict__ S, int N, int K, int group_rows,
                                                  float* __restrict__ yf, __nv_bfloat16* __restrict__ yb,
                                                  uint8_t* __restrict__ q, uint8_t* __restrict__ qs, int wn, int wk,
                                                  NormIn nin) {
-  gemv16_body<FMT, MT, CC, NORM, kLowRows>(x, M, W, S, N, K, group_rows, yf, yb, q, qs, wn, wk, nin);
+  gemv16_body<FMT, MT, CC, NORM, kLowRows, PRE>(x, M, W, S, N, K, group_rows, yf, yb, q, qs, wn, wk, nin);
 }
 
 // 9..16 rows. (512, 1): ptxas would otherwise hold some at 64 registers and spill.
@@ -389,9 +392,10 @@ __global__ void __launch_bounds__(512) k_gemv16_masked(const uint8_t* __restrict
   gemv16_body<FMT, MT, false, NORM, kLowRows>(x, M, W, S, N, K, group_rows, yf, yb, q, qs, wn, wk, nin);
 }
 
-template <int FMT, int MT, bool CC, bool NORM, int RB>
+template <int FMT, int MT, bool CC, bool NORM, int RB, bool PRE = false>
 constexpr auto gemv16_kernel() {
-  if constexpr (RB == kLowRows) return k_gemv16<FMT, MT, CC, NORM>;
+  static_assert(!PRE || RB == kLowRows, "the second batch before the wait: up to 8 rows");
+  if constexpr (RB == kLowRows) return k_gemv16<FMT, MT, CC, NORM, PRE>;
   else return k_gemv16_r16<FMT, MT, NORM>;
 }
 
@@ -685,6 +689,11 @@ bool persist16(const __nv_bfloat16* x, int M, const uint8_t* W, int N, int K, fl
   return true;
 }
 
+// kPre16: the router gate's kernel (bf16, normed, one tile per warp, up to 8 rows), the only gemv16 shape that takes
+// the second batch before the wait.
+template <int FMT, int MT, bool CC, bool NORM, int RB>
+constexpr bool kPre16 = FMT == kBF16 && NORM && MT == 1 && !CC && RB == kLowRows;
+
 template <int FMT, int MT, bool CC, bool NORM = false, int RB = kLowRows>
 void launch16(const __nv_bfloat16* x, int M, const uint8_t* W, const uint8_t* S, int N, int K, int group_rows, float* yf,
               __nv_bfloat16* yb, uint8_t* q, uint8_t* qs, GemvCfg cfg, cudaStream_t st, const NormIn& nin = NormIn{}) {
@@ -699,9 +708,18 @@ void launch16(const __nv_bfloat16* x, int M, const uint8_t* W, const uint8_t* S,
     if (smem > attr) {
       CUDA_CHECK(cudaFuncSetAttribute(gemv16_kernel<FMT, MT, CC, NORM, RB>(), cudaFuncAttributeMaxDynamicSharedMemorySize,
                                       (int)smem));
+      if constexpr (kPre16<FMT, MT, CC, NORM, RB>)
+        CUDA_CHECK(cudaFuncSetAttribute(gemv16_kernel<FMT, MT, CC, NORM, RB, true>(),
+                                        cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
       attr = smem;
     }
   }
+  if constexpr (kPre16<FMT, MT, CC, NORM, RB>)
+    if (pre2_mask() & 2) {
+      launch_pdl(gemv16_kernel<FMT, MT, CC, NORM, RB, true>(), dim3(N / rows_cta), dim3(32 * cfg.wn * cfg.wk), smem, st,
+                 cfg.pdl, x, M, W, S, N, K, group_rows, yf, yb, q, qs, cfg.wn, cfg.wk, nin);
+      return;
+    }
   launch_pdl(gemv16_kernel<FMT, MT, CC, NORM, RB>(), dim3(N / rows_cta), dim3(32 * cfg.wn * cfg.wk), smem, st, cfg.pdl, x,
              M, W, S, N, K, group_rows, yf, yb, q, qs, cfg.wn, cfg.wk, nin);
 }

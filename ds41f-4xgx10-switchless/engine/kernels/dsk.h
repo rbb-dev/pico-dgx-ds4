@@ -56,6 +56,15 @@ inline int carveout_pref() {
 // GemvCfg says: their rings load while the collective runs. One row by default (the decode loop at
 // k = 1, 1k: 18.58 -> 18.32 ms; spec steps of 2-6 rows unchanged; with more rows the normed input
 // takes the rings' shared memory). DSK_PERSIST=<rows> sets another bound, 0 turns it off.
+// The classic GEMVs request their first weight batch before waiting on the previous kernel (PDL). Up to 8 rows
+// (kLowRows), the normed GEMVs that follow a collective (wq_a + wkv in FP8, the router gate in bf16) also request
+// their second batch before the wait, in kernels of their own (kPre in gemv_fp8.cu, gemv16.cu). Only the issue
+// time of the loads changes. DSK_PRE2=<mask> selects them: 1 the FP8 GEMVs, 2 the gate; default 3, 0 none.
+inline int pre2_mask() {
+  static const int m = getenv("DSK_PRE2") ? atoi(getenv("DSK_PRE2")) : 3;
+  return m;
+}
+
 inline int persist_rows() {
   static const int r = getenv("DSK_PERSIST") ? atoi(getenv("DSK_PERSIST")) : 1;
   return r;
@@ -299,8 +308,14 @@ struct PrefillTuning {
   int tord = -1;  // tile order: k > 0 one tile of the most-picked experts, then k of the fewest (0: descending; -1: the default)
   int upf = -1;  // up: weights prefetched into L2 this many chunks of 256 k ahead (0: none; -1: the default)
   int dgrp = -1, dring = 3;  // down: column blocks per CTA (0: one, k_moe_down_p; -1: the default), weight steps in flight (3 or 9)
+  int upk = -1;  // up: 0 k_moe_up_p; 1.. k_moe_up_ws's shapes (up_ws_shape); -1 the default (shape 1)
+  int dwk = -1;  // down (separate combine, one column block a CTA): 0 k_moe_down_p; 1.. k_moe_down_ws's shapes (down_ws_shape); -1 the default (shape 1 for chunks of kDownWsRows rows or more, see DSGB10_PF_DWS)
 };
 void prefill_tuning(const PrefillTuning& t);
+// k_moe_up_ws's shape v (PrefillTuning::upk): consumer warps, 64-k steps a stage, stages; false past the last.
+bool up_ws_shape(int v, int* C, int* KU, int* S);
+// k_moe_down_ws's shape v (PrefillTuning::dwk): consumer warps, 64-k steps a stage, stages; false past the last.
+bool down_ws_shape(int v, int* C, int* KU, int* S);
 struct MoePCfg {
   int phases = 31;               // 1 bucketing, 2 shared expert, 4 routed up, 8 routed down, 16 combine
   cudaStream_t side = nullptr;   // if set, the shared expert's GEMMs run there, beside the routed experts

@@ -803,16 +803,18 @@ static void bench_prefill() {
       for (int c = 0; c < gate_copies; ++c) dsk::gemm_bf16_p(xb, M, gateW[c], 96, kD, yf, st);
     });
     const double moe_flops = 2.0 * M * 6 * (3.0 * kI * kD) + 2.0 * M * 3.0 * kI * kD;
-    for (int sk = 0; sk < 6; ++sk) {
+    const int dwk = getenv("PF_DWK") ? atoi(getenv("PF_DWK")) : 1;  // the down kernel's producer/consumer shape of the last lines
+    for (int sk = 0; sk < 7; ++sk) {
       const char* nm[] = {"moe, uniform routing", "moe, skewed routing", "moe, uniform, shared beside",
                           M > 2560 ? "moe, uniform, fused comb." : "moe, uniform, comb. apart",
-                          "moe, uniform, no L2 hints", "moe, uniform, L2 all normal"};
+                          "moe, uniform, no L2 hints", "moe, uniform, L2 all normal", "moe, uniform, down ws"};
       names.push_back(nm[sk]), flops.push_back(moe_flops), reps.push_back(1);
       fns.push_back([&, M, sk](cudaStream_t st) {
         dsk::MoePCfg cfg;
         if (sk == 2) cfg.side = side;
         dsk::PrefillTuning t = base;
-        t.down = sk == 3 ? (M > 2560 ? 2 : 1) : 0;
+        t.down = sk == 3 ? (M > 2560 ? 2 : 1) : sk == 6 ? 1 : 0;
+        if (sk == 6) t.dwk = dwk;
         t.l2 = sk == 4 ? 0 : sk == 5 ? 8 : base.l2;
         dsk::prefill_tuning(t);
         dsk::moe_prefill(xq, xs, M, sk == 1 ? idx_s : idx_u, wts, E, mw, ws, yf, st, cfg);
@@ -820,15 +822,21 @@ static void bench_prefill() {
       });
     }
     const char* phase_names[] = {"  bucketing", "  shared expert", "  routed up", "  routed down (+combine)",
-                                 "  combine"};
-    for (int ph = 0; ph < 5; ++ph) {
+                                 "  combine", "  routed down, ws (apart)"};
+    for (int ph = 0; ph < 6; ++ph) {
       names.push_back(phase_names[ph]);
-      flops.push_back(ph == 1 ? 2.0 * M * 3.0 * kI * kD : ph == 2 ? 2.0 * M * 6 * 2.0 * kI * kD : ph == 3 ? 2.0 * M * 6 * kI * kD : 0);
+      flops.push_back(ph == 1 ? 2.0 * M * 3.0 * kI * kD : ph == 2 ? 2.0 * M * 6 * 2.0 * kI * kD : ph == 3 || ph == 5 ? 2.0 * M * 6 * kI * kD : 0);
       reps.push_back(1);
       fns.push_back([&, M, ph](cudaStream_t st) {
         dsk::MoePCfg cfg;
-        cfg.phases = 1 << ph;
+        cfg.phases = ph == 5 ? 8 : 1 << ph;
+        if (ph == 5) {
+          dsk::PrefillTuning t = base;
+          t.down = 1, t.dwk = dwk;
+          dsk::prefill_tuning(t);
+        }
         dsk::moe_prefill(xq, xs, M, idx_u, wts, E, mw, ws, yf, st, cfg);
+        if (ph == 5) dsk::prefill_tuning(base);
       });
     }
     // one layer's GEMMs for the chunk (indexer included, MoE with uniform routing)
@@ -1479,8 +1487,199 @@ static void bench_moe_wide() {
   }
 }
 
+// ---- upws / downws (bench_ws): the producer/consumer shapes of the up kernel (PF_UPK, default "1 2 3";
+// PrefillTuning::upk) or of the down kernel (PF_DWK, default "1 2 3"; PrefillTuning::dwk, with the separate combine)
+// against k_moe_up_p / k_moe_down_p (0) at each PF_M (default "64 200 2000 8192"). First the whole MoE's y is compared
+// bit for bit with the unchanged kernel's (uniform and skewed routes, scales raw and from their code); then the kernel
+// alone is timed interleaved over PF_ROUNDS (default 11), median and min. Exit status 1 when any output differs.
+// Random signs on random FP8 (mask 0x80) or packed e2m1 (0x88) bytes: dev_fill's values are all positive, which
+// drives every SwiGLU input into its clamp and leaves the outputs blind to the up kernel's arithmetic.
+__global__ void k_sign(uint8_t* p, size_t n, uint32_t seed, uint8_t mask) {
+  for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) {
+    uint32_t h = (uint32_t)i * 2654435761u ^ seed * 0x9E3779B9u;
+    h ^= h >> 15, h *= 0x2C1B3C6Du, h ^= h >> 12;
+    p[i] ^= (uint8_t)(h & mask);
+  }
+}
+
+static int bench_ws(bool down) {
+  std::vector<int> Ms = env_ints("PF_M"), vs = env_ints(down ? "PF_DWK" : "PF_UPK");
+  if (Ms.empty()) Ms = {64, 200, 2000, 8192};
+  if (vs.empty()) vs = {1, 2, 3};
+  vs.insert(vs.begin(), 0);
+  for (size_t k = 1; k < vs.size(); ++k) {
+    int C, KU, S;
+    if (!(down ? dsk::down_ws_shape(vs[k], &C, &KU, &S) : dsk::up_ws_shape(vs[k], &C, &KU, &S))) die("%s: no shape %d", down ? "downws" : "upws", vs[k]);
+  }
+  const int rounds = getenv("PF_ROUNDS") ? atoi(getenv("PF_ROUNDS")) : 11;
+  // PF_RED=1: every variant's y gets one element changed by one bit before the comparison, which must report DIFFERS
+  // for every variant at every M (the check that the comparison sees a single differing element at that size)
+  const bool red = getenv("PF_RED") && atoi(getenv("PF_RED"));
+  const int kD = 5120, kI = 576, E = 384, Mmax = *std::max_element(Ms.begin(), Ms.end());
+  const size_t w13 = (size_t)kI * kD / 2, s13 = (size_t)kI * kD / 32, w2b = (size_t)kD * kI / 2, s2b = (size_t)kD * kI / 32;
+  dsk::MoeWeights mw{};
+  // Inputs whose outputs move with every bit of the up kernel's arithmetic: signed weights and activations,
+  // activation scales 2^-8 .. 2^-5 (act_quant's range for O(1) rows), so the SwiGLU inputs stay inside its clamp;
+  // the shared expert zero, so y is the routed experts' sum alone. y's spread is printed: a saturated or NaN y
+  // would compare equal whatever the kernel did.
+  mw.w1 = dev_fill(E * w13, 1), mw.w3 = dev_fill(E * w13, 3), mw.w2 = dev_fill(E * w2b, 5);
+  k_sign<<<512, 256>>>((uint8_t*)mw.w1, E * w13, 31, 0x88);
+  k_sign<<<512, 256>>>((uint8_t*)mw.w3, E * w13, 33, 0x88);
+  k_sign<<<512, 256>>>((uint8_t*)mw.w2, E * w2b, 35, 0x88);
+  {
+    uint8_t* z[3];
+    const size_t zn[3] = {(size_t)kI * kD, (size_t)kI * kD, (size_t)kD * kI};
+    for (int i = 0; i < 3; ++i) {
+      CUDA_CHECK(cudaMalloc(&z[i], zn[i]));
+      CUDA_CHECK(cudaMemset(z[i], 0, zn[i]));
+    }
+    mw.sh_w1 = z[0], mw.sh_w3 = z[1], mw.sh_w2 = z[2];
+  }
+  mw.sh_s1 = dev_fill((size_t)kI / 32 * (kD / 32), 8, 120, 2), mw.sh_s3 = dev_fill((size_t)kI / 32 * (kD / 32), 10, 120, 2);
+  mw.sh_s2 = dev_fill((size_t)kD / 32 * (kI / 32), 12, 120, 2);
+  std::vector<uint8_t> hsc[3] = {std::vector<uint8_t>(E * s13), std::vector<uint8_t>(E * s13), std::vector<uint8_t>(E * s2b)};
+  uint8_t* ds[3];
+  for (int i = 0; i < 3; ++i) {
+    synth_scales(hsc[i], E, 21 + i);
+    CUDA_CHECK(cudaMalloc(&ds[i], hsc[i].size()));
+    CUDA_CHECK(cudaMemcpy(ds[i], hsc[i].data(), hsc[i].size(), cudaMemcpyHostToDevice));
+  }
+  mw.s1 = ds[0], mw.s3 = ds[1], mw.s2 = ds[2];
+  dsk::MoeWeights mwc = mw;  // the same scales read from their code
+  {
+    const size_t nc13 = dsk::scale_code_words(E, kI, kD / 32), nc2 = dsk::scale_code_words(E, kD, kI / 32);
+    uint32_t* dc;
+    CUDA_CHECK(cudaMalloc(&dc, (2 * nc13 + nc2) * 4));
+    int b[3];
+    const double f1 = dsk::scale_code(mw.s1, E, kI, kD / 32, dc, &b[0], 0);
+    const double f3 = dsk::scale_code(mw.s3, E, kI, kD / 32, dc + nc13, &b[1], 0);
+    const double f2 = dsk::scale_code(mw.s2, E, kD, kI / 32, dc + 2 * nc13, &b[2], 0);
+    mwc.c1 = {dc, (uint32_t)b[0] * 0x01010101u};
+    mwc.c3 = {dc + nc13, (uint32_t)b[1] * 0x01010101u};
+    mwc.c2 = {dc + 2 * nc13, (uint32_t)b[2] * 0x01010101u};
+    std::vector<uint32_t> hc(nc13);
+    std::vector<int> raw;
+    CUDA_CHECK(cudaMemcpy(hc.data(), dc, nc13 * 4, cudaMemcpyDeviceToHost));
+    const size_t bad = check_code(hsc[0], hc, E, kI, kD / 32, b[0], raw);
+    printf("%s: scales coded w1 %.2f %%, w3 %.2f %%, w2 %.2f %%; w1's code decodes %s\n", down ? "downws" : "upws", 100 * f1, 100 * f3, 100 * f2,
+           bad ? "WRONG" : "exact");
+    if (bad) return 1;
+  }
+  uint8_t* xq = dev_fill((size_t)Mmax * kD, 13);
+  k_sign<<<512, 256>>>(xq, (size_t)Mmax * kD, 37, 0x80);
+  uint8_t* xs = dev_fill((size_t)Mmax * kD / 32, 14, 119, 4);
+  int *idx_u, *idx_s;
+  float *wts, *yf;
+  CUDA_CHECK(cudaMalloc(&idx_u, (size_t)Mmax * 24));
+  CUDA_CHECK(cudaMalloc(&idx_s, (size_t)Mmax * 24));
+  CUDA_CHECK(cudaMalloc(&wts, (size_t)Mmax * 24));
+  CUDA_CHECK(cudaMalloc(&yf, (size_t)Mmax * kD * 4));
+  {
+    auto hu = make_routing(Mmax, E, false, 1), hsk = make_routing(Mmax, E, true, 2);
+    std::vector<float> hw((size_t)Mmax * 6);
+    // routing weights from a thousand values: with seventeen, the outputs of a 16,384-row chunk repeat so often that the
+    // spread check below cannot tell a kernel's arithmetic from its neighbour's
+    for (size_t i = 0; i < hw.size(); ++i) hw[i] = 0.05f + 0.0007f * (float)(((uint32_t)i * 2654435761u >> 7) % 1031);
+    CUDA_CHECK(cudaMemcpy(idx_u, hu.data(), hu.size() * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(idx_s, hsk.data(), hsk.size() * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(wts, hw.data(), hw.size() * 4, cudaMemcpyHostToDevice));
+  }
+  void* ws;
+  CUDA_CHECK(cudaMalloc(&ws, dsk::moe_prefill_workspace_bytes(Mmax, E)));
+  cudaStream_t st;
+  CUDA_CHECK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
+  dsk::PrefillTuning tune;
+  tune.down = 1;  // the separate combine: the down kernel is k_moe_down_p (v 0) or k_moe_down_ws
+  auto use = [&](int v) {
+    (down ? tune.dwk : tune.upk) = v;
+    dsk::prefill_tuning(tune);
+  };
+  auto shape = [&](int v) {
+    char b[48];
+    int C, KU, S;
+    if (v == 0 || !(down ? dsk::down_ws_shape(v, &C, &KU, &S) : dsk::up_ws_shape(v, &C, &KU, &S)))
+      snprintf(b, sizeof b, down ? "k_moe_down_p" : "k_moe_up_p");
+    else
+      snprintf(b, sizeof b, "ws C%d KU%d S%d", C, KU, S);
+    return std::string(b);
+  };
+  int fails = 0;
+  for (const int M : Ms) {
+    const size_t ny = (size_t)M * kD;
+    std::vector<float> ref(ny), y(ny);
+    printf("\nM=%d: the whole MoE's y against %s's, bit for bit\n", M, down ? "k_moe_down_p" : "k_moe_up_p");
+    for (int sk = 0; sk < 2; ++sk)
+      for (int cd = 0; cd < 2; ++cd) {
+        printf("  %-8s %-5s:", sk ? "skewed" : "uniform", cd ? "code" : "raw");
+        for (size_t k = 0; k < vs.size(); ++k) {
+          use(vs[k]);
+          CUDA_CHECK(cudaMemsetAsync(yf, 0xFF, ny * 4, st));
+          dsk::moe_prefill(xq, xs, M, sk ? idx_s : idx_u, wts, E, cd ? mwc : mw, ws, yf, st);
+          CUDA_CHECK(cudaStreamSynchronize(st));
+          CUDA_CHECK(cudaMemcpy(k ? y.data() : ref.data(), yf, ny * 4, cudaMemcpyDeviceToHost));
+          if (!k) {  // the reference's spread: the test sees the kernel only if y varies and is finite
+            size_t bad = 0, zero = 0;
+            double amax = 0;
+            std::vector<float> s;
+            for (size_t i = 0; i < ny; ++i) {
+              const float v = ref[i];
+              if (!std::isfinite(v)) ++bad;
+              else if (v == 0.f) ++zero;
+              else amax = std::max(amax, (double)fabsf(v));
+              if (i % 997 == 0) s.push_back(v);
+            }
+            std::sort(s.begin(), s.end());
+            const size_t distinct = std::unique(s.begin(), s.end()) - s.begin();
+            printf(" [y: %zu not finite, %zu zero, max |y| %.3g, %zu distinct of %zu sampled]", bad, zero, amax, distinct,
+                   s.size());
+            if (bad || distinct * 2 < s.size()) printf(" BLIND"), ++fails;
+            continue;
+          }
+          if (red) {
+            uint32_t bits;
+            memcpy(&bits, &y[ny / 2 + (size_t)k * 7], 4);
+            bits ^= 1u;
+            memcpy(&y[ny / 2 + (size_t)k * 7], &bits, 4);
+          }
+          size_t diff = 0;
+          for (size_t i = 0; i < ny; ++i) diff += memcmp(&y[i], &ref[i], 4) != 0;
+          printf("  %d %s", vs[k], diff ? "DIFFERS" : "same");
+          if (diff) printf(" (%zu of %zu)", diff, ny), ++fails;
+        }
+        printf("\n");
+      }
+    use(0);
+    dsk::MoePCfg b1;
+    b1.phases = down ? 5 : 1;  // bucketing (and the up kernel's h rows, for the down kernel) once: the kernels below read them
+    dsk::moe_prefill(xq, xs, M, idx_u, wts, E, mwc, ws, yf, st, b1);
+    CUDA_CHECK(cudaStreamSynchronize(st));
+    std::vector<std::function<void(cudaStream_t)>> fns;
+    for (int v : vs)
+      fns.push_back([&, M, v](cudaStream_t s) {
+        use(v);
+        dsk::MoePCfg c4;
+        c4.phases = down ? 8 : 4;
+        dsk::moe_prefill(xq, xs, M, idx_u, wts, E, mwc, ws, yf, s, c4);
+        use(0);
+      });
+    const auto ts = time_interleaved(fns, rounds);
+    const double fl = 2.0 * M * 6 * (down ? 1.0 : 2.0) * kI * kD, t0 = ts[0][ts[0].size() / 2];
+    printf("M=%d: the %s kernel alone (code, uniform), median of %d interleaved rounds\n", M, down ? "down" : "up", rounds);
+    printf("  %3s %-18s %10s %10s %8s %8s\n", "v", "kernel", "us", "(min)", "TFLOPS", "vs 0");
+    for (size_t k = 0; k < vs.size(); ++k) {
+      const double us = ts[k][ts[k].size() / 2];
+      printf("  %3d %-18s %10.1f %10.1f %8.1f %+7.1f%%\n", vs[k], shape(vs[k]).c_str(), us, ts[k][0], fl / us / 1e6,
+             100 * (us / t0 - 1));
+    }
+  }
+  printf("\n%s: %s\n", down ? "downws" : "upws", fails ? "OUTPUTS DIFFER" : down ? "every output bit-identical to k_moe_down_p's" : "every output bit-identical to k_moe_up_p's");
+  return fails ? 1 : 0;
+}
+
 int main(int argc, char** argv) {
   std::string filter = argc > 1 ? argv[1] : "";
+  if (filter == "upws") return bench_ws(false);  // PF_UPK="1 2 3", PF_M, PF_ROUNDS
+  if (filter == "downws") return bench_ws(true);  // PF_DWK="1 2 3", PF_M, PF_ROUNDS
   bool sweep = getenv("SWEEP") != nullptr;
   const Shape fp8_shapes[] = {
       {"wq_a", 320, 5120}, {"wkv", 128, 5120},   {"wq_b", 8192, 1280}, {"wo_b", 5120, 2048},

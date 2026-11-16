@@ -29,7 +29,8 @@ struct Segs {
 // RB: the rows it is built for, 8 (k_gemv_fp8) or 16 (k_gemv_fp8_r16: rows 8..15 in the MMAs' upper
 // half, lane group g has rows g and g + 8, the odd lanes give row g + 8's scales; the same weight loads
 // and MMAs, the activations of half a batch of steps at a time).
-template <int MT, bool TILED, bool NORM, int RB>
+// PRE (pre2_mask(), dsk.h): the second weight batch is requested before the wait too.
+template <int MT, bool TILED, bool NORM, int RB, bool PRE = false>
 __device__ __forceinline__ void gemv_fp8_body(const uint8_t* __restrict__ xq, const uint8_t* __restrict__ xs, int M,
                                               const Segs& segs, int K, int wn, int wk, NormIn nin) {
   extern __shared__ float red[];  // [wk][RB][rows_cta] (>= 256 + RB); NORM: then q [M][K + 32], s [M][K/32]
@@ -172,6 +173,8 @@ __device__ __forceinline__ void gemv_fp8_body(const uint8_t* __restrict__ xq, co
     else comp8(b, p);
   };
   load_w(ba, p0);
+  const bool pre2 = PRE && p0 + kU < p1;
+  if (pre2) load_w(bb, p0 + kU);
   pdl_launch_dependents();
   pdl_wait();
   if constexpr (NORM) {
@@ -181,7 +184,7 @@ __device__ __forceinline__ void gemv_fp8_body(const uint8_t* __restrict__ xq, co
     __syncthreads();
   }
   for (int p = p0; p < p1; p += 2 * kU) {
-    if (p + kU < p1) load_w(bb, p + kU);
+    if (p + kU < p1 && !(pre2 && p == p0)) load_w(bb, p + kU);
     comp(ba, p);
     if (p + kU >= p1) break;
     if (p + 2 * kU < p1) load_w(ba, p + 2 * kU);
@@ -210,10 +213,10 @@ __device__ __forceinline__ void gemv_fp8_body(const uint8_t* __restrict__ xq, co
   }
 }
 
-template <int MT, bool TILED, bool NORM>
+template <int MT, bool TILED, bool NORM, bool PRE = false>
 __global__ void __launch_bounds__(512) k_gemv_fp8(const uint8_t* __restrict__ xq, const uint8_t* __restrict__ xs,
                                                    int M, Segs segs, int K, int wn, int wk, NormIn nin) {
-  gemv_fp8_body<MT, TILED, NORM, kLowRows>(xq, xs, M, segs, K, wn, wk, nin);
+  gemv_fp8_body<MT, TILED, NORM, kLowRows, PRE>(xq, xs, M, segs, K, wn, wk, nin);
 }
 
 // 9..16 rows, one tile per warp. (512, 1): up to 128 registers.
@@ -223,9 +226,10 @@ __global__ void __launch_bounds__(512, 1) k_gemv_fp8_r16(const uint8_t* __restri
   gemv_fp8_body<1, TILED, NORM, kMaxRows>(xq, xs, M, segs, K, wn, wk, nin);
 }
 
-template <int MT, bool TILED, bool NORM, int RB>
+template <int MT, bool TILED, bool NORM, int RB, bool PRE = false>
 constexpr auto gemv_fp8_kernel() {
-  if constexpr (RB == kLowRows) return k_gemv_fp8<MT, TILED, NORM>;
+  static_assert(!PRE || RB == kLowRows, "the second batch before the wait: up to 8 rows");
+  if constexpr (RB == kLowRows) return k_gemv_fp8<MT, TILED, NORM, PRE>;
   else return k_gemv_fp8_r16<TILED, NORM>;
 }
 
@@ -423,13 +427,25 @@ void launch_fp8(const uint8_t* xq, const uint8_t* xs, int M, const Segs& segs, i
   size_t smem = (size_t)std::max(cfg.wk * RB * rows_cta, 256 + RB) * sizeof(float);
   if (NORM) smem += (size_t)M * (K + 32) + (size_t)M * (K / 32);
   if (smem > 96 * 1024) die("gemv_fp8: M=%d K=%d wk=%d needs %zu bytes of shared memory", M, K, cfg.wk, smem);
+  // kPre: the normed GEMVs with one tile per warp, up to 8 rows (MT == 1, NORM, RB == kLowRows).
+  constexpr bool kPre = MT == 1 && NORM && RB == kLowRows;
+  const bool pre = kPre && (pre2_mask() & 1);
   static bool attr = false;
   if (NORM && !attr) {
     CUDA_CHECK(cudaFuncSetAttribute(gemv_fp8_kernel<MT, TILED, NORM, RB>(), cudaFuncAttributeMaxDynamicSharedMemorySize,
                                     96 * 1024));
+    if constexpr (kPre)
+      CUDA_CHECK(cudaFuncSetAttribute(gemv_fp8_kernel<MT, TILED, NORM, RB, true>(),
+                                      cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024));
     attr = true;
   }
   dim3 grid(segs.row0[segs.n] / rows_cta), block(32 * cfg.wn * cfg.wk);
+  if constexpr (kPre)
+    if (pre) {
+      launch_pdl(gemv_fp8_kernel<MT, TILED, NORM, RB, true>(), grid, block, smem, st, cfg.pdl, xq, xs, M, segs, K, cfg.wn,
+                 cfg.wk, nin);
+      return;
+    }
   launch_pdl(gemv_fp8_kernel<MT, TILED, NORM, RB>(), grid, block, smem, st, cfg.pdl, xq, xs, M, segs, K, cfg.wn, cfg.wk,
              nin);
 }

@@ -89,9 +89,11 @@ ops::StepSamp samp_of(const Sampling& s) { return ops::StepSamp{s.seed, s.temper
 // The step's input (as ops::step_in), a verify step's rows, tokens and positions from the spec state;
 // then the switch's value, the row count - 1.
 // stack4: cert_bodies > 0: the certified bodies follow the plain ones; a step takes them when every row's session is
-// greedy and asks no top logprobs (the sampler then needs the argmax alone).
+// greedy and asks no top logprobs (the sampler then needs the argmax alone); with cert_samp also when it samples with
+// the temperature alone, up to 1 (no top-k or top-p: the sampler needs the Gumbel-max winner alone; above 1 the scores
+// flatten and more of the head survives the bound).
 __global__ void k_spec_in(const ops::StepIn* ring, uint32_t* counter, const ops::SpecState* ss, ops::StepIn* d,
-                          cudaGraphConditionalHandle h, int cert_bodies) {
+                          cudaGraphConditionalHandle h, int cert_bodies, int cert_samp) {
   constexpr int n = sizeof(ops::StepIn) / 4;
   static_assert(sizeof(ops::StepIn) % 4 == 0, "StepIn");
   const uint32_t slot = *counter % ops::kInSlots;
@@ -113,7 +115,8 @@ __global__ void k_spec_in(const ops::StepIn* ring, uint32_t* counter, const ops:
       bool ok = d->rows >= 1 && d->rows <= cert_bodies;
       for (int r = 0; ok && r < d->rows; ++r) {
         const ops::StepSamp& sp = d->samp[min(max(d->sess[r], 0), ops::kMaxSess - 1)];
-        ok = !(sp.temperature > 0.f) && sp.n_top <= 0;
+        ok = sp.n_top <= 0 && (!(sp.temperature > 0.f) ||
+                               (cert_samp && sp.temperature <= 1.f && !(sp.top_k > 0) && !(sp.top_p < 1.f)));
       }
       if (ok) cv = cert_bodies;
     }
@@ -791,7 +794,7 @@ cudaGraphExec_t Model::Impl::spec_graph(int ctx) {
   // the step's rows, and the switch's value
   CUDA_CHECK(cudaStreamBeginCaptureToGraph(st, g, nullptr, nullptr, 0, mode));
   const int cert_bodies = cert.on && head_coded ? kMaxSessRows : 0;  // stack4
-  k_spec_in<<<1, 128, 0, st>>>(in_h, in_ctr, sp.ss, in_d, h, cert_bodies);
+  k_spec_in<<<1, 128, 0, st>>>(in_h, in_ctr, sp.ss, in_d, h, cert_bodies, cert.samp ? 1 : 0);
   CUDA_CHECK(cudaGetLastError());
   cudaStreamCaptureStatus cs;
   const cudaGraphNode_t* deps = nullptr;

@@ -47,6 +47,17 @@ __device__ __forceinline__ uint32_t e2m1x4_expand(uint32_t v16) {
   return ((p << 2) & 0x003C003Cu) | ((p >> 2) & 0x3C003C00u);
 }
 
+// The same expansion of the low (lo) or high (hi) 16 bits of a 32-bit word: the byte permute reads only the bytes it names,
+// so that no mask and no shift of the word is needed first.
+__device__ __forceinline__ uint32_t e2m1x4_lo(uint32_t w) {
+  const uint32_t p = __byte_perm(w, 0, 0x1100);
+  return ((p << 2) & 0x003C003Cu) | ((p >> 2) & 0x3C003C00u);
+}
+__device__ __forceinline__ uint32_t e2m1x4_hi(uint32_t w) {
+  const uint32_t p = __byte_perm(w, 0, 0x3322);
+  return ((p << 2) & 0x003C003Cu) | ((p >> 2) & 0x3C003C00u);
+}
+
 // ue8m0 byte -> 2^(e-127) as fp32 (e >= 1).
 __device__ __forceinline__ float ue8m0_to_f32(uint32_t e) { return __uint_as_float(e << 23); }
 

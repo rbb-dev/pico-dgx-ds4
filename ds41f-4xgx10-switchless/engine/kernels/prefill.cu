@@ -12,11 +12,14 @@
 //    in fp32 and adds the shared expert (dense FP8 GEMMs) last, as the reference does. The routed
 //    scales from their 1-bit code when the weights carry it (dsk.h, ScaleCode), as in the decode.
 #include <algorithm>
+#include <type_traits>
 
 #include "comm/ring_dev.cuh"
 #include "common/check.h"
 #include "kernels/common.cuh"
 #include "kernels/dsk.h"
+
+#include <climits>
 
 namespace dsk {
 
@@ -905,7 +908,7 @@ __global__ void __launch_bounds__(128) k_moe_up_p(MoePArgs a) {
 #pragma unroll
           for (int h = 0; h < 2; ++h) {
             const uint32_t word = (&w[u][mat].x)[2 * h + blk];
-            const uint32_t b0 = e2m1x4_expand(word & 0xFFFFu), b1 = e2m1x4_expand(word >> 16);
+            const uint32_t b0 = e2m1x4_lo(word), b1 = e2m1x4_hi(word);
             const uint32_t sfb = (sw[u][mat] >> (8 * (2 * h + blk))) & 0xFFu;
 #pragma unroll
             for (int mi = 0; mi < 4; ++mi)
@@ -961,6 +964,260 @@ __global__ void __launch_bounds__(128) k_moe_up_p(MoePArgs a) {
     const uint32_t ex = act_scale_byte(warp_max(fabsf(v)));
     a.hq[(size_t)(base + r) * kInterP + q * 64 + 32 * jb + lane] = (uint8_t)quant_e4m3(v, ex);
     if (lane == 0) a.hs[(size_t)(base + r) * kKB2P + q * 2 + jb] = (uint8_t)ex;
+  }
+}
+
+// ---- The up kernel, producer/consumer (k_moe_up_ws).
+// mbarriers in shared memory, CTA scope: a stage's 'full' completes when the producer's copies into it have
+// landed, its 'empty' when every consumer warp has finished reading it.
+__device__ __forceinline__ void mbar_init(uint32_t bar, uint32_t count) {
+  asm volatile("mbarrier.init.shared.b64 [%0], %1;" ::"r"(bar), "r"(count) : "memory");
+}
+__device__ __forceinline__ void mbar_arrive(uint32_t bar) {
+  asm volatile("{\n .reg .b64 st;\n mbarrier.arrive.shared.b64 st, [%0];\n}" ::"r"(bar) : "memory");
+}
+// One arrive on bar once every cp.async this thread issued before has landed (the barrier's count includes it).
+__device__ __forceinline__ void mbar_arrive_cp_async(uint32_t bar) {
+  asm volatile("cp.async.mbarrier.arrive.noinc.shared.b64 [%0];" ::"r"(bar) : "memory");
+}
+// try_wait sleeps in the barrier until the phase completes; the suspend-time hint bounds a sleep at 10 ms (0x989680 ns).
+// A spinning loop would take issue slots from the computing warps.
+__device__ __forceinline__ void mbar_wait(uint32_t bar, uint32_t parity) {
+  uint32_t done;
+  do {
+    asm volatile(
+        "{\n .reg .pred p;\n mbarrier.try_wait.parity.shared.b64 p, [%1], %2, %3;\n selp.u32 %0, 1, 0, p;\n}"
+        : "=r"(done)
+        : "r"(bar), "r"(parity), "r"(0x989680u)
+        : "memory");
+  } while (!done);
+}
+// mma_e4m3_e2m1 with whole scale words: the byte selectors (PTX {byte-id, thread-id}) pick each operand's scale
+// byte, so that no shift and mask builds it before the MMA (the same byte reaches the same MMA: the same result).
+__device__ __forceinline__ void mma_e4m3_e2m1_sel(float d[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+                                                  uint32_t b0, uint32_t b1, uint32_t sfa, uint16_t ba, uint32_t sfb,
+                                                  uint16_t bb) {
+  asm("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e2m1.f32.ue8m0 "
+      "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3},{%10},{%11,%12},{%13},{%14,%15};\n"
+      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(sfa), "h"(ba), "h"((uint16_t)0), "r"(sfb), "h"(bb),
+        "h"((uint16_t)0));
+}
+// N (4, 8 or 16) bytes global -> shared, zero-filled when !pred, with the L2 policy when H.
+template <bool H, int N>
+__device__ __forceinline__ void cp_async_n(uint32_t dst, const void* src, bool pred, uint64_t pol) {
+  static_assert(N == 4 || N == 8 || N == 16, "cp.async moves 4, 8 or 16 bytes");
+  if constexpr (H)
+    asm volatile("cp.async.ca.shared.global.L2::cache_hint [%0], [%1], %2, %3, %4;\n" ::"r"(dst), "l"(src), "n"(N),
+                 "r"(pred ? N : 0), "l"(pol)
+                 : "memory");
+  else
+    asm volatile("cp.async.ca.shared.global [%0], [%1], %2, %3;\n" ::"r"(dst), "l"(src), "n"(N), "r"(pred ? N : 0)
+                 : "memory");
+}
+
+// The shared memory of k_moe_up_ws<C, KU, S>: a ring of S stages, each [activations 64 x KC (k_moe_up_p's
+// swizzle) | their scales 64 x KC/32 | weights: per consumer warp, matrix (w1, w3) and 64-k step, 512 bytes,
+// each lane's 16 at lane * 16 | scale words: likewise 32 bytes, the 8 words of g, or (coded) the code word
+// first]; then the barriers (full[S], empty[S]), the tile's token ids and routing weights, the code's raw flags.
+// After the k loop the epilogue's bf16 rows sit over the ring.
+template <int C, int KU, int S>
+struct UpWs {
+  static constexpr int KC = 64 * KU, NCH = kDimP / KC, NT = 32 * (C + 1);
+  static constexpr int kA = kTileRows * KC, kSA = kTileRows * (KC / 32), kW = C * 2 * KU * 512, kWS = C * 2 * KU * 32;
+  static constexpr int kStage = kA + kSA + kW + kWS;
+  static constexpr int kHS = 16 * C + 8;  // the epilogue's row stride, bf16
+  static constexpr int kH = kTileRows * kHS * 2;
+  static constexpr int kRing = S * kStage > kH ? S * kStage : kH;
+  static constexpr int kSmem = kRing + 2 * S * 8 + kTileRows * 8 + C * 8 * 4;
+  static constexpr int kMinBlocks = 2 * kSmem <= 99 * 1024 ? 2 : 1;
+};
+
+// Up kernel, producer/consumer: C consumer warps and one producer warp (the last). Consumer warp w computes the n16
+// group q * C + w of w1 and w3 against one 64-row tile of an expert; the producer copies each KC-wide chunk
+// (activations, scales, weights, or the scale code) global -> shared with cp.async into a ring of S stages, counted on
+// the stage's 'full' barrier; consumers release a stage on 'empty'. No block-wide barrier in the k loop.
+template <int C, int KU, int S, bool H, bool CS>
+__global__ void __launch_bounds__(32 * (C + 1), UpWs<C, KU, S>::kMinBlocks) k_moe_up_ws(MoePArgs a) {
+  using L = UpWs<C, KU, S>;
+  constexpr int KC = L::KC, NCH = L::NCH;
+  static_assert(KU >= 2, "the activations' swizzle needs 4 units of 32 bytes a row");
+  static_assert(32 % KU == 0, "a chunk's flags in one word");
+  static_assert(36 % C == 0 && C % 2 == 0, "C n16 groups a CTA: whole tiles of the 576 columns, whole 32-column blocks");
+  extern __shared__ __align__(16) uint8_t smem[];
+  uint64_t* bars = reinterpret_cast<uint64_t*>(smem + L::kRing);
+  int* stok = reinterpret_cast<int*>(bars + 2 * S);
+  float* srw = reinterpret_cast<float*>(stok + kTileRows);
+  uint32_t* sfl = reinterpret_cast<uint32_t*>(srw + kTileRows);  // CS: [warp][3 mat + j], steps 32j .. 32j + 31
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
+  pdl_launch_dependents();
+  pdl_wait();
+  const int4 te = a.tiles[blockIdx.y];  // (read beside the count: entries past it are stale, never used)
+  if ((int)blockIdx.y >= *a.ntiles) return;
+  const int e = te.x, base = te.y, rows = te.z, q = blockIdx.x;
+  const int mt = (rows + 15) / 16;  // m16 tiles with rows
+  const uint64_t pol_w = l2_policy((a.l2 & 1) && te.w <= kTileRows), pol_x = l2_policy(a.l2 & 4 ? 2 : 0);
+  if (tid < kTileRows) {
+    stok[tid] = tid < rows ? a.perm_tok[base + tid] : 0;
+    srw[tid] = tid < rows ? a.perm_w[base + tid] : 0.f;
+  }
+  if constexpr (CS)
+    for (int i = tid; i < C * 6; i += L::NT) {
+      const int w = i / 6, k = i % 6;
+      sfl[w * 8 + k] = __ldg((k < 3 ? a.w.c1.code : a.w.c3.code) + ((uint32_t)e * kT13P + q * C + w) * kB13P + kP1P + k % 3);
+    }
+  const uint32_t s0 = smem_addr(smem), full0 = smem_addr(bars), empty0 = full0 + 8 * S;
+  if (tid == 0)
+    for (int s = 0; s < S; ++s) mbar_init(full0 + 8 * s, 32), mbar_init(empty0 + 8 * s, C);
+  __syncthreads();
+  // CS: steps p0 .. p0 + KU - 1's raw flags of consumer w's w1 (mat 0) or w3
+  auto chunk_flags = [&](int w, int p0, int mat) -> uint32_t {
+    return (sfl[w * 8 + 3 * mat + (p0 >> 5)] >> (p0 & 31)) & ((1u << KU) - 1u);
+  };
+
+  if (warp == C) {  // the producer
+    for (int c = 0; c < NCH; ++c) {
+      const int s = c % S;
+      if (c >= S) mbar_wait(empty0 + 8 * s, (uint32_t)(c / S - 1) & 1u);
+      const uint32_t sA = s0 + s * L::kStage, sSA = sA + L::kA, sW = sSA + L::kSA, sWS = sW + L::kW;
+#pragma unroll
+      for (int j = 0; j < kTileRows * (KC / 16) / 32; ++j) {
+        const int i = lane + 32 * j, r = i / (KC / 16), c16 = i % (KC / 16);
+        cp_async16<H>(sA + r * KC + 32 * ((c16 >> 1) ^ (r & 3)) + 16 * (c16 & 1),
+                      a.xq + (size_t)stok[r] * kDimP + c * KC + 16 * c16, r < rows, pol_x);
+      }
+#pragma unroll
+      for (int r = lane; r < kTileRows; r += 32)
+        cp_async_n<H, KC / 32>(sSA + r * (KC / 32), a.xs + (size_t)stok[r] * kKB1P + c * (KC / 32), r < rows, pol_x);
+#pragma unroll
+      for (int j = 0; j < C * 2 * KU; ++j) {  // j = (w * 2 + mat) * KU + u
+        const int w = j / (2 * KU), mat = j / KU % 2, u = j % KU;
+        const uint8_t* src = (mat ? a.w.w3 : a.w.w1) + (size_t)e * kW13P + ((size_t)(q * C + w) * kP1P + c * KU + u) * 512;
+        cp_async16<H>(sW + j * 512 + lane * 16, src + lane * 16, true, pol_w);
+      }
+      for (int i = lane; i < C * 2 * KU * 2; i += 32) {  // the scale words' 16-byte halves
+        const int j = i >> 1, half = i & 1, w = j / (2 * KU), mat = j / KU % 2, u = j % KU, nq = q * C + w, p = c * KU + u;
+        const uint8_t* raw = (mat ? a.w.s3 : a.w.s1) + (size_t)e * kS13P + ((size_t)nq * kP1P + p) * 32 + 16 * half;
+        if constexpr (CS) {
+          if (chunk_flags(w, c * KU, mat) >> u & 1u)
+            cp_async16<H>(sWS + j * 32 + 16 * half, raw, true, pol_w);
+          else if (!half)
+            cp_async_n<H, 4>(sWS + j * 32, (mat ? a.w.c3.code : a.w.c1.code) + ((uint32_t)e * kT13P + nq) * kB13P + p, true,
+                             pol_w);
+        } else {
+          cp_async16<H>(sWS + j * 32 + 16 * half, raw, true, pol_w);
+        }
+      }
+      mbar_arrive_cp_async(full0 + 8 * s);
+    }
+    return;
+  }
+
+  // the consumers
+  float acc[4][4][4];  // [m16 tile][w1 lo, w1 hi, w3 lo, w3 hi][c]
+#pragma unroll
+  for (int mi = 0; mi < 4; ++mi)
+#pragma unroll
+    for (int j = 0; j < 4; ++j) acc[mi][j][0] = acc[mi][j][1] = acc[mi][j][2] = acc[mi][j][3] = 0.f;
+  for (int c = 0; c < NCH; ++c) {
+    const int s = c % S, p0 = c * KU;
+    mbar_wait(full0 + 8 * s, (uint32_t)(c / S) & 1u);
+    const uint8_t* A = smem + s * L::kStage;
+    const uint8_t* SA = A + L::kA;
+    const uint4* W = reinterpret_cast<const uint4*>(SA + L::kSA) + warp * 2 * KU * 32;
+    const uint32_t* WS = reinterpret_cast<const uint32_t*>(SA + L::kSA + L::kW) + warp * 2 * KU * 8;
+    uint4 w[KU][2];
+    uint32_t sw[KU][2];  // the scale words (CS: rebuilt from the code)
+#pragma unroll
+    for (int u = 0; u < KU; ++u)
+#pragma unroll
+      for (int mat = 0; mat < 2; ++mat) {
+        w[u][mat] = W[(mat * KU + u) * 32 + lane];
+        if constexpr (CS) {
+          const bool raw = chunk_flags(warp, p0, mat) >> u & 1u;
+          const uint32_t s1 = WS[(mat * KU + u) * 8 + (raw ? g : 0)];
+          sw[u][mat] = raw ? s1 : ((s1 >> g) & 0x01010101u) + (mat ? a.w.c3.base4 : a.w.c1.base4);
+        } else {
+          sw[u][mat] = WS[(mat * KU + u) * 8 + g];
+        }
+      }
+    // The activations' scale words: this lane's row of each m16 tile, the chunk's 2 KU bytes (4 a word); the MMA
+    // takes a whole word and its byte selector picks the 32-k unit's byte (and the weights' word likewise).
+    uint32_t sfaw[4][(KU + 1) / 2];
+#pragma unroll
+    for (int mi = 0; mi < 4; ++mi)
+#pragma unroll
+      for (int j = 0; j < (KU + 1) / 2; ++j)
+        sfaw[mi][j] = reinterpret_cast<const uint32_t*>(SA + (mi * 16 + g + 8 * (lane & 1)) * (KC / 32))[j];
+    // The chunk's MMAs; FULL (all 4 m16 tiles have rows: most tiles of a long chunk) without a branch between
+    // them, so that the compiler can interleave the next unit's loads and unpacking with this one's MMAs.
+    auto chunk = [&](auto full) {
+      constexpr bool FULL = decltype(full)::value;
+#pragma unroll
+      for (int u = 0; u < KU; ++u)
+#pragma unroll
+        for (int blk = 0; blk < 2; ++blk) {
+          const int unit = 2 * u + blk;  // 32-k block within the chunk
+          uint32_t af[4][4];
+#pragma unroll
+          for (int mi = 0; mi < 4; ++mi) {
+            if (!FULL && mi >= mt) break;  // m16 tiles without rows are skipped (uniform per CTA)
+            const int r = mi * 16 + g;
+            const uint2 lo = *reinterpret_cast<const uint2*>(A + r * KC + 32 * (unit ^ (r & 3)) + 8 * t);
+            const uint2 hi = *reinterpret_cast<const uint2*>(A + (r + 8) * KC + 32 * (unit ^ (r & 3)) + 8 * t);
+            af[mi][0] = lo.x, af[mi][1] = hi.x, af[mi][2] = lo.y, af[mi][3] = hi.y;
+          }
+#pragma unroll
+          for (int mat = 0; mat < 2; ++mat)
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+              const uint32_t word = (&w[u][mat].x)[2 * h + blk];
+              const uint32_t b0 = e2m1x4_lo(word), b1 = e2m1x4_hi(word);
+#pragma unroll
+              for (int mi = 0; mi < 4; ++mi)
+                if (FULL || mi < mt)
+                  mma_e4m3_e2m1_sel(acc[mi][2 * mat + h], af[mi][0], af[mi][1], af[mi][2], af[mi][3], b0, b1,
+                                    sfaw[mi][unit >> 2], (uint16_t)(unit & 3), sw[u][mat], (uint16_t)(2 * h + blk));
+            }
+        }
+    };
+    if (mt == 4)
+      chunk(std::true_type{});
+    else
+      chunk(std::false_type{});
+    __syncwarp();
+    if (lane == 0) mbar_arrive(empty0 + 8 * s);
+  }
+
+  // SwiGLU (gate and up of the same columns sit in this thread), routing weight, bf16 -> rows over the ring
+  // (every consumer is past its last stage first), then act_quant per 32 columns
+  asm volatile("bar.sync 1, %0;" ::"n"(32 * C) : "memory");
+  __nv_bfloat16* sH = reinterpret_cast<__nv_bfloat16*>(smem);
+#pragma unroll
+  for (int mi = 0; mi < 4; ++mi)
+#pragma unroll
+    for (int h = 0; h < 2; ++h)
+#pragma unroll
+      for (int hr = 0; hr < 2; ++hr) {
+        const int r = mi * 16 + g + 8 * hr, col = 16 * warp + 8 * h + 2 * t;
+        const float rw = srw[r];
+        float v[2];
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+          const float gt = __bfloat162float(__float2bfloat16_rn(acc[mi][h][2 * hr + j]));
+          const float up = __bfloat162float(__float2bfloat16_rn(acc[mi][2 + h][2 * hr + j]));
+          v[j] = rw * swiglu(gt, up);
+        }
+        *reinterpret_cast<uint32_t*>(&sH[r * L::kHS + col]) = pack_bf16x2(v[0], v[1]);
+      }
+  asm volatile("bar.sync 1, %0;" ::"n"(32 * C) : "memory");
+  constexpr int NB = C / 2;  // 32-column blocks of the tile
+  for (int u = warp; u < rows * NB; u += C) {
+    const int r = u / NB, jb = u % NB;
+    const float v = bf2f(sH[r * L::kHS + 32 * jb + lane]);
+    const uint32_t ex = act_scale_byte(warp_max(fabsf(v)));
+    a.hq[(size_t)(base + r) * kInterP + q * 16 * C + 32 * jb + lane] = (uint8_t)quant_e4m3(v, ex);
+    if (lane == 0) a.hs[(size_t)(base + r) * kKB2P + q * NB + jb] = (uint8_t)ex;
   }
 }
 
@@ -1092,29 +1349,33 @@ __global__ void __launch_bounds__(128) k_moe_down_p(MoePArgs a) {
 #pragma unroll
       for (int blk = 0; blk < 2; ++blk) {
         const int unit = 2 * (p0 + u) + blk;
-        uint32_t af[4][4], sfa[4];
-#pragma unroll
-        for (int mi = 0; mi < 4; ++mi) {
-          if (mi >= mt) break;
-          const int r = mi * 16 + g;
-          const int off = 32 * (unit ^ ((r >> 1) & 1)) + 8 * t;  // rows r and r + 8 share the swizzle
-          const uint2 lo = *reinterpret_cast<const uint2*>(sA + r * LDA + off);
-          const uint2 hi = *reinterpret_cast<const uint2*>(sA + (r + 8) * LDA + off);
-          af[mi][0] = lo.x, af[mi][1] = hi.x, af[mi][2] = lo.y, af[mi][3] = hi.y;
-          sfa[mi] = sS[(mi * 16 + g + 8 * (lane & 1)) * kKB2P + unit];
-        }
+        // acc[mi][j] receives one MMA per (step, blk) in the loop's order. The weight operands of the four
+        // (group, h) pairs are expanded once; then each m16 tile loads its activation quad once and issues its
+        // four MMAs. `mt` is uniform per CTA.
+        uint32_t b0[4], b1[4], sfb[4];  // [2 * i + h]
 #pragma unroll
         for (int i = 0; i < 2; ++i)
 #pragma unroll
           for (int h = 0; h < 2; ++h) {
             const uint32_t word = (&w[u][i].x)[2 * h + blk];
-            const uint32_t b0 = e2m1x4_expand(word & 0xFFFFu), b1 = e2m1x4_expand(word >> 16);
-            const uint32_t sfb = (sw[u][i] >> (8 * (2 * h + blk))) & 0xFFu;
-#pragma unroll
-            for (int mi = 0; mi < 4; ++mi)
-              if (mi < mt)
-                mma_e4m3_e2m1(acc[mi][2 * i + h], af[mi][0], af[mi][1], af[mi][2], af[mi][3], b0, b1, sfa[mi], sfb);
+            b0[2 * i + h] = e2m1x4_lo(word);
+            b1[2 * i + h] = e2m1x4_hi(word);
+            sfb[2 * i + h] = (sw[u][i] >> (8 * (2 * h + blk))) & 0xFFu;
           }
+#pragma unroll
+        for (int mi = 0; mi < 4; ++mi) {
+          if (mi >= mt) break;
+          const int r = mi * 16 + g;
+          const int off = 32 * (unit ^ ((r >> 1) & 1)) + 8 * t;  // rows r and r + 8 share the swizzle
+          const uint8_t* pa = sA + r * LDA + off;
+          const uint32_t a0 = *reinterpret_cast<const uint32_t*>(pa);
+          const uint32_t a1 = *reinterpret_cast<const uint32_t*>(pa + 8 * LDA);
+          const uint32_t a2 = *reinterpret_cast<const uint32_t*>(pa + 4);
+          const uint32_t a3 = *reinterpret_cast<const uint32_t*>(pa + 8 * LDA + 4);
+          const uint32_t sfa = sS[(mi * 16 + g + 8 * (lane & 1)) * kKB2P + unit];
+#pragma unroll
+          for (int n = 0; n < 4; ++n) mma_e4m3_e2m1(acc[mi][n], a0, a1, a2, a3, b0[n], b1[n], sfa, sfb[n]);
+        }
       }
   };
   load_w(wa, sa, 0);
@@ -1160,6 +1421,226 @@ __global__ void __launch_bounds__(128) k_moe_down_p(MoePArgs a) {
     }
     __syncthreads();
     for (int i = 0; i < nsgrp; ++i) combine_group<H>(a, ng, sgrp[i]);
+  }
+}
+
+// ---- The down kernel, producer/consumer (k_moe_down_ws).
+// Eight packed e2m1 nibbles (a word, low nibble first) -> two words of four bytes with the value in bits 5:2: the
+// bytes of e2m1x4_expand(word & 0xFFFF) and e2m1x4_expand(word >> 16), from the even and the odd nibbles.
+__device__ __forceinline__ void e2m1x8_expand(uint32_t w, uint32_t& lo, uint32_t& hi) {
+  const uint32_t ev = (w << 2) & 0x3C3C3C3Cu, od = (w >> 2) & 0x3C3C3C3Cu;
+  lo = __byte_perm(ev, od, 0x5140);
+  hi = __byte_perm(ev, od, 0x7362);
+}
+__device__ __forceinline__ uint32_t lds32(uint32_t addr) {
+  uint32_t v;
+  asm volatile("ld.shared.u32 %0, [%1];" : "=r"(v) : "r"(addr) : "memory");
+  return v;
+}
+
+// The shared memory of k_moe_down_ws<C, KU, S>: the tile's h rows (k_moe_down_p's swizzle) and their scales (a row of
+// 9 words, word p holding the bytes of step p's two 32-k units, so that one 32-bit load serves a step's MMAs), then a
+// ring of S stages;
+// a stage holds KU 64-k steps of the CTA's 8 n16 groups: per group and step the weights (512 bytes, each lane's 16 at
+// lane * 16) and the scale words (32 bytes: the 8 words of g, or (coded) the code word first). Then the barriers:
+// full[S], empty[S] and the rows'. After the k loop the outputs' bf16 rows sit over the h rows.
+template <int C, int KU, int S>
+struct DownWs {
+  static constexpr int NCH = kP2P / KU, NT = 32 * (C + 1), kLdS = 4 * kP2P;
+  static constexpr int kA = kTileRows * kInterP, kSS = kTileRows * kLdS;
+  static constexpr int kW = 8 * KU * 512, kWS = 8 * KU * 32, kStage = kW + kWS;
+  static constexpr int kRing = kA + kSS, kBars = kRing + S * kStage;
+  static constexpr int kSmem = kBars + (2 * S + 1) * 8;
+  static constexpr int kMinBlocks = 2 * kSmem <= 99 * 1024 ? 2 : 1;
+};
+
+// Down kernel, producer/consumer: C consumer warps and one mover warp (the last). A CTA is k_moe_down_p's: 128
+// output columns (8 n16 groups) of one 64-row tile; consumer warp w computes the 8 / C groups w * 8 / C ... of them,
+// the same MMAs in the same order. The mover copies the weight steps into the ring (counted on the stage's 'full'
+// barrier), then the tile's h rows and their scales, then the remaining steps as the consumers release stages on
+// 'empty'. No block-wide barrier in the k loop.
+template <int C, int KU, int S, bool H, bool CS>
+__global__ void __launch_bounds__(32 * (C + 1), DownWs<C, KU, S>::kMinBlocks) k_moe_down_ws(MoePArgs a) {
+  using L = DownWs<C, KU, S>;
+  constexpr int GPW = 8 / C, NCH = L::NCH, LDA = kInterP;
+  static_assert(8 % C == 0, "8 n16 groups a CTA");
+  static_assert(kP2P % KU == 0, "whole stages");
+  extern __shared__ __align__(16) uint8_t smem[];
+  uint64_t* bars = reinterpret_cast<uint64_t*>(smem + L::kBars);
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
+  pdl_launch_dependents();
+  pdl_wait();
+  const int tile = blockIdx.y;
+  const int ng = a.cb0 + blockIdx.x;  // output columns ng*128 .. +127
+  const int4 te = a.tiles[tile];
+  if (tile >= *a.ntiles) return;
+  const int e = te.x, base = te.y, rows = te.z;
+  const int mt = (rows + 15) / 16;  // m16 tiles with rows
+  const uint64_t pol_w = l2_policy((a.l2 & 2) && te.w <= kTileRows), pol_h = l2_policy(a.l2 & 4 ? 2 : 0);
+  const uint64_t pol_o = l2_policy(a.l2 & 2 ? 1 : 0);
+  const uint32_t s0 = smem_addr(smem), full0 = smem_addr(bars), empty0 = full0 + 8 * S, rows0 = full0 + 16 * S;
+  if (tid == 0) {
+    for (int s = 0; s < S; ++s) mbar_init(full0 + 8 * s, 32), mbar_init(empty0 + 8 * s, C);
+    mbar_init(rows0, 64);
+  }
+  __syncthreads();
+
+  if (warp == C) {  // the mover
+    uint32_t flg = 0;  // CS: the raw flags (bit p: step p) of the group this lane's quad copies
+    if constexpr (CS) flg = __ldg(a.w.c2.code + ((size_t)e * kT2P + ng * 8 + (lane >> 2)) * kB2P + kP2P);
+    (void)flg;
+    const uint32_t ring0 = s0 + L::kRing;
+    auto issue = [&](int c) {
+      const uint32_t sW = ring0 + (c % S) * L::kStage, sWS = sW + L::kW;
+#pragma unroll
+      for (int u = 0; u < KU; ++u) {
+        const int p = c * KU + u;
+#pragma unroll
+        for (int gq = 0; gq < 8; ++gq)
+          cp_async16<H>(sW + (u * 8 + gq) * 512 + lane * 16,
+                        a.w.w2 + (size_t)e * kW2P + ((size_t)(ng * 8 + gq) * kP2P + p) * 512 + lane * 16, true, pol_w);
+        const int gq = lane >> 2, q4 = lane & 3, nq = ng * 8 + gq;
+        const uint8_t* raw = a.w.s2 + (size_t)e * kS2P + ((size_t)nq * kP2P + p) * 32 + 16 * q4;
+        if constexpr (CS) {
+          if (flg >> p & 1u) {
+            if (q4 < 2) cp_async16<H>(sWS + (u * 8 + gq) * 32 + 16 * q4, raw, true, pol_w);
+          } else if (q4 == 0) {
+            cp_async_n<H, 4>(sWS + (u * 8 + gq) * 32, a.w.c2.code + ((size_t)e * kT2P + nq) * kB2P + p, true, pol_w);
+          }
+        } else if (q4 < 2) {
+          cp_async16<H>(sWS + (u * 8 + gq) * 32 + 16 * q4, raw, true, pol_w);
+        }
+      }
+      mbar_arrive_cp_async(full0 + 8 * (c % S));
+    };
+    constexpr int PRE = S < NCH ? S : NCH;
+    for (int c = 0; c < PRE; ++c) issue(c);
+    // the tile's h rows, then their scales (plain loads and stores: 18 bytes a row are not 4-byte aligned)
+    for (int i = lane; i < kTileRows * (LDA / 16); i += 32) {
+      const int r = i / (LDA / 16), c16 = i % (LDA / 16);
+      cp_async16<H>(s0 + r * LDA + 32 * ((c16 >> 1) ^ ((r >> 1) & 1)) + 16 * (c16 & 1),
+                    a.hq + (size_t)(base + (r < rows ? r : 0)) * kInterP + 16 * c16, r < rows, pol_h);
+    }
+    mbar_arrive_cp_async(rows0);
+    // all loads first (kTileRows * kP2P / 32 = 18 a lane): their latencies overlap
+    uint32_t sv[kTileRows * kP2P / 32];
+#pragma unroll
+    for (int j = 0; j < kTileRows * kP2P / 32; ++j) {
+      const int i = lane + 32 * j, r = i / kP2P, k = i % kP2P;
+      sv[j] = r < rows ? *reinterpret_cast<const uint16_t*>(a.hs + (size_t)(base + r) * kKB2P + 2 * k) : 0x7F7Fu;
+    }
+#pragma unroll
+    for (int j = 0; j < kTileRows * kP2P / 32; ++j) {
+      const int i = lane + 32 * j, r = i / kP2P, k = i % kP2P;
+      *reinterpret_cast<uint32_t*>(smem + L::kA + r * L::kLdS + 4 * k) = sv[j];
+    }
+    mbar_arrive(rows0);
+    for (int c = PRE; c < NCH; ++c) {
+      mbar_wait(empty0 + 8 * (c % S), (uint32_t)(c / S - 1) & 1u);
+      issue(c);
+    }
+    return;
+  }
+
+  // the consumers
+  uint32_t fl[GPW] = {};  // CS: this warp's groups' raw flags (bit p: step p)
+  if constexpr (CS)
+#pragma unroll
+    for (int i = 0; i < GPW; ++i) fl[i] = __ldg(a.w.c2.code + ((size_t)e * kT2P + ng * 8 + GPW * warp + i) * kB2P + kP2P);
+  float acc[4][2 * GPW][4];  // [m16 tile][group i: lo, hi][c]
+#pragma unroll
+  for (int mi = 0; mi < 4; ++mi)
+#pragma unroll
+    for (int j = 0; j < 2 * GPW; ++j) acc[mi][j][0] = acc[mi][j][1] = acc[mi][j][2] = acc[mi][j][3] = 0.f;
+  mbar_wait(rows0, 0);
+  const uint32_t abase = s0 + g * LDA + 8 * t;
+  // 0, but not known to be: the fragment's words 0 and 2 stay two 32-bit loads, which land in the MMA's registers
+  // directly (a 64-bit load of the pair would need four moves to build the fragment's order)
+  const uint32_t nomerge = (uint32_t)a.cb0 >> 20;
+  const uint8_t* sS = smem + L::kA;
+  for (int c = 0; c < NCH; ++c) {
+    const int s = c % S;
+    mbar_wait(full0 + 8 * s, (uint32_t)(c / S) & 1u);
+    const uint8_t* ST = smem + L::kRing + s * L::kStage;
+    const uint4* W = reinterpret_cast<const uint4*>(ST);
+    const uint32_t* WS = reinterpret_cast<const uint32_t*>(ST + L::kW);
+    uint4 w[KU][GPW];
+    uint32_t sw[KU][GPW];  // the scale words (CS: rebuilt from the code)
+#pragma unroll
+    for (int u = 0; u < KU; ++u)
+#pragma unroll
+      for (int i = 0; i < GPW; ++i) {
+        const int gq = GPW * warp + i;
+        w[u][i] = W[(u * 8 + gq) * 32 + lane];
+        if constexpr (CS) {
+          const bool raw = fl[i] >> (c * KU + u) & 1u;
+          const uint32_t s1 = WS[(u * 8 + gq) * 8 + (raw ? g : 0)];
+          sw[u][i] = raw ? s1 : ((s1 >> g) & 0x01010101u) + a.w.c2.base4;
+        } else {
+          sw[u][i] = WS[(u * 8 + gq) * 8 + g];
+        }
+      }
+    // The activations' scale words: this lane's row of each m16 tile, one word a step (byte blk: the unit's).
+    uint32_t sfaw[KU][4];
+#pragma unroll
+    for (int u = 0; u < KU; ++u)
+#pragma unroll
+      for (int mi = 0; mi < 4; ++mi)
+        sfaw[u][mi] = reinterpret_cast<const uint32_t*>(sS + (mi * 16 + g + 8 * (lane & 1)) * L::kLdS)[c * KU + u];
+    auto chunk = [&](auto full) {
+      constexpr bool FULL = decltype(full)::value;
+#pragma unroll
+      for (int u = 0; u < KU; ++u)
+#pragma unroll
+        for (int blk = 0; blk < 2; ++blk) {
+          // this lane's fragment base for the step's unit blk (the swizzle flips the unit's low bit for rows 2, 3 mod 4)
+          const uint32_t aa = abase + 64 * (c * KU + u) + 32 * (blk ^ ((g >> 1) & 1)), ab = aa + 4 + nomerge;
+          uint32_t b0[2 * GPW], b1[2 * GPW];  // [2 * i + h]
+#pragma unroll
+          for (int i = 0; i < GPW; ++i)
+#pragma unroll
+            for (int h = 0; h < 2; ++h) e2m1x8_expand((&w[u][i].x)[2 * h + blk], b0[2 * i + h], b1[2 * i + h]);
+#pragma unroll
+          for (int mi = 0; mi < 4; ++mi) {
+            if (!FULL && mi >= mt) break;  // m16 tiles without rows are skipped (uniform per CTA)
+            // the fragment's four words, one 32-bit load each (rows r and r + 8 share the swizzle)
+            const uint32_t pa = aa + mi * 16 * LDA, pb = ab + mi * 16 * LDA;
+            const uint32_t a0 = lds32(pa), a1 = lds32(pa + 8 * LDA), a2 = lds32(pb), a3 = lds32(pb + 8 * LDA);
+#pragma unroll
+            for (int i = 0; i < GPW; ++i)
+#pragma unroll
+              for (int h = 0; h < 2; ++h)
+                mma_e4m3_e2m1_sel(acc[mi][2 * i + h], a0, a1, a2, a3, b0[2 * i + h], b1[2 * i + h], sfaw[u][mi],
+                                  (uint16_t)blk, sw[u][i], (uint16_t)(2 * h + blk));
+          }
+        }
+    };
+    if (mt == 4)
+      chunk(std::true_type{});
+    else
+      chunk(std::false_type{});
+    __syncwarp();
+    if (lane == 0) mbar_arrive(empty0 + 8 * s);
+  }
+
+  // bf16 outputs through shared memory (over the h rows, once every consumer is past its last read), then
+  // 16-byte stores of whole 256-byte row pieces
+  asm volatile("bar.sync 1, %0;" ::"n"(32 * C) : "memory");
+  constexpr int LDO = 128 + 8;
+  __nv_bfloat16* sO = reinterpret_cast<__nv_bfloat16*>(smem);
+#pragma unroll
+  for (int mi = 0; mi < 4; ++mi)
+#pragma unroll
+    for (int j = 0; j < 2 * GPW; ++j) {
+      const int r = mi * 16 + g, cc = 16 * GPW * warp + 8 * j + 2 * t;
+      *reinterpret_cast<uint32_t*>(&sO[r * LDO + cc]) = pack_bf16x2(acc[mi][j][0], acc[mi][j][1]);
+      *reinterpret_cast<uint32_t*>(&sO[(r + 8) * LDO + cc]) = pack_bf16x2(acc[mi][j][2], acc[mi][j][3]);
+    }
+  asm volatile("bar.sync 1, %0;" ::"n"(32 * C) : "memory");
+  for (int i = tid; i < rows * 16; i += 32 * C) {
+    const int r = i >> 4, c8 = i & 15;
+    stg128<H>(a.dout + (size_t)(base + r) * kDimP + ng * 128 + 8 * c8,
+              *reinterpret_cast<const uint4*>(&sO[r * LDO + 8 * c8]), pol_o);
   }
 }
 
@@ -1239,29 +1720,33 @@ __global__ void __launch_bounds__(128) k_moe_down_g(MoePArgs a) {
 #pragma unroll
       for (int blk = 0; blk < 2; ++blk) {
         const int unit = 2 * p + blk;
-        uint32_t af[4][4], sfa[4];
-#pragma unroll
-        for (int mi = 0; mi < 4; ++mi) {
-          if (mi >= mt) break;
-          const int r = mi * 16 + g;
-          const int off = 32 * (unit ^ ((r >> 1) & 1)) + 8 * t;  // rows r and r + 8 share the swizzle
-          const uint2 lo = *reinterpret_cast<const uint2*>(sA + r * LDA + off);
-          const uint2 hi = *reinterpret_cast<const uint2*>(sA + (r + 8) * LDA + off);
-          af[mi][0] = lo.x, af[mi][1] = hi.x, af[mi][2] = lo.y, af[mi][3] = hi.y;
-          sfa[mi] = sS[(mi * 16 + g + 8 * (lane & 1)) * kKB2P + unit];
-        }
+        // acc[mi][j] receives one MMA per (step, blk) in the loop's order. The weight operands of the four
+        // (group, h) pairs are expanded once; then each m16 tile loads its activation quad once and issues its
+        // four MMAs. `mt` is uniform per CTA.
+        uint32_t b0[4], b1[4], sfb[4];  // [2 * i + h]
 #pragma unroll
         for (int i = 0; i < 2; ++i)
 #pragma unroll
           for (int h = 0; h < 2; ++h) {
             const uint32_t word = (&w[j][i].x)[2 * h + blk];
-            const uint32_t b0 = e2m1x4_expand(word & 0xFFFFu), b1 = e2m1x4_expand(word >> 16);
-            const uint32_t sfb = (s[j][i] >> (8 * (2 * h + blk))) & 0xFFu;
-#pragma unroll
-            for (int mi = 0; mi < 4; ++mi)
-              if (mi < mt)
-                mma_e4m3_e2m1(acc[mi][2 * i + h], af[mi][0], af[mi][1], af[mi][2], af[mi][3], b0, b1, sfa[mi], sfb);
+            b0[2 * i + h] = e2m1x4_lo(word);
+            b1[2 * i + h] = e2m1x4_hi(word);
+            sfb[2 * i + h] = (s[j][i] >> (8 * (2 * h + blk))) & 0xFFu;
           }
+#pragma unroll
+        for (int mi = 0; mi < 4; ++mi) {
+          if (mi >= mt) break;
+          const int r = mi * 16 + g;
+          const int off = 32 * (unit ^ ((r >> 1) & 1)) + 8 * t;  // rows r and r + 8 share the swizzle
+          const uint8_t* pa = sA + r * LDA + off;
+          const uint32_t a0 = *reinterpret_cast<const uint32_t*>(pa);
+          const uint32_t a1 = *reinterpret_cast<const uint32_t*>(pa + 8 * LDA);
+          const uint32_t a2 = *reinterpret_cast<const uint32_t*>(pa + 4);
+          const uint32_t a3 = *reinterpret_cast<const uint32_t*>(pa + 8 * LDA + 4);
+          const uint32_t sfa = sS[(mi * 16 + g + 8 * (lane & 1)) * kKB2P + unit];
+#pragma unroll
+          for (int n = 0; n < 4; ++n) mma_e4m3_e2m1(acc[mi][n], a0, a1, a2, a3, b0[n], b1[n], sfa, sfb[n]);
+        }
       }
       // the slot's next step: D past this one, in this block or the next
       if (b + (p + D) / NS < nb) load(j, b + (p + D) / NS, (p + D) % NS);
@@ -1456,6 +1941,19 @@ PrefillTuning g_tune;
 constexpr int kDownGroup = 0, kDownGroupF = 0;
 constexpr int kTileOrder = 0;   // tile_pos's k by default (0: descending count)
 constexpr int kUpPrefetch = 0;  // k_moe_up_p's L2 prefetch distance in chunks by default (0: none)
+constexpr int kUpKernel = 1;    // the up kernel by default: k_moe_up_ws's shape 1 (4 consumer warps, 2 stages of 128 k)
+constexpr int kDownKernel = 1;  // the down kernel for chunks of down_ws_rows() rows or more: k_moe_down_ws's shape (down_ws_shape)
+constexpr int kDownWsRows = 4096;  // below it k_moe_down_p: a short chunk has too few tiles for the mover's ring to pay
+// DSGB10_PF_DWS: unset, the default (kDownWsRows); 0, k_moe_down_p at every size; N > 0, k_moe_down_ws from N rows a chunk
+int down_ws_rows() {
+  static const int rows = [] {
+    const char* e = std::getenv("DSGB10_PF_DWS");
+    if (!e || !*e) return kDownWsRows;
+    const int v = std::atoi(e);
+    return v > 0 ? v : INT_MAX;
+  }();
+  return rows;
+}
 
 // k_moe_down_g by column groups of G blocks, with g_tune.dring (3 or 9) weight steps in flight
 void launch_down_g(MoePArgs a, int G, int maxt, bool fused, bool h, cudaStream_t st) {
@@ -1468,6 +1966,75 @@ void launch_down_g(MoePArgs a, int G, int maxt, bool fused, bool h, cudaStream_t
   const int ncg = (a.ncb + G - 1) / G;
   launch_pdl(ks[g_tune.dring == 9][fused][h], fused ? dim3(maxt, ncg) : dim3(ncg, maxt), dim3(128), kDownGSmem, st,
              true, a);
+}
+
+// k_moe_up_ws's shapes (PrefillTuning::upk 1..): consumer warps C, 64-k steps a stage KU, stages S.
+struct UpWsShape {
+  int C, KU, S;
+};
+constexpr UpWsShape kUpWsShapes[] = {{0, 0, 0}, {4, 2, 2}, {6, 2, 2}, {12, 2, 2}, {4, 4, 2}, {6, 2, 3}, {4, 2, 3}};
+constexpr int kUpWsN = sizeof(kUpWsShapes) / sizeof(kUpWsShapes[0]);
+
+template <int C, int KU, int S>
+void launch_up_ws_shape(const MoePArgs& a, int maxt, bool h, bool cs, cudaStream_t st) {
+  using K = void (*)(MoePArgs);
+  static const K ks[2][2] = {{k_moe_up_ws<C, KU, S, false, false>, k_moe_up_ws<C, KU, S, false, true>},
+                             {k_moe_up_ws<C, KU, S, true, false>, k_moe_up_ws<C, KU, S, true, true>}};
+  static const bool once = [] {
+    for (auto& r : ks)
+      for (K k : r) {
+        set_smem(k, UpWs<C, KU, S>::kSmem);
+        CUDA_CHECK(cudaFuncSetAttribute(k, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+      }
+    return true;
+  }();
+  (void)once;
+  launch_pdl(ks[h][cs], dim3(kInterP / (16 * C), maxt), dim3(UpWs<C, KU, S>::NT), UpWs<C, KU, S>::kSmem, st, true, a);
+}
+
+void launch_up_ws(const MoePArgs& a, int v, int maxt, bool h, bool cs, cudaStream_t st) {
+  switch (v) {
+    case 1: return launch_up_ws_shape<4, 2, 2>(a, maxt, h, cs, st);
+    case 2: return launch_up_ws_shape<6, 2, 2>(a, maxt, h, cs, st);
+    case 3: return launch_up_ws_shape<12, 2, 2>(a, maxt, h, cs, st);
+    case 4: return launch_up_ws_shape<4, 4, 2>(a, maxt, h, cs, st);
+    case 5: return launch_up_ws_shape<6, 2, 3>(a, maxt, h, cs, st);
+    case 6: return launch_up_ws_shape<4, 2, 3>(a, maxt, h, cs, st);
+    default: die("up kernel variant %d (1..%d)", v, kUpWsN - 1);
+  }
+}
+
+// k_moe_down_ws's shapes (PrefillTuning::dwk 1..): consumer warps C, 64-k steps a stage KU, stages S.
+constexpr UpWsShape kDownWsShapes[] = {{0, 0, 0}, {4, 1, 2}, {8, 1, 2}, {2, 1, 2}, {4, 1, 3}, {4, 3, 2}, {4, 1, 4}};
+constexpr int kDownWsN = sizeof(kDownWsShapes) / sizeof(kDownWsShapes[0]);
+
+template <int C, int KU, int S>
+void launch_down_ws_shape(const MoePArgs& a, int maxt, bool h, bool cs, cudaStream_t st) {
+  using K = void (*)(MoePArgs);
+  static const K ks[2][2] = {{k_moe_down_ws<C, KU, S, false, false>, k_moe_down_ws<C, KU, S, false, true>},
+                             {k_moe_down_ws<C, KU, S, true, false>, k_moe_down_ws<C, KU, S, true, true>}};
+  static const bool once = [] {
+    for (auto& r : ks)
+      for (K k : r) {
+        set_smem(k, DownWs<C, KU, S>::kSmem);
+        CUDA_CHECK(cudaFuncSetAttribute(k, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+      }
+    return true;
+  }();
+  (void)once;
+  launch_pdl(ks[h][cs], dim3(a.ncb, maxt), dim3(DownWs<C, KU, S>::NT), DownWs<C, KU, S>::kSmem, st, true, a);
+}
+
+void launch_down_ws(const MoePArgs& a, int v, int maxt, bool h, bool cs, cudaStream_t st) {
+  switch (v) {
+    case 1: return launch_down_ws_shape<4, 1, 2>(a, maxt, h, cs, st);
+    case 2: return launch_down_ws_shape<8, 1, 2>(a, maxt, h, cs, st);
+    case 3: return launch_down_ws_shape<2, 1, 2>(a, maxt, h, cs, st);
+    case 4: return launch_down_ws_shape<4, 1, 3>(a, maxt, h, cs, st);
+    case 5: return launch_down_ws_shape<4, 3, 2>(a, maxt, h, cs, st);
+    case 6: return launch_down_ws_shape<4, 1, 4>(a, maxt, h, cs, st);
+    default: die("down kernel variant %d (1..%d)", v, kDownWsN - 1);
+  }
 }
 
 void gemm_fp8_any(const uint8_t* xq, const uint8_t* xs, int M, const Fp8Seg* segs, int nseg, int K, int epi,
@@ -1592,6 +2159,18 @@ void gemm_fp8w_f32_p(const __nv_bfloat16* x, int M, const uint8_t* W, const uint
 
 void prefill_tuning(const PrefillTuning& t) { g_tune = t; }
 
+bool down_ws_shape(int v, int* C, int* KU, int* S) {
+  if (v < 1 || v >= kDownWsN) return false;
+  *C = kDownWsShapes[v].C, *KU = kDownWsShapes[v].KU, *S = kDownWsShapes[v].S;
+  return true;
+}
+
+bool up_ws_shape(int v, int* C, int* KU, int* S) {
+  if (v < 1 || v >= kUpWsN) return false;
+  *C = kUpWsShapes[v].C, *KU = kUpWsShapes[v].KU, *S = kUpWsShapes[v].S;
+  return true;
+}
+
 size_t moe_prefill_workspace_bytes(int M, int E) { return carve(nullptr, M, E).bytes; }
 
 void moe_prefill_shared(void* ws, int M, int E, const uint8_t** hq, const uint8_t** hs) {
@@ -1663,15 +2242,22 @@ void moe_prefill(const uint8_t* xq, const uint8_t* xs, int M, const int* idx, co
   const bool h = l2 != 0;
   // the routed scales from their code when the weights carry it (k_moe_down_g, a tuning, reads them raw)
   const bool cs13 = w.c1.code && w.c3.code, cs2 = w.c2.code != nullptr;
-  if (cfg.phases & 4)
+  const int upk = g_tune.upk >= 0 ? g_tune.upk : kUpKernel;
+  if ((cfg.phases & 4) && upk > 0) {
+    launch_up_ws(a, upk, maxt, h, cs13, st);
+  } else if (cfg.phases & 4) {
     launch_pdl(cs13 ? (h ? k_moe_up_p<4, true, true> : k_moe_up_p<4, false, true>)
                     : (h ? k_moe_up_p<4, true> : k_moe_up_p<4, false>),
                dim3(kInterP / 64, maxt), dim3(128), 0, st, true, a);
+  }
   if (fork) CUDA_CHECK(cudaStreamWaitEvent(st, ev[1], 0));
   if (cfg.phases & 8) {  // with the combine fused, after the shared expert (above)
     const int G = g_tune.dgrp >= 0 ? g_tune.dgrp : fused ? kDownGroupF : kDownGroup;
+    const int dwk = g_tune.dwk >= 0 ? g_tune.dwk : M >= down_ws_rows() ? kDownKernel : 0;
     if (G > 0)
       launch_down_g(a, G, maxt, fused, h, st);
+    else if (!fused && dwk > 0)
+      launch_down_ws(a, dwk, maxt, h, cs2, st);
     else if (fused)
       launch_pdl(cs2 ? (h ? k_moe_down_p<true, true, true> : k_moe_down_p<true, false, true>)
                      : (h ? k_moe_down_p<true, true> : k_moe_down_p<true, false>),

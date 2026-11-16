@@ -115,36 +115,59 @@ __global__ void __launch_bounds__(128) attn_kernel(AttnArgs a) {
 #pragma unroll
   for (int i = 0; i < 16; ++i) o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.f;
   int b0 = split * a.per_split, b1 = min(a.nblocks, b0 + a.per_split);
-  for (int blk = b0; blk < b1; ++blk) {
-    if (blk < a.nwin && wlo + blk * kBlk > whi) continue;  // past this row's window (uniform in the CTA)
-    __syncthreads();  // the previous block's ks/ps are consumed (and qs is ready)
-    // This warp's 16 keys: the positions first (lane k < 16 holds key k's, -1 = none), then every key's
-    // codes and scale in flight at once (decode is latency-bound), then dequantised into ks.
-    int my_kp = -1;
+  // Blocks past this row's window are skipped (uniform in the CTA); the others run in order.
+  auto skipped = [&](int bk) { return bk < a.nwin && wlo + bk * kBlk > whi; };
+  auto first_live = [&](int bk) {
+    while (bk < b1 && skipped(bk)) ++bk;
+    return bk;
+  };
+  // A block's keys are fetched one block ahead: the positions first (lane k < 16 holds key k's, -1 = none), then
+  // every key's codes and scale at once. The next block's fetch is issued as soon as this block's codes are
+  // dequantised, so its loads overlap the block's scores, softmax and PV. A compressed block's codes (8 bytes a
+  // lane) sit in .x, .y of the uint4 that holds a window block's 16.
+  int my_kp = -1;
+  uint4 kc[16];
+  uint32_t ke[16];
+  auto fetch = [&](int bk) {
+    my_kp = -1;
     if (lane < 16) {
       int key = warp * 16 + lane;
-      if (blk < a.nwin) {
-        int kp = wlo + blk * kBlk + key;
+      if (bk < a.nwin) {
+        int kp = wlo + bk * kBlk + key;
         my_kp = kp <= whi ? kp : -1;
       } else {
-        my_kp = a.topk[(size_t)r * a.kmax + (blk - a.nwin) * kBlk + key];
+        my_kp = a.topk[(size_t)r * a.kmax + (bk - a.nwin) * kBlk + key];
       }
-      kvalid[key] = my_kp >= 0;
     }
-    if (blk < a.nwin) {  // e4m3 x ue8m0 per 32: lane holds elements 16 lane .. +15
-      uint4 c[16];
-      uint32_t e[16];
+    if (bk < a.nwin) {  // e4m3 x ue8m0 per 32: lane holds elements 16 lane .. +15
 #pragma unroll
       for (int kk = 0; kk < 16; ++kk) {
         int kp = __shfl_sync(0xffffffffu, my_kp, kk), slot = (kp - win.base) & win.mask;
-        c[kk] = kp >= 0 ? *reinterpret_cast<const uint4*>(win.kv + (size_t)slot * kHead + lane * 16)
-                        : make_uint4(0, 0, 0, 0);
-        e[kk] = kp >= 0 ? win.sc[slot * 16 + lane / 2] : 127u;
+        kc[kk] = kp >= 0 ? *reinterpret_cast<const uint4*>(win.kv + (size_t)slot * kHead + lane * 16)
+                         : make_uint4(0, 0, 0, 0);
+        ke[kk] = kp >= 0 ? win.sc[slot * 16 + lane / 2] : 127u;
       }
+    } else {  // e2m1 x e4m3 per 16: lane holds elements 16 lane .. +15
 #pragma unroll
       for (int kk = 0; kk < 16; ++kk) {
-        float s = ue8m0_to_f(e[kk]);
-        const uint32_t cw[4] = {c[kk].x, c[kk].y, c[kk].z, c[kk].w};
+        int kp = __shfl_sync(0xffffffffu, my_kp, kk);
+        const uint2 v = kp >= 0 ? *reinterpret_cast<const uint2*>(ckv.kv + (size_t)kp * (kHead / 2) + lane * 8)
+                                : make_uint2(0, 0);
+        kc[kk] = make_uint4(v.x, v.y, 0u, 0u);
+        ke[kk] = kp >= 0 ? ckv.sc[(size_t)kp * 32 + lane] : 0u;
+      }
+    }
+  };
+  int blk = first_live(b0);
+  if (blk < b1) fetch(blk);
+  while (blk < b1) {
+    __syncthreads();  // the previous block's ks/ps are consumed (and qs is ready)
+    if (lane < 16) kvalid[warp * 16 + lane] = my_kp >= 0;
+    if (blk < a.nwin) {
+#pragma unroll
+      for (int kk = 0; kk < 16; ++kk) {
+        float s = ue8m0_to_f(ke[kk]);
+        const uint32_t cw[4] = {kc[kk].x, kc[kk].y, kc[kk].z, kc[kk].w};
         uint32_t w[8];
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
@@ -155,20 +178,11 @@ __global__ void __launch_bounds__(128) attn_kernel(AttnArgs a) {
         dst[0] = make_uint4(w[0], w[1], w[2], w[3]);
         dst[1] = make_uint4(w[4], w[5], w[6], w[7]);
       }
-    } else {  // e2m1 x e4m3 per 16: lane holds elements 16 lane .. +15
-      uint2 c[16];
-      uint32_t e[16];
+    } else {
 #pragma unroll
       for (int kk = 0; kk < 16; ++kk) {
-        int kp = __shfl_sync(0xffffffffu, my_kp, kk);
-        c[kk] = kp >= 0 ? *reinterpret_cast<const uint2*>(ckv.kv + (size_t)kp * (kHead / 2) + lane * 8)
-                        : make_uint2(0, 0);
-        e[kk] = kp >= 0 ? ckv.sc[(size_t)kp * 32 + lane] : 0u;
-      }
-#pragma unroll
-      for (int kk = 0; kk < 16; ++kk) {
-        float s = e4m3_to_f(e[kk]);
-        const uint32_t cw[2] = {c[kk].x, c[kk].y};
+        float s = e4m3_to_f(ke[kk]);
+        const uint32_t cw[2] = {kc[kk].x, kc[kk].y};
         uint32_t w[8];
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
@@ -180,6 +194,8 @@ __global__ void __launch_bounds__(128) attn_kernel(AttnArgs a) {
         dst[1] = make_uint4(w[4], w[5], w[6], w[7]);
       }
     }
+    const int nxt = first_live(blk + 1);
+    if (nxt < b1) fetch(nxt);
     __syncthreads();
     // S = q . k for this warp's 16 keys (two n-tiles), all 16 heads
     float s[2][4] = {{0.f, 0.f, 0.f, 0.f}, {0.f, 0.f, 0.f, 0.f}};
@@ -271,6 +287,7 @@ __global__ void __launch_bounds__(128) attn_kernel(AttnArgs a) {
         mma_bf16(o[2 * np + 1], af, bf[2], bf[3]);
       }
     }
+    blk = nxt;
   }
   if (a.splits == 1) {
     float d0 = __fadd_rn(l0, expf(__fsub_rn(a.sink[g], m0))), d1 = __fadd_rn(l1, expf(__fsub_rn(a.sink[g + 8], m1)));

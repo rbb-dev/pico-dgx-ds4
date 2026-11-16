@@ -1123,12 +1123,42 @@ constexpr int kCertCtas = kVocabPart / kCertRowsCta;
 constexpr int kCertRows = 8;                           // step rows of a certified body, at most (argmax_rows: an even count)
 static_assert(kVocabPart % kCertRowsCta == 0 && kMaxSessRows <= kCertRows, "cert");
 
+// A sampled row (Cert::samp: a temperature up to 1, no top-k or top-p) takes the Gumbel-max winner of l / T - log(-log(u)), u
+// hashed from the session's seed, the row's position and the id (ops::sample, sample.cu). That score is monotone in l, so
+// the logit bounds give bounds of it, each side with another 1e-3 of slack for the roundings. A greedy row keeps the
+// logit bounds.
+struct CertRow {
+  bool samp;
+  float invT;
+  uint64_t base;
+};
+__device__ __forceinline__ uint64_t cert_mix64(uint64_t x) {
+  x ^= x >> 31;
+  x *= 0xBF58476D1CE4E5B9ull;
+  x ^= x >> 29;
+  x *= 0x94D049BB133111EBull;
+  x ^= x >> 32;
+  return x;
+}
+__device__ __forceinline__ CertRow cert_row(const ops::StepIn* in, int b) {
+  const ops::StepSamp sp = in->samp[min(max(in->sess[b], 0), ops::kMaxSess - 1)];
+  CertRow r;
+  r.samp = sp.temperature > 0.f;
+  r.invT = r.samp ? 1.f / sp.temperature : 1.f;
+  r.base = cert_mix64(sp.seed) ^ ((uint64_t)(uint32_t)in->pos[b] * 0x9E3779B97F4A7C15ull);
+  return r;
+}
+__device__ __forceinline__ float cert_noise(uint64_t base, int id) {  // log(-log(u)), as the sampler takes it
+  const uint64_t h = cert_mix64(base + (uint64_t)id * 0xD1B54A32D192ED03ull);
+  return logf(-logf(((float)(h >> 40) + 0.5f) * (1.0f / 16777216.0f)));
+}
+
 // Row b = blockIdx.x: xn[b] = an upper bound of ||x_b||_2 (x the normed final hidden); cand[b] = this rank's largest
-// lower bound of a logit, coarse - xn B (B[v]: the row's residual norm plus the rounding slack of both kernels).
-// Block 0 clears the CTA mask and counts the step.
+// lower bound of a logit, coarse - xn B (B[v]: the row's residual norm plus the rounding slack of both kernels), or of
+// a sampled row's score. Block 0 clears the CTA mask and counts the step.
 __global__ void __launch_bounds__(1024) k_cert_lo(const float* C, const bf16* x, const float* B, int R, int vocab0,
                                                   float* xn, comm::ArgMax* cand, uint8_t* mask, uint32_t* stats,
-                                                  float bscale) {
+                                                  float bscale, const ops::StepIn* in) {
   __shared__ float sv[1024];
   __shared__ int si[1024];
   const int b = blockIdx.x, t = threadIdx.x;
@@ -1157,10 +1187,12 @@ __global__ void __launch_bounds__(1024) k_cert_lo(const float* C, const bf16* x,
   const float n = __int_as_float(si[0]);
   __syncthreads();
   const float* c = C + (size_t)b * kVocabPart;
+  const CertRow cr = cert_row(in, b);
   float m = -INFINITY;
   int mi = INT_MAX;
   for (int i = t; i < kVocabPart; i += 1024) {
-    const float lo = c[i] - n * B[i];
+    float lo = c[i] - n * B[i];
+    if (cr.samp) lo = (lo - 1e-3f) * cr.invT - cert_noise(cr.base, vocab0 + i);
     if (lo > m) m = lo, mi = vocab0 + i;
   }
   sv[t] = m, si[t] = mi;
@@ -1171,12 +1203,12 @@ __global__ void __launch_bounds__(1024) k_cert_lo(const float* C, const bf16* x,
     cand[b] = comm::ArgMax{m - 1e-3f, mi};
   }
 }
-// Row b: with g[b].v the largest lower bound over the ranks, a vocabulary row whose upper bound coarse + xn B reaches
-// it may hold the argmax: its CTA's mask byte is set. Every logit of the row becomes -inf; the masked exact GEMV then
-// writes the surviving CTAs' logits. A forced step, or a threshold or norm that is not finite, sets every CTA.
+// Row b: with g[b].v the largest lower bound over the ranks, a vocabulary row whose upper bound coarse + xn B (a
+// sampled row: its score's) reaches it may hold the winner: its CTA's mask byte is set; every logit of the row becomes
+// -inf and the masked exact GEMV writes the surviving CTAs'. A forced step, or a non-finite threshold or norm, sets every CTA.
 __global__ void __launch_bounds__(1024) k_cert_mask(const float* C, const float* B, const float* xn,
                                                     const comm::ArgMax* g, int R, float* logits, uint8_t* mask,
-                                                    uint32_t* stats, int force) {
+                                                    uint32_t* stats, int force, const ops::StepIn* in, int vocab0) {
   const int b = blockIdx.x, t = threadIdx.x;
   if (b >= R) return;
   const float T = g[b].v, n = xn[b];
@@ -1185,9 +1217,12 @@ __global__ void __launch_bounds__(1024) k_cert_mask(const float* C, const float*
   if (b == 0 && t == 0 && forced) stats[6] += 1;
   const float* c = C + (size_t)b * kVocabPart;
   float* l = logits + (size_t)b * kVocabPart;
+  const CertRow cr = cert_row(in, b);
   for (int i = t; i < kVocabPart; i += 1024) {
     l[i] = -INFINITY;
-    if (all || !(c[i] + n * B[i] + 1e-3f < T)) mask[i / kCertRowsCta] = 1;
+    float hi = c[i] + n * B[i] + 1e-3f;
+    if (cr.samp) hi = hi * cr.invT - cert_noise(cr.base, vocab0 + i) + 1e-3f;
+    if (all || !(hi < T)) mask[i / kCertRowsCta] = 1;
   }
 }
 // DSGB10_CERT_CHECK: row b's maximum and its lowest id in the certified logits against the full head's (l2). The token
@@ -1197,7 +1232,7 @@ __global__ void __launch_bounds__(1024) k_cert_mask(const float* C, const float*
 // where this rank's two maxima agree. Also the largest |coarse - exact| / (xn B) (stats[4], float bits), the CTAs set.
 __global__ void __launch_bounds__(1024) k_cert_check(const float* logits, const float* l2, const float* C, const float* B,
                                                      const float* xn, int R, const uint8_t* mask, uint32_t* stats,
-                                                     const comm::ArgMax* g) {
+                                                     const comm::ArgMax* g, const ops::StepIn* in, int vocab0) {
   __shared__ float sv[1024], sw[1024], sr[1024];
   __shared__ int si[1024], sj[1024];
   const int b = blockIdx.x, t = threadIdx.x;
@@ -1219,11 +1254,17 @@ __global__ void __launch_bounds__(1024) k_cert_check(const float* logits, const 
   const float* e = l2 + (size_t)b * kVocabPart;
   const float* c = C + (size_t)b * kVocabPart;
   const float n = xn[b];
+  const CertRow cr = cert_row(in, b);  // a sampled row: the scores' winners compared
   float m1 = -INFINITY, m2 = -INFINITY, rt = 0.f;
   int i1 = INT_MAX, i2 = INT_MAX;
   for (int i = t; i < kVocabPart; i += 1024) {
-    if (a[i] > m1) m1 = a[i], i1 = i;
-    if (e[i] > m2) m2 = e[i], i2 = i;
+    float av = a[i], ev = e[i];
+    if (cr.samp) {
+      const float nz = cert_noise(cr.base, vocab0 + i);
+      av = av * cr.invT - nz, ev = ev * cr.invT - nz;
+    }
+    if (av > m1) m1 = av, i1 = i;
+    if (ev > m2) m2 = ev, i2 = i;
     rt = fmaxf(rt, fabsf(c[i] - e[i]) / (n * B[i]));
   }
   sv[t] = m1, si[t] = i1, sw[t] = m2, sj[t] = i2, sr[t] = rt;
@@ -1248,16 +1289,18 @@ void Model::Impl::cert_head(int R) {
   dsk::rmsnorm(yraw, norm_w, R, kDim, kNormEps, hfin, nullptr, nullptr, st);
   dsk::gemv_fp8w_f32(hfin, R, cert.h8, cert.h8s, kVocabPart, kDim, cert.clog, dsk::GemvCfg{2, 1, 8}, st);
   attn::launch(k_cert_lo, dim3(kCertRows), dim3(1024), 0, st, false, (const float*)cert.clog, (const bf16*)hfin,
-               (const float*)cert.B, R, kVocabPart * rank, cert.xn, cert.cand, cert.mask, cert.stats, cert.bscale);
+               (const float*)cert.B, R, kVocabPart * rank, cert.xn, cert.cand, cert.mask, cert.stats, cert.bscale,
+               (const ops::StepIn*)in_d);
   comm::argmax_rows(ch, cert.cand, cert.gcand, kCertRows, st);  // COLLECTIVE: each row's threshold over the ranks
   attn::launch(k_cert_mask, dim3(kCertRows), dim3(1024), 0, st, false, (const float*)cert.clog, (const float*)cert.B,
-               (const float*)cert.xn, (const comm::ArgMax*)cert.gcand, R, logits, cert.mask, cert.stats, cert.force);
+               (const float*)cert.xn, (const comm::ArgMax*)cert.gcand, R, logits, cert.mask, cert.stats, cert.force,
+               (const ops::StepIn*)in_d, kVocabPart * rank);
   dsk::gemv_bf16x_norm_masked(yraw, norm_w, kNormEps, R, head, kVocabPart, kDim, logits, chead, cert.mask, st);
   if (cert.check) {
     dsk::gemv_bf16x_norm(yraw, norm_w, kNormEps, R, head, kVocabPart, kDim, cert.logits2, nullptr, chead, st);
     attn::launch(k_cert_check, dim3(kCertRows), dim3(1024), 0, st, false, (const float*)logits, (const float*)cert.logits2,
                  (const float*)cert.clog, (const float*)cert.B, (const float*)cert.xn, R, (const uint8_t*)cert.mask,
-                 cert.stats, (const comm::ArgMax*)cert.gcand);
+                 cert.stats, (const comm::ArgMax*)cert.gcand, (const ops::StepIn*)in_d, kVocabPart * rank);
   }
 }
 
@@ -1297,10 +1340,12 @@ void Model::Impl::cert_setup(const uint8_t* head_raw, const uint8_t* q, const ui
   if (cert.check) cert.logits2 = dalloc<float>((size_t)kCertRows * kVocabPart);
   cert.force = getenv("DSGB10_CERT_FORCE") ? atoi(getenv("DSGB10_CERT_FORCE")) : 0;
   cert.bscale = getenv("DSGB10_CERT_BSCALE") ? (float)atof(getenv("DSGB10_CERT_BSCALE")) : 1.f;
+  cert.samp = !getenv("DSGB10_CERT_SAMPLED") || atoi(getenv("DSGB10_CERT_SAMPLED")) != 0;
   if (!(cert.bscale >= 1.f)) die("model: DSGB10_CERT_BSCALE below 1");
   cert.on = true;
-  std::fprintf(stderr, "cert: rank %d: certified head on (FP8 coarse read; bound mean %.4f max %.4f; check %d force %d bscale %g)\n",
-               rank, sum / kVocabPart, mx, (int)cert.check, cert.force, cert.bscale);
+  std::fprintf(stderr, "cert: rank %d: certified head on (FP8 coarse read; bound mean %.4f max %.4f; sampled rows %d; check %d "
+                       "force %d bscale %g)\n",
+               rank, sum / kVocabPart, mx, (int)cert.samp, (int)cert.check, cert.force, cert.bscale);
 }
 
 void Model::Impl::forward_rows(int R, int ctx, uint32_t flags, Sink* sink, int pos0) {

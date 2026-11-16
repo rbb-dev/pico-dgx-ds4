@@ -255,12 +255,14 @@ struct Model::Impl {
   std::unique_ptr<detail::Store> store_s;
   std::unique_ptr<detail::Spec> spec;
   bool mh_on = false;  // capturing a spec step: main_hidden at the inputs of layers 37-39
-  // stack4, the certified head (DSGB10_CERT=1; one-session spec steps whose rows are all greedy without top logprobs):
+  // The certified head (DSGB10_CERT=1; one-session spec steps whose rows are all greedy without top logprobs,
+  // or sampled at a temperature up to 1 without top-k, top-p or top logprobs, bounding the Gumbel score):
   // a coarse read of every vocabulary row (the drafter's FP8 copy of the head) with a rigorous bound per row, one
   // cross-rank threshold per step row, and the exact head kernel on the CTAs that the bound cannot exclude. The
   // sampler then finds the token the full head gives (cert_head, model.cu).
   struct Cert {
     bool on = false, check = false;
+    bool samp = false;    // sampled rows too (DSGB10_CERT_SAMPLED=0: off): the bound on l / T - log(-log(u))
     int force = 0;        // DSGB10_CERT_FORCE=N: every Nth step runs every CTA (the fallback, exercised)
     float bscale = 1.f;   // DSGB10_CERT_BSCALE: the bound scaled up (more survivors; measurement)
     const uint8_t *h8 = nullptr, *h8s = nullptr;  // the FP8 copy and its scales (dspark's)
