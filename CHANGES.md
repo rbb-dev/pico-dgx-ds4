@@ -1,136 +1,340 @@
-# Changes in pico-dgx-ds4
+# Changes in this repository
 
-Fork of blaesus/dsgx10 by Andy Shu (MIT). Changes by Patrick Moorhead.
-Base: upstream `a92b8f4` (master, 2026-10-18). All changes are in `ds41f-4xgx10-switchless/`.
+This repository builds on [pico-dgx-ds4](https://github.com/Picom-code/pico-dgx-ds4) by Pico (Patrick Moorhead), from its
+commit `7c123ad`, which builds on [dsgx10](https://github.com/blaesus/dsgx10) by Andy Shu. Below is every change this repository
+makes to it, as the code here has it. pico-dgx-ds4's own change list is [`CHANGES-pico.md`](CHANGES-pico.md).
 
-Measured on four GB10 boxes (TP=4) over a 200G switch, serving DeepSeek-V4.1-Flash-1017, `--max-ctx 1048576`.
-Speeds are decode tok/s (total across concurrent requests). "agent" = 8 concurrent sessions with
-80K-300K-token prompts, 512 tokens per turn. qeval = 75-question quality eval, bar >= 70.
+The code is in `ds41f-4xgx10-switchless/`. How each change works is in [`docs/`](docs/README.md); the [README](README.md) is the
+user's view.
 
-| # | Change | Files | Default | Lossless | Before -> after |
-|---|---|---|---|---|---|
-| 1 | 17-bit block index in `select_bins` (prefix split `nlow`, guard `bkeys_stride` <= 131072) | `engine/attn/indexer.cu` | on | yes | max context 512K -> 1M; needle at 947,826 tokens 3/3; prefill 9.2k tok/s; qeval 71/75; c1 unchanged |
-| 2 | `DefaultBodyLimit` 64 MB (axum default 2 MB) | `frontend/src/server.rs` | on | yes | HTTP 413 above ~400K tokens -> 948K-token prompts accepted |
-| 3 | 16 slots, big/small slot units (`--big-slots`), slot-aware admission, big-slot wait instead of die | `engine/model/*`, `engine/server/{main,serve}.cpp` | `--slots`/`--big-slots` | yes | code c16 172 -> 234-247, c8 170 -> 195-200; c1 unchanged; qeval 71 |
-| 4 | 9..16-row normed GEMVs as rmsnorm + plain r16 GEMV (`DSGB10_FUSED16=1` reverts) | `engine/model/model.cu` | on | yes (same bits) | c16 234 -> 253, c4 187 -> 204, step 77.3 -> 74.8 ms |
-| 5 | Batch-aware expert re-routing `DSGB10_OEA=K0,KP,MINROWS` | `engine/kernels/{common.cuh,moe.cu}` | off | **no** | with 4,12,9: c16 253 -> 286, agent 180.7 -> 203.4; qeval 71/72 |
-| 6 | Cross-session draft row budget `DSGB10_BUDGET=1` | `engine/model/{spec.cu,ops.h,model.h}`, `engine/server/cmd.cpp` | off | yes | c16 253 -> 259, agent 180.7 -> 189.5 |
+**How the numbers were measured.** Four GB10 Sparks, tensor parallel over four, one ConnectX-7 port each on one 200G switch,
+serving DeepSeek-V4.1-Flash-1017 with the settings of [`deploy/pico.env.example`](deploy/pico.env.example) (a 4,194,304-token
+context) and the GPU clock limited to 2,200 MHz. Speeds of the served build come from a clean boot of all four Sparks. Any
+other number is the change's own before and after, and the
+entry says what it was compared with. Two boots of the same build differ by up to about 5 %, so a smaller difference is
+reported as equal. Prompt Processing (PP) and Token Generation (TG) are in tokens a second (t/s).
 
-## End to end
+Contents: [The memory store](#the-memory-store) · [Context to 4M](#context-to-4m) ·
+[The conversation cache](#the-conversation-cache) · [Prompts](#prompts) · [Weights and kernels](#weights-and-kernels) ·
+[Drafting](#drafting) · [Images and video](#images-and-video) · [The dashboard](#the-dashboard) ·
+[Serving and operating](#serving-and-operating) · [Fixes](#fixes)
 
-| Build | chat c1 | code c1 | c4 | c8 | c16 | agent | qeval c4/c16 | max ctx |
-|---|---|---|---|---|---|---|---|---|
-| upstream, 256K, 8 slots | 80 | 140 | - | - | 177 | - | 71 | 256K |
-| + 1 + 2, 1M, 4 slots | 78-82 | 134-140 | - | 170 | 172 | - | 71 | 1M |
-| + 3, 16 slots (4 big) | 79 | 135-140 | 187 | 197 | 234 | 180.1 | 71/71 | 1M |
-| + 4 + 6 (`DSGB10_BUDGET=1`) | 80.4 | 137.8 | 211 | 212 | 259 | 189.5 | 71/71 | 1M |
-| + 5 (`DSGB10_OEA=4,12,9`) | 77.5-78.5 | 137.8-139.3 | 239 | 236 | 296 | 215.1 | 71/73 | 1M |
+## The memory store
 
-Engine args for the last row: `--max-ctx 1048576 --slots 16 --big-slots 4 --setenv DSGB10_BUDGET=1 --setenv DSGB10_OEA=4,12,9`.
+[`docs/store.md`](docs/store.md) explains the whole store.
 
-## Wide step (branch wide64, now main)
+**One memory store.** At start, all the memory the weights leave on a Spark, less what you keep for the host, becomes one store
+of equal chunks, the same on all four Sparks. It holds every conversation's cache, its restart points and its image rows. A
+conversation that moves between a running line and the store copies nothing, and a fork shares its base's chunks.
+- Setting: `--pool-free-gib` (served: 6.3 GiB kept for the host on every Spark).
+- Measured: the served store is 25.38 GiB on every Spark, 30.6 million cached positions. Against the same engine with fixed
+  memory per line: TG equal, outputs bit-equal; a fork of a 40K-token conversation and its base hold 58 chunks, where two copies
+  would hold about 98.
 
-| # | Change | Default | Lossless | Before -> after |
-|---|---|---|---|---|
-| 7 | Wide batch step, 17-64 rows (`DSGB10_WIDE=W`): prefill GEMMs + `moe_prefill`, indexer/compressor/head in 16-row groups | off | ~1 ulp | c16 296 -> 350, agent 215 -> 240 |
-| 8 | Cost-aware wide gate (`DSGB10_WIDE_COST`) | on with WIDE | yes | wide only when drafts pay |
-| 9 | One-pass drafter (`DSGB10_DRAFT1=6`) + coded-head GEMM (`DSGB10_HEADG`) | off / on | ~1 ulp / same bits | 48-row step 120 -> 109 ms |
-| 10 | Gate re-fit + `WIDE=64` | - | yes | c16 350 -> 438, c8 295 -> 330, agent 240 -> 260; qeval 71/71; needle 3/3 at 948K |
+**What the host keeps, checked at every start.** The engine counts every other user of memory at its cap (its own heap, the
+front-end, the media worker, request frames, the server's token ids), sizes the store from what is left after
+`--pool-free-gib`, and prints the account at every start. It refuses to start when the store could not hold one conversation of
+the full window, and while serving it logs any Spark whose free memory falls under the setting.
+- Settings: `--front-mib` (served: 840), `--media-mib` (512), `--frame-stage-mib` (400: a larger request is refused).
+- Measured: the served build at ready keeps 10.1 GiB of host memory free on rank 0.
 
-## Vision
+**Up to 64 conversations live at once.** A line (`--slots`) holds only a conversation's window state, 5.8 MiB a Spark, and points
+at its chunks in the store, so every line can grow to the whole context. One step decodes 16 lines; the others take turns.
+- Setting: `--slots` (served: 32; at most 64).
+- Measured: 32 users together 328.5 t/s, 16 users 354.0 t/s.
 
-| # | Change | Files | Default | Lossless | Before -> after |
-|---|---|---|---|---|---|
-| 11 | Image input: side encoder (the checkpoint's `inference/vision.py` + `image_processor.py`, SDPA on contiguous 4D views: MATH -> flash, 3.1 s -> 0.39 s per 444-token image); dsfront `--vision-addr` accepts `image_url`/`image` parts, expands each placeholder into its span; SUBMIT flag 8 carries the spans' rows; prefill injects them, span rows route with `ffn.gate.bias_vl`, Engram dead on spans; decode untouched | `tools/vision/`, `frontend/src/{vision,server,protocol,main}.rs`, `engine/common/frontend_protocol.h`, `engine/model/{prefill,model,ops}.cu`, `engine/server/{serve,cmd}.cpp`, `engine/engram/hash.cpp` | off (needs `--vision-addr`) | text: same path | images refused (400) -> 15/15 image checks, ~0.26 s TTFT per image; text: chat/code c1 79.7/138.4 -> 81.9/144.4, distinct c16 367 -> 380, agent 260 -> 266, qeval 71/71 -> 71/72, needle 948K 3/3 (noise) |
+**Cache gives way; a running request is never cut.** Everything no running request uses is cache, and it gives way in one order:
+free chunks, then stored conversations least recently used first, then idle lines. A request reserves its prompt and a stretch
+of output, not its whole window. A request that finds no memory waits; if every growing request is stuck for 2 s, the one with
+the longest output ends with reason `length` and the others go on.
+- Setting: `--grow-ahead` (131,072 tokens of output a reservation covers).
+- Measured: with a store too small for four 355K-token conversations to grow, one ended with `length` within 5 s and the other
+  three went on at once.
 
-## Single user (c1fast)
+**Tenants of the store.** The store lends whole groups of 178 MiB to the engine's other users of memory: the 2M and 4M windows,
+the Engram row cache, the image encoder's work area and the buffers for 16,384-row prompt passes. A loan that fails on any Spark
+is undone on all four and never stops the engine.
 
-The served build is the exact path: chat c1 ~80-82, code c1 ~138-144 (9-run medians). Change 12 below was a lossy
-experiment; the code stays in tree, off by default, and is not used.
+**The Engram row cache, sized while serving.** The cache lives in memory the store lends, so it never takes from what the host
+keeps. The dashboard's ENGRAM CACHE SIZE changes it between runs.
+- Settings: `--engram-cache-mib` (served: 2,032); live: 2,032, 4,096 or 6,912 MiB.
+- Measured: a resize lands in 1.2 s on an idle engine; outputs bit-equal at every size; PP and TG within 1 %.
 
-| # | Change | Files | Default | Lossless | Before -> after |
-|---|---|---|---|---|---|
-| 12 | Relaxed accept for one-session greedy decode (`DSGB10_RELAX_P=P`: a draft the target gives >= P probability is kept as the row's token; `DSGB10_RELAX=G` logit-gap form) + `DSGB10_RELAX_THRESH=T` fixed verify gate for one-session greedy decodes. Batch steps and sampled requests keep exact accept and the default gate | `engine/model/sample.cu`, `engine/server/cmd.cpp` | off | **no** | **REMOVED from the build 2026-11-09 (outputs must be bit-identical; this was lossy).** Measured with P=0.003, T=0.05: chat c1 81.6 -> 102.8, code c1 140.1 -> 162.9 (our bench, 9-run medians); sparkDash prose 101 -> 145, code 166 -> 172; qeval c1/c4/c16 72/71/71; distinct c16 381, copies 434, distinct c8 311, agent 260 (vis1 same day 262), needle 948K 3/3, images 15/15 |
+**The Engram row cache in the display memory.** A GB10 sets aside about 2 GiB for a display, unused on a Spark with no screen.
+The cache's slots live there, so they cost the store almost nothing.
+- Setting: `--engram-vram on` (served; refused when a screen is connected).
+- Measured: PP and TG within 0.6 % from 24K to 4M tokens, outputs bit-equal; the served 2,032 MiB cache takes one 178 MiB group
+  from the store.
 
-Method check (sparkDash 1.8.8 at 754f40a, upstream's own sdrun.mjs harness): upstream's README 95 / 151 vs our 80 / 140
-was the method (one easier prompt, 256 tokens), not the engine: the exact build scores 101 / 166 on sparkDash. Full
-sweep and profile: [docs/c1fast.md](ds41f-4xgx10-switchless/docs/c1fast.md).
+**Token ids kept once, in the engine.** The engine keeps each conversation's token ids. The front-end sends only the new part of
+a prompt and keeps a small table of where earlier prompts ended (no text and no ids); when the engine no longer has the
+conversation, the front-end sends it whole once.
+- Setting: front-end `--no-prefix` turns it off.
+- Measured: the saved index of 97 conversations of 200K ids is 10 KB, where it was 77.6 MB; a four-turn conversation gives the
+  same outputs with and without.
 
+**A smaller front-end session table, with a cap.** The table keeps a token mark every 32 tokens, is capped by `--front-mib`,
+and is saved off the request path.
+- Measured: 8.7 bytes a token on the serving front-end, where it was 22.8.
 
-## stack4: three small single-user levers (2026-11-10)
+**Host memory bounded.** The Engram token history is kept to the prompt in flight plus its last 4,096 ids, the engine's heap
+arenas are capped and trimmed, and a front-end connection with more than 64 MiB queued is closed.
+- Measured: PP and TG within 0.4 %, outputs bit-equal.
 
-All three act on one-session steps only; batch (multi-user) steps run as before. Proof per lever: paired runs on the same 320
-held-out prompts (same texts), GPU ms per step by rows, and the 54-prompt identity set on a test port. Design and proofs:
-[docs/stack4.md](ds41f-4xgx10-switchless/docs/stack4.md).
+**The store's rules in one testable class.** All the store's rules live in `store_core`, which runs without a GPU. The engine can
+record every store operation on the Sparks, and the recordings replay against the class anywhere; with `DSGB10_STORE_CHECK=1`
+the four ranks compare a digest of the store after every command.
+- Measured: 20 recordings from the four Sparks replay equal; PP and TG unchanged (an 8K prompt 968 against 981 ms).
 
-| # | Change | Files | Default | Same output | Before -> after |
-|---|---|---|---|---|---|
-| 13 | `DSGB10_HEAD4_C1=1` with upstream's `--draft-head4 --draft-markov8`: MXFP4 drafter head and FP8 Markov head for one-session drafts, the FP8 head copy kept for batch draft passes | `engine/dspark/dspark.cu`, `engine/model/spec.cu` | off | yes: drafts only; 374/374 test outputs identical | draft pass -0.30..-0.38 ms; 320 prompts chat 86.19 -> 87.17, code 128.20 -> 129.29, math 133.70 -> 134.93; 16 distinct 363-370 (unchanged) |
-| 14 | Confidence MLP gate `DSGB10_CF_MLP=FILE`, `DSGB10_CF_ALPHA=A` (one-session drafts): per depth the shipped logit, top-1 margin and top-1 log p (a scan kernel per rank, one all-gather, one MLP kernel), 64 hidden units; trained offline on 661K anchors | `engine/dspark/dspark.{h,cu}`, `engine/model/{spec.cu,ops.h}`, `engine/server/cmd.cpp`, `tools/stack4/` | off | every token is still the verifier's top choice; the gate changes which drafts are verified, which regroups steps and can flip a close call (alpha 1.0: 374/374 identical; alpha 0.9: 319/320 held texts) | accepted drafts per step chat 1.17 -> 1.24; chat 87.17 -> 88.17, code 129.29 -> 130.50, math 134.93 -> 136.11 |
-| 15 | Certified LM head `DSGB10_CERT=1` (one-session steps whose rows are greedy without logprobs): FP8 coarse GEMV, per-row rigorous bound, cross-rank threshold, exact coded-head kernel on surviving 16-row groups (`gemv_bf16x_norm_masked`), sampler unchanged; `DSGB10_CERT_CHECK=1` runs the full head beside it | `engine/model/{model.cu,spec.cu,impl.h,model.h}`, `engine/kernels/{gemv16.cu,dsk.h}`, `engine/dspark/dspark.{h,cu}`, `engine/server/{cmd,serve}.cpp` | off | yes: same steps, same token; 1,344,416 real step rows checked on each rank, 0 mismatches, fallback exercised | head -0.18..-0.28 ms a step; chat 88.17 -> 89.45, code 130.50 -> 130.88, math 136.11 -> 137.05 |
-| - | Measurement tools: `DSGB10_STEP_LOG`, `DSGB10_FORCE_NTOP`, `DSGB10_CF_DBG`, `DSGB10_CERT_FORCE`, `DSGB10_CERT_BSCALE`, `DSGB10_MH_DUMP` | `engine/server/{cmd,serve}.cpp`, `engine/model/spec.cu` | off | - | - |
+**Memory readings without a pause.** The memory reading every 10 s rides the decode step instead of pausing it, and rank 0's
+bookkeeping for each request runs once a step, after the next step is queued.
+- Measured: the decoders' longest gap before a long prompt 0.30 s, where the reading's pause gave 0.41 s.
 
-Stack vs the exact build, same binary: 320 held prompts chat +3.78 %, code +2.09 %, math +2.51 %; our bench 27-run medians
-79.6 / 136.6 -> 80.1 / 142.4; sparkDash c1 prose 99.1 -> 100.5, code 162.9 -> 162.8, catalogs 76.3 / 125.2 / 151.2 ->
-79.5 / 130.7 / 154.0; 16 distinct 365-366, copies 446, 8 distinct 302, agent 262, prefill 10.0k, qeval 71 / 71, needle 3/3 at
-948K, images 15/15.
+## Context to 4M
 
-Measured and not built: the target's output at a rejected row as the next draft (right 18 % of the time against the drafter's
-65 %), a vocabulary shortlist for the drafter's head (+0.3 % simulated on top of #13), 6-7 bit coarse codes for #15 (about
-0.07 ms), 7-bit packing of the FP8 dense weights (upstream's costing: no gain at the measured decode cost).
+[`docs/engine.md`](docs/engine.md) and the README's [Context to 4M](README.md#context-to-4m).
 
-Carryover pilot (2026-11-10, offline only): carried rejected-row states with the shipped drafter frozen raise the accepted
-length after a rejection by 2.2 % (3.5 % with small gated adapters) on 12,220 held anchors; realised speed with the current
-confidence gate is about zero, so it is not in the engine. Numbers and code: docs/stack4.md, tools/stack4/carryover/.
+**Contexts that grow to 4M on their own.** Each request runs in the smallest window that holds it: 1M, 2M or 4M tokens, with the
+matching YaRN factor. A conversation that outgrows its window is read again once at the next size and goes on, with the same
+output as a cold start, and a request is never refused for its length. The dashboard's "Extend context" switches growth past 1M
+on or off.
+- Settings: `--max-ctx` (served: 4,194,304), `--extend on|off` (on).
+- Measured, the served build, one cold prompt and then 256 tokens of output:
 
-Live build re-measured on our bench (27 runs, 2026-11-10, no other traffic): chat 82.7, code 142.6 (medians). README
-table and charts now show 83 / 143.
-
-Setup and bench (2026-11-10): README "run it" now lists the steps for the exact served build; tools/bench/bench.py is the
-bench behind the README numbers. 16 users re-measured on the live build: 368 distinct, 436 copies (medians of 3).
-
-Front-end fix (2026-11-11): a message that contains the image placeholder as ordinary text (a doc, a log, an error quoted
-back) used to get HTTP 400 on every later turn. The placeholder is now rewritten with ASCII bars in request text and served
-as plain text; image parts are unchanged; error texts no longer quote the token. `frontend/src/encoding.rs`, `server.rs`.
-
-## stack5: sync without relays; coded weights and a 4-bit drafter body measured, not built (2026-11-11)
-
-Three levers got a decisive measurement before any engine work; one shipped. Design, proofs and the two negative results:
-[docs/stack5.md](ds41f-4xgx10-switchless/docs/stack5.md).
-
-| # | Change | Files | Default | Same output | Before -> after |
-|---|---|---|---|---|---|
-| 16 | Direct ring `DSGB10_RING_DIRECT=1\|2` (`comm::Options::direct`, `ring_test --direct`) for fleets where every rank reaches every other in one hop (a switch): each rank also connects to the opposite rank and writes its contribution there itself; proxies relay nothing. Mode 2 also sends a small contribution to a neighbour as one write and one write of both flags. Buffers, flags, device kernels and the order of every sum are unchanged | `engine/comm/{ring.cpp,ring.h}`, `engine/comm/tests/ring_test.cu` | off | yes: same bits; 54/54 identity prompts, 320/320 held texts, identical steps | 10 KB all-reduce 14.45 -> 9.89 us, a step's 80 all-reduces 1.16 -> 0.79 ms (ring bench); engine GPU step -0.21 ms at one row .. -0.59 ms at six; 320 prompts chat 89.16 -> 90.28, code 131.32 -> 133.62, math 136.99 -> 139.46 |
-| - | Bench only: a fixed-length lossless FP8 weight code decoded inside the GEMV (`k_gemv_fp8x`), next to upstream's fused Huffman kernel; `bench_wcomp` is now a CMake target | `engine/kernels/tests/bench_wcomp.cu`, `engine/kernels/CMakeLists.txt` | - | bit-exact (bench) | no gain: see below |
-
-Gates with #16 on (test port; relay ring in the same window or stack4's gate run in brackets): 16 distinct 372.5, 373.9
-(367.3, 361.6); copies 458.7 (439.1); 8 distinct 307.4 (302); agent 269.5 (262.4); our bench 27-run 82.4 / 143.7
-(81.5 / 145.3: within its noise); sparkDash c1 prose 101.9-102.3 (100.3-100.9), code 159.9-165.3 (162.5-163.4), catalogs
-80.7 / 132.4 / 156.1 (78.8 / 128.8 / 154.1); prefill 9.0k / 10.2k; qeval 71 / 71; needle 3/3 at 948K; images 15/15.
-
-Measured and not built:
-- Lossless coding of the dense FP8 weights, decoded inside the GEMV, on one Spark with our weights. Fused Huffman (upstream's
-  kernel, 17 % fewer bytes): 10-48 % slower than today's kernels, as upstream found. A fixed-length 7-bit code with a
-  side list for outliers (8.3-8.8 % fewer bytes, every byte exact, outputs bit-identical): -6 % to +6 % against today's
-  kernels by site and row count, about par on average; it reads its stored bytes at 216-237 GB/s against 248-258 GB/s raw.
-  The bar was 3 % of the dense time.
-- The drafter's FP8 body as MXFP4, post hoc, in the torch mirror: accepted length -1.9 % chat, -1.3 % code, -1.4 % math for a
-  pass that would be 0.30 ms shorter; first-order simulated gain 0 to +0.2 %. A 22-minute quantisation-aware pilot on
-  166 held-out sequences did not close the gap (chat accepted length 1.463 -> 1.464, FP8 1.493); a full fine-tune was not run.
-
-The chat target of 100 tok/s on the 320 held prompts was not reached: 90.3.
-
-## Thinking options, 100 images per request, video input (2026-11-15; pull requests #4, #5, #6 by MiaAI-Lab)
-
-Merged with maintainer commits on top. Tested on the real 4-Spark engine on a test port: output identity 54/54,
-images 15/15, 16 users 375-378 tok/s (unchanged), encoder rows byte-identical to the previous encoder's.
-
-| Change | Default | Notes |
+| Prompt | Prompt Processing | TG after it |
 |---|---|---|
-| `reasoning_effort` is validated; `thinking: {"type": "enabled" \| "disabled"}` is read | thinking stays OFF unless a request or `--thinking` turns it on | unknown values now return 400; any explicit off-switch wins; `minimal` = 1, `ultra` = 95 |
-| Up to 100 images per request (was 16) | `--max-image-rows 40000` per request, `--max-image-rows-in-flight 80000` across requests | over the per-request cap: 400 before anything is encoded; over the in-flight cap: 429 with `Retry-After`; body limit stays 64 MiB (`--max-body-mb`) |
-| Video input (`video_url`, timestamped frame sampling, 32 frames by default) | on when the vision encoder runs | frames count against the same row caps; unreadable clips, local paths and private addresses return 400 |
+| 1M tokens | 97.3 s (10,276 t/s) | 105.5 t/s |
+| 2.05M tokens | 225.0 s (9,112 t/s) | 105.0 t/s |
+| 4.15M tokens | 552.6 s (7,509 t/s) | 95.8 t/s |
 
-Memory on a 4-Spark head: about 1.3 GiB for 100 small images, 0.8 GiB for 40 full-size images in one request (measured).
-Two full-size requests at once were not measured: set `--max-image-rows-in-flight 40000` on a head with less than ~10 GiB free.
-The engine, the front-end and the vision encoder must be updated together: the new front-end sends requests the older engine and encoder refuse.
+  Under 1M, against a build with a 1M window only: outputs bit-equal, speed equal.
+
+**Larger windows only when needed.** A start reserves only what the 1M window needs; the 2M and 4M windows are made from the
+store when a request first needs them and given back when the store is short.
+- Measured: a 4M start's store is as large as a 1M start's; a 1.57M-token request opened the 2M window in 0.43 s.
+
+**Window sizes take turns.** A step runs one window size, so each run starts with the first waiting request of another size.
+- Tested on a host model of the run loop (`turns_test`): a 1M request beside two 4M requests runs in 50 of 100 runs, where it
+  ran in none.
+
+## The conversation cache
+
+The SSD tier and keeping conversations across a planned stop are pico-dgx-ds4's; these are this repository's changes to them.
+[`docs/split.md`](docs/split.md) explains the whole cache.
+
+**The SSD tier piece by piece.** Each piece of a conversation is written to the SSDs once, in the background and off every
+request's path; eviction takes the last piece first, and a piece already on disk leaves memory without a write.
+- Settings: `--disk-gib` (served: 512), `--keep-days` (30).
+- Measured: a 60K-token conversation evicted and read back twice: 117 MiB came back in 25.2 and 26.0 ms, bit-equal; the second
+  eviction wrote nothing.
+
+**A quarter on each SSD, and the split cache.** Each Spark writes its own quarter of every piece to its own SSD. With the split
+cache on, an idle conversation's written pieces are marked free where they lie, with no copy: if it returns before the memory is
+taken it costs nothing, otherwise the four Sparks read their quarters and exchange them. Memory holds a conversation whole or
+not at all.
+- Setting: `--kv-split off|tiered|max` (served: tiered).
+- Measured on a test build of the split cache: a conversation of 64 pieces came back from the four SSDs in 28.7 to 29.4 ms
+  (about 0.46 ms a piece), resuming at its last position.
+
+**Read-backs admitted on what they need.** A conversation coming back from the SSDs is admitted on the memory it actually lacks.
+- Measured: requests that had waited without end under the old count are admitted; 20 read-backs in a row each equal a cold start.
+
+**The SSD tier's size and expiry changed while serving.** From the dashboard; a smaller size gives the disk space back at once.
+- Measured: grown from 512 to 768 GiB while serving.
+
+**Crash checkpoints.** While the engine is idle it saves the idle conversations as a planned stop does, so a crash comes back to
+the last checkpoint; the front-end saves its session table the same way.
+- Setting: `--ssd-flush-s` (30: the least time between two checkpoints).
+- Measured: after rank 0 was killed and restarted, every conversation idle at the last checkpoint gave bit-equal outputs.
+
+**Kept conversations in the served settings.** pico-dgx-ds4's keeping of conversations across a planned stop is switched on.
+- Setting: `KEEP_GIB` (served: 64).
+- Measured: the next turn of a 64K-token conversation after a planned restart: first token after 0.23 s, where the same prompt
+  cold took 6.55 s. A new engine binary cannot read the kept conversations, so an upgrade starts them cold.
+
+## Prompts
+
+**Interleaved prefill.** A long prompt is processed in pieces between the decoding users' steps, so they keep receiving tokens;
+a short prompt that arrives meanwhile starts beside it and goes first. All of it changes live on the dashboard.
+[`docs/interleave.md`](docs/interleave.md)
+- Settings: `--interleave-gap-ms` (600: the longest a decoding user waits), `--interleave-share` (40), `--no-interleave`.
+- Measured with synthetic token ids through rank 0's socket: one user decoding beside a cold 200K-token prompt keeps 79.3 t/s with a longest silence of 0.60 s; without it the
+  user stops for 20.2 s. In the served build, beside 4 decoding users the longest silence was 0.6 s.
+
+**Long prompts processed 16,384 rows at a pass.** A second set of prefill buffers for 16,384-row passes is made from store memory
+that is free, never by moving a conversation, and is the first thing given back when the store runs short; without it the
+engine processes 8,192 rows a pass.
+- Setting: `--prefill-rows-max` (served: 16,384; 0 off).
+- Measured against the same build without it, a clean boot each. Prompt Processing of a single cold prompt is 9 to 10 % faster
+  from 28K to 1M tokens, 8.6 % at 2.05M and 7.2 % at 4.15M:
+
+| | Without | With |
+|---|---|---|
+| 1M-token prompt | 106.9 s (9,357 t/s) | 97.3 s (10,276 t/s) |
+| 2.05M-token prompt | 244.3 s (8,391 t/s) | 225.0 s (9,112 t/s) |
+| 4.15M-token prompt | 592.5 s (7,005 t/s) | 552.6 s (7,509 t/s) |
+| A prompt of about 785K tokens beside 4 decoding users, first token | 151.1 s | 139.9 s |
+| A prompt of about 170K tokens beside 4 decoding users, first token | 51.0 s | 53.7 s |
+
+  TG at 1, 16 and 32 users equal; after the 4.15M prompt 95.8 against 103.6 t/s (one run each). Outputs bit-equal.
+
+**pico-dgx-ds4's balanced reduce-scatter and prefill tuning, switched on.** `DSGB10_RING_RSBAL=1` spreads the prompt exchange's reduce-scatter
+evenly over the network card's two PCIe functions (its two rails); `DSGB10_PF_TUNE=hc,small,down` picks the prefill kernels' shapes by row count. Both are pico-dgx-ds4's code
+(pico-dgx-ds4 `f2bafa4` and `a40eeb8`), each in its own commit authored by Pico; this repository switches them on.
+[`docs/ring.md`](docs/ring.md)
+- Measured, one setting at a time on the same build: the tuning, 16 users 4.0 % faster (334.0 to 347.2 t/s); the balanced
+  reduce-scatter, equal at 16 users, and a long prompt 2.3 % shorter on the engine's own clock (not a clean boot). Outputs
+  bit-equal.
+
+**A clock for the prompt passes' waits.** `DSGB10_PF_STALL=1` times how long each prompt pass waits at its two joins with the
+exchange stream (after the attention's all-to-all and after the MoE's last column group) on layers 0 to 19, and rank 0 prints one
+line after each request. Off by default; when off no timing event is made. [`docs/ring.md`](docs/ring.md)
+
+## Weights and kernels
+
+**Weights loaded into place.** Each Spark loads its own quarter of the gathered weights straight into its slot of the whole
+buffer, so the separate copies are gone.
+- Measured: 0.75 GiB more store on every Spark; outputs bit-equal.
+
+**The embedding cut four ways.** Each Spark keeps a quarter of the embedding table, by vocabulary. The rank files are version 3:
+cut them again with `dsw_convert`.
+- Measured: 0.98 GiB more free memory on every Spark; outputs equal.
+
+**Rotary tables computed, not stored.** Each rotation is computed from its position and factor, so the table and its copies are
+gone, and the 2M and 4M windows need no tables of their own (0.5 and 1 GiB a Spark).
+- Measured: 0.25 GiB a Spark not taken; the computed values equal the table's bit for bit.
+
+**The decode index scan split four ways.** Each Spark scans a quarter of a conversation's index keys and the results are merged.
+- Setting: `--pscan off|ext|all` (served: all).
+- Measured (rank 0's step time at 1M tokens): 3 % shorter at 2 rows a step (22.94 to 22.26 ms), equal at 6 rows and under 64K;
+  the picks equal the whole scan's in 72 of 72 cases.
+
+**Prefill MoE up kernel with a mover warp.** One warp moves the data and four compute. [`docs/kernel-trims.md`](docs/kernel-trims.md)
+- Measured: the kernel 7.2 % shorter at 8,192 rows; bit-identical.
+
+**Prefill MoE down kernel with a mover warp.** The same for the down kernel. It is not used in the served settings, where pico-dgx-ds4's
+tuning picks pico-dgx-ds4's column-group down kernel, which measured better.
+- Measured, without that tuning: the kernel 16 % shorter at 8,192 rows, Prompt Processing 0.7 % faster; bit-identical.
+
+**Smaller loops in the prefill MoE kernels.** The down kernels expand the weights first, and the 4-bit expand reads its half of a
+word directly.
+- Measured: the routed down kernel 1.2 % shorter; bit-identical.
+
+**Decode attention prefetch.** The next block's keys are fetched while the current block is scored.
+- Measured: decode attention 10 to 27 % shorter on one Spark; bit-identical.
+
+**Decode matrix-vector kernels fetch earlier.** The kernels right after an exchange (`wq_a` with `wkv`, and the router's) request
+their second batch of weights while the exchange is still running.
+- Measured: a decode step at one user 0.7 to 0.9 % shorter; outputs bit-equal.
+
+**The certified head for sampled requests.** pico-dgx-ds4's certified LM head (it reads a coarse copy of the head and computes the exact
+one only where the winner is in doubt) also serves requests sampled at temperature up to 1 with no top-k, top-p or log
+probabilities. With the served default of top_p 0.95, requests use it only when they set top_p to 1.
+- Measured: a decode step at one user 0.7 % shorter; checked against the full head on 43,041 rows, 0 differences.
+
+## Drafting
+
+Every drafted token is checked by the model before it counts, so the output is the model's own. [`docs/batching.md`](docs/batching.md)
+
+**Copy drafting.** When a conversation's last 8 tokens appeared earlier in it, the tokens that followed are offered as extra drafts.
+Agents editing code repeat much of what they read, so these drafts are often right.
+- Setting: `DSGB10_COPY=1` (served: on).
+- Measured on an earlier build with a table fitted from real traffic, on rank 0's own clock: agent edit sessions 3.6 % faster
+  (inside the spread), one user and 16 users unchanged; outputs bit-equal.
+
+**Copy drafting that learns from the traffic.** How many copied drafts a step checks is learned from which ones were accepted,
+for each match length and for each conversation, the same on every Spark.
+- Setting: on with copy drafting (`DSGB10_COPY_ADAPT=0` turns it off).
+- Measured: equal to the built-in table alone on every bench (within 1.5 %), with no table to fit.
+
+**Drafting for several users.** In steps shared by several users, pico-dgx-ds4's confidence network estimates each draft's chance, and
+drafts are kept in order of expected accepted tokens per millisecond of step time.
+- Settings: `DSGB10_BATCH_CF=1`, `DSGB10_BATCH_TRIM=1` (served: on).
+- Measured: 2 to 5 users at temperature 1.0, on average 0.8 % faster (inside the spread), from 5.3 % slower to 9.6 % faster.
+
+## Images and video
+
+[`docs/vision.md`](docs/vision.md) explains the whole change, with the path of an image and a clip; [`docs/media.md`](docs/media.md)
+the media worker.
+
+**The image encoder inside the engine, split four ways.** Each Spark holds a quarter of the vision tower's weights and runs its share of every image over the ring, in units
+that fit between the decoding users' steps.
+- Setting: `--vision-weights` (each Spark's quarter, made by `dsw_convert --vision`).
+- Measured through the API with 8 users decoding (medians of five), against pico-dgx-ds4's separate encoder (two builds:
+  [`docs/vision.md`](docs/vision.md#measured) says which):
+
+| | Separate encoder | Inside the engine |
+|---|---|---|
+| One image, first token | 0.737 s | 0.443 s |
+| 32 video frames, first token | 12.56 s | 10.20 s |
+| Users' longest pause during the 32 frames | 2.01 s | 0.58 s |
+| Users' longest pause during one image | 0.33 s | 0.51 s |
+
+  Every image's rows equal the unsplit encoder's, byte for byte.
+
+**The separate encoder no longer started.** With the engine encoding, rank 0 runs no encoder container (`--vision container`
+still selects it).
+- Result: rank 0's memory counted outside the store is the media worker's 512 MiB cap instead of the container's 1,260 MiB cap.
+
+**Pixels in the request, read by a media worker.** A small worker with no model and no GPU (Pillow, numpy and PyAV) fetches and
+decodes images and clips; the front-end sends their pixels to the engine, which checks them before it keeps anything.
+- Settings: front-end `--media-addr` (served: 127.0.0.1:18951); engine `--media-mib` (512).
+- Measured: the worker's pixels equal the checkpoint's reference bit for bit on 11 images in 4 formats.
+
+**Image rows in the store.** A request's image rows live in store chunks on every Spark from its first pass until it ends, so a
+resumed request encodes nothing again.
+- Measured: first token equal (+0.5 %); a cancel or a client that leaves gives every chunk back.
+
+**Smaller loading of the vision weights.** The loader sizes its staging to its reads.
+- Measured: loading the vision weights costs the store 104 chunks, where it cost 292.
+
+**Image conversations reuse their cache.** Images are keyed by content and place, so a later turn processes only its new tokens.
+- Measured (with the separate encoder): the second turn of an image conversation answered in 0.25 s, the first in 1.40 s.
+
+## The dashboard
+
+`/dashboard` on the front-end. [`docs/dashboard.md`](docs/dashboard.md)
+
+**A live status page.** The decode and prefill rates; nine tiles (first token, context cache, max context, conversations, shared
+prefixes, Engram cache, lent memory, SSD cache, cache hits); decode, prefill and cache charts; one row a request with its phase
+and progress; one row a Spark with memory, temperatures, GPU, SSD wear, both links and fans; and the settings that change live.
+- Measured with the first version of the page on an earlier build: one user 79.3 t/s with it open, 79.8 with it closed.
+
+**Sign-in.** Every data route needs the front-end's API key; the page asks once and keeps it until SIGN OUT. Settings changes
+must be JSON, so another site's form cannot change them.
+
+**COOLING AND CLOCK.** One fan profile for all four Sparks, and each Spark's GPU clock limit at 2,400, 2,200, 2,000 or 1,800 MHz,
+never unlocked. Needs the external tool `dgx-fan-fleet` (`--fan-tool`).
+
+## Serving and operating
+
+**Runtime abliteration as a second model name.** The engine serves `NAME-ablit` beside `NAME` from the same weights: the published
+abliteration edit (by mrfakename, for this checkpoint) is applied at run time, only to the requests that ask for that name, and both
+names run in one batch. The file is in this repository: `ds41f-4xgx10-switchless/tools/ablit/ablit.bin`.
+[`docs/ablit.md`](docs/ablit.md)
+- Settings: engine `--ablit FILE`; front-end `--no-ablit-alias` serves the plain name only.
+- Measured: the plain name's outputs are unchanged; 16 users at the same speed with and without the edit (321.9 t/s).
+
+**The served front-end settings.** For a request that sets none: thinking on at effort 75, temperature 1.0, top_p 0.95, and an
+output cap of 1,048,576 tokens (the code's default of 32,768 cuts long outputs).
+
+**A served installation in `deploy/`.** The settings file, the systemd units for the engine, front-end and media worker, and
+`pico-ctl.sh`, which drops every Spark's page cache before a start, refuses a start when a Spark has too little memory free, and
+sets the GPU clock limit on every Spark. [`docs/setup.md`](docs/setup.md) goes from a clone to a running service;
+[`docs/operations.md`](docs/operations.md) covers start, stop, upgrade and rollback.
+
+**The network, reproducible.** The switch's configuration (RoCE with flow control on one priority) and each Spark's flow control at
+boot. [`NETWORK.md`](NETWORK.md)
+- Measured: three Sparks sending to one at line rate, engine stopped: 0 drops, 0 retransmissions.
+
+## Fixes
+
+Fixes to code this repository builds on; each was shown failing before the fix.
+
+| Fix | Before | After |
+|---|---|---|
+| A request that ends inside a batch gets its end at once | beside two long outputs, a 20-token answer came back after 12.1 s | 0.35 s |
+| A client that leaves ends its request wherever it waits | a queued or non-streaming request ran to its end for nobody | it ends at once, streaming or not |
+| Engram look-ahead used only by its own conversation | a prompt cancelled between pieces could give another conversation a wrong output (4 of 5 in the test) | 5 of 5 equal |
+| A full session store keeps every restart point | under a squeezed store, agents resumed from nothing or an old point | every agent resumes at its end |
+| Batch cancel marks index the batch's entries | a request on line 31 would have paused the whole batch | marks only its own entry |

@@ -23,13 +23,21 @@ with its licence:
 - `ds41f-4xgx10-switchless/golden/long.messages.json`: the golden agentic transcript carries, as tool
   results, excerpts of CPython 3.12's standard library (`json`, `textwrap`, `heapq`), under the PSF License
   2.0 (https://docs.python.org/3/license.html).
+- `ds41f-4xgx10-switchless/tools/ablit/ablit.bin`: the abliteration file for DeepSeek-V4.1-Flash-1017, made by
+  `tools/ablit/make_ablit.py` from the abliteration edit `abliteration-edit.npz` of the Hugging Face repository
+  mrfakename/DeepSeek-V4.1-Flash-1017-abliterated (MIT) and from the checkpoint's shared-expert weights
+  (DeepSeek-V4.1-Flash-1017, MIT, Copyright (c) 2023 DeepSeek).
 - Not vendored, fetched at build or run time under their own licences: the Rust crates of
   `frontend/Cargo.lock`; MiaAI-Lab's sparkDash (Apache-2.0), which `bench/sparkdash` drives from a
   separate checkout.
 
-No model weights are included.
+No model weights are included, except the abliteration file above, which is derived from them.
 
 ## This fork (pico-dgx-ds4)
 
 Fork of blaesus/dsgx10 by Andy Shu (MIT). Changes by Patrick Moorhead.
-The upstream LICENSE is unchanged and covers the changes too. The changes are listed in CHANGES.md.
+The upstream LICENSE is unchanged and covers the changes too. The changes are listed in CHANGES-pico.md.
+
+## This repository
+
+Built on pico-dgx-ds4 (MIT). The same LICENSE covers its changes, which are listed in CHANGES.md.
