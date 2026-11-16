@@ -1594,6 +1594,12 @@ void prefill_tuning(const PrefillTuning& t) { g_tune = t; }
 
 size_t moe_prefill_workspace_bytes(int M, int E) { return carve(nullptr, M, E).bytes; }
 
+void moe_prefill_shared(void* ws, int M, int E, const uint8_t** hq, const uint8_t** hs) {
+  const MoePWs b = carve(ws, M, E);
+  *hq = b.shq;
+  *hs = b.shs;
+}
+
 bool moe_prefill_fuses(int M) {
   const size_t P = (size_t)M * kTopK;
   return g_tune.down == 0 ? P * (256 + kInterP) <= (12u << 20) : g_tune.down == 2;

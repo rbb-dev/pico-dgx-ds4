@@ -1,13 +1,15 @@
 //! A rank-0 stand-in for testing the front-end end to end: speaks the protocol, keeps sessions
 //! (reporting cached_tokens from the longest common prefix), and streams scripted text.
 //!
+//! A request with the ABLIT flag gets `[ablit] ` before its answer, so a test sees the flag arrive.
+//!
 //! Script, from the decoded prompt: reasoning if the prompt ends in `<think>`; then, for the last
 //! user turn, `MOCK_TOOL <name> <json args>` → that tool call (if tools are in the prompt),
 //! `MOCK_LOOP` → a repeating sentence, `MOCK_LONG <n>` → n numbered filler words, a tool result → a reply
 //! quoting it, anything else → a reply quoting the user.
 
 use crate::encoding::{render_tool_calls, ASSISTANT_SP, THINK_END, THINK_START, USER_SP};
-use crate::protocol::{read_frame, Done, DoneReason, Frame, HelloEngine, Submit, Tokens, FLAG_KEEP, FLAG_LOGPROBS, VERSION};
+use crate::protocol::{read_frame, Done, DoneReason, Frame, HelloEngine, Submit, Tokens, FLAG_ABLIT, FLAG_KEEP, FLAG_LOGPROBS, VERSION};
 use crate::tokenizer::Tokenizer;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -30,7 +32,8 @@ pub struct MockConfig {
     pub max_context: u32,
 }
 
-type Sessions = Arc<Mutex<HashMap<u64, Vec<u32>>>>;
+/// session id -> (its history, whether it was made on the ablit path)
+type Sessions = Arc<Mutex<HashMap<u64, (Vec<u32>, bool)>>>;
 
 pub async fn run(cfg: MockConfig) -> std::io::Result<()> {
     let _ = std::fs::remove_file(&cfg.socket);
@@ -153,10 +156,18 @@ async fn generate(s: Submit, cancel: Arc<AtomicBool>, tx: &mpsc::UnboundedSender
         let _ = tx.send(Frame::Done(done).encode());
         return;
     }
+    let ablit = s.flags & FLAG_ABLIT != 0;
     let cached = {
         let ss = sessions.lock().unwrap();
         let hist = ss.get(&s.session_id).or_else(|| if s.base_session_id != 0 { ss.get(&s.base_session_id) } else { None });
-        hist.map_or(0, |h| lcp(h, &s.prompt)).min(s.prompt.len() - 1)
+        if hist.is_some_and(|h| h.ablit != ablit) {
+            // rank 0 never continues or forks a session across the two weights paths
+            drop(ss);
+            done.error = "session was made on the other weights path".into();
+            let _ = tx.send(Frame::Done(done).encode());
+            return;
+        }
+        hist.map_or(0, |h| lcp(&h.hist, &s.prompt)).min(s.prompt.len() - 1)
     };
     done.cached_tokens = cached as u32;
     let todo = s.prompt.len() - cached;
@@ -167,7 +178,10 @@ async fn generate(s: Submit, cancel: Arc<AtomicBool>, tx: &mpsc::UnboundedSender
     done.prefill_us = (t_first - t0).as_micros() as u64;
 
     let prompt_text = cfg.tok.decode(&s.prompt);
-    let script = script(&prompt_text);
+    let mut script = script(&prompt_text);
+    if ablit && !script.endless {
+        script.body.insert_str(0, "[ablit] ");
+    }
     let pre = cfg.tok.encode(&script.prefix);
     let mut body = cfg.tok.encode(&script.body);
     if !script.endless {
@@ -206,7 +220,7 @@ async fn generate(s: Submit, cancel: Arc<AtomicBool>, tx: &mpsc::UnboundedSender
         // the last sampled id has no KV yet
         let mut hist = s.prompt.clone();
         hist.extend_from_slice(&generated[..generated.len().saturating_sub(1)]);
-        sessions.lock().unwrap().insert(s.session_id, hist);
+        sessions.lock().unwrap().insert(s.session_id, (hist, ablit));
     } else {
         sessions.lock().unwrap().remove(&s.session_id);
     }

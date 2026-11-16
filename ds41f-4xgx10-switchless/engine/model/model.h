@@ -24,6 +24,7 @@ struct Sampling {
   int32_t top_k = 0;        // 0: off
   int32_t n_top = 0;        // top logprobs per row, 0..ops::kTopLogprobs
   uint64_t seed = 0;
+  float ablit = 0.f;  // 1: the runtime abliteration (Options::ablit) on this request's rows; 0: the checkpoint's model
 };
 using ops::SampleOut;
 
@@ -141,6 +142,8 @@ struct Options {
   // EXPERIMENT, bench only (docs/engine.md, "Draft trees"): every spec step's draft pass also runs the
   // drafter's probe (dspark::Draft::probe) along SpecCfg::probe, into SampleOut::probe
   bool tree_probe = false;
+  // the runtime abliteration (model/ablit.h, tools/ablit/make_ablit.py): its file; empty: none (Sampling::ablit is ignored)
+  std::string ablit;
 };
 
 class Model {
@@ -246,8 +249,9 @@ class Model {
   // barrier and the weights' all-gathers after it, so a rank that cannot allocate stops every rank at
   // the barrier. Returns this rank's free device memory afterwards.
   size_t prefill_init(comm::Ring& ring);
+  // ablit: the chunk's session's Sampling::ablit (every chunk carries it; sp only the one that samples)
   uint64_t prefill(int a, int M, const Sampling* sp = nullptr, int handle = -1, const std::vector<int>& snaps = {},
-                   bool ced = false);
+                   bool ced = false, float ablit = 0.f, int rows_set = 0);
   // The last prefill chunk's GPU time in ms (waits for the chunk): [0] the encoder (layers 0-19; every
   // layer without ced), [1] CED's projection, keep and replay, [2] the head and the sampling, [3] the
   // draft module's windows.

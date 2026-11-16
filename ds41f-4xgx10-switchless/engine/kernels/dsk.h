@@ -310,6 +310,9 @@ void moe_prefill(const uint8_t* xq, const uint8_t* xs, int M, const int* idx, co
                  const MoeWeights& w, void* ws, float* y, cudaStream_t st, MoePCfg cfg = MoePCfg{});
 // Whether moe_prefill runs the combine inside the down kernel at M rows (outputs kept in L2).
 bool moe_prefill_fuses(int M);
+// The shared expert's activations that a moe_prefill call of M rows left in ws: hq [M][576] e4m3, hs [M][18] ue8m0
+// (read by model/ablit.h).
+void moe_prefill_shared(void* ws, int M, int E, const uint8_t** hq, const uint8_t** hs);
 // For chunks it does not fuse: the combine of output columns [col0, col0 + cols) (multiples of 128;
 // down done for them) fused into their reduce-scatter by rows over the ring. Rank k gets rows
 // [k rq, (k + 1) rq) (rows past M count as zeros): the four ranks' sums added in rank order and

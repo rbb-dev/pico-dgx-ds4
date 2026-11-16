@@ -71,6 +71,8 @@
 //     serve's default, --draft-bf16 opts out); --draft-head4: that head as MXFP4 instead (made from the FP8
 //     copy, which goes), --draft-markov8: the Markov head as FP8 (docs/engine.md, "The draft pass's
 //     approximations": bundle B's formats, the study's simulated drafts bit for bit; off by default)
+//   --ablit FILE: the runtime abliteration (model/ablit.h, made by tools/ablit/make_ablit.py; every rank reads the same
+//     file): a request whose SUBMIT carries the ablit flag runs with the edit on its rows; the others are untouched
 //   --tree-probe FILE (spectf; EXPERIMENT, docs/engine.md "Draft trees"): each step also runs the drafter's
 //     probe along the golden tokens after the bonus (dspark::ProbeOut), a JSON line per step into FILE, with
 //     the target's own top logprobs for the bonus's position (and with --seq-list, the sequence);
@@ -304,6 +306,7 @@ struct Args {
   bool spec = false, no_spec = false, draft_fp8 = false, draft_bf16 = false, draft_head4 = false, draft_markov8 = false;
   bool head_raw = false, no_l2pf = false;
   std::string draft_weights;  // --draft-weights FILE: the drafter (mtp.*) from this rank file instead of --weights
+  std::string ablit;          // --ablit FILE: the runtime abliteration (model/ablit.h); requests opt in per request
   int spec_drafts = 5;
   float spec_thresh = -1.f;
   float spec_cost[3] = {19.4f, 3.6f, 3.3f};
@@ -403,6 +406,7 @@ Args parse(int argc, char** argv) {
     else if (s == "--draft-bf16") a.draft_bf16 = true;
     else if (s == "--draft-head4") a.draft_head4 = true;
     else if (s == "--draft-markov8") a.draft_markov8 = true;
+    else if (s == "--ablit") a.ablit = val();
     else if (s == "--tree-probe") a.tree_probe = val();
     else if (s == "--tree-sib") a.tree_sib = std::atoi(val().c_str());
     else if (s == "--seq-list") a.seq_list = val();
@@ -530,8 +534,17 @@ uint64_t run_id(const Args& a) {
   file(a.weights);
   if (!a.draft_weights.empty()) file(a.draft_weights);
   if (!a.no_engram) file(a.hashmap), file(a.shard[0]), file(a.shard[1]);
+  // --ablit: the abliteration file's bytes, as an ablit session's state depends on them; not its time,
+  // which every start's copy to the workers renews
+  if (!a.ablit.empty()) {
+    const int af = open(a.ablit.c_str(), O_RDONLY | O_CLOEXEC);
+    if (af < 0) die("run id: %s: %s", a.ablit.c_str(), std::strerror(errno));
+    for (ssize_t r; (r = read(af, buf.data(), buf.size())) > 0;) h = keepfile::fnv(buf.data(), (size_t)r, h);
+    close(af);
+  }
   const int64_t o[] = {a.max_ctx, a.exact, a.spec, a.draft_fp8, a.prefill_rows, a.small_rows, a.snap_every,
-                       a.no_engram, a.layers, a.first, (int64_t)a.ring_cap, a.draft_head4, a.draft_markov8};
+                       a.no_engram, a.layers, a.first, (int64_t)a.ring_cap, a.draft_head4, a.draft_markov8,
+                       !a.ablit.empty()};
   return keepfile::fnv(o, sizeof o, h);
 }
 
@@ -586,6 +599,7 @@ int main(int argc, char** argv) {
   mo.wave_probe = a.wave_probe, mo.wave_probe_at = a.wave_probe_at;
   mo.draft_fp8 = a.draft_fp8;
   mo.draft_head4 = a.draft_head4, mo.draft_markov8 = a.draft_markov8;
+  mo.ablit = a.ablit;
   mo.tree_probe = !a.tree_probe.empty();
   mo.slots = a.slots;
   mo.big_slots = a.big_slots;

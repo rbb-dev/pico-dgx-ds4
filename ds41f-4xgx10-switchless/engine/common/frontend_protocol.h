@@ -7,7 +7,7 @@
 
 namespace fe {
 
-constexpr uint32_t kVersion = 1;
+constexpr uint32_t kVersion = 2;
 constexpr const char* kDefaultSocket = "/tmp/dsgb10-engine.sock";
 
 enum MsgType : uint16_t {
@@ -40,6 +40,9 @@ enum SubmitFlags : uint32_t {
   // vision (docs/vision.md): after prompt[], uint32 n_images, ImageSpan spans[n_images], then the spans' rows,
   // bf16 [sum rows][5120] in span order. Only image requests set it; a text SUBMIT is unchanged.
   kFlagImages = 8,
+  // ablated weights path: the request runs with the ablation direction applied. Sessions are kept per flag: the
+  // front-end never continues or forks a session with a request of the other flag.
+  kFlagAblit = 16,
 };
 
 // An image's span of the prompt: positions [start, start + rows), every id 129264 (<｜deepseek_image｜>);

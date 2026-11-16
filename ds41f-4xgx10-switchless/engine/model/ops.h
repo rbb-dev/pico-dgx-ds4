@@ -39,6 +39,7 @@ struct StepSamp {  // one session's sampling (model::Sampling)
   float top_p;        // 1: off
   int32_t top_k;      // 0: off
   int32_t n_top;      // top logprobs per row, 0..kTopLogprobs
+  float ablit;        // the runtime abliteration on this session's rows (model/ablit.h): 0 off, 1 on
 };
 struct StepIn {
   int32_t tokens[kMaxRows];  // >= 0: the token; -1 - j: row j of the previous step's sample (decode

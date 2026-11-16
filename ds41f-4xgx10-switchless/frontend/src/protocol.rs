@@ -4,7 +4,7 @@
 
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 pub const DEFAULT_SOCKET: &str = "/tmp/dsgb10-engine.sock";
 /// Up to 100 image spans, plus room for a 1M-token prompt and framing.
 pub const MAX_FRAME: usize = crate::vision::MAX_IMAGES * crate::vision::MAX_IMAGE_ROWS * crate::vision::IMAGE_DIM * 2 + (8 << 20);
@@ -25,6 +25,8 @@ pub const FLAG_KEEP: u32 = 2;
 pub const FLAG_LOGPROBS: u32 = 4;
 /// vision: the image part (vision::payload) follows prompt[]
 pub const FLAG_IMAGES: u32 = 8;
+/// the ablated weights path: the request runs with the ablation direction applied
+pub const FLAG_ABLIT: u32 = 16;
 
 pub const TOK_LOGPROBS: u32 = 1;
 pub const TOK_TOP: u32 = 2;
@@ -495,7 +497,7 @@ mod tests {
             top_p: 0.95,
             top_k: 20,
             max_new_tokens: 100,
-            flags: FLAG_SEED | FLAG_KEEP,
+            flags: FLAG_SEED | FLAG_KEEP | FLAG_ABLIT,
             n_top_logprobs: 0,
             prefix_hint: 5,
             stop_ids: vec![1],

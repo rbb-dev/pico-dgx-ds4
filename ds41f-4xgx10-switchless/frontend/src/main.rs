@@ -12,7 +12,10 @@ fn usage() -> ! {
                                 never 0.0.0.0 or ::)
       --engine-socket PATH      /tmp/dsgb10-engine.sock
       --api-key-file PATH       require this bearer key (the file's content, trimmed)
-      --model-name NAME         deepseek-v4.1-flash-uncensored
+      --model-name NAME         deepseek-v4.1-flash-uncensored; also served as NAME-ablit, which runs a
+                                request on the ablated weights path (NAME and any other `model` run on
+                                the plain path)
+      --no-ablit-alias          serve NAME only
       --max-tokens N            default and cap for max_tokens: 32768
       --effort N                reasoning effort budget when a request names none: 75
       --encoding E              the chat encoding: v4.1 (DeepSeek-V4.1-Flash's encoding.py, the default)
@@ -122,6 +125,7 @@ fn serve(args: &[String]) {
     }
     let cfg = ServerConfig {
         model_name: opt(args, "--model-name").unwrap_or_else(|| "deepseek-v4.1-flash-uncensored".into()),
+        ablit_alias: !args.iter().any(|a| a == "--no-ablit-alias"),
         api_key,
         max_tokens_cap: parse_opt(args, "--max-tokens", 32768u32),
         default_effort: parse_opt(args, "--effort", 75i64).clamp(1, 100),

@@ -118,8 +118,9 @@ model::Ctl to_ctl(const Cmd& c) {
 uint64_t run_prefill(model::Model& m, const Cmd& c) {
   const std::vector<int> snaps(c.snaps, c.snaps + c.n_snaps);
   const uint64_t n =
-      m.prefill(c.pos0, c.rows, (c.flags & kPfSample) ? &c.sp : nullptr, c.handle, snaps, (c.flags & kPfCed) != 0);
-  if (c.next > 0) m.prefill_lookup(c.pos0 + c.rows, c.next);
+      m.prefill(c.pos0, c.rows, (c.flags & kPfSample) ? &c.sp : nullptr, c.handle, snaps, (c.flags & kPfCed) != 0,
+                c.sp.ablit, c.rows_set);
+  if (c.next > 0) m.prefill_lookup(c.pos0 + c.rows, c.next, c.rows_set);
   return n;
 }
 

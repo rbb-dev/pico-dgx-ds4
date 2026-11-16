@@ -1,10 +1,14 @@
-add_library(dsmodel STATIC model.cu ops.cu fused.cu sample.cu prefill.cu state.cu spec.cu wave_probe.cu spill.cpp)
+add_library(dsmodel STATIC model.cu ablit.cu ops.cu fused.cu sample.cu prefill.cu state.cu spec.cu wave_probe.cu spill.cpp)
 target_include_directories(dsmodel PUBLIC ${CMAKE_SOURCE_DIR})
 target_link_libraries(dsmodel PUBLIC dsattn dsk_kernels dsgb10_comm engram dsw_loader dspark)
 
 add_executable(coll_tests tests/coll_tests.cu)
 target_include_directories(coll_tests PRIVATE ${CMAKE_SOURCE_DIR}/attn/tests)
 target_link_libraries(coll_tests dsmodel)
+
+# the runtime abliteration's kernels against a host reference (one GB10, no ring, no weights)
+add_executable(ablit_test tests/ablit_test.cu)
+target_link_libraries(ablit_test dsmodel)
 
 # B3: the batch spec step's layout and verdicts (spec_batch.h) against a host reference; host only, no GPU
 add_executable(spec_batch_test tests/spec_batch_test.cu)

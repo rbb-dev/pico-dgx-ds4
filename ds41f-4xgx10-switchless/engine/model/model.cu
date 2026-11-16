@@ -47,7 +47,7 @@ __global__ void route_rotate(float* gl, int shift, int group) {
   for (int i = threadIdx.x; i < kExperts; i += blockDim.x) g[(i + shift * (blockIdx.x / group)) % kExperts] = s[i];
 }
 
-ops::StepSamp samp_of(const Sampling& s) { return ops::StepSamp{s.seed, s.temperature, s.top_p, s.top_k, s.n_top}; }
+ops::StepSamp samp_of(const Sampling& s) { return ops::StepSamp{s.seed, s.temperature, s.top_p, s.top_k, s.n_top, s.ablit}; }
 
 // night (technique 5): at 9..16 rows the normed GEMVs' prologue (every CTA normalising all rows) made wq_b,
 // wq_a+wkv and the gate run at 50-150 GB/s; one rmsnorm launch, then the plain r16 GEMVs, gives the same bits
@@ -399,6 +399,10 @@ void Model::Impl::bind(dsw::WeightFile& wf, comm::Ring& ring) {
   if (opt.n_layers > opt.first_layer)
     std::printf("moe: the experts' scale codes, %.1f MiB: %.2f %% of their 32-scale groups coded\n", code_bytes / 1048576.0,
                 100 * code_share / (opt.n_layers - opt.first_layer));
+  if (!opt.ablit.empty()) {
+    ablit::load(ab, opt.ablit, rank);
+    if (rank == 0) std::printf("model: runtime abliteration from %s\n", opt.ablit.c_str());
+  }
   bound = true;
 }
 
@@ -662,6 +666,7 @@ void Model::Impl::attention(int L, int R, int ctx, bool dumps, bool sub_in, Sink
     dsk::gemv_woa(o, R, w.woa, w.soa, kOPart, kWoaK, kOGroupRows, nullptr, cwoa, false, st, oq, os);
     dsk::gemv_fp8(oq, os, R, w.wob, w.sob, kDim, kOPart, part, c8, st);
   }
+  ablit::rows_bf16(U(part), R, kDim, ab, L, in_d, st);  // this rank's partial: the all-reduce sums projected parts
   l2pf(4, L, R);
   join(sa);
   ops::allreduce_hc(ch, part, false, R, x, a_post, a_comb, a_pre, mid, yraw, dumps ? sub : nullptr, st);
@@ -741,6 +746,17 @@ void Model::Impl::ffn(int L, int R, bool dumps, Sink* sink, int pos0) {
     dsk::MoeCfg mc{};
     mc.down = R == 1 ? 2 : 4;
     dsk::moe_routed(yq, ys, R, gl, w.gate_bias, kExperts, kRouteScale, w.moe, moe_ws, ymoe, mc, st, ridx, rwts);
+  }
+  if (ab.on && ab.s[L][1] != 0.f) {  // the shared expert's share of this rank's partial, through its activations
+    const uint8_t *hq, *hs;
+    if (wide) {
+      dsk::moe_prefill_shared(moe_pws, R, kExperts, &hq, &hs);
+    } else {  // moe_routed's workspace: the shared expert is the slot after the union's (dsk.h moe_hs_offset)
+      const int RB = dsk::row_budget(R);
+      hq = static_cast<const uint8_t*>(moe_ws) + (size_t)RB * kTopK * RB * 576;
+      hs = static_cast<const uint8_t*>(moe_ws) + dsk::moe_hs_offset(R) + (size_t)RB * kTopK * RB * 18;
+    }
+    ablit::shexp(ymoe, R, kDim, hq, 576, hs, 18, ab, L, in_d, st);
   }
   if (route_ring) k_route_copy<<<1, 128, 0, st>>>(ridx, in_d, L, route_ring);
   l2pf(1, L + 1, R);

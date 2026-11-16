@@ -915,6 +915,7 @@ class Server {
       if (force_ntop > 0) f.sp.n_top = std::min(force_ntop, (int)model::ops::kTopLogprobs);
     }
     f.sp.seed = (h.flags & fe::kFlagSeed) ? h.seed : rng_();
+    f.sp.ablit = (h.flags & fe::kFlagAblit) ? 1.f : 0.f;  // the runtime abliteration on this request (--ablit)
     flying_.insert(h.session_id);
     if (go(f, false)) {  // it decodes in the next run, first
       f.t_paused = now_s();

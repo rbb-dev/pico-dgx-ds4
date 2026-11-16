@@ -497,16 +497,17 @@ void Model::Impl::attention_p(int L, int a, int M, const std::vector<std::pair<i
   comm::alltoall_rows(ch, oa, 2, Q, p.cs, kRsBlocks);
   auto wob = [&](int k, const uint8_t* xq, const uint8_t* xs) {
     const dsk::Fp8Seg seg{g.wob + (size_t)k * kDim * kOPart, g.sob + (size_t)k * (kDim / 32) * (kOPart / 32),
-                          p.part + (size_t)k * Q * kDim, kDim};
+                          p.rs->part + (size_t)k * Q * kDim, kDim};
     dsk::gemm_fp8_p(xq, xs, n, &seg, 1, kOPart, st);
   };
-  if (n > 0) wob(rank, p.oq + (size_t)r0 * kOPart, p.os + (size_t)r0 * (kOPart / 32));
-  rs_join(p, st);
+  if (n > 0) wob(rank, p.rs->oq + (size_t)r0 * kOPart, p.rs->os + (size_t)r0 * (kOPart / 32));
+  rs_join(p, st, 0);
   if (n > 0) {
     for (int k = 0; k < kRanks; ++k)
-      if (k != rank) wob(k, p.oqa + (size_t)k * Q * kOPart, p.osa + (size_t)k * Q * (kOPart / 32));
-    dsk::sum4_bf16_p(p.part, (size_t)Q * kDim, (size_t)n * kDim, p.sub, st);
-    boundary_p(n, p.sub, p.x, p.a_post, p.a_comb, p.a_pre, p.mid, L, 1, p.pm, p.f_post, p.f_comb);
+      if (k != rank) wob(k, p.rs->oqa + (size_t)k * Q * kOPart, p.rs->osa + (size_t)k * Q * (kOPart / 32));
+    dsk::sum4_bf16_p(p.rs->part, (size_t)Q * kDim, (size_t)n * kDim, p.rs->sub, st);
+    ablit::rows_bf16_lam(U(p.rs->sub), n, kDim, ab, L, pf_ablit, st);  // these rows' whole sums
+    boundary_p(n, p.rs->sub, p.rs->x, p.rs->a_post, p.rs->a_comb, p.rs->a_pre, p.rs->mid, L, 1, p.rs->pm, p.rs->f_post, p.rs->f_comb);
   }
 }
 
@@ -556,8 +557,18 @@ void Model::Impl::ffn_p(int L, int M) {
       dsk::moe_combine_rs(ch, p.moe_ws, M, kExperts, Q, mc.col0, kGroupCols, p.sub, kDim, p.cs, kCombRsBlocks);
   }
   rs_join(p, st);
+  // the abliteration's shared-expert share: every rank's dot products of every row (each rank holds its 576 of the
+  // intermediate units), gathered on every rank (a collective: a rank without rows of its own takes part)
+  const bool ab_sh = pf_ablit != 0.f && ab.s[L][1] != 0.f;
+  if (ab_sh) {
+    const uint8_t *hq, *hs;
+    dsk::moe_prefill_shared(p.rs->moe_ws, M, kExperts, &hq, &hs);
+    ablit::shexp_dots(ab, L, M, hq, 576, hs, 18, st);
+    comm::allgather(ch, ab.c_part, ab.c_all, (size_t)((M + 1) & ~1) * ablit::kK * 4, st);
+  }
   if (n == 0) return;
-  if (fuses) ops::f32_to_bf16(p.ysum, p.sub, n * kDim, st);
+  if (fuses) ops::f32_to_bf16(p.ysum, p.rs->sub, n * kDim, st);
+  if (ab_sh) ablit::shexp_apply_bf16(U(p.rs->sub), n, kDim, r0, M, ab, L, pf_ablit, st);
   // the boundary: x and the next layer's attention input, unless Engram changes x first; after the last
   // layer only the head's collapse
   const int nL = L + 1 < kLayers && !(engram_layer(L + 1) && store) ? L + 1 : -1;
@@ -653,10 +664,23 @@ void Model::Impl::ced_replay(int P, const std::vector<std::pair<int, uint8_t*>>&
 
 // ---- a chunk ---------------------------------------------------------------------------------------
 
+void Model::Impl::prefill_use(int rows_set) {
+  Prefill& p = *pf;
+  if (rows_set == 1 && pf_big_ready()) {
+    p.rs = &p.big;
+  } else if (rows_set == 0) {
+    p.rs = &p.rows;
+  } else {
+    die("model: prefill on row set %d, which this rank does not hold (%s)", rows_set, rows_set == 1 ? "the lent set is not whole" : "no such set");
+  }
+}
+
 uint64_t Model::Impl::prefill(int a, int M, const Sampling* sp, int handle, const std::vector<int>& snap_pos,
-                              bool ced) {
+                              bool ced, float ablit, int rows_set) {
   NVTX_RANGE("chunk a=%d M=%d%s%s", a, M, ced ? " ced" : "", sp ? " sample" : "");
   if (!bound) die("model: prefill before bind");
+  pf_ablit = ab.on ? ablit : 0.f;  // every rank gets the same command, so every rank takes the same branches
+  if (pf_ablit != 0.f) ablit::reserve(ab, M);
   prefill_alloc();
   Prefill& p = *pf;
   if (M < 1 || M > p.cap || a < 0 || a + M > slot_ctx_[cur_slot]) die("model: bad prefill [%d, +%d) in slot %d", a, M, cur_slot);
@@ -776,8 +800,9 @@ void Model::prefill_lookup(int a, int M) {
   d_->prefill_engram(a, M, 1 - p.e_last);
 }
 
-uint64_t Model::prefill(int a, int M, const Sampling* sp, int handle, const std::vector<int>& snaps, bool ced) {
-  return d_->prefill(a, M, sp, handle, snaps, ced);
+uint64_t Model::prefill(int a, int M, const Sampling* sp, int handle, const std::vector<int>& snaps, bool ced,
+                        float ablit, int rows_set) {
+  return d_->prefill(a, M, sp, handle, snaps, ced, ablit, rows_set);
 }
 
 }  // namespace model

@@ -5,6 +5,9 @@
 //! sent as that session's own token ids, which is what is in the engine's KV state; the rest is
 //! tokenised on its own from a cut next to an added token, where tokenisation restarts anyway.
 //!
+//! A session belongs to the weights path it was created on (`ablit`, protocol flag ABLIT): a request is
+//! matched only against sessions of its own path, so a continuation or a fork never crosses the two.
+//!
 //! The table outlives a stop (`save`, `load`; docs/engine.md, "Kept sessions"): the engine keeps its
 //! sessions across a planned stop, and the table is what finds them again. It holds the conversations'
 //! text, so its file is ours alone: mode 0600 in a directory of mode 0700, written whole or not at all.
@@ -32,6 +35,8 @@ struct Session {
     last_used: u64,
     /// Unix time of its last request: a saved table leaves out what is older than its limit.
     t_used: u64,
+    /// The ablated weights path: its state was computed with the ablation direction applied.
+    ablit: bool,
 }
 
 pub struct Plan {
@@ -89,7 +94,11 @@ fn unix_now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-const TABLE_MAGIC: &[u8; 8] = b"DSFT0001";
+/// The table's layout with each session's flags word. The first layout (`DSFT0001`) has none: its sessions
+/// are all of the plain path.
+const TABLE_MAGIC: &[u8; 8] = b"DSFT0002";
+const TABLE_MAGIC_V1: &[u8; 8] = b"DSFT0001";
+const TABLE_FLAG_ABLIT: u64 = 1;
 
 fn fnv(b: &[u8]) -> u64 {
     b.iter().fold(1469598103934665603u64, |h, &x| (h ^ x as u64).wrapping_mul(1099511628211))
@@ -150,7 +159,7 @@ impl SessionTable {
                 continue;
             }
             n += 1;
-            for v in [id, s.last_used, s.t_used, s.prompt_len as u64, s.text.len() as u64] {
+            for v in [id, s.last_used, s.t_used, s.prompt_len as u64, s.text.len() as u64, if s.ablit { TABLE_FLAG_ABLIT } else { 0 }] {
                 body.extend(v.to_le_bytes());
             }
             body.extend(s.text.as_bytes());
@@ -208,9 +217,10 @@ impl SessionTable {
         }
         let mut f = Vec::new();
         file.read_to_end(&mut f).map_err(|e| e.to_string())?;
-        if f.len() < 56 || &f[..8] != TABLE_MAGIC {
+        if f.len() < 56 || (&f[..8] != TABLE_MAGIC && &f[..8] != TABLE_MAGIC_V1) {
             return Err("not a saved table".into());
         }
+        let with_flags = &f[..8] == TABLE_MAGIC;
         let mut h = Bytes { b: &f[8..56], at: 0 };
         let (written, next_id, clock, n, body_len, hash) = (h.u64()?, h.u64()?, h.u64()?, h.u64()?, h.u64()?, h.u64()?);
         let now = unix_now();
@@ -225,6 +235,7 @@ impl SessionTable {
         let mut got = HashMap::new();
         for _ in 0..n {
             let (id, last_used, t_used, prompt_len, text_len) = (r.u64()?, r.u64()?, r.u64()?, r.u64()? as usize, r.u64()? as usize);
+            let flags = if with_flags { r.u64()? } else { 0 };
             let text = r.take(text_len)?;
             let n_ids = r.u64()? as usize;
             let raw = r.take(n_ids.checked_mul(4).ok_or("a bad count")?)?;
@@ -243,7 +254,8 @@ impl SessionTable {
             if at != text.len() || tok.decode_bytes(&ids) != text.as_bytes() {
                 continue; // another tokenizer's ids
             }
-            got.insert(id, Session { text: text.to_string(), ids, ends, prompt_len, busy: false, last_used, t_used });
+            let ablit = flags & TABLE_FLAG_ABLIT != 0;
+            got.insert(id, Session { text: text.to_string(), ids, ends, prompt_len, busy: false, last_used, t_used, ablit });
         }
         if r.at != body.len() {
             return Err("a bad body".into());
@@ -262,12 +274,16 @@ impl SessionTable {
         id
     }
 
-    /// Choose the session and the token ids for a prompt. The chosen session is busy until
-    /// `finish` or `abandon`. Returns the plan and the sessions to RELEASE on the engine.
-    pub fn plan(&mut self, text: &str, tok: &Tokenizer, threads: usize) -> (Plan, Vec<u64>) {
+    /// Choose the session and the token ids for a prompt of the weights path `ablit`: only sessions of
+    /// that path are candidates. The chosen session is busy until `finish` or `abandon`. Returns the
+    /// plan and the sessions to RELEASE on the engine.
+    pub fn plan(&mut self, text: &str, tok: &Tokenizer, threads: usize, ablit: bool) -> (Plan, Vec<u64>) {
         self.clock += 1;
         let mut top: Option<(u64, usize)> = None;
         for (&id, s) in &self.sessions {
+            if s.ablit != ablit {
+                continue;
+            }
             let n = common_prefix(text.as_bytes(), s.text.as_bytes());
             if n > 0 && top.map_or(true, |(_, bn)| n > bn) {
                 top = Some((id, n));
@@ -322,6 +338,7 @@ impl SessionTable {
             busy: false,
             last_used: clock,
             t_used: 0,
+            ablit,
         });
         s.busy = true;
         s.last_used = clock;
@@ -397,14 +414,14 @@ mod tests {
         let mut t = SessionTable::new(8, 1 << 20);
         let sys = "<｜begin▁of▁sentence｜><｜System｜>You are a careful assistant who answers briefly and well.";
         let p1 = format!("{sys}<｜User｜>hello<｜Assistant｜></think>");
-        let (plan, _) = t.plan(&p1, &tok, 1);
+        let (plan, _) = t.plan(&p1, &tok, 1, false);
         assert_eq!(plan.ids, tok.encode(&p1));
         // the model spelled "Hi there" in single letters, which BPE would never produce
         let mut gen: Vec<u32> = "Hi there".chars().map(|c| tok.encode(&c.to_string())[0]).collect();
         gen.push(tok.token_id("<｜end▁of▁sentence｜>").unwrap());
         t.finish(plan.session_id, &p1, &plan.ids, &gen, &tok);
         let p2 = format!("{p1}Hi there<｜end▁of▁sentence｜><｜User｜>next<｜Assistant｜></think>");
-        let (plan2, _) = t.plan(&p2, &tok, 1);
+        let (plan2, _) = t.plan(&p2, &tok, 1, false);
         assert_eq!(plan2.session_id, plan.session_id);
         let mut want = plan.ids.clone();
         want.extend(&gen);
@@ -414,7 +431,7 @@ mod tests {
         assert_eq!(tok.decode(&plan2.ids), p2);
         // the same system prompt in another conversation forks instead of taking over the session
         let p3 = format!("{sys}<｜User｜>something else entirely<｜Assistant｜></think>");
-        let (plan3, _) = t.plan(&p3, &tok, 1);
+        let (plan3, _) = t.plan(&p3, &tok, 1, false);
         assert_ne!(plan3.session_id, plan.session_id);
         assert_eq!(plan3.base_session_id, plan.session_id);
         assert_eq!(tok.decode(&plan3.ids), p3);
@@ -430,12 +447,12 @@ mod tests {
             format!("<｜begin▁of▁sentence｜><｜System｜>{body}Current date and time: Monday, October 12, 2026 at {time}\n\n## Tools\n\nnone<｜User｜>{msg}<｜Assistant｜></think>")
         };
         let a = conv("09:14:08 AM", "fix the build");
-        let (pa, _) = t.plan(&a, &tok, 1);
+        let (pa, _) = t.plan(&a, &tok, 1, false);
         assert_eq!(pa.describe(a.len()), format!("session {}, new: no session shares a byte", pa.session_id));
         t.finish(pa.session_id, &a, &pa.ids, &tok.encode("Done."), &tok);
         // another conversation, a minute later: a fork of the first, which has every id before the time
         let b = conv("09:15:31 AM", "write the tests");
-        let (pb, _) = t.plan(&b, &tok, 1);
+        let (pb, _) = t.plan(&b, &tok, 1, false);
         assert_eq!(pb.base_session_id, pa.session_id);
         assert_eq!(pb.ids, tok.encode(&b), "the ids are a cold run's");
         let head = tok.encode(&b[..b.find("09:15").unwrap()]).len();
@@ -445,13 +462,13 @@ mod tests {
         assert!(d.ends_with(&format!("of {} bytes, {} ids in common", b.len(), pb.common)), "{d}");
         // the next turn of the first: in place
         let a2 = format!("{a}Done.<｜end▁of▁sentence｜><｜User｜>thanks<｜Assistant｜></think>");
-        let (pa2, _) = t.plan(&a2, &tok, 1);
+        let (pa2, _) = t.plan(&a2, &tok, 1, false);
         assert_eq!(pa2.session_id, pa.session_id);
         assert!(pa2.describe(a2.len()).starts_with(&format!("session {} in place: it shares ", pa.session_id)));
         t.finish(pa2.session_id, &a2, &pa2.ids, &tok.encode("Sure."), &tok);
         // a prompt that shares only the BOS and a few bytes: a new session, which names no base
         let c = "<｜begin▁of▁sentence｜><｜User｜>hi<｜Assistant｜></think>";
-        let (pc, _) = t.plan(c, &tok, 1);
+        let (pc, _) = t.plan(c, &tok, 1, false);
         assert_eq!(pc.base_session_id, 0);
         let n = common_prefix(c.as_bytes(), a.as_bytes());
         assert!(n > 0 && n < MIN_SHARED);
@@ -469,10 +486,10 @@ mod tests {
         let path = dir.join("front.table");
         let mut t = SessionTable::new(8, 1 << 20);
         let p1 = "<｜begin▁of▁sentence｜><｜System｜>You are a careful assistant who answers briefly and well.<｜User｜>hello<｜Assistant｜></think>";
-        let (plan, _) = t.plan(p1, &tok, 1);
+        let (plan, _) = t.plan(p1, &tok, 1, false);
         let gen = tok.encode("Hi there.");
         t.finish(plan.session_id, p1, &plan.ids, &gen, &tok);
-        let (busy, _) = t.plan("<｜begin▁of▁sentence｜><｜System｜>Another conversation, still in its request, which is not saved.", &tok, 1);
+        let (busy, _) = t.plan("<｜begin▁of▁sentence｜><｜System｜>Another conversation, still in its request, which is not saved.", &tok, 1, false);
         let repo = dir.join("repo");
         std::fs::create_dir_all(repo.join(".git")).unwrap();
         std::fs::create_dir(repo.join("run")).unwrap();
@@ -489,7 +506,7 @@ mod tests {
         assert!(!path.exists(), "the file goes once read");
         assert!(u.next_id > busy.session_id, "ids go on after the saved table's");
         let p2 = format!("{p1}Hi there.<｜User｜>next<｜Assistant｜></think>");
-        let (plan2, _) = u.plan(&p2, &tok, 1);
+        let (plan2, _) = u.plan(&p2, &tok, 1, false);
         assert_eq!(plan2.session_id, plan.session_id);
         assert_eq!(plan2.reused, plan.ids.len() + gen.len());
         assert_eq!(tok.decode(&plan2.ids), p2);
@@ -513,6 +530,111 @@ mod tests {
         assert!(SessionTable::new(8, 1 << 20).load(&path, &tok, 3600).unwrap_err().starts_with("saved"));
         t.sessions.get_mut(&plan.session_id).unwrap().t_used = 1;
         assert_eq!(t.save(&path, 3600), Ok(0));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    const SYS: &str = "<｜begin▁of▁sentence｜><｜System｜>You are a careful assistant who answers briefly and well, and who never gives a long answer where a short one will do.";
+
+    fn turn(prefix: &str, msg: &str) -> String {
+        format!("{prefix}<｜User｜>{msg}<｜Assistant｜></think>")
+    }
+
+    #[test]
+    fn sessions_are_kept_per_weights_path() {
+        let tok = crate::tokenizer::synthetic::tokenizer();
+        let mut t = SessionTable::new(8, 1 << 20);
+        let p1 = turn(SYS, "hello");
+        let (plain, _) = t.plan(&p1, &tok, 1, false);
+        t.finish(plain.session_id, &p1, &plain.ids, &tok.encode("Hi.<｜end▁of▁sentence｜>"), &tok);
+        // the same prompt on the other path: a new session that names no base, and reuses nothing
+        let (abl, _) = t.plan(&p1, &tok, 1, true);
+        assert_ne!(abl.session_id, plain.session_id);
+        assert_eq!((abl.base_session_id, abl.reused, abl.matched), (0, 0, 0));
+        assert_eq!(tok.decode(&abl.ids), p1);
+        t.finish(abl.session_id, &p1, &abl.ids, &tok.encode("Hey.<｜end▁of▁sentence｜>"), &tok);
+        // the next turn of each conversation continues its own session, in place
+        let n1 = format!("{p1}Hi.<｜end▁of▁sentence｜>");
+        let (c_plain, _) = t.plan(&turn(&n1, "more"), &tok, 1, false);
+        assert_eq!((c_plain.session_id, c_plain.base_session_id), (plain.session_id, 0));
+        let n2 = format!("{p1}Hey.<｜end▁of▁sentence｜>");
+        let (c_abl, _) = t.plan(&turn(&n2, "more"), &tok, 1, true);
+        assert_eq!((c_abl.session_id, c_abl.base_session_id), (abl.session_id, 0));
+        // a fork takes its base from the request's own path
+        t.finish(c_abl.session_id, &turn(&n2, "more"), &c_abl.ids, &tok.encode("Ok.<｜end▁of▁sentence｜>"), &tok);
+        t.finish(c_plain.session_id, &turn(&n1, "more"), &c_plain.ids, &tok.encode("Ok.<｜end▁of▁sentence｜>"), &tok);
+        let other = turn(SYS, "something else entirely");
+        let (f_abl, _) = t.plan(&other, &tok, 1, true);
+        assert_eq!(f_abl.base_session_id, c_abl.session_id);
+        let (f_plain, _) = t.plan(&other, &tok, 1, false);
+        assert_eq!(f_plain.base_session_id, c_plain.session_id);
+        // a busy session of the other path is no candidate either
+        let lonely_text = "<｜begin▁of▁sentence｜><｜System｜>A prompt that only the ablit path has seen so far, long enough to share.";
+        let (lonely, _) = t.plan(&turn(lonely_text, "x"), &tok, 1, true);
+        let (twin, _) = t.plan(&turn(lonely_text, "y"), &tok, 1, false);
+        assert_eq!(twin.base_session_id, 0);
+        assert!(twin.matched != lonely.session_id && twin.session_id != lonely.session_id);
+    }
+
+    /// The first table layout, written by hand: a session has five words before its text and no flags.
+    fn write_v1_table(path: &Path, sessions: &[(u64, &str, &[u32])]) {
+        let mut body = Vec::new();
+        for &(id, text, ids) in sessions {
+            for v in [id, 1u64, unix_now(), text.len() as u64, text.len() as u64] {
+                body.extend(v.to_le_bytes());
+            }
+            body.extend(text.as_bytes());
+            body.extend((ids.len() as u64).to_le_bytes());
+            for &x in ids {
+                body.extend(x.to_le_bytes());
+            }
+        }
+        let mut f = TABLE_MAGIC_V1.to_vec();
+        for v in [unix_now(), 1000, 5, sessions.len() as u64, body.len() as u64, fnv(&body)] {
+            f.extend(v.to_le_bytes());
+        }
+        f.extend(body);
+        let mut o = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path).unwrap();
+        o.write_all(&f).unwrap();
+    }
+
+    #[test]
+    fn a_saved_table_carries_the_weights_path() {
+        let tok = syn();
+        let dir = std::env::temp_dir().join(format!("dsfront-flag-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("front.table");
+        let mut t = SessionTable::new(8, 1 << 20);
+        let p1 = turn(SYS, "hello");
+        let (plain, _) = t.plan(&p1, &tok, 1, false);
+        let gen = tok.encode("Hi.<｜end▁of▁sentence｜>");
+        t.finish(plain.session_id, &p1, &plain.ids, &gen, &tok);
+        let p2 = turn("<｜begin▁of▁sentence｜><｜System｜>Another conversation altogether, on the ablit path, which is as long as the other one.", "hello");
+        let (abl, _) = t.plan(&p2, &tok, 1, true);
+        t.finish(abl.session_id, &p2, &abl.ids, &gen, &tok);
+        assert_eq!(t.save(&path, 3600), Ok(2));
+        let mut u = SessionTable::new(8, 1 << 20);
+        assert_eq!(u.load(&path, &tok, 3600), Ok(2));
+        // each is found again by a request of its own path, and by that one only
+        let next = |p: &str| format!("{p}Hi.<｜end▁of▁sentence｜><｜User｜>again<｜Assistant｜></think>");
+        let (a, _) = u.plan(&next(&p2), &tok, 1, true);
+        assert_eq!((a.session_id, a.base_session_id), (abl.session_id, 0));
+        let (b, _) = u.plan(&next(&p1), &tok, 1, false);
+        assert_eq!((b.session_id, b.base_session_id), (plain.session_id, 0));
+        let (c, _) = u.plan(&next(&p1), &tok, 1, true);
+        assert_eq!((c.reused, c.base_session_id), (0, 0));
+        // a table of the first layout loads, every session on the plain path
+        let ids = tok.encode(&p1);
+        write_v1_table(&path, &[(77, &p1, &ids)]);
+        let mut v = SessionTable::new(8, 1 << 20);
+        assert_eq!(v.load(&path, &tok, 3600), Ok(1));
+        let (on, _) = v.plan(&turn(&p1, "more"), &tok, 1, true);
+        assert_eq!(on.reused, 0, "an older table's session is not on the ablit path");
+        let mut w = SessionTable::new(8, 1 << 20);
+        write_v1_table(&path, &[(77, &p1, &ids)]);
+        assert_eq!(w.load(&path, &tok, 3600), Ok(1));
+        let (off, _) = w.plan(&turn(&p1, "more"), &tok, 1, false);
+        assert_eq!((off.session_id, off.reused), (77, ids.len()));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

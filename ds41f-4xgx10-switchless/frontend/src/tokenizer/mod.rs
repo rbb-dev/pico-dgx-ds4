@@ -584,3 +584,38 @@ impl StreamDecoder {
         }
     }
 }
+
+/// A byte-level tokenizer with no merges and the chat encoding's added tokens, for tests and for the mock
+/// engine's smoke runs where the checkpoint's tokenizer.json is not at hand (tools/make_test_tokenizer.py
+/// writes the same file). Ids 0 and 1 are BOS and EOS as in the checkpoint.
+pub mod synthetic {
+    use super::{bytes_to_unicode, Tokenizer};
+
+    pub const ADDED: [&str; 8] = [
+        "<｜begin▁of▁sentence｜>",
+        "<｜end▁of▁sentence｜>",
+        "<｜User｜>",
+        "<｜Assistant｜>",
+        "<｜System｜>",
+        "<think>",
+        "</think>",
+        "<｜tool▁outputs▁begin｜>",
+    ];
+
+    /// The tokenizer.json text.
+    pub fn json() -> String {
+        let b2u = bytes_to_unicode();
+        let base = ADDED.len();
+        let vocab: Vec<String> = b2u.iter().enumerate().map(|(b, c)| format!("{}:{}", serde_json::to_string(&c.to_string()).unwrap(), base + b)).collect();
+        let added: Vec<String> = ADDED
+            .iter()
+            .enumerate()
+            .map(|(i, t)| format!(r#"{{"id":{i},"content":{},"special":true,"normalized":false}}"#, serde_json::to_string(t).unwrap()))
+            .collect();
+        format!(r#"{{"added_tokens":[{}],"model":{{"type":"BPE","vocab":{{{}}},"merges":[]}}}}"#, added.join(","), vocab.join(","))
+    }
+
+    pub fn tokenizer() -> Tokenizer {
+        Tokenizer::from_json(&json()).expect("synthetic tokenizer")
+    }
+}

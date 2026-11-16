@@ -9,7 +9,7 @@ use crate::encoding::{api_tool_name, encode_messages, Delta, EncodeOptions, Enco
 use crate::engine::{EngineClient, Event as EngineEvent};
 use crate::gate::{Gate, Pass, Refused, RETRY_AFTER_S};
 use crate::guard::{LoopGuard, StopMatcher, LINE_WINDOW_TOKENS};
-use crate::protocol::{DoneReason, Submit, FLAG_KEEP, FLAG_SEED};
+use crate::protocol::{DoneReason, Submit, FLAG_ABLIT, FLAG_KEEP, FLAG_SEED};
 use crate::pyjson::truthy;
 use crate::session::SessionTable;
 use crate::tokenizer::{StreamDecoder, Tokenizer};
@@ -30,6 +30,8 @@ use tokio::sync::mpsc;
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
     pub model_name: String,
+    /// Also serve `{model_name}-ablit`: a request naming it runs on the ablated weights path.
+    pub ablit_alias: bool,
     pub api_key: Option<String>,
     /// Default and cap for max_tokens (the kit's DSV41_MAX_NEW_TOKENS).
     pub max_tokens_cap: u32,
@@ -81,7 +83,51 @@ impl App {
         let think_end_id = tok.token_id("</think>");
         let gate = Gate::new(cfg.hold);
         let image_rows = crate::vision::RowsInFlight::new(cfg.max_image_rows_in_flight);
-        Arc::new(App { cfg, tok, engine, gate, image_rows, sessions: Mutex::new(SessionTable::new(256, 16 << 20)), think_end_id, counter: AtomicU64::new(0) })
+        table.defer_limits();
+        let app = Arc::new(App {
+            cfg,
+            tok,
+            engine,
+            gate,
+            image_rows,
+            sessions: Mutex::new(SessionTable::new(256, 16 << 20)),
+            think_end_id,
+            counter: AtomicU64::new(0),
+        });
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            let (weak, mut rx) = (Arc::downgrade(&app), app.engine.watch_info());
+            rt.spawn(async move {
+                loop {
+                    let hello = rx.borrow_and_update().clone();
+                    if let Some(info) = hello {
+                        let Some(app) = weak.upgrade() else { return };
+                        app.apply_engine_limits(&info);
+                    }
+                    if rx.changed().await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+        app
+    }
+
+    /// The table's limits from the engine's HELLO, as soon as it is known (before any request) and at every reconnect: the
+    /// saved table loaded at start keeps all its sessions up to what the engine can keep.
+    fn apply_engine_limits(&self, info: &crate::protocol::HelloEngine) {
+        let released = {
+            let mut t = self.sessions.lock().unwrap();
+            t.keep_for(info.keep_positions, info.max_context);
+            t.trim_to_limits()
+        };
+        for s in released {
+            self.engine.release(s);
+        }
+    }
+
+    /// The served name that asks for the ablated path, when it is served.
+    pub fn ablit_name(&self) -> Option<String> {
+        self.cfg.ablit_alias.then(|| format!("{}-ablit", self.cfg.model_name))
     }
 
     /// The session table an earlier run saved (session.rs `load`), for the next turns of its
@@ -245,9 +291,11 @@ async fn models(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
         return r;
     }
     let max_len = app.engine.info().map(|i| i.max_context);
-    let body = json!({"object": "list", "data": [{
-        "id": app.cfg.model_name, "object": "model", "created": 0, "owned_by": "dsgb10",
-        "root": app.cfg.model_name, "max_model_len": max_len}]});
+    let data: Vec<Value> = std::iter::once(app.cfg.model_name.clone())
+        .chain(app.ablit_name())
+        .map(|id| json!({"id": id, "object": "model", "created": 0, "owned_by": "dsgb10", "root": id, "max_model_len": max_len}))
+        .collect();
+    let body = json!({"object": "list", "data": data});
     (StatusCode::OK, [("content-type", "application/json")], body.to_string()).into_response()
 }
 
@@ -274,6 +322,19 @@ pub struct Prepared {
     /// vision: this request's share of the image rows in flight (`hold_image_rows`), given back when
     /// the request ends, however it ends; None for text
     pub rows_held: Option<crate::vision::RowsHeld>,
+    /// The served name the request asked for, which the response's `model` echoes.
+    pub model: String,
+    /// `Some(true)`: the request named the ablit name; None: it follows the default.
+    pub ablit: Option<bool>,
+}
+
+/// The served name and weights path a request's `model` asks for: `{name}-ablit` (when served) is the
+/// ablated path under that name; anything else, a missing `model` included, is `name` on the default path.
+pub fn resolve_model(cfg: &ServerConfig, model: Option<&Value>) -> (String, Option<bool>) {
+    match model.and_then(Value::as_str) {
+        Some(m) if cfg.ablit_alias && m == format!("{}-ablit", cfg.model_name) => (m.to_string(), Some(true)),
+        _ => (cfg.model_name.clone(), None),
+    }
 }
 
 fn num_f64(v: &Value) -> Option<f64> {
@@ -551,6 +612,7 @@ pub fn prepare(cfg: &ServerConfig, req: &Value) -> Result<Prepared, String> {
     };
     let ignore_eos = truthy(r.get("ignore_eos"));
     let stream = truthy(r.get("stream"));
+    let (model, ablit) = resolve_model(cfg, r.get("model"));
     let include_usage = truthy(r.get("stream_options").and_then(|s| s.get("include_usage")));
     Ok(Prepared {
         prompt,
@@ -568,6 +630,8 @@ pub fn prepare(cfg: &ServerConfig, req: &Value) -> Result<Prepared, String> {
         ignore_eos,
         images,
         rows_held: None,
+        model,
+        ablit,
     })
 }
 
@@ -776,12 +840,13 @@ async fn start(app: &Arc<App>, p: &Prepared, pass: Pass) -> Result<Gen, ApiError
     if !p.images.is_empty() {
         return start_images(app, p, pass, info).await;
     }
+    let ablit = p.ablit.unwrap_or(false);
     let (plan, released) = {
         let app2 = app.clone();
         let text = p.prompt.clone();
         tokio::task::spawn_blocking(move || {
             let mut t = app2.sessions.lock().unwrap();
-            t.plan(&text, &app2.tok, app2.cfg.tokenize_threads)
+            t.plan(&text, &app2.tok, app2.cfg.tokenize_threads, ablit)
         })
         .await
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "server_error".into(), e.to_string()))?
@@ -812,7 +877,7 @@ async fn start(app: &Arc<App>, p: &Prepared, pass: Pass) -> Result<Gen, ApiError
         top_p: p.top_p,
         top_k: p.top_k,
         max_new_tokens: max_new,
-        flags: FLAG_KEEP | if p.seed.is_some() { FLAG_SEED } else { 0 },
+        flags: FLAG_KEEP | if p.seed.is_some() { FLAG_SEED } else { 0 } | if ablit { FLAG_ABLIT } else { 0 },
         n_top_logprobs: 0,
         prefix_hint: plan.reused as u32,
         stop_ids: stop_ids.clone(),
@@ -895,7 +960,7 @@ async fn start_images(app: &Arc<App>, p: &Prepared, pass: Pass, info: crate::pro
         top_p: p.top_p,
         top_k: p.top_k,
         max_new_tokens: max_new,
-        flags: crate::protocol::FLAG_IMAGES | if p.seed.is_some() { FLAG_SEED } else { 0 },
+        flags: crate::protocol::FLAG_IMAGES | if p.seed.is_some() { FLAG_SEED } else { 0 } | if p.ablit.unwrap_or(false) { FLAG_ABLIT } else { 0 },
         n_top_logprobs: 0,
         prefix_hint: 0,
         stop_ids: stop_ids.clone(),
@@ -978,7 +1043,7 @@ async fn chat(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> R
     dump(&app, &req, &p, &gen);
     let id = format!("chatcmpl-{}", app.random_hex(24));
     let created = now_secs();
-    let model = app.cfg.model_name.clone();
+    let model = p.model.clone();
     // non-streaming
     let (mut reasoning, mut content, mut calls) = (String::new(), String::new(), Vec::new());
     let mut out = Vec::new();
@@ -1058,7 +1123,7 @@ fn stream(app: Arc<App>, p: Prepared, req: Value, pass: Option<Pass>) -> Respons
         dump(&app, &req, &p, &gen);
         let id = format!("chatcmpl-{}", app.random_hex(24));
         let created = now_secs();
-        let model = app.cfg.model_name.clone();
+        let model = p.model.clone();
         let chunk = |delta: Value, finish: Option<&str>| {
             json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": model,
                    "choices": [{"index": 0, "delta": delta, "logprobs": null, "finish_reason": finish}]})
@@ -1113,6 +1178,7 @@ pub(crate) mod tests {
     pub(crate) fn cfg() -> ServerConfig {
         ServerConfig {
             model_name: "m".into(),
+            ablit_alias: true,
             api_key: None,
             max_tokens_cap: 32768,
             default_effort: 75,
@@ -1673,4 +1739,26 @@ pub(crate) mod tests {
         // the limit follows the setting
         assert_eq!(post_status(2 << 20, 1 << 20).await, 200);
     }
+
+    #[test]
+    fn model_names_resolve_to_a_weights_path() {
+        let c = cfg();
+        let r = |m: Option<Value>| resolve_model(&c, m.as_ref());
+        assert_eq!(r(Some(json!("m-ablit"))), ("m-ablit".to_string(), Some(true)));
+        assert_eq!(r(Some(json!("m"))), ("m".to_string(), None));
+        assert_eq!(r(Some(json!("gpt-4"))), ("m".to_string(), None));
+        assert_eq!(r(Some(json!(null))), ("m".to_string(), None));
+        assert_eq!(r(None), ("m".to_string(), None));
+        assert_eq!(r(Some(json!("M-ablit"))), ("m".to_string(), None), "names are exact");
+        let off = ServerConfig { ablit_alias: false, ..cfg() };
+        assert_eq!(resolve_model(&off, Some(&json!("m-ablit"))), ("m".to_string(), None));
+        // prepare carries it
+        let req = json!({"model": "m-ablit", "messages": [{"role": "user", "content": "hi"}]});
+        let p = prepare(&c, &req).unwrap();
+        assert_eq!((p.model.as_str(), p.ablit), ("m-ablit", Some(true)));
+        let req = json!({"model": "other", "messages": [{"role": "user", "content": "hi"}]});
+        let p = prepare(&c, &req).unwrap();
+        assert_eq!((p.model.as_str(), p.ablit), ("m", None));
+    }
+
 }
