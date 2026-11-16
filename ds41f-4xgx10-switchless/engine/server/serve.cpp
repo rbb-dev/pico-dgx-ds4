@@ -464,6 +464,7 @@ struct Flight {
   int slices = 0, decoded = 0, batched = 0;  // runs; tokens decoded, of them in batches
   DecodeEnd de;                      // the slices' drafts, summed
   double spec_tok = 1, spec_ms = 0;  // the drafts' rate (SpecRate) from slice to slice
+  bool done_sent = false;            // its DONE went out when it ended inside a batch (finish() sends no other)
 };
 
 // b's drafts and steps added to a's (a request's decode slices)
@@ -1539,12 +1540,16 @@ class Server {
     bcast_payload(ring_, e.data(), e.size() * sizeof(BatchEntry), 0);
     uint32_t ctl = 0;
     std::vector<std::vector<int32_t>> samples(n);
-    std::vector<char> cancel(n, 0);
+    // ended: a request that ended in this run. Its DONE goes out at once, while the others go on: the front-end
+    // completes a response only on DONE, and the run (whose end finishes the request's session) can last as long
+    // as the longest of them. The session's next request waits for that end, as any request of a session in
+    // flight does; its arrival pauses the run (below).
+    std::vector<char> cancel(n, 0), ended(n, 0);
     const OnBatch cb = [&](int k, const model::SampleOut& o, int row) {
       Flight& f = fl[k];
       samples[k].push_back(o.row[row].token);
       if (f.tu.dec1_ms < 0) f.tu.dec1_ms = 1e3 * (now_s() - t_dec);
-      if (cancel[k]) return;
+      if (cancel[k] || ended[k]) return;
       if (Io::cancelled(f.rq)) {  // its slot's bit: it ends after the step that reads it
         cancel[k] = 1;
         m_.set_ctl(ctl |= 1u << e[k].slot);
@@ -1555,7 +1560,12 @@ class Server {
       f.out.push_back(t);
       // a new request pauses the batch when it can have a slot; one waiting for a slot does when this one
       // ends, which frees one (its session no longer in flight)
-      const bool ends = stop_id(f, t) || (int)f.out.size() >= (int)f.rq.h.max_new_tokens;
+      const bool stop = stop_id(f, t), ends = stop || (int)f.out.size() >= (int)f.rq.h.max_new_tokens;
+      if (ends) {
+        ended[k] = 1;
+        f.done_sent = true;
+        done(f.rq, stop ? fe::kStop : fe::kLength, (uint32_t)f.q, (uint32_t)f.out.size(), f.t_start, f.t_first);
+      }
       if (!(ctl & kCtlPause) && (io_.submit_waiting() || !wait_.empty()) && (ends || admissible()))
         m_.set_ctl(ctl |= kCtlPause);
     };
@@ -1690,7 +1700,7 @@ class Server {
   // requests held for the session go on.
   void finish(Flight& f, uint32_t why) {
     const fe::SubmitHeader& h = f.rq.h;
-    done(f.rq, why, (uint32_t)f.q, (uint32_t)f.out.size(), f.t_start, f.t_first);
+    if (!f.done_sent) done(f.rq, why, (uint32_t)f.q, (uint32_t)f.out.size(), f.t_start, f.t_first);
     Io::forget(f.rq);
     const double t_end = now_s();
     flying_.erase(h.session_id);
