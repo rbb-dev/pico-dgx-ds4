@@ -71,7 +71,7 @@ def own_rows(M):
     return min(q_rows(M), M)  # rank 0's rows (the full share)
 
 
-# L1: hc_boundary_tuning by the chunk with prefetch 2 (built, off): the kernels agent's bench ratios (0.66 at 32
+# L1: hc_boundary_tuning by the chunk with prefetch 2 (built, off): bench ratios of the kernels (0.66 at 32
 # rows, 0.92 at 500, 0.99 at 8192), log-interpolated
 def l1_ratio(n):
     if n <= 32:
@@ -155,7 +155,7 @@ def L5(k, M, Q, L, r):
     return 1.0 if k in ('rep', 'exact') else 0.0
 
 
-# L7 (the kernels agent's): the last layer for the last row only
+# L7: the last layer for the last row only
 def L7(k, M, Q, L, r):
     return 3.0 if k == 'rep' else 1.6 if k == 'exact' else 0.0
 

@@ -1,0 +1,20 @@
+# ~/.config/systemd/user/pico-media.service. The media worker: reads images and clips into pixels for the front-end.
+# No model, no GPU; host networking, read-only root, no capabilities, 512 MiB with no swap.
+[Unit]
+Description=pico media worker: images and clips read into pixels
+After=docker.service network-online.target
+
+[Service]
+Type=exec
+EnvironmentFile=%h/dsgb10/pico.env
+# the last run's container stays until this start (its logs and exit), then goes
+ExecStartPre=-/usr/bin/docker rm -f pico-media
+# --memory and --memory-swap are the engine's --media-mib (512); the only mount is the checkpoint's config.json, where the
+# worker reads its vision settings; the front-end reaches it at 127.0.0.1:18951 (--media-addr in FRONT_ARGS)
+ExecStart=/usr/bin/docker run --name pico-media --net=host --memory=512m --memory-swap=512m --read-only --tmpfs /tmp:rw,size=192m --cap-drop=ALL --security-opt=no-new-privileges -v ${MODEL_SNAPSHOT}/inference/config.json:/model/inference/config.json:ro ${MEDIA_IMAGE} --host 127.0.0.1 --port 18951 --max-images 100
+ExecStop=/usr/bin/docker stop -t 10 pico-media
+Restart=always
+RestartSec=10s
+
+[Install]
+WantedBy=default.target

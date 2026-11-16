@@ -35,7 +35,7 @@ accuracy).
 - The speed-ups changed no output: all 7 reference hashes reproduce on release candidate 5 (one of them
   checked nothing, M1, fixed in b47c510), and CED's turn rule holds bit for bit (17 of 17).
 - Production is deterministic for a given server state: B1 time-slicing changed no token (2 of 2),
-  and repeats of a request gave the first answer wherever CED's turn rule promises the same bits.
+  and repeats of a request gave the first answer wherever CED's turn rule gives the same bits.
   A repeat answered from another state of the same prompt can differ at a near-tie (4 of 10 repeats),
   as engine.md says but the README does not (m7).
 - On tasks with known answers, through production: GSM8K's first 100 test problems 100 of 100
@@ -156,7 +156,7 @@ second, our margin 0.015; the server's path still gives the documented 12, S1), 
 `ref/torchref/ced_run.py` around `model.py`. The README row now says so and that CED is an
 approximation the SGLang kit serves too (fixed).
 
-**m3: DESIGN decision 6 promised an approximate fallback that is not built.** It said an evicted or
+**m3: DESIGN decision 6 described an approximate fallback that is not built.** It said an evicted or
 divergent prefix falls back to Encoder SWA Bounded Replay; the server restarts exactly from the live
 rings or a window snapshot instead (engine.md, "Exact reuse"). protocol.md said the same of a resumed
 session, and that an evicted session is "simply cold" (it comes back from the disk tier). Fixed in

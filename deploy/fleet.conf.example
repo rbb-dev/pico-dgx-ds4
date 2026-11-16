@@ -1,0 +1,71 @@
+# ~/dsgb10/bin/fleet.conf (keep your copy as ~/dsgb10/fleet.conf and let pico-ctl.sh install put it in bin/): the four
+# Sparks on one switch. Each Spark has ONE 200G port, which appears as two RDMA devices (rails A and B), so the "next"
+# and "previous" neighbours are the same devices and the same addresses. Format: KEY=value lines and # comments; a
+# value has no spaces or quotes; a leading ~/ in a path is the home of the user on the box that uses it; {rank} is the rank.
+# Read by the engine and by the scripts; an unknown or repeated key stops the start and names the line.
+
+# The RDMA devices of the two rails and the RoCE v2 GID index of their IPv4 addresses (NETWORK.md, section 4: check with
+# cat /sys/class/infiniband/mlx5_0/ports/1/gid_attrs/types/3, which must say RoCE v2). The engine checks the GID against
+# the addresses below at its start. Device names differ with the rdma-core package (NETWORK.md, section 4).
+NEXT_DEV0=mlx5_0
+NEXT_DEV1=mlx5_2
+PREV_DEV0=mlx5_0
+PREV_DEV1=mlx5_2
+GID_INDEX=3
+
+# Every Spark alike: the binaries, the logs, the service's folder and the ring lock (a folder that exists, on rank 0).
+BIN_DIR=~/dsgb10/bin
+LOG_DIR=~/dsgb10/logs
+SERVICE_DIR=~/dsgb10/service
+RING_LOCK=~/dsgb10/ring.lock
+
+# Rank 0
+RANK0_NAME=rank0
+RANK0_HOSTNAME=<rank0-hostname>
+RANK0_NEXT_IP0=<rank0-rail-a-address>
+RANK0_NEXT_IP1=<rank0-rail-b-address>
+RANK0_PREV_IP0=<rank0-rail-a-address>
+RANK0_PREV_IP1=<rank0-rail-b-address>
+RANK0_WEIGHTS=~/dsgb10/weights/rank0.dsw
+RANK0_HASHMAP=~/dsgb10/engram/engram_hashmap.bin
+RANK0_ENGRAM=~/dsgb10/engram
+RANK0_SPILL=~/dsgb10/spill
+
+# Rank 1
+RANK1_NAME=rank1
+RANK1_HOSTNAME=<rank1-hostname>
+RANK1_SSH=<rank1-lan-address>
+RANK1_NEXT_IP0=<rank1-rail-a-address>
+RANK1_NEXT_IP1=<rank1-rail-b-address>
+RANK1_PREV_IP0=<rank1-rail-a-address>
+RANK1_PREV_IP1=<rank1-rail-b-address>
+RANK1_WEIGHTS=~/dsgb10/weights/rank1.dsw
+RANK1_HASHMAP=~/dsgb10/engram/engram_hashmap.bin
+RANK1_ENGRAM=~/dsgb10/engram
+RANK1_SPILL=~/dsgb10/spill
+
+# Rank 2
+RANK2_NAME=rank2
+RANK2_HOSTNAME=<rank2-hostname>
+RANK2_SSH=<rank2-lan-address>
+RANK2_NEXT_IP0=<rank2-rail-a-address>
+RANK2_NEXT_IP1=<rank2-rail-b-address>
+RANK2_PREV_IP0=<rank2-rail-a-address>
+RANK2_PREV_IP1=<rank2-rail-b-address>
+RANK2_WEIGHTS=~/dsgb10/weights/rank2.dsw
+RANK2_HASHMAP=~/dsgb10/engram/engram_hashmap.bin
+RANK2_ENGRAM=~/dsgb10/engram
+RANK2_SPILL=~/dsgb10/spill
+
+# Rank 3
+RANK3_NAME=rank3
+RANK3_HOSTNAME=<rank3-hostname>
+RANK3_SSH=<rank3-lan-address>
+RANK3_NEXT_IP0=<rank3-rail-a-address>
+RANK3_NEXT_IP1=<rank3-rail-b-address>
+RANK3_PREV_IP0=<rank3-rail-a-address>
+RANK3_PREV_IP1=<rank3-rail-b-address>
+RANK3_WEIGHTS=~/dsgb10/weights/rank3.dsw
+RANK3_HASHMAP=~/dsgb10/engram/engram_hashmap.bin
+RANK3_ENGRAM=~/dsgb10/engram
+RANK3_SPILL=~/dsgb10/spill

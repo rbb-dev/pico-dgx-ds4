@@ -61,7 +61,7 @@ API); node2 to node4 are the workers.
 | node3 | node3 | qsfp56-dd-1-5 | 10.255.0.3/24 | 10.255.1.3/24 |
 | node4 | node4 | qsfp56-dd-1-1 | 10.255.0.4/24 | 10.255.1.4/24 |
 
-Other addresses work if the fleet file names them (`NEXT_IP<d>` and `PREV_IP<d>` in
+These are example addresses; use your own subnets, one per rail. Other addresses work if the fleet file names them (`NEXT_IP<d>` and `PREV_IP<d>`; a fleet file for one switch is `deploy/fleet.conf.example`, the ring file is
 `ds41f-4xgx10-switchless/fleet/homelab.conf`). Use one subnet per rail, so that every RoCE path has one route and no two interfaces of a
 host share a subnet; shared subnets cause ARP flux, which drops RDMA packets.
 

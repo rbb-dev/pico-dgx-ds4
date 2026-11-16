@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Batched decoding (docs/batching.md, B2) through rank 0's socket, for a server with --slots N (N >= 2):
+"""Batched decoding (docs/batching.md) through rank 0's socket, for a server with --slots N (N >= 2):
 requests that decode together, a row of each per step, must each give what they give alone, bit for bit
 (greedy and seeded sampling, tokens and log-probabilities); a request that comes while others decode gets
 its first token after its own prefill, not after their decode; more requests than slots take turns
 (--slice > 0) or wait for a slot (--slice 0); a cancel and a stop id inside a batch end only their own
 request; a kept session whose slot went to another continues from the store. With drafts (serve's
-default, docs/batching.md B3) batches of up to kMaxRows / 2 sessions decode with drafts across them: the
+default, docs/batching.md) batches of up to kMaxRows / 2 sessions decode with drafts across them: the
 last two scenarios run pairs and triples (a draft cap of 5 and 4 each with kMaxRows 16), a pause, a
 cancel and a stop id inside a drafted batch; every request must still equal its run alone.
 
@@ -173,7 +173,7 @@ def main():
               '%s: cached %d of %d (its session holds %d), %d tokens, %s' % (
                   e.recs[r]['name'], d['cached'], d['prompt'], base, d['completion'], d['reason']))
 
-    print('7. drafts across sessions (B3): pairs (a draft cap of 5 each with kMaxRows 16), then triples (4 each)')
+    print('7. drafts across sessions: pairs (a draft cap of 5 each with kMaxRows 16), then triples (4 each)')
     # a server with drafts runs batches of up to kMaxRows / 2 sessions through the spec batch loop; the
     # sampled B, D and F and C with its top 5 log-probabilities cover the verdicts' bits; when one of a
     # group ends first the rest go on (the last one alone, with drafts)

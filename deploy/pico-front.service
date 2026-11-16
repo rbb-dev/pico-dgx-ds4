@@ -1,0 +1,20 @@
+# ~/.config/systemd/user/pico-front.service. dsfront: the OpenAI API, the Anthropic-style routes, the dashboard and its
+# sign-in. It holds requests (HOLD_S) while the engine restarts, so it stays up when pico-engine restarts.
+[Unit]
+Description=pico front-end (dsfront): the API and the dashboard on rank 0
+After=network-online.target
+
+[Service]
+Type=exec
+WorkingDirectory=%h/dsgb10
+EnvironmentFile=%h/dsgb10/pico.env
+# listens on loopback and on rank 0's LAN address, never 0.0.0.0. The key file is the API key every request and the
+# dashboard need; the table file keeps the session table across a restart; the admin socket is the service's own.
+ExecStart=%h/dsgb10/bin/dsfront serve --listen 127.0.0.1:${PORT} --listen ${LAN_ADDR}:${PORT} --engine-socket %h/dsgb10/run/engine.sock --api-key-file %h/dsgb10/api-key --admin-socket %h/dsgb10/run/admin.sock --hold-s ${HOLD_S} --table-file %h/dsgb10/run/front.table $FRONT_ARGS
+KillSignal=SIGTERM
+TimeoutStopSec=20
+Restart=always
+RestartSec=5s
+
+[Install]
+WantedBy=default.target
