@@ -347,11 +347,19 @@ class Model {
   // of this run_id (main.cpp: the binary, the weights, the options), at most max_age_s old and beside
   // its file (whose size goes to *bytes), else 0 (*why: the reason, "" when there is none). With reuse
   // (every rank's check returned the same gen) state_disk opens that file as it is, and its sessions
-  // are spilled ones; either way the index is removed, so that a crash from then on starts clean. A
-  // block of a kept session that comes back different from what went out stops the process.
+  // are spilled ones, and the index stays: it is the latest checkpoint until the next (its images keep
+  // their space); without reuse it is removed. A piece that comes back different from what went out
+  // cuts its session at the same position on every rank (state_unspill).
+  // state_checkpoint(gen): the same index while serving (rank 0's server, when nothing runs; every rank
+  // alike), naming every session as far as its pieces have images, so that a crash comes back to it;
+  // state_checkpointed: the sessions the last one named on this rank (the server writes theirs);
+  // state_version: images written or dropped since the start (a checkpoint is due when it moved).
   uint64_t state_kept_check(const std::string& base, uint64_t run_id, double max_age_s, size_t* bytes, std::string* why);
   void state_disk(const std::string& base, size_t bytes, size_t staging, bool reuse = false, uint64_t run_id = 0);
   void state_keep(uint64_t gen);
+  void state_checkpoint(uint64_t gen);
+  std::vector<int> state_checkpointed() const;
+  uint64_t state_version() const;
   uint64_t state_kept() const;              // the gen whose sessions this run's store holds (0: none)
   std::vector<int> state_sessions() const;  // the sessions in the store
   size_t state_disk_capacity() const;

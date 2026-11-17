@@ -156,6 +156,45 @@ impl App {
         }
     }
 
+    /// While serving, saves the session table every `every` when it changed (session.rs `save_if_changed`): copied under
+    /// the lock, written after it on a blocking thread, so requests never wait for the disk. A failed save logs one line
+    /// and is tried again at the next interval; `every` of zero starts nothing.
+    pub fn spawn_table_saver(self: &Arc<Self>, path: std::path::PathBuf, max_age_s: u64, every: Duration) {
+        if every.is_zero() {
+            return;
+        }
+        let app = self.clone();
+        tokio::spawn(async move {
+            let mut saved = app.sessions.lock().unwrap().changes();
+            let mut failing = false;
+            let mut tick = tokio::time::interval(every);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                let (a, p) = (app.clone(), path.clone());
+                let Ok((back, r)) = tokio::task::spawn_blocking(move || {
+                    let mut s = saved;
+                    let r = crate::session::save_if_changed(&a.sessions, &mut s, &p, max_age_s);
+                    (s, r)
+                })
+                .await
+                else {
+                    continue;
+                };
+                saved = back;
+                match r {
+                    Some(Err(e)) if !failing => {
+                        eprintln!("session table: NOT saved: {e} (tried again every {} s)", every.as_secs());
+                        failing = true;
+                    }
+                    Some(Ok(_)) => failing = false,
+                    _ => {}
+                }
+            }
+        });
+    }
+
     fn random_hex(&self, n: usize) -> String {
         // splitmix64 over time and a counter: ids only need to be unique
         let mut x = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64

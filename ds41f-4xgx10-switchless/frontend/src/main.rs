@@ -31,9 +31,12 @@ fn usage() -> ! {
       --hold-s N                while the engine is down (the ring lent, or a restart), a request
                                 waits this long (600), then is answered 503 with Retry-After: 60
       --admin-socket PATH       commands from service.sh (mode 600): status, hold IDLE_S, release
-      --table-file PATH         the session table, saved here at a stop and taken back at the next
-                                start (mode 600, in a directory of mode 700; it holds the
+      --table-file PATH         the session table, saved here while serving and at a stop, and taken back
+                                at the next start (mode 600, in a directory of mode 700; it holds the
                                 conversations' text), so that the engine's kept sessions are found again
+      --table-save-s N          while serving, save the table every N seconds when it has changed
+                                (30; 0 = only at the stop); written whole or not at all, off the
+                                request path
       --table-days N            sessions unused for longer are not kept: 7
       --node-stats HOST:PORT,... each rank's sampler, in rank order (docs/dashboard.md): the dashboard at
                                 /dashboard polls them while it is open; without them its NODE HEALTH is empty
@@ -155,6 +158,7 @@ fn serve(args: &[String]) {
     let admin = opt(args, "--admin-socket");
     let table = opt(args, "--table-file").map(std::path::PathBuf::from);
     let table_age_s = (parse_opt(args, "--table-days", 7f64) * 86400.0) as u64;
+    let table_save_s = parse_opt(args, "--table-save-s", 30u64);
     let tok = std::sync::Arc::new(load_tokenizer(args));
     let socket = opt(args, "--engine-socket").unwrap_or_else(|| dsfront::protocol::DEFAULT_SOCKET.into());
     runtime().block_on(async move {
@@ -165,6 +169,9 @@ fn serve(args: &[String]) {
             eprintln!("{}", app.load_sessions(t, table_age_s));
         }
         let saver = app.clone();
+        if let Some(t) = &table {
+            app.spawn_table_saver(t.clone(), table_age_s, std::time::Duration::from_secs(table_save_s));
+        }
         if let Some(path) = admin {
             let (gate, engine) = (app.gate.clone(), app.engine.clone());
             tokio::spawn(async move {

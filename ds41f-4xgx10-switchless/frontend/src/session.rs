@@ -103,6 +103,9 @@ pub struct SessionTable {
     index: HashMap<u128, Vec<u64>>,
     next_id: u64,
     clock: u64,
+    /// Bumped by every change to the sessions held (a request planned or finished, a session
+    /// dropped, a table loaded): what tells a periodic save that there is something new.
+    changes: u64,
     max_sessions: usize,
     max_tokens: usize,
 }
@@ -189,23 +192,81 @@ impl<'a> Bytes<'a> {
     }
 }
 
+/// `bytes` (a table's `snapshot`) at `path`, whole or not at all: written to `path`.new (mode 0600), synced,
+/// renamed over `path`, the directory synced. A crash in between leaves the previous file and at most a
+/// `.new`, which a load ignores. The directory must be ours alone. One write at a time in the process.
+pub fn write_table(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    private_dir(path.parent().unwrap_or(Path::new(".")))?;
+    let tmp = PathBuf::from(format!("{}.new", path.display()));
+    let _ = std::fs::remove_file(&tmp);
+    let write = || -> std::io::Result<()> {
+        let mut o = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
+        o.write_all(bytes)?;
+        o.sync_all()?;
+        drop(o);
+        std::fs::rename(&tmp, path)?;
+        if let Some(d) = path.parent() {
+            std::fs::File::open(d)?.sync_all()?;
+        }
+        Ok(())
+    };
+    write().map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("{}: {e}", path.display())
+    })
+}
+
+/// One periodic save: if `table` changed since the count in `saved`, snapshot it under the lock, write it after the
+/// lock is let go and set `saved` to that count. None when nothing changed; a failed write leaves `saved`, so the next
+/// call tries again.
+pub fn save_if_changed(table: &std::sync::Mutex<SessionTable>, saved: &mut u64, path: &Path, max_age_s: u64) -> Option<Result<usize, String>> {
+    let (bytes, n, at) = {
+        let t = table.lock().unwrap();
+        if t.changes() == *saved {
+            return None;
+        }
+        let (b, n) = t.snapshot(max_age_s);
+        (b, n, t.changes())
+    };
+    Some(write_table(path, &bytes).map(|()| {
+        *saved = at;
+        n
+    }))
+}
+
 impl SessionTable {
     /// Holds up to `max_sessions` sessions and `max_tokens` ids in total. Ids start from the clock,
     /// so that a table begun afresh never reuses an earlier one's ids, whose sessions the engine may
     /// still keep.
     pub fn new(max_sessions: usize, max_tokens: usize) -> Self {
-        SessionTable { sessions: HashMap::new(), index: HashMap::new(), next_id: (unix_now() << 20).max(1), clock: 0, max_sessions, max_tokens }
+        SessionTable { sessions: HashMap::new(), index: HashMap::new(), next_id: (unix_now() << 20).max(1), clock: 0, changes: 0, max_sessions, max_tokens }
     }
 
-    /// The table for the next start: the sessions not in a request and used within `max_age_s`,
-    /// written to `path` under a temporary name (mode 0600), synced and renamed into place. The
-    /// directory must be ours alone. Returns how many sessions it holds.
+    /// How many changes the sessions held have seen (see `changes`); equal counts mean equal tables.
+    pub fn changes(&self) -> u64 {
+        self.changes
+    }
+
+    /// The table for the next start: the sessions used within `max_age_s` (one in a request as its
+    /// last finished turn left it), written to `path` (see `write_table`). Returns how many sessions it holds.
     pub fn save(&self, path: &Path, max_age_s: u64) -> Result<usize, String> {
-        private_dir(path.parent().unwrap_or(Path::new(".")))?;
+        let (bytes, n) = self.snapshot(max_age_s);
+        write_table(path, &bytes)?;
+        Ok(n)
+    }
+
+    /// The saved form of the sessions used within `max_age_s` (one in a request as its last finished turn left it;
+    /// one with no finished turn is left out), and how many
+    /// they are. Memory only: the file is written from it after the table's lock is let go.
+    pub fn snapshot(&self, max_age_s: u64) -> (Vec<u8>, usize) {
         let now = unix_now();
         let (mut body, mut n) = (Vec::new(), 0u64);
         for (&id, s) in &self.sessions {
-            if s.busy || now.saturating_sub(s.t_used) > max_age_s {
+            // a session in a request is saved as its last finished turn left it (its text and ids change only
+            // at `finish`); one with no finished turn has nothing to save
+            if s.text.is_empty() || now.saturating_sub(s.t_used) > max_age_s {
                 continue;
             }
             n += 1;
@@ -232,36 +293,18 @@ impl SessionTable {
             f.extend(v.to_le_bytes());
         }
         f.extend(body);
-        let tmp = PathBuf::from(format!("{}.new", path.display()));
-        let _ = std::fs::remove_file(&tmp);
-        let write = || -> std::io::Result<()> {
-            let mut o = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
-            o.write_all(&f)?;
-            o.sync_all()?;
-            drop(o);
-            std::fs::rename(&tmp, path)?;
-            if let Some(d) = path.parent() {
-                std::fs::File::open(d)?.sync_all()?;
-            }
-            Ok(())
-        };
-        write().map_err(|e| {
-            let _ = std::fs::remove_file(&tmp);
-            format!("{}: {e}", path.display())
-        })?;
-        Ok(n as usize)
+        (f, n as usize)
     }
 
     /// The table an earlier run saved at `path`, when the file is whole, ours alone (mode 0600, in a
-    /// directory of ours) and at most `max_age_s` old. The file goes once read: a crash from then on
-    /// starts afresh. Sessions not used within `max_age_s`, or whose ids do not spell their text with
+    /// directory of ours) and at most `max_age_s` old. The file stays where it is, whole or not, until a
+    /// save replaces it: a crash at any moment from the start on finds the last saved table. Sessions not used within `max_age_s`, or whose ids do not spell their text with
     /// this tokenizer, are left out. Err holds the reason ("" when there is no file).
     pub fn load(&mut self, path: &Path, tok: &Tokenizer, max_age_s: u64) -> Result<usize, String> {
         if let Err(e) = std::fs::symlink_metadata(path) {
             return Err(if e.kind() == std::io::ErrorKind::NotFound { String::new() } else { format!("{}: {e}", path.display()) });
         }
         let r = self.load_file(path, tok, max_age_s);
-        let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(format!("{}.new", path.display()));
         r
     }
@@ -333,6 +376,7 @@ impl SessionTable {
         self.next_id = self.next_id.max(next_id).max(got.keys().max().map_or(0, |m| m + 1));
         self.clock = self.clock.max(clock);
         self.sessions = got;
+        self.changes += 1;
         self.index.clear();
         let ids: Vec<u64> = self.sessions.keys().copied().collect();
         for id in ids {
@@ -360,6 +404,7 @@ impl SessionTable {
     /// images inside the shared text are not these (see the module comment) is no candidate.
     pub fn plan_images(&mut self, text: &str, tok: &Tokenizer, threads: usize, ablit: bool, images: &[ImageKey]) -> (Plan, Vec<u64>) {
         self.clock += 1;
+        self.changes += 1;
         let top = self.best(text, ablit, images);
         let best = top.filter(|&(_, n)| n >= MIN_SHARED);
         let (mut plan, cut) = match best {
@@ -428,6 +473,7 @@ impl SessionTable {
 
     /// `finish` for a prompt with images (`plan_images`' text and keys).
     pub fn finish_images(&mut self, session_id: u64, prompt_text: &str, prompt_ids: &[u32], generated: &[u32], tok: &Tokenizer, images: &[ImageKey]) {
+        self.changes += 1;
         let Some(s) = self.sessions.get_mut(&session_id) else { return };
         let gen_bytes = tok.decode_bytes(generated);
         let mut text = prompt_text.to_string();
@@ -506,6 +552,7 @@ impl SessionTable {
 
     /// Remove session `id` from the table and the index.
     fn remove(&mut self, id: u64) {
+        self.changes += 1;
         self.leave(id);
         self.sessions.remove(&id);
     }
@@ -558,6 +605,160 @@ mod tests {
         t.sessions.insert(id, Session { text: text.into(), ids: Vec::new(), ends: Vec::new(), prompt_len: text.len(), busy: false,
                                         last_used: 0, t_used: 0, ablit, images: Vec::new(), keys: Vec::new() });
         t.enter(id);
+    }
+
+    fn table_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("dsfront-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        dir
+    }
+
+    /// `put`, used just now (a session older than the save's age limit is not saved).
+    fn put_fresh(t: &mut SessionTable, id: u64, text: &str, ablit: bool) {
+        put(t, id, text, ablit);
+        t.sessions.get_mut(&id).unwrap().t_used = unix_now();
+    }
+
+    #[test]
+    fn a_periodic_save_writes_only_after_a_change() {
+        let dir = table_dir("periodic");
+        let path = dir.join("front.table");
+        let table = std::sync::Mutex::new(SessionTable::new(8, 1 << 20));
+        let mut saved = table.lock().unwrap().changes();
+        // nothing changed: nothing written
+        assert!(save_if_changed(&table, &mut saved, &path, 3600).is_none());
+        assert!(!path.exists());
+        // a change: the file is written, and a second look finds nothing new
+        {
+            let mut t = table.lock().unwrap();
+            put_fresh(&mut t, 7, "<｜begin▁of▁sentence｜>a conversation long enough to be kept", false);
+            t.changes += 1;
+        }
+        assert_eq!(save_if_changed(&table, &mut saved, &path, 3600), Some(Ok(1)));
+        assert!(path.exists() && !dir.join("front.table.new").exists());
+        assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+        std::fs::remove_file(&path).unwrap();
+        assert!(save_if_changed(&table, &mut saved, &path, 3600).is_none());
+        assert!(!path.exists(), "no change, no write");
+        // a failed write is tried again at the next call
+        let bad = dir.join("missing/front.table");
+        table.lock().unwrap().changes += 1;
+        assert!(matches!(save_if_changed(&table, &mut saved, &bad, 3600), Some(Err(_))));
+        assert_eq!(save_if_changed(&table, &mut saved, &path, 3600), Some(Ok(1)));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_planned_and_a_finished_request_count_as_changes() {
+        let tok = crate::tokenizer::synthetic::tokenizer();
+        let mut t = SessionTable::new(8, 1 << 20);
+        let c0 = t.changes();
+        let p = "<｜begin▁of▁sentence｜><｜System｜>You are a careful assistant who answers briefly and well.<｜User｜>hello<｜Assistant｜></think>";
+        let (plan, _) = t.plan(p, &tok, 1, false);
+        assert!(t.changes() > c0);
+        let c1 = t.changes();
+        t.finish(plan.session_id, p, &plan.ids, &tok.encode("Hi."), &tok);
+        assert!(t.changes() > c1);
+        let c2 = t.changes();
+        t.abandon(plan.session_id);
+        assert!(t.changes() > c2);
+    }
+
+    #[test]
+    fn a_leftover_temporary_file_does_not_touch_the_saved_table() {
+        let dir = table_dir("leftover");
+        let path = dir.join("front.table");
+        let mut t = SessionTable::new(8, 1 << 20);
+        put_fresh(&mut t, 3, "<｜begin▁of▁sentence｜>the first table's conversation", false);
+        assert_eq!(t.save(&path, 3600), Ok(1));
+        let first = std::fs::read(&path).unwrap();
+        // a crash in the middle of the next save: half a file under the temporary name
+        let tmp = dir.join("front.table.new");
+        std::fs::write(&tmp, &first[..first.len() / 2]).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), first, "the saved file is as it was");
+        // the next save replaces the leftover and the file whole
+        put_fresh(&mut t, 4, "<｜begin▁of▁sentence｜>and a second conversation", false);
+        assert_eq!(t.save(&path, 3600), Ok(2));
+        assert!(!tmp.exists());
+        assert_ne!(std::fs::read(&path).unwrap(), first);
+        // at a load: the previous table loads, the leftover goes, the table stays
+        std::fs::write(&path, &first).unwrap();
+        std::fs::write(&tmp, b"half").unwrap();
+        let tok = syn();
+        let mut u = SessionTable::new(8, 1 << 20);
+        assert!(u.load(&path, &tok, 3600).is_ok(), "the file itself is taken whole");
+        assert!(!tmp.exists() && path.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_session_in_a_request_is_saved_as_its_last_finished_turn() {
+        let tok = syn();
+        let dir = table_dir("busy");
+        let path = dir.join("front.table");
+        let mut t = SessionTable::new(8, 1 << 20);
+        let p1 = "<｜begin▁of▁sentence｜><｜System｜>You are a careful assistant who answers briefly and well.<｜User｜>hello<｜Assistant｜></think>";
+        let (plan, _) = t.plan(p1, &tok, 1, false);
+        assert_eq!(t.snapshot(3600).1, 0, "a session with no finished turn has nothing to save");
+        let gen = tok.encode("Hi there.");
+        t.finish(plan.session_id, p1, &plan.ids, &gen, &tok);
+        assert_eq!(t.save(&path, 3600), Ok(1));
+        // the next turn of the conversation is in its request: the session is busy, and still saved
+        let p2 = format!("{p1}Hi there.<｜User｜>next<｜Assistant｜></think>");
+        let (plan2, _) = t.plan(&p2, &tok, 1, false);
+        assert_eq!(plan2.session_id, plan.session_id);
+        assert!(t.sessions[&plan.session_id].busy);
+        assert_eq!(t.save(&path, 3600), Ok(1));
+        let mut u = SessionTable::new(8, 1 << 20);
+        assert_eq!(u.load(&path, &tok, 3600), Ok(1));
+        let s = &u.sessions[&plan.session_id];
+        assert_eq!(s.text, format!("{p1}Hi there."), "its earlier history, not the turn in flight");
+        assert_eq!(s.ids.len(), plan.ids.len() + gen.len());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_load_leaves_the_file_so_a_second_load_finds_the_same_table() {
+        let tok = syn();
+        let dir = table_dir("twice");
+        let path = dir.join("front.table");
+        let mut t = SessionTable::new(8, 1 << 20);
+        let p1 = "<｜begin▁of▁sentence｜><｜System｜>You are a careful assistant who answers briefly and well.<｜User｜>hello<｜Assistant｜></think>";
+        let (plan, _) = t.plan(p1, &tok, 1, false);
+        t.finish(plan.session_id, p1, &plan.ids, &tok.encode("Hi there."), &tok);
+        assert_eq!(t.save(&path, 3600), Ok(1));
+        let bytes = std::fs::read(&path).unwrap();
+        let mut a = SessionTable::new(8, 1 << 20);
+        assert_eq!(a.load(&path, &tok, 3600), Ok(1));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes, "the file is as it was");
+        // a crash right after the start: the next start loads the same table
+        let mut b = SessionTable::new(8, 1 << 20);
+        assert_eq!(b.load(&path, &tok, 3600), Ok(1));
+        assert_eq!(b.sessions[&plan.session_id].text, a.sessions[&plan.session_id].text);
+        // the loaded table counts as changed, so the first periodic save writes it again
+        let table = std::sync::Mutex::new(b);
+        let mut saved = 0;
+        assert_eq!(save_if_changed(&table, &mut saved, &path, 3600), Some(Ok(1)));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_saved_table_round_trips() {
+        let dir = table_dir("roundtrip");
+        let path = dir.join("front.table");
+        let mut t = SessionTable::new(8, 1 << 20);
+        put_fresh(&mut t, 3, "<｜begin▁of▁sentence｜>one conversation", false);
+        put_fresh(&mut t, 9, "<｜begin▁of▁sentence｜>another, ablated", true);
+        assert_eq!(t.save(&path, 3600), Ok(2));
+        // the file is exactly the snapshot, and saving the unchanged table again gives the same sessions
+        let (snap, n) = t.snapshot(3600);
+        assert_eq!(n, 2);
+        let on_disk = std::fs::read(&path).unwrap();
+        // the header's first field is the write time; the rest is the table
+        assert_eq!(on_disk[16..], snap[16..]);
+        assert_eq!(on_disk.len(), snap.len());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -716,7 +917,10 @@ mod tests {
         assert_eq!(std::fs::metadata(&dir).unwrap().mode() & 0o777, 0o700);
         let mut u = SessionTable::new(8, 1 << 20);
         assert_eq!(u.load(&path, &tok, 3600), Ok(1));
-        assert!(!path.exists(), "the file goes once read");
+        assert!(path.exists(), "the file stays until a save replaces it");
+        let mut again = SessionTable::new(8, 1 << 20);
+        assert_eq!(again.load(&path, &tok, 3600), Ok(1), "a crash right after the start finds the same table");
+        assert_eq!(again.next_id, u.next_id);
         assert!(u.next_id > busy.session_id, "ids go on after the saved table's");
         let p2 = format!("{p1}Hi there.<｜User｜>next<｜Assistant｜></think>");
         let (plan2, _) = u.plan(&p2, &tok, 1, false);
@@ -731,7 +935,7 @@ mod tests {
         b[k] ^= 1;
         std::fs::write(&path, &b).unwrap();
         assert_eq!(SessionTable::new(8, 1 << 20).load(&path, &tok, 3600), Err("incomplete or damaged".into()));
-        assert!(!path.exists());
+        assert!(path.exists(), "a damaged file stays until a save replaces it");
         t.save(&path, 3600).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(SessionTable::new(8, 1 << 20).load(&path, &tok, 3600).is_err());
@@ -806,6 +1010,7 @@ mod tests {
             f.extend(v.to_le_bytes());
         }
         f.extend(body);
+        let _ = std::fs::remove_file(path);
         let mut o = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path).unwrap();
         o.write_all(&f).unwrap();
     }

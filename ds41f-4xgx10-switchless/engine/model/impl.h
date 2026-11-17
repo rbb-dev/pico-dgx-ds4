@@ -8,6 +8,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -142,6 +143,7 @@ struct Model::Impl {
   cudaStream_t st = nullptr;
   comm::DevChannel ch{};
   comm::DevChannel ch2{};  // --wave-probe
+  comm::Ring* host_ring = nullptr;  // bind: host-side agreement across ranks (a read-back's cut, state.cu)
   bool has_ch2 = false;
   bool bound = false;
 
@@ -461,6 +463,12 @@ struct Model::Impl {
   uint64_t state_kept_check(const std::string& base, uint64_t run_id, double max_age_s, size_t* bytes, std::string* why);
   void state_disk(const std::string& base, size_t bytes, size_t staging, bool reuse, uint64_t run_id);
   void state_keep(uint64_t gen);
+  // state_checkpoint: a planned stop's index while serving (every rank alike; the sessions it names in ckpt_sess).
+  // kept_index: an index body of gen: the sessions as a planned stop keeps them (all false) or every one as far as its
+  // pieces have images (true), the images in *names. space_free: an image's file space back (inside the tier's size).
+  void state_checkpoint(uint64_t gen);
+  std::vector<uint8_t> kept_index(uint64_t gen, bool all, std::vector<int>* hs, std::set<size_t>* names);
+  void space_free(size_t off, size_t bytes);
   size_t disk_take(int h, size_t bytes);  // room in the disk tier's file for session h (dropping), or kNone
   void state_spill(int h);
   void state_unspill(int h);

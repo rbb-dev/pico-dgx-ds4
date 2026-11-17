@@ -7,6 +7,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -90,6 +91,12 @@ struct Store {
   std::vector<Kept> kept;           // a kept index as state_kept_check read it, for state_disk
   uint64_t kept_gen = 0, kept_clock = 0;  // its stop's generation and the store's clock then
   uint64_t loaded_gen = 0;                // the generation this run's store came from (0: none)
+  // Checkpoints (state_checkpoint): the images the index on disk names keep their file space until the next index is
+  // durable (an image dropped meanwhile is retired, not freed), so no write lands where that index points.
+  std::set<size_t> named;                          // images the latest index names
+  std::vector<std::pair<size_t, size_t>> retired;  // (image, bytes) dropped while named: freed at the next checkpoint
+  uint64_t ver = 0;                                // images written or dropped since the start (a checkpoint is due when it moved)
+  std::vector<int> ckpt_sess;                      // the sessions the last checkpoint named (rank 0's server writes theirs)
   uint64_t clock = 0;
   std::vector<int> pinned;   // the sessions the current command uses: never evicted during it
   std::vector<int> live;     // the sessions running in the slots (a running request's): never evicted either; a session on an

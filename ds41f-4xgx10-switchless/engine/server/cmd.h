@@ -47,6 +47,7 @@ enum : int32_t {
   kStAttach,       // slot_attach(a, h): slot a's unit holds session h from now on (its rows are h's chunk lists, no copy)
   kStFlush,        // state_flush(h): an idle session's pieces in the pool that have no image get one
   kStDiskSize,     // state_disk_resize(a * 64 KiB): the disk tier's file made that long (the dashboard's SSD size)
+  kStCheckpoint,   // state_checkpoint(gen): the index a crash comes back to (gen = a | b << 32)
   kStUnreserve,    // slot_unreserve(a): slot a's reservation to 0 (its request has finished: no reservation to anyone)
 };
 struct StateOp {

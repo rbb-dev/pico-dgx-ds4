@@ -38,6 +38,8 @@ size_t end_bytes(bool spec) { return kEndBytes + (spec ? kSpecEndBytes : 0); }
 // What a restart needs (serve.cpp choose): the end snapshot at e when the caches hold [0, e) (saved >= e),
 // a window snapshot at s when they hold its restart position q (s, or s - 1 for an odd s; saved >= q).
 int snap_q(int s) { return s & 1 ? s - 1 : s; }
+// the first position kv source k's entry i holds
+int ent_pos(int k, int i) { return i * attn::kChunkEntries * (k < 3 ? 2 : 1); }
 bool end_usable(int end_pos, int saved) { return end_pos >= 0 && end_pos <= saved; }
 bool snap_usable(int s, int saved) { return snap_q(s) <= saved; }
 // The latest position a session holding `saved` positions of pages, the end snapshot at end_pos (-1: none)
@@ -286,12 +288,14 @@ void Model::Impl::state_disk(const std::string& base, size_t bytes, size_t stagi
   s.disk = std::make_unique<SpillFile>(base, bytes, staging, reuse);
   s.dpool.size = s.disk->size();
   s.dpool.free.emplace(0, s.dpool.size);
-  unlink((base + ".index").c_str());  // whatever happens from now on, a crash starts clean
+  if (!reuse) unlink((base + ".index").c_str());  // a reused index stays the latest checkpoint (its images held)
   unlink((base + ".index.new").c_str());
   if (reuse) {  // the kept sessions, every piece only on the disk: back on demand, each checked (state_unspill)
+    s.disk->keep();
     const bool sp = spec != nullptr;
     auto take = [&](size_t off, size_t n, uint64_t sum) {  // an image named again (a shared one) is taken once
       if (s.drefs[off]++) return;
+      s.named.insert(off);
       if (!s.dpool.take_at(off, n)) die("state: a kept image at %zu is not free", off);
       s.dbytes += Pool::round(n);
       *s.disk->sum(off, false) = sum;
@@ -316,6 +320,71 @@ void Model::Impl::state_disk(const std::string& base, size_t bytes, size_t stagi
   s.kept.shrink_to_fit();
 }
 
+// An index body of gen (its KeptHeader first). A planned stop (all false): every session no line holds whose pieces all
+// have an image and are only on the disk. A checkpoint (all true): every session as far as its pieces from position 0 on
+// have images (its length cut to its first entry without one, the bookmarks inside that). *hs: the sessions named; *names: the images.
+std::vector<uint8_t> Model::Impl::kept_index(uint64_t gen, bool all, std::vector<int>* hs, std::set<size_t>* names) {
+  Store& s = store_of();
+  const bool sp = spec != nullptr;
+  std::vector<uint8_t> f(sizeof(KeptHeader));
+  using keepfile::put;
+  int n = 0;
+  for (const auto& [h, ss] : s.sess) {
+    if (h <= 0) continue;
+    int saved = ss.saved;
+    for (int k = 0; k < kKvSlots; ++k)
+      for (size_t i = 0; i < ss.lists[k].size(); ++i)
+        if (i >= ss.dl[k].size() || ss.dl[k][i] == Pool::kNone) {
+          saved = std::min(saved, ent_pos(k, (int)i));
+          break;
+        }
+    std::vector<std::pair<int, size_t>> bks;  // the window bookmarks it keeps
+    for (const auto& sn : ss.snaps) {
+      const auto d = ss.dsnaps.find(sn.first);
+      if (d != ss.dsnaps.end() && snap_q(sn.first) <= saved) bks.emplace_back(sn.first, d->second);
+    }
+    const bool end = ss.end_pos >= 0 && ss.end_pos <= saved && ss.dend != Pool::kNone;
+    if (all) {
+      if (saved <= 0 || (bks.empty() && !end)) continue;
+    } else {
+      bool whole = ss.line < 0 && saved == ss.saved && bks.size() == ss.snaps.size() && (ss.end_pos < 0 || end) && ss.out();
+      for (int k = 0; k < kKvSlots && whole; ++k)
+        for (size_t i = 0; i < ss.lists[k].size() && whole; ++i) whole = i < ss.dl[k].size() && ss.dl[k][i] != Pool::kNone;
+      if (!whole) continue;
+    }
+    ++n;
+    hs->push_back(h);
+    put<int32_t>(f, h), put<int32_t>(f, saved), put<int32_t>(f, end ? ss.end_pos : -1);
+    put<int32_t>(f, (int32_t)bks.size()), put<int32_t>(f, end), put<uint64_t>(f, ss.used);
+    for (int k = 0; k < kKvSlots; ++k) {
+      int ne = 0;  // a checkpoint lists the entries below its saved length; a planned stop every one
+      while (ne < (int)ss.lists[k].size() && (!all || ent_pos(k, ne) < saved)) ++ne;
+      put<int32_t>(f, ne);
+      for (int i = 0; i < ne; ++i) {
+        put<uint64_t>(f, ss.dl[k][i]), put<uint64_t>(f, *s.disk->sum(ss.dl[k][i], false));
+        names->insert(ss.dl[k][i]);
+      }
+    }
+    for (const auto& [pos, o] : bks) {
+      put<int32_t>(f, pos), put<int32_t>(f, 0), put<uint64_t>(f, o), put<uint64_t>(f, *s.disk->sum(o, false));
+      names->insert(o);
+    }
+    if (end) {
+      put<uint64_t>(f, ss.dend), put<uint64_t>(f, *s.disk->sum(ss.dend, false));
+      names->insert(ss.dend);
+    }
+  }
+  KeptHeader hd{};
+  std::memcpy(hd.magic, kKeptMagic, sizeof kKeptMagic);
+  hd.gen = gen, hd.run_id = s.run_id, hd.file_bytes = s.disk->size(), hd.written = (int64_t)std::time(nullptr);
+  hd.rank = rank, hd.n_sess = n, hd.clock = s.clock;
+  hd.image_bytes = chunk_image(), hd.snap_bytes = snap_bytes(sp), hd.end_bytes = end_bytes(sp);
+  hd.body_bytes = f.size() - sizeof hd;
+  hd.body_hash = keepfile::fnv(f.data() + sizeof hd, hd.body_bytes);
+  std::memcpy(f.data(), &hd, sizeof hd);
+  return f;
+}
+
 // A planned stop (every rank alike, after the server spilled what it keeps): the file synced, then its
 // index, and the file stays at exit. A rank whose index cannot be written keeps nothing (the next
 // start's gens differ: every rank starts clean).
@@ -326,37 +395,9 @@ void Model::Impl::state_keep(uint64_t gen) {
   CUDA_CHECK(cudaStreamSynchronize(st));  // the checksums of what went out are in
   s.disk->sync();
   const double t1 = wall_s();
-  const bool sp = spec != nullptr;
-  std::vector<uint8_t> f(sizeof(KeptHeader));
-  using keepfile::put;
-  int n = 0;
-  for (const auto& [h, ss] : s.sess) {
-    // a session the server spilled: every cache entry and bookmark with an image (one that lacks any is not kept)
-    bool whole = h > 0 && ss.line < 0;
-    for (int k = 0; k < kKvSlots && whole; ++k)
-      for (size_t i = 0; i < ss.lists[k].size() && whole; ++i) whole = i < ss.dl[k].size() && ss.dl[k][i] != Pool::kNone;
-    for (const auto& sn : ss.snaps) whole = whole && ss.dsnaps.count(sn.first);
-    whole = whole && (ss.end_pos < 0 || ss.dend != Pool::kNone) && ss.out();
-    if (!whole) continue;
-    ++n;
-    put<int32_t>(f, h), put<int32_t>(f, ss.saved), put<int32_t>(f, ss.end_pos);
-    put<int32_t>(f, (int32_t)ss.dsnaps.size()), put<int32_t>(f, ss.dend != Pool::kNone), put<uint64_t>(f, ss.used);
-    for (int k = 0; k < kKvSlots; ++k) {
-      put<int32_t>(f, (int32_t)ss.lists[k].size());
-      for (size_t i = 0; i < ss.lists[k].size(); ++i) put<uint64_t>(f, ss.dl[k][i]), put<uint64_t>(f, *s.disk->sum(ss.dl[k][i], false));
-    }
-    for (const auto& [pos, o] : ss.dsnaps)
-      put<int32_t>(f, pos), put<int32_t>(f, 0), put<uint64_t>(f, o), put<uint64_t>(f, *s.disk->sum(o, false));
-    if (ss.dend != Pool::kNone) put<uint64_t>(f, ss.dend), put<uint64_t>(f, *s.disk->sum(ss.dend, false));
-  }
-  KeptHeader hd{};
-  std::memcpy(hd.magic, kKeptMagic, sizeof kKeptMagic);
-  hd.gen = gen, hd.run_id = s.run_id, hd.file_bytes = s.disk->size(), hd.written = (int64_t)std::time(nullptr);
-  hd.rank = rank, hd.n_sess = n, hd.clock = s.clock;
-  hd.image_bytes = chunk_image(), hd.snap_bytes = snap_bytes(sp), hd.end_bytes = end_bytes(sp);
-  hd.body_bytes = f.size() - sizeof hd;
-  hd.body_hash = keepfile::fnv(f.data() + sizeof hd, hd.body_bytes);
-  std::memcpy(f.data(), &hd, sizeof hd);
+  std::vector<int> hs;
+  std::set<size_t> names;
+  const std::vector<uint8_t> f = kept_index(gen, false, &hs, &names);
   std::string why;
   if (!keepfile::write_atomic(s.base + ".index", f.data(), f.size(), &why)) {
     std::printf("state: rank %d keeps nothing: %s\n", rank, why.c_str());
@@ -364,8 +405,39 @@ void Model::Impl::state_keep(uint64_t gen) {
   }
   s.disk->keep();
   if (rank == 0)
-    std::printf("state: %d sessions kept for the next start (%.2f GiB of the file): synced in %.1f ms, index of %.1f KiB "
-                "in %.1f ms\n", n, s.dbytes / 1073741824.0, 1e3 * (t1 - t0), f.size() / 1024.0, 1e3 * (wall_s() - t1));
+    std::printf("state: %zu sessions kept for the next start (%.2f GiB of the file): synced in %.1f ms, index of %.1f KiB "
+                "in %.1f ms\n", hs.size(), s.dbytes / 1073741824.0, 1e3 * (t1 - t0), f.size() / 1024.0, 1e3 * (wall_s() - t1));
+}
+
+// A checkpoint while serving (rank 0's server, when nothing runs; every rank alike): the file synced, then the index of
+// every session as far as its pieces have images, written whole or not at all; images the previous index named that were
+// dropped since are freed once this one is durable. A rank whose index cannot be written keeps the previous one.
+void Model::Impl::state_checkpoint(uint64_t gen) {
+  Store& s = store_of();
+  s.ckpt_sess.clear();
+  if (!s.disk || !gen) return;
+  const double t0 = wall_s();
+  CUDA_CHECK(cudaStreamSynchronize(st));
+  s.disk->sync();
+  const double t1 = wall_s();
+  std::vector<int> hs;
+  std::set<size_t> names;
+  const std::vector<uint8_t> f = kept_index(gen, true, &hs, &names);
+  std::string why;
+  if (!keepfile::write_atomic(s.base + ".index", f.data(), f.size(), &why)) {
+    std::printf("state: rank %d: no checkpoint: %s\n", rank, why.c_str());
+    return;
+  }
+  s.disk->keep();
+  s.named = std::move(names);
+  size_t freed = 0;
+  for (const auto& [off, bytes] : s.retired) space_free(off, bytes), freed += Pool::round(bytes);
+  s.retired.clear();
+  s.ckpt_sess = std::move(hs);
+  if (rank == 0)
+    std::printf("state: checkpoint: %zu sessions (%zu images), the file synced in %.1f ms, index of %.1f KiB in %.1f ms; "
+                "%.1f MiB of dropped images freed\n", s.ckpt_sess.size(), s.named.size(), 1e3 * (t1 - t0), f.size() / 1024.0,
+                1e3 * (wall_s() - t1), freed / 1048576.0);
 }
 
 void Model::Impl::state_reserve(size_t bytes) {
@@ -776,8 +848,6 @@ size_t img_slice(int a) {
   for (int j = 0; j < a; ++j) o += (size_t)attn::kChunkEntries * kArr[j];
   return o;
 }
-// the first position kv source k's entry i holds
-int ent_pos(int k, int i) { return i * attn::kChunkEntries * (k < 3 ? 2 : 1); }
 // whether the session has a piece only on the disk tier (it is read back before use)
 bool is_out(const Store::Sess& x) {
   for (const Nums& l : x.lists)
@@ -792,9 +862,10 @@ bool is_out(const Store::Sess& x) {
 
 bool Store::Sess::out() const { return is_out(*this); }
 
-// File space for an image of session h: while there is none, the least recently used session that the current
-// command does not use gives up its images: one that needs them (a piece only on the disk) is dropped (gone:
-// state_evicted), one that has everything in the pool only loses its copies. kNone when none is left.
+// File space for an image of session h: while there is none, the least recently used session the current command does
+// not use and no running request uses (a conversation on an idle or paused line is cache like a stored one), with an image
+// the index on disk does not hold, gives up its images (dropped: state_evicted, if it needs them, a piece only on the
+// disk; else it only loses its copies; a conversation on a line is never freed, its pieces in the pool are the truth). kNone when none is left (retired space returns at the next checkpoint).
 size_t Model::Impl::disk_take(int h, size_t bytes) {
   Store& s = store_of();
   for (;;) {
@@ -807,10 +878,13 @@ size_t Model::Impl::disk_take(int h, size_t bytes) {
     uint64_t oldest = UINT64_MAX;
     for (const auto& [k, ss] : s.sess) {
       if (ss.used >= oldest || !rules::disk_victim_ok({k, ss.line, ss.used}, h, s.pinned, s.live)) continue;
-      bool imgs = ss.dend != Pool::kNone || !ss.dsnaps.empty();
+      bool gives = false;  // an image the index on disk does not hold: dropping the session's images gives space
+      const auto g = [&](size_t o) { gives = gives || (o != Pool::kNone && !s.named.count(o)); };
+      g(ss.dend);
+      for (const auto& d : ss.dsnaps) g(d.second);
       for (const auto& d : ss.dl)
-        for (const size_t o : d) imgs = imgs || o != Pool::kNone;
-      if (imgs) victim = k, oldest = ss.used;
+        for (const size_t o : d) g(o);
+      if (gives) victim = k, oldest = ss.used;
     }
     if (victim < 0) return Pool::kNone;
     Store::Sess& v = s.sess.at(victim);
@@ -825,15 +899,24 @@ size_t Model::Impl::disk_take(int h, size_t bytes) {
 }
 
 // one reference less on image `off`; at none its file space goes back (and the number holding its content, if any,
-// has no copy any more)
+// has no copy any more), unless the latest checkpoint's index names it: then at the next checkpoint (retired)
 void Model::Impl::img_drop(size_t off, size_t bytes) {
   Store& s = store_of();
   const auto it = s.drefs.find(off);
   if (it == s.drefs.end() || !it->second) die("state: image %zu dropped with no reference", off);
+  ++s.ver;
   if (--it->second) return;
   s.drefs.erase(it);
   if (const auto n = s.dnum.find(off); n != s.dnum.end()) s.ndisk[n->second] = Pool::kNone, s.dnum.erase(n);
-  s.dpool.give_off(off, bytes), s.dbytes -= Pool::round(bytes);
+  if (s.named.count(off)) s.retired.emplace_back(off, bytes);
+  else space_free(off, bytes);
+}
+
+// file space back: the part inside the tier's present size (a smaller size leaves what lies past it unused)
+void Model::Impl::space_free(size_t off, size_t bytes) {
+  Store& s = store_of();
+  s.dbytes -= Pool::round(bytes);
+  if (off < s.dpool.size) s.dpool.give_off(off, std::min(Pool::round(bytes), s.dpool.size - off));
 }
 
 // every image of session x dropped (its pieces in the pool stay; one only on the disk is lost: callers free x then)
@@ -867,6 +950,7 @@ void Model::Impl::free_lists(int h) {
 size_t Model::Impl::img_write(int h, uint32_t c) {
   Store& s = store_of();
   if (!s.disk) return Pool::kNone;
+  ++s.ver;
   if (s.ndisk[c] != Pool::kNone) {
     ++s.drefs[s.ndisk[c]];
     return s.ndisk[c];
@@ -893,6 +977,7 @@ size_t Model::Impl::bk_write(int h, const Nums& b, size_t bytes) {
   sum_block(s.gather, bytes, s.disk->sum(off, false), st);
   s.wseq = s.disk->write(s.gather, bytes, off, st);
   s.drefs[off] = 1;
+  ++s.ver;
   ++tier.spills, tier.spill_bytes += bytes;
   return off;
 }
@@ -1092,6 +1177,9 @@ bool Model::Impl::state_disk_resize(size_t bytes) {
   } else {
     s.dpool.size = bytes;
     s.dpool.give_off(cur, bytes - cur);
+    for (const auto& [off, n] : s.retired)  // a retired image past the old size still holds its space
+      if (off >= cur && off < bytes && !s.dpool.take_at(off, std::min(Pool::round(n), bytes - off)))
+        die("state: a retired image at %zu is not free", off);
   }
   if (rank == 0)
     std::printf("state: the disk tier is now %.1f GiB (was %.1f; %.2f GiB in images)\n", bytes / 1073741824.0, cur / 1073741824.0,
@@ -1209,12 +1297,17 @@ void Model::Impl::state_unspill(int h) {
     ++bad;
     bad_pos = std::min(bad_pos, b.k >= 0 ? ent_pos(b.k, b.i) : b.snap >= 0 ? b.snap - kSnapRows : x.end_pos - 1);
   }
-  if (bad) {
+  if (bad)
     std::printf("state: session %d: ERROR: %zu of %zu pieces read back from the disk differ from what was written (rank %d)\n",
                 h, bad, back.size(), rank);
-    if (x.kept) die("state: session %d, kept by an earlier run, came back different from the disk (rank %d)", h, rank);
-    cut_at(h, std::max(0, bad_pos));
+  if (host_ring) {  // every rank cuts at the smallest first bad position (each reaches this in the same command): the
+                    // session stays the same on every rank, and rank 0's server restarts below the cut
+    int32_t all[4];
+    const int32_t mine = bad_pos;
+    host_ring->allgather_host(&mine, all, sizeof mine);
+    for (const int32_t b : all) bad_pos = std::min<int>(bad_pos, b);
   }
+  if (bad_pos != INT32_MAX) cut_at(h, std::max(0, bad_pos));
   x.kept = false;
   if (rank == 0)
     std::printf("state: session %d back from disk: %.1f MiB in %.1f ms (%.2f GB/s; %.1f ms waiting for writes; %zu pieces "
@@ -1601,6 +1694,9 @@ void Model::state_disk(const std::string& base, size_t bytes, size_t staging, bo
   d_->state_disk(base, bytes, staging, reuse, run_id);
 }
 void Model::state_keep(uint64_t gen) { d_->state_keep(gen); }
+void Model::state_checkpoint(uint64_t gen) { d_->state_checkpoint(gen); }
+std::vector<int> Model::state_checkpointed() const { return d_->store_s ? d_->store_s->ckpt_sess : std::vector<int>{}; }
+uint64_t Model::state_version() const { return d_->store_s ? d_->store_s->ver : 0; }
 uint64_t Model::state_kept() const { return d_->store_s ? d_->store_s->loaded_gen : 0; }
 std::vector<int> Model::state_sessions() const {
   std::vector<int> v;

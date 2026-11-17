@@ -18,3 +18,6 @@ add_executable(pool_rules_test tests/pool_rules_test.cpp)
 
 # bounds.h: the output queue's cap and the prompts' byte budget (host only)
 add_executable(bounds_test tests/bounds_test.cpp)
+
+# common/heap.h: giving the free pages of the heap back (host only)
+add_executable(heap_test tests/heap_test.cpp)

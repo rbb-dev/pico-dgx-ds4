@@ -63,6 +63,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <map>
@@ -76,6 +77,7 @@
 #include <cuda_profiler_api.h>
 
 #include "common/check.h"
+#include "common/heap.h"
 #include "model/nvtx.h"
 #include "common/frontend_protocol.h"
 #include "common/keepfile.h"
@@ -554,6 +556,7 @@ class Server {
       } else {
         resize_idle();
         flush_idle();
+        checkpoint();
       }
     }
     // the stop ends what is paused or held with an error (Io::stopping): "the server is stopping"
@@ -573,17 +576,16 @@ class Server {
     bcast(ring_, Cmd{});  // stop the other ranks
   }
 
-  // The sessions an earlier run kept at its planned stop (keep), when the store reused that stop's
-  // files (Model::state_kept: the same generation): their histories and ranges from o_.keep_index, which
-  // goes once read, so that a crash from now on starts clean. Sessions it names that the store does not
-  // hold on disk, or unused for keep_age_s, are dropped, and so are the store's sessions it does not name.
+  // The sessions kept at a planned stop or checkpoint, when the store reused those files (Model::state_kept):
+  // histories and ranges from o_.keep_index, which stays as the latest checkpoint's and goes when it does not check out.
+  // Sessions the store does not hold on disk, or unused for keep_age_s, are dropped, and so are the store's sessions the
+  // index does not name.
   void load_kept() {
     if (o_.keep_index.empty()) return;
     const double t0 = now_s();
     std::vector<uint8_t> f;
     std::string why;
     const bool got = keepfile::read_private(o_.keep_index, 16ull << 30, &f, &why);
-    unlink(o_.keep_index.c_str());
     unlink((o_.keep_index + ".new").c_str());
     const uint64_t gen = m_.state_kept();
     std::map<uint64_t, Session> kept;
@@ -629,6 +631,7 @@ class Server {
         why = "the index is damaged";
       }
     }
+    if (!why.empty() || !gen) unlink(o_.keep_index.c_str());  // none to come back to
     // the store's sessions that no kept session names go
     std::vector<StateOp> v;
     std::set<int> named;
@@ -727,12 +730,31 @@ class Server {
     gen += !gen;
     state({{kStKeep, -1, (int32_t)(uint32_t)gen, (int32_t)(uint32_t)(gen >> 32)}});
     const double t1 = now_s();
+    std::set<int> hs;
+    for (const auto& [id, s] : sess_)
+      if (m_.state_info(s.h).on_disk) hs.insert(s.h);
+    int n = 0;
+    size_t fb = 0;
+    std::string why;
+    const bool ok = write_index(gen, hs, &n, &fb, &why);
+    heap::release();
+    std::printf("serve: kept sessions: %d for the next start (%d on disk before, %d spilled now: %.2f GiB; %d freed past "
+                "%.1f GiB, %d unused for %.0f days), the ranks' files synced and indexed in %.2f s; histories %.1f KiB "
+                "in %.1f ms%s%s\n",
+                ok ? n : 0, before, spilled, bytes / 1073741824.0, freed, o_.keep_bytes / 1073741824.0, old,
+                keep_age_s_ / 86400, t1 - t0, fb / 1024.0, 1e3 * (now_s() - t1), ok ? "" : ": NOT WRITTEN, ",
+                why.c_str());
+  }
+
+  // The server's index of gen (keepfile.h: whole or not at all), beside the ranks' of the same gen: the sessions whose
+  // handles hs names, each with its id, handle, restart ranges, LRU clock and time, history, encoder-only snapshots.
+  bool write_index(uint64_t gen, const std::set<int>& hs, int* n, size_t* bytes, std::string* why) {
     std::vector<uint8_t> f(sizeof(SrvHeader));
     using keepfile::put;
-    int n = 0;
+    *n = 0;
     for (const auto& [id, s] : sess_) {
-      if (!m_.state_info(s.h).on_disk) continue;
-      ++n;
+      if (!hs.count(s.h)) continue;
+      ++*n;
       put<uint64_t>(f, id), put<int32_t>(f, s.h), put<int32_t>(f, s.pe_snap);
       put<int32_t>(f, s.end_lo), put<int32_t>(f, s.end_clo), put<int32_t>(f, s.end_w), put<int32_t>(f, s.end_dec_lo);
       put<uint64_t>(f, s.used), put<double>(f, s.t_used);
@@ -742,18 +764,52 @@ class Server {
     }
     SrvHeader hd{};
     std::memcpy(hd.magic, kSrvMagic, sizeof kSrvMagic);
-    hd.gen = gen, hd.written = (int64_t)unix_now(), hd.n_sess = n, hd.next_h = next_h_, hd.clock = clock_;
+    hd.gen = gen, hd.written = (int64_t)unix_now(), hd.n_sess = *n, hd.next_h = next_h_, hd.clock = clock_;
     hd.body_bytes = f.size() - sizeof hd;
     hd.body_hash = keepfile::fnv(f.data() + sizeof hd, hd.body_bytes);
     std::memcpy(f.data(), &hd, sizeof hd);
+    *bytes = f.size();
+    return keepfile::write_atomic(o_.keep_index, f.data(), f.size(), why);
+  }
+
+  // While nothing runs, a checkpoint a crash comes back to (docs/engine.md "Checkpoints while serving"): when the
+  // store's images changed and --ssd-flush-s has passed since the last, the lines' conversations are saved as a planned
+  // stop saves them, every rank writes its index (kStCheckpoint), then this server its sessions index of the same gen.
+  // A crash between the two leaves gens that differ: the next start is clean or uses the previous pair.
+  // DSGB10_CKPT_STOP=1 ends the process between them.
+  void checkpoint() {
+    if (!o_.keep_bytes || o_.keep_index.empty() || !m_.state_disk_capacity()) return;
+    const double t0 = now_s();
+    if (t0 - ckpt_at_ < std::max(1, o_.ssd_flush_s) || m_.state_version() == ckpt_ver_) return;
+    // a line's conversation as a planned stop keeps it, the line kept: its caches to its history's end and its end
+    // bookmark (persist_ops), then every piece of it written (kStFlush), so a crash restarts it where the line stood
+    std::vector<StateOp> fl;
+    for (int s = 0; s < (int)slot_.size(); ++s)
+      if (slot_[s] && !flying_.count(slot_[s]))
+        if (Session* x = find(slot_[s])) {
+          persist_slot(s, false);
+          fl.push_back({kStFlush, x->h, 0, 0});
+          x->flushed = x->used;
+        }
+    if (!fl.empty()) state(fl);
+    uint64_t gen = rng_();
+    gen += !gen;
+    state({{kStCheckpoint, -1, (int32_t)(uint32_t)gen, (int32_t)(uint32_t)(gen >> 32)}});
+    ckpt_at_ = now_s(), ckpt_ver_ = m_.state_version();
+    const std::vector<int> v = m_.state_checkpointed();
+    if (const char* e = std::getenv("DSGB10_CKPT_STOP"); e && *e == '1' && !v.empty()) {
+      std::printf("serve: DSGB10_CKPT_STOP: stopping between the ranks' indexes (%zu conversations) and the server's\n", v.size());
+      std::fflush(stdout);
+      _exit(9);
+    }
+    const std::set<int> hs(v.begin(), v.end());
+    int n = 0;
+    size_t fb = 0;
     std::string why;
-    const bool ok = keepfile::write_atomic(o_.keep_index, f.data(), f.size(), &why);
-    std::printf("serve: kept sessions: %d for the next start (%d on disk before, %d spilled now: %.2f GiB; %d freed past "
-                "%.1f GiB, %d unused for %.0f days), the ranks' files synced and indexed in %.2f s; histories %.1f KiB "
-                "in %.1f ms%s%s\n",
-                ok ? n : 0, before, spilled, bytes / 1073741824.0, freed, o_.keep_bytes / 1073741824.0, old,
-                keep_age_s_ / 86400, t1 - t0, f.size() / 1024.0, 1e3 * (now_s() - t1), ok ? "" : ": NOT WRITTEN, ",
-                why.c_str());
+    const bool ok = write_index(gen, hs, &n, &fb, &why);
+    std::printf("serve: checkpoint: %d conversations a crash comes back to; the ranks' indexes in %.1f ms, histories %.1f KiB "
+                "in %.1f ms%s%s\n", ok ? n : 0, 1e3 * (ckpt_at_ - t0), fb / 1024.0, 1e3 * (now_s() - ckpt_at_),
+                ok ? "" : ": NOT WRITTEN, ", why.c_str());
   }
 
   // The disk tier's size the dashboard asked for (CONFIG ssd_gib), when no request is in flight or paused between turns:
@@ -2214,6 +2270,8 @@ class Server {
   const ServeOptions& o_;
   double keep_age_s_;  // --keep-days, changed live (CONFIG keep_days)
   int64_t ssd_pending_ = 0;  // a disk tier size the dashboard asked for (GiB), applied when nothing runs (resize_idle)
+  double ckpt_at_ = 0;      // when the last checkpoint was written (checkpoint())
+  uint64_t ckpt_ver_ = 0;   // the store's version it saw (Model::state_version)
   Io& io_;
   const size_t budget_;  // the store's bytes kept between requests (the rest: room for the next one)
   std::map<uint64_t, Session> sess_;

@@ -287,6 +287,7 @@ void Model::Impl::inject(Sink* sink, int L, const char* name, int pos0, int R, v
 
 void Model::Impl::bind(dsw::WeightFile& wf, comm::Ring& ring) {
   ch = ring.dev();
+  host_ring = &ring;
   auto need = [&](const std::string& n, dsw::DType t, std::initializer_list<int64_t> shape) -> uint8_t* {
     const dsw::DeviceTensor& d = wf[n];
     if (d.dtype != t || d.ndim != (int)shape.size())

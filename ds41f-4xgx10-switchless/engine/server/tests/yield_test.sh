@@ -267,8 +267,8 @@ until_ 30 test -s "$T/n.rc" && [ "$(cat "$T/n.rc")" = 0 ] && t=$(since "$(cat "$
   ok "the inner ring.sh ran ${t} s after the outer one got the ring" || bad "nested: $(cat "$T/n.rc" 2> /dev/null), $(tail -n 3 "$T/n.log")"
 [ "$(grep -c 'the ring is busy' "$T/n.log")" = 1 ] && ok "only the outer one waited for the ring" || bad "nested waits: $(grep -c 'the ring is busy' "$T/n.log")"
 rc_of n && until_ 30 serving && ok "back to serving" || bad "after the nested job: $(state)"
-grep -q "session table: [1-9][0-9]* sessions from" "$T/svc/logs/front.log" && [ ! -e "$T/svc/run/front.table" ] &&
-  ok "the restarted dsfront took its table back, and the file is gone: $(grep 'session table' "$T/svc/logs/front.log" | tail -n 1)" ||
+grep -q "session table: [1-9][0-9]* sessions from" "$T/svc/logs/front.log" && [ -f "$T/svc/run/front.table" ] &&
+  ok "the restarted dsfront took its table back, and the file stays until a save replaces it: $(grep 'session table' "$T/svc/logs/front.log" | tail -n 1)" ||
   bad "the table at the start: $(grep 'session table' "$T/svc/logs/front.log" | tail -n 1); $(ls "$T/svc/run" | tr '\n' ' ')"
 
 echo "10. a driver's held want keeps the ring lent between its parts; a job that waits in the gap goes first"

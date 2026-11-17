@@ -154,6 +154,7 @@
 
 #include "comm/ring.h"
 #include "common/check.h"
+#include "common/heap.h"
 #include "common/keepfile.h"
 #include "dspark/dspark.h"
 #include "engram/engram.h"
@@ -653,6 +654,7 @@ void mem_report(int rank, const char* when) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  heap::limit_arenas();
   setvbuf(stdout, nullptr, _IOLBF, 0);
   const Args a = parse(argc, argv);
   const double t0 = now_s();

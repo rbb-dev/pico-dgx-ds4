@@ -17,6 +17,7 @@
 #include <cuda_runtime.h>
 
 #include "common/check.h"
+#include "common/heap.h"
 #include "model/nvtx.h"
 
 namespace srv {
@@ -74,7 +75,15 @@ void apply_state(model::Model& m, const StateOp& o) {
     case kStAttach: m.slot_attach(o.a, o.h); break;
     case kStFlush: m.state_flush(o.h); break;
     case kStDiskSize: m.state_disk_resize((size_t)(uint32_t)o.a << 16); break;
+    case kStCheckpoint:
+      m.state_checkpoint((uint64_t)(uint32_t)o.a | (uint64_t)(uint32_t)o.b << 32);
+      heap::release();  // the index's buffers are freed: their pages go back
+      break;
     case kStUnreserve: m.slot_unreserve(o.a); break;
+    case kStImgTake:
+      if (!m.image_take(o.h, (size_t)(uint32_t)o.a, o.b)) die("state: no room for the image rows of flight %d (%d rows), or the flight holds them already", o.h, o.a);
+      break;
+    case kStImgFree: m.image_free(o.h); break;
     default: die("state: unknown operation %d", o.op);
   }
 }
