@@ -69,8 +69,9 @@ main#view:focus { outline: none; }
 [hidden] { display: none !important; }
 /* ---- the Overview: a status board's front page (its colours, type and density) ---- */
 /* the board: the ENGINE box across the top; LINES beside DECODE over PREFILL (the charts take the LINES height); NODE HEALTH
-   across */
-.board { display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(0, 1fr); grid-template-areas: "engine engine" "lines plots" "health health"; gap: 12px; align-items: stretch; }
+   across; the settings box across */
+.board { display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(0, 1fr); grid-template-areas: "engine engine" "lines plots" "health health" "reading reading"; gap: 12px; align-items: stretch; }
+.board > [data-box="reading"] { grid-area: reading; }
 .board > [data-box="lines"] { grid-area: lines; }
 .board > [data-box="health"] { grid-area: health; }
 .board > [data-box="engine"] { grid-area: engine; }
@@ -207,20 +208,25 @@ nav.sections button[aria-current="page"] { background: transparent; color: var(-
 .pfoot > span { width: 38px; flex: none; }
 .xlab { flex: 1; display: flex; justify-content: space-between; font-family: var(--mono); font-size: 9px; color: #5a6165; }
 
-@media (max-width: 1099px) { .board { grid-template-columns: minmax(0, 1fr); grid-template-areas: "engine" "lines" "plots" "health"; } .tiles { margin-left: 0; } }
+@media (max-width: 1099px) { .board { grid-template-columns: minmax(0, 1fr); grid-template-areas: "engine" "lines" "plots" "health" "reading"; } .tiles { margin-left: 0; } }
 @media (max-width: 720px) { .lrow { grid-template-columns: 18px 56px minmax(30px, 1fr) 62px 52px 70px; } .lrow > span:nth-child(n+7) { display: none; } }
 
 /* the served names in the header */
 .htile[data-tile="served"] .v { color: var(--t2); }
 
-/* sign-in (the API key, kept in this browser until Sign out) */
+/* sign-in (the API key, kept in this browser until Sign out) and the engine settings */
 .signin { position: fixed; inset: 0; background: rgba(5, 7, 8, .94); display: flex; align-items: center; justify-content: center; z-index: 50; }
 .signin form { background: var(--panel); border: 1px solid var(--line2); padding: 20px 22px; display: flex; flex-direction: column; gap: 10px; width: min(360px, calc(100vw - 32px)); }
 .signin .t { font-family: var(--mono); font-size: 12px; letter-spacing: .1em; color: var(--t2); }
 .signin .m { font-size: 13px; color: var(--t4); }
 .signin input { background: var(--well); border: 1px solid var(--line2); padding: 8px 10px; font-family: var(--mono); }
-.signin button, button.signout { background: var(--raise); border: 1px solid var(--line2); padding: 5px 9px; }
+.signin button, .settings select, button.signout { background: var(--raise); border: 1px solid var(--line2); padding: 5px 9px; }
 button.signout { font-family: var(--mono); font-size: 11px; letter-spacing: .08em; margin-left: 12px; color: var(--t4); }
+.settings { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px 16px; align-items: end; font-size: 13px; }
+.settings .field { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+.settings .k { color: var(--t4); font-family: var(--mono); font-size: 11px; letter-spacing: .08em; text-transform: uppercase; }
+.settings .note { grid-column: 1 / -1; color: var(--t5); font-size: 12px; }
+.settings .note.bad { color: var(--bad); }
 </style>
 </head>
 <body>
@@ -748,17 +754,67 @@ function tierCard() {
 
 
 
+// Interleaved prefill's settings (the engine's --interleave-* flags), changed here at once: what the engine runs comes back in
+// its next status. Each list holds the useful values; a value set at start that is not in a list is shown too.
+function settingsBox() {
+  const ROWS = [
+    ['on', 'SPLIT LONG PROMPTS', 'On: a long prompt is read in pieces while others decode. Off: every prompt is read whole.', [[true, 'on'], [false, 'off']]],
+    ['share', 'TIME FOR OTHERS', 'Of the time while a long prompt is read, the part the decoding users get. More: they write faster, the prompt takes longer.', [10, 20, 30, 40, 50, 60, 70, 80, 90].map((v) => [v, v + ' %'])],
+    ['gap_ms', 'MAX PAUSE FOR OTHERS', 'The longest a decoding user waits between tokens while a long prompt is read; it sets the piece size (shorter: smaller pieces, the prompt a little slower).', [300, 450, 600, 800, 1000, 1500].map((v) => [v, v + ' ms'])],
+    ['push_rows', 'READ 2 AT ONCE UP TO', 'A long prompt with at most this many tokens to compute reads beside one already being read, instead of waiting behind it.', [32768, 65536, 131072, 262144, 524288].map((v) => [v, (v / 1024) + 'K tokens'])],
+    ['whole_rows', 'NO SPLIT UP TO', 'A prompt with at most this many tokens to compute (after what is cached) is read whole: the decoding users wait for it.', [8192, 16384, 32768, 65536, 131072].map((v) => [v, (v / 1024) + 'K tokens'])],
+  ];
+  const note = h('span', { class: 'note' });
+  const copyLine = h('span', { class: 'note', hidden: true });
+  const sels = {};
+  const grid = h('div', { class: 'settings' }, ROWS.map(([key, label, tip, opts]) => {
+    const sel = h('select', { 'aria-label': label, disabled: true, onchange: async () => {
+      const v = key === 'on' ? sel.value === 'true' : Number(sel.value);
+      sel.disabled = true;
+      const r = await api('settings', null, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ [key]: v }) });
+      sel.disabled = false;
+      note.classList.toggle('bad', !r.ok);
+      setText(note, r.ok ? label.toLowerCase() + ' set; the engine shows it within a second' : ((r.body && r.body.error && r.body.error.message) || 'not set: HTTP ' + r.status));
+    } }, opts.map(([v, text]) => h('option', { value: String(v), text })));
+    sels[key] = sel;
+    return h('label', { class: 'field', title: tip }, h('span', { class: 'k', text: label }), sel);
+  }), note, copyLine);
+  const b = box('reading', 'PROMPT READING', 'How the engine reads long prompts while others decode (interleaved prefill). Changes apply at once and last until the engine restarts; its start flags set them again.', grid);
+  function update(st) {
+    const il = st && st.interleave;
+    for (const [key, sel] of Object.entries(sels)) {
+      sel.disabled = !il;
+      if (!il || document.activeElement === sel) continue;
+      const v = String(il[key]);
+      if (![...sel.options].some((o) => o.value === v)) sel.append(h('option', { value: v, text: v }));
+      if (sel.value !== v) sel.value = v;
+    }
+    const cp = st && st.copy;
+    copyLine.hidden = !cp;
+    if (cp) {
+      const chance = (cp.chance_pm || []).map((v) => whole.format(Math.round(Number(v) / 10)) + ' %').join(', ');
+      const rows = Number(cp.rows_verified);
+      setText(copyLine, `Copy drafts: ` + (Number(cp.scored) === 0 ? 'learning, no outcomes yet.' : `learning from ${whole.format(Number(cp.scored))} outcomes. A copied token is right ${chance} of the time after a match of 8, 16, 32, 64 tokens. ` +
+        (rows > 0 ? `${whole.format(Math.round(100 * Number(cp.rows_accepted) / rows))} % of copied rows accepted. ` : '') + `${pl(cp.failing_requests, 'request')} with failing copies.`));
+    }
+    if (!il) setText(b.right, 'not reported');
+    else setText(b.right, `${il.reading} reading · ${il.queued} waiting`);
+  }
+  return { el: b.el, update };
+}
+
 function overview() {
-  const lines = linesBox(), health = healthBox(), rate = rateCard(), kv = sessionsCard(), tier = tierCard();
+  const lines = linesBox(), health = healthBox(), rate = rateCard(), kv = sessionsCard(), tier = tierCard(), reading = settingsBox();
   const cd = chart('DECODE', 'Tokens a second the engine generates, all streams, the last 15 minutes. Fixed 10-second buckets: a bucket keeps its value as the window moves; hover for the bucket\'s mean and peak.', '#e8eaec', 'tok/s', 'decode_tps');
   const cp = chart('PREFILL', 'Prompt tokens a second of the prompt passes as they ran (the speed now, sampled every second), the last 15 minutes. Fixed 10-second buckets; hover for the mean and peak.', '#9d8bd0', 'tok/s', 'prefill_tps');
   const wrap = (name, c) => h('section', { class: 'box plotbox', 'data-box': name }, c.el);
-  // the board: the ENGINE box across the top, LINES beside DECODE over PREFILL, NODE HEALTH across
+  // the board: the ENGINE box across the top, LINES beside DECODE over PREFILL, NODE HEALTH across, the settings box across
   refs.main.append(h('div', { class: 'board' },
     box('engine', 'ENGINE', 'The rates, the sessions and the SSD tier, as the engine reports them. Hover a row for its detail.', h('div', { class: 'vrow' }, rate.el, kv.el, tier.el)).el,
     lines.el,
     h('div', { class: 'plots' }, wrap('decode', cd), wrap('prefill', cp)),
-    health.el));
+    health.el,
+    reading.el));
   const seen = new Map(); // request id -> { gen, at, tps, waitS }
   let inflight = [], recent = [], ledger = null, alive = true;
   const track = (body, at) => {
@@ -820,6 +876,7 @@ function overview() {
     kv.update(st, inflight);
     tier.update(st);
     rate.update(st, recent);
+    reading.update(st);
     const live = (st.health || {}).live || {};
     cd.setNow(live.decode_tokens_per_second);
     cp.setNow(live.prefill_tokens_per_second);

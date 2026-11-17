@@ -12,7 +12,7 @@
 //! quoting it, anything else → a reply quoting the user.
 
 use crate::encoding::{render_tool_calls, ASSISTANT_SP, THINK_END, THINK_START, USER_SP};
-use crate::protocol::{read_frame, Done, DoneReason, EngineStats, Frame, HelloEngine, Submit, Tokens, FLAG_ABLIT, FLAG_KEEP, FLAG_LOGPROBS, VERSION};
+use crate::protocol::{read_frame, ConfigFrame, Done, DoneReason, EngineStats, Frame, HelloEngine, Submit, Tokens, FLAG_ABLIT, FLAG_KEEP, FLAG_LOGPROBS, VERSION};
 use crate::tokenizer::Tokenizer;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -83,6 +83,7 @@ async fn connection(stream: UnixStream, cfg: MockConfig, sessions: Sessions) {
     let _ = tx.send(Frame::HelloEngine(hello).encode());
     let cancels: Arc<Mutex<HashMap<u64, Arc<AtomicBool>>>> = Arc::new(Mutex::new(HashMap::new()));
     let mut greeted = false;
+    let mut il = MockIl::default();
     loop {
         let (ty, p) = match read_frame(&mut rd).await {
             Ok(Some(f)) => f,
@@ -126,8 +127,9 @@ async fn connection(stream: UnixStream, cfg: MockConfig, sessions: Sessions) {
                 sessions.lock().unwrap().remove(&session_id);
             }
             Frame::StatsReq => {
-                let _ = tx.send(Frame::Stats(stats(&cfg, &sessions)).encode());
+                let _ = tx.send(Frame::Stats(stats(&cfg, &sessions, &il)).encode());
             }
+            Frame::Config(c) => il.apply(&c, cfg.max_context as i64),
             f => {
                 eprintln!("mock engine: unexpected frame {f:?}");
                 break;
@@ -140,8 +142,48 @@ async fn connection(stream: UnixStream, cfg: MockConfig, sessions: Sessions) {
     eprintln!("mock engine: front-end disconnected");
 }
 
+/// Interleaved prefill's settings as the engine keeps them: its flags' defaults, then CONFIG frames in its flags' ranges.
+#[derive(Clone, Copy, Debug)]
+struct MockIl {
+    on: u64,
+    whole_rows: u64,
+    push_rows: u64,
+    gap_ms: u64,
+    share: u64,
+    burst_max_ms: u64,
+}
+
+impl Default for MockIl {
+    fn default() -> Self {
+        MockIl { on: 1, whole_rows: 32768, push_rows: 131072, gap_ms: 600, share: 40, burst_max_ms: 1000 }
+    }
+}
+
+impl MockIl {
+    fn apply(&mut self, c: &ConfigFrame, max_ctx: i64) {
+        if c.on == 0 || c.on == 1 {
+            self.on = c.on as u64;
+        }
+        if (8192..=max_ctx).contains(&c.whole_rows) {
+            self.whole_rows = c.whole_rows as u64;
+        }
+        if (0..=max_ctx).contains(&c.push_rows) {
+            self.push_rows = c.push_rows as u64;
+        }
+        if (100..=60000).contains(&c.gap_ms) {
+            self.gap_ms = c.gap_ms as u64;
+        }
+        if (10..=90).contains(&c.share) {
+            self.share = c.share as u64;
+        }
+        if (50..=60000).contains(&c.burst_max_ms) {
+            self.burst_max_ms = c.burst_max_ms as u64;
+        }
+    }
+}
+
 /// Plausible numbers: 32 slots (two with the whole context), a 256 GiB disk tier holding half the sessions.
-fn stats(cfg: &MockConfig, sessions: &Sessions) -> EngineStats {
+fn stats(cfg: &MockConfig, sessions: &Sessions, il: &MockIl) -> EngineStats {
     let (n, held) = {
         let ss = sessions.lock().unwrap();
         (ss.len() as u64, ss.values().map(|h| h.0.len() as u64).sum::<u64>())
@@ -169,6 +211,14 @@ fn stats(cfg: &MockConfig, sessions: &Sessions) -> EngineStats {
         slot_ctx_big,
         slot_ctx_small,
         positions_held: held,
+        il_on: il.on,
+        il_whole_rows: il.whole_rows,
+        il_push_rows: il.push_rows,
+        il_gap_ms: il.gap_ms,
+        il_share: il.share,
+        il_burst_max_ms: il.burst_max_ms,
+        il_reading: 0,
+        il_queued: 0,
     }
 }
 

@@ -56,6 +56,21 @@
 //                comes while others decode pauses them and is prefilled; while more requests decode
 //                than there are slots, they take turns of N tokens (default 64; 0: no turns, and a
 //                request that would need the slot of another in flight waits for one to free).
+//                Interleaved prefill (docs/interleave.md): a prompt with more than --interleave-whole-rows
+//                rows to compute (default 32768; the rows after its restart point, not the whole prompt)
+//                is read in pieces while others decode: after each piece the decoders get a window, so
+//                that they get --interleave-share % of the time (default 40) and wait at most
+//                --interleave-gap-ms between steps (default 600: the piece size follows from it;
+//                --interleave-rows N fixes it), a window at most --interleave-burst-max-ms (1000).
+//                With nobody decoding a long prompt reads in --prefill-rows pieces, or in --prefill-rows-max pieces
+//                (0: off, the default) while the pool lends the second set of row buffers they need (tenant 4: taken at the
+//                start, given back when the pool has fewer than --prefill-loan-low-groups free groups (2) and nothing reads on it,
+//                asked for again when it has the set's groups plus --prefill-loan-high-groups (8) free and its top groups
+//                hold no number in use). Long prompts
+//                wait in a queue holding nothing; one with at most --interleave-push-rows rows to compute
+//                (default 131072; 0: none) reads beside the one being read, first. The dashboard (and a
+//                CONFIG frame) changes these settings live.
+//                --no-interleave: every prompt read whole. --exact reads every prompt whole.
 //                The slots' compressed caches and index keys are one pool of 2 MiB chunks made at the
 //                start and mapped per slot as its session grows (model/vmm.h): the pool holds what the
 //                slots would take whole, or --slot-gib G of it, plus --session-gib: the session store is a
@@ -312,6 +327,7 @@ struct Args {
   bool bgraph_check = false;  // DIAGNOSTICS (B3 phase 2a): the one-session draft of every entry after the batch
                               // step's pass over them, and the words that differ, printed by --mode batch
   int slice = 64;  // serve: time-slicing's turns, in tokens (0: none)
+  il::Settings il;  // serve: interleaved prefill's settings (--interleave-*)
   bool snap_all = false;
   size_t ring_cap = 4u << 20;  // the ring's per-rank collective size (prefill's bulk collectives post cap / 4)
   bool spec = false, no_spec = false, draft_fp8 = false, draft_bf16 = false, draft_head4 = false, draft_markov8 = false;
@@ -412,6 +428,14 @@ Args parse(int argc, char** argv) {
     else if (s == "--batch-tf") a.batch_tf = true;
     else if (s == "--batch-rows") a.batch_rows = std::atoi(val().c_str());
     else if (s == "--slice") a.slice = std::atoi(val().c_str());
+    else if (s == "--interleave") a.il.on = true;
+    else if (s == "--no-interleave") a.il.on = false;
+    else if (s == "--interleave-whole-rows") a.il.whole_rows = std::atoi(val().c_str());
+    else if (s == "--interleave-push-rows") a.il.push_rows = std::atoi(val().c_str());
+    else if (s == "--interleave-gap-ms") a.il.gap_ms = std::atoi(val().c_str());
+    else if (s == "--interleave-share") a.il.share = std::atoi(val().c_str());
+    else if (s == "--interleave-burst-max-ms") a.il.burst_max_ms = std::atoi(val().c_str());
+    else if (s == "--interleave-rows") a.il.rows = std::atoi(val().c_str());
     else if (s == "--snap-all") a.snap_all = true;
     else if (s == "--small-rows") a.small_rows = std::atoi(val().c_str());
     else if (s == "--ring-cap") a.ring_cap = std::strtoull(val().c_str(), nullptr, 10);
@@ -465,6 +489,10 @@ Args parse(int argc, char** argv) {
     die("--disk-tag: at most 32 of a-z, 0-9, _ and -");
   if (a.keep_gib < 0 || !(a.keep_days > 0)) die("--keep-gib must be >= 0 and --keep-days > 0");
   if (a.slice < 0) die("--slice must be >= 0");
+  if (a.il.share < 10 || a.il.share > 90) die("--interleave-share must be 10..90 (%% of the time decoders get)");
+  if (a.il.gap_ms < 100) die("--interleave-gap-ms must be >= 100");
+  if (a.il.burst_max_ms < 50) die("--interleave-burst-max-ms must be >= 50");
+  if (a.il.rows < 0 || a.il.whole_rows < 0 || a.il.push_rows < 0) die("--interleave-rows, -whole-rows and -push-rows must be >= 0");
   // this box's rank and files: the fleet file's, unless given
   const comm::Fleet& fl = comm::fleet(a.fleet);
   if (a.rank < 0) a.rank = comm::rank_from_hostname(a.fleet);
@@ -809,6 +837,10 @@ int main(int argc, char** argv) {
     so.small_rows = a.small_rows;
     so.snap_every = a.snap_every;
     so.slice = a.slice;
+    so.interleave = a.il;
+    so.interleave.prefill_rows = a.prefill_rows;
+    if (a.exact) so.interleave.on = false;  // --exact reads every prompt whole
+    if (so.interleave.whole_rows < std::max(a.prefill_rows, a.prefill_rows_max)) so.interleave.whole_rows = std::max(a.prefill_rows, a.prefill_rows_max);
     so.snap_thin = !a.snap_all;
     so.budget = (size_t)(a.session_gib * 1073741824.0);
     so.keep_index = disk_dir + "/server" + disk_tag + ".index";

@@ -2,11 +2,12 @@
 //! and what the samplers report, served under /dashboard (docs/dashboard.md). The token path only bumps atomics or
 //! takes a lock for a few instructions; rates, series and JSON are made by the 1 Hz task or a handler.
 
-use crate::protocol::{Done, DoneReason, EngineStats};
+use crate::protocol::{ConfigFrame, Done, DoneReason, EngineStats};
 use crate::server::App;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
+use axum::body::Bytes;
 use axum::routing::get;
 use axum::Router;
 use serde_json::{json, Map, Value};
@@ -486,7 +487,75 @@ pub fn status_json(app: &App) -> Value {
     json!({"at_ms": unix_ms(), "model_name": app.cfg.model_name,
            "ablit": {"alias": app.ablit_name()},
            "engine": {"connected": info.is_some(), "name": info.as_ref().map(|i| i.name.clone()), "uptime_s": t.started.elapsed().as_secs()},
-           "health": health, "sessions": kv, "node_health": node_health_json(t)})
+           "health": health, "sessions": kv, "node_health": node_health_json(t),
+           "interleave": settings_json(stats.as_ref())})
+}
+
+/// Interleaved prefill's settings as the engine runs them (its last STATS), and the long prompts being processed and waiting
+pub fn settings_json(s: Option<&EngineStats>) -> Value {
+    match s {
+        Some(s) if s.il_share > 0 => json!({"on": s.il_on == 1, "whole_rows": s.il_whole_rows, "push_rows": s.il_push_rows,
+                                            "gap_ms": s.il_gap_ms, "share": s.il_share, "burst_max_ms": s.il_burst_max_ms,
+                                            "reading": s.il_reading, "queued": s.il_queued}),
+        _ => Value::Null,
+    }
+}
+
+/// A settings change from the dashboard: a JSON object of the fields to change, each checked against the range the
+/// engine accepts for it; anything else is refused, so the engine never sees a value it would ignore.
+pub fn parse_settings(v: &Value, max_ctx: i64) -> Result<ConfigFrame, String> {
+    let Some(o) = v.as_object() else { return Err("a JSON object of settings".into()) };
+    let mut c = ConfigFrame::default();
+    for (k, x) in o {
+        let int = |lo: i64, hi: i64| -> Result<i64, String> {
+            let n = x.as_i64().ok_or_else(|| format!("{k}: a whole number"))?;
+            if (lo..=hi).contains(&n) { Ok(n) } else { Err(format!("{k}: {n} is outside {lo}..{hi}")) }
+        };
+        match k.as_str() {
+            "on" => c.on = x.as_bool().ok_or("on: true or false")? as i64,
+            "share" => c.share = int(10, 90)?,
+            "gap_ms" => c.gap_ms = int(100, 60000)?,
+            "burst_max_ms" => c.burst_max_ms = int(50, 60000)?,
+            "whole_rows" => c.whole_rows = int(8192, max_ctx)?,
+            "push_rows" => c.push_rows = int(0, max_ctx)?,
+            _ => return Err(format!("{k}: not a setting (on, share, gap_ms, burst_max_ms, whole_rows, push_rows)")),
+        }
+    }
+    if c == ConfigFrame::default() {
+        return Err("no setting to change".into());
+    }
+    Ok(c)
+}
+
+async fn settings_get(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
+    if let Err(r) = authed(&app, &headers) {
+        return *r;
+    }
+    let t = app.engine.telemetry();
+    t.watch();
+    json_response(StatusCode::OK, settings_json(t.stats().as_ref()))
+}
+
+async fn settings_post(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> Response {
+    if let Err(r) = authed(&app, &headers) {
+        return *r;
+    }
+    if let Err(r) = json_body(&headers) {
+        return *r;
+    }
+    let max_ctx = app.engine.info().map_or(1 << 20, |i| i.max_context as i64);
+    let v: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => return failure(StatusCode::BAD_REQUEST, &format!("settings: {e}")),
+    };
+    match parse_settings(&v, max_ctx) {
+        Ok(c) => {
+            app.engine.configure(c);
+            app.engine.request_stats();
+            json_response(StatusCode::OK, json!({"sent": v}))
+        }
+        Err(e) => failure(StatusCode::BAD_REQUEST, &e),
+    }
 }
 
 // ------------------------------------------------------------------ routes
@@ -499,6 +568,7 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/dashboard/api/v1/requests", get(requests))
         .route("/dashboard/api/v1/series", get(series))
         .route("/dashboard/api/v1/ledger", get(ledger))
+        .route("/dashboard/api/v1/settings", get(settings_get).post(settings_post))
 }
 
 /// A request's host name (the Host header without its port), lower case.
@@ -509,8 +579,8 @@ fn host_of(v: &str) -> String {
 }
 
 /// The dashboard answers only requests that name this server (Host one of `dashboard_hosts`), so a name rebound to this
-/// address by a page elsewhere gets 403. The page itself carries no data; every data route needs the API key (`authed`:
-/// the page asks for it once and keeps it in the browser until its user signs out).
+/// address by a page elsewhere gets 403. The page itself carries no data; every data route and the settings need the
+/// API key (`authed`: the page asks for it once and keeps it in the browser until its user signs out).
 fn guard(app: &App, headers: &HeaderMap) -> Result<(), Box<Response>> {
     let host = headers.get("host").and_then(|v| v.to_str().ok()).unwrap_or("");
     if !app.cfg.dashboard_hosts.iter().any(|h| *h == host_of(host)) {
@@ -523,6 +593,18 @@ fn guard(app: &App, headers: &HeaderMap) -> Result<(), Box<Response>> {
 fn authed(app: &App, headers: &HeaderMap) -> Result<(), Box<Response>> {
     guard(app, headers)?;
     crate::server::check_auth(app, headers)
+}
+
+/// A POST's body is JSON sent as `Content-Type: application/json` (else 415). Without a CORS preflight, which this server
+/// never answers, a page on another site can make a browser send only a form or plain text here, so a dashboard run
+/// without an API key takes no change from another site.
+fn json_body(headers: &HeaderMap) -> Result<(), Box<Response>> {
+    let ct = headers.get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("");
+    if ct.split(';').next().is_some_and(|t| t.trim().eq_ignore_ascii_case("application/json")) {
+        Ok(())
+    } else {
+        Err(Box::new(failure(StatusCode::UNSUPPORTED_MEDIA_TYPE, "send the body as Content-Type: application/json")))
+    }
 }
 
 fn json_response(status: StatusCode, v: Value) -> Response {
@@ -696,6 +778,33 @@ pub fn mock_node_json(rank: u32, t: f64) -> Value {
                      {"rx_bytes": (t * 1.9e8) as u64, "tx_bytes": (t * 2.0e8) as u64, "errors": 0, "discards": 0}],
            "memory": {"device_bytes": (121.6 * gib as f64) as u64, "weights_bytes": (74.2 * gib as f64) as u64,
                       "work_bytes": (18.1 * gib as f64) as u64, "kv_bytes": (15.3 * gib as f64) as u64}})
+}
+
+#[cfg(test)]
+mod settings_tests {
+    use super::*;
+
+    #[test]
+    fn settings_are_checked_against_the_engine_flags() {
+        let c = parse_settings(&json!({"share": 40, "gap_ms": 600}), 1 << 20).unwrap();
+        assert_eq!((c.share, c.gap_ms, c.on, c.whole_rows), (40, 600, -1, -1), "only the given fields change");
+        assert_eq!(parse_settings(&json!({"on": false}), 1 << 20).unwrap().on, 0);
+        assert_eq!(parse_settings(&json!({"push_rows": 131072, "whole_rows": 32768}), 1 << 20).unwrap().push_rows, 131072);
+        for bad in [json!({"share": 95}), json!({"share": 5}), json!({"gap_ms": 50}), json!({"whole_rows": 4096}),
+                    json!({"whole_rows": 2_000_000}), json!({"share": "40"}), json!({"on": 1}), json!({"speed": 1}),
+                    json!({}), json!([1])] {
+            assert!(parse_settings(&bad, 1 << 20).is_err(), "{bad} must be refused");
+        }
+    }
+
+    #[test]
+    fn settings_json_reads_the_stats() {
+        assert_eq!(settings_json(None), Value::Null);
+        assert_eq!(settings_json(Some(&EngineStats::default())), Value::Null, "an engine without interleave");
+        let s = EngineStats { il_on: 1, il_share: 40, il_gap_ms: 600, il_reading: 1, il_queued: 2, ..Default::default() };
+        let v = settings_json(Some(&s));
+        assert_eq!((v["on"].as_bool(), v["share"].as_u64(), v["queued"].as_u64()), (Some(true), Some(40), Some(2)));
+    }
 }
 
 #[cfg(test)]

@@ -221,6 +221,15 @@ struct Model::Impl {
   std::vector<size_t> img_row0;  // span i's first row in img_rows
   uint16_t* img_rows = nullptr;
   size_t img_cap = 0;  // rows img_rows holds
+  // the other units' image sets: a prompt's images stay with its unit (use_slot swaps them in and out, as hists), so that
+  // another prompt's chunks read between its pieces see their own (interleaved prefill)
+  struct ImgSet {
+    std::vector<std::pair<int, int>> span;
+    std::vector<size_t> row0;
+    uint16_t* rows = nullptr;
+    size_t cap = 0;
+  };
+  ImgSet imgs[kMaxUnits];
   // this rank's rows [i0, i1) of the current chunk (absolute first position a) inside span k, clipped to [0, n)
   template <class F>
   void img_runs(int a, int n, F&& f) const {

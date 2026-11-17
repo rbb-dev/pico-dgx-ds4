@@ -103,6 +103,11 @@ impl EngineClient {
         self.send(Frame::StatsReq);
     }
 
+    /// Interleaved prefill's settings to rank 0, applied at once (the dashboard's live settings).
+    pub fn configure(&self, c: crate::protocol::ConfigFrame) {
+        self.send(Frame::Config(c));
+    }
+
     pub fn cancel(&self, req_id: u64) {
         self.send(Frame::Cancel { req_id });
     }

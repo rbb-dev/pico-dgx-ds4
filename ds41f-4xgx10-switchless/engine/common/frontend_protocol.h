@@ -17,6 +17,7 @@ enum MsgType : uint16_t {
   kCancel = 0x03,   // Cancel
   kRelease = 0x04,  // Release
   kStatsReq = 0x05, // StatsReq: ask for one Stats frame (the dashboard is being watched)
+  kConfig = 0x06,   // Config: interleaved prefill's settings, applied at once (the dashboard's live settings)
   // rank 0 -> front-end
   kHelloEngine = 0x81,  // HelloEngine, char name[name_len]
   kTokens = 0x82,       // TokensHeader, uint32 ids[n], [float logprob[n]], [TopLogprob top[n * n_top]]
@@ -146,11 +147,27 @@ struct StatsReq {
   uint32_t reserved1;  // 0
 };
 
+// Interleaved prefill's settings (the engine's --interleave-* flags), changed while it serves: version, the number of
+// i64 fields that follow, then the fields in this order; a field < 0, or one not sent, keeps its value. The engine checks
+// each against its flag's range and ignores one out of range; the next Stats frame shows what it runs.
+constexpr uint32_t kConfigVersion = 1;
+constexpr uint32_t kConfigFields = 6;
+struct Config {
+  uint32_t version;  // kConfigVersion
+  uint32_t n_fields;
+  int64_t on;            // 0 off, 1 on
+  int64_t whole_rows;    // a prompt with at most this many rows to compute is read whole
+  int64_t push_rows;     // a second reader's rows to compute, at most
+  int64_t gap_ms;        // the longest a decoding session waits between steps
+  int64_t share;         // % of the time decoders get while a prompt is read (10-90)
+  int64_t burst_max_ms;  // one decode window, at most
+};
+
 // The engine's own counters for the dashboard: version, the number of u64 fields that follow, then the
 // fields in this order. A front-end reads min(n_fields, kStatsFields) of them; a field it does not get
 // is 0. Byte counts are per rank 0's own store; the counters count from the engine's start.
 constexpr uint32_t kStatsVersion = 1;
-constexpr uint32_t kStatsFields = 19;
+constexpr uint32_t kStatsFields = 27;
 struct StatsFrame {
   uint32_t version;   // kStatsVersion
   uint32_t n_fields;  // kStatsFields
@@ -173,6 +190,15 @@ struct StatsFrame {
   uint64_t slot_ctx_big;            // positions of a big slot
   uint64_t slot_ctx_small;          // positions of each other slot
   uint64_t positions_held;          // positions the resident sessions hold
+  // interleaved prefill: the settings it runs now (Config), and the long prompts being read and waiting
+  uint64_t il_on;
+  uint64_t il_whole_rows;
+  uint64_t il_push_rows;
+  uint64_t il_gap_ms;
+  uint64_t il_share;
+  uint64_t il_burst_max_ms;
+  uint64_t il_reading;
+  uint64_t il_queued;
 };
 
 static_assert(sizeof(FrameHeader) == 8);
@@ -190,6 +216,8 @@ static_assert(sizeof(Progress) == 16);
 static_assert(sizeof(StatsReq) == 8);
 static_assert(sizeof(StatsFrame) == 8 + 8 * kStatsFields);
 static_assert(offsetof(StatsFrame, store_cap_bytes) == 8);
-static_assert(offsetof(StatsFrame, positions_held) == 8 + 8 * (kStatsFields - 1));
+static_assert(offsetof(StatsFrame, positions_held) == 8 + 8 * 18);
+static_assert(offsetof(StatsFrame, il_queued) == 8 + 8 * (kStatsFields - 1));
+static_assert(sizeof(Config) == 8 + 8 * kConfigFields);
 
 }  // namespace fe

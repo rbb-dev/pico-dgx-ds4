@@ -495,6 +495,12 @@ void Model::Impl::use_slot(int s) {
   if (s < 0 || s >= nslots) die("model: slot %d of %d", s, nslots);
   const int u = unit_of[s];
   if (u != cur_unit) hist.swap(hists[cur_unit]), hist.swap(hists[u]);  // Engram's history: slot s's
+  if (u != cur_unit) {  // and its prompt's images
+    const auto park = [&](ImgSet& d) {
+      std::swap(img_span, d.span), std::swap(img_row0, d.row0), std::swap(img_rows, d.rows), std::swap(img_cap, d.cap);
+    };
+    park(imgs[cur_unit]), park(imgs[u]);
+  }
   cur_slot = s, cur_unit = u;
   for (int L = 0; L < kLayers; ++L) ring_kv[L] = ring_kv0[L] + u * kRingKvBytes, ring_sc[L] = ring_sc0[L] + u * kRingScBytes;
   for (int k = 0; k < kKvSlots; ++k) kvs[k] = kvs0[k].at(u);

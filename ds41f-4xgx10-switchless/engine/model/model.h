@@ -266,7 +266,7 @@ class Model {
   // only one at P covers the decoder layers; the others hold the encoder layers' rings only.
   void set_tokens(int pos0, int n, const int32_t* tokens);
   // Vision (docs/vision.md): image spans [lo[i], hi[i]) of the current slot's sequence and their rows
-  // (bf16 [sum (hi - lo)][kDim], copied), used by the prefill chunks that follow until set_images(0, ...):
+  // (bf16 [sum (hi - lo)][kDim], copied), the current slot's: used by its prefill chunks until set_images(0, ...):
   // the rows replace the embeddings there, the span routes with ffn.gate.bias_vl and Engram leaves it
   // alone. The history (set_tokens) must hold -1 at those positions. Text requests never call it.
   void set_images(int n, const int32_t* lo, const int32_t* hi, const uint16_t* rows);

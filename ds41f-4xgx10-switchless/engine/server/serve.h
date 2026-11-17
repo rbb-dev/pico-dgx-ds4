@@ -7,6 +7,7 @@
 #include "comm/ring.h"
 #include "model/model.h"
 #include "server/cmd.h"
+#include "server/interleave.h"
 
 namespace srv {
 
@@ -45,6 +46,9 @@ struct ServeOptions {
   // --profile-from-req N: request N's first command opens nsys's capture range on every rank
   // (model::kFlagProfile; nsys --capture-range=cudaProfilerApi), until the server stops. 0: never.
   uint64_t profile_from_req = 0;
+  // Interleaved prefill (server/interleave.h, docs/interleave.md): a prompt with more than interleave.whole_rows rows
+  // to compute is read in pieces while others decode; interleave.on false: every prompt is prefilled whole
+  il::Settings interleave;
 };
 
 // Serves until SIGINT / SIGTERM, then stops the other ranks (kCmdStop). Rank 0 only.

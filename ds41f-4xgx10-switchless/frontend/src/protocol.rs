@@ -17,6 +17,7 @@ pub const T_SUBMIT: u16 = 0x02;
 pub const T_CANCEL: u16 = 0x03;
 pub const T_RELEASE: u16 = 0x04;
 pub const T_STATS_REQ: u16 = 0x05;
+pub const T_CONFIG: u16 = 0x06;
 pub const T_HELLO_ENGINE: u16 = 0x81;
 pub const T_TOKENS: u16 = 0x82;
 pub const T_DONE: u16 = 0x83;
@@ -132,7 +133,7 @@ pub struct Done {
 
 /// The fields of a STATS frame, in wire order (docs/protocol.md, "The dashboard's frames").
 pub const STATS_VERSION: u32 = 1;
-pub const STATS_FIELDS: usize = 19;
+pub const STATS_FIELDS: usize = 27;
 
 /// The engine's own counters for the dashboard. Byte counts are rank 0's store; counters count from the
 /// engine's start.
@@ -157,6 +158,15 @@ pub struct EngineStats {
     pub slot_ctx_big: u64,
     pub slot_ctx_small: u64,
     pub positions_held: u64,
+    /// interleaved prefill: the settings the engine runs now (ConfigFrame), and the long prompts being processed and waiting
+    pub il_on: u64,
+    pub il_whole_rows: u64,
+    pub il_push_rows: u64,
+    pub il_gap_ms: u64,
+    pub il_share: u64,
+    pub il_burst_max_ms: u64,
+    pub il_reading: u64,
+    pub il_queued: u64,
 }
 
 impl EngineStats {
@@ -181,6 +191,14 @@ impl EngineStats {
             self.slot_ctx_big,
             self.slot_ctx_small,
             self.positions_held,
+            self.il_on,
+            self.il_whole_rows,
+            self.il_push_rows,
+            self.il_gap_ms,
+            self.il_share,
+            self.il_burst_max_ms,
+            self.il_reading,
+            self.il_queued,
             self.copy_adapt,
             self.copy_proposals_total,
             self.copy_scored_total,
@@ -218,7 +236,41 @@ impl EngineStats {
             slot_ctx_big: f(16),
             slot_ctx_small: f(17),
             positions_held: f(18),
+            il_on: f(19),
+            il_whole_rows: f(20),
+            il_push_rows: f(21),
+            il_gap_ms: f(22),
+            il_share: f(23),
+            il_burst_max_ms: f(24),
+            il_reading: f(25),
+            il_queued: f(26),
         }
+    }
+}
+
+/// Interleaved prefill's settings for rank 0 (docs/protocol.md, CONFIG): a field < 0 keeps the engine's value; the engine
+/// takes each one in its flag's range and ignores the others; its next STATS shows what it runs.
+pub const CONFIG_VERSION: u32 = 1;
+pub const CONFIG_FIELDS: u32 = 6;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConfigFrame {
+    pub on: i64,
+    pub whole_rows: i64,
+    pub push_rows: i64,
+    pub gap_ms: i64,
+    pub share: i64,
+    pub burst_max_ms: i64,
+}
+
+impl Default for ConfigFrame {
+    fn default() -> Self {
+        ConfigFrame { on: -1, whole_rows: -1, push_rows: -1, gap_ms: -1, share: -1, burst_max_ms: -1 }
+    }
+}
+
+impl ConfigFrame {
+    fn fields(&self) -> [i64; CONFIG_FIELDS as usize] {
+        [self.on, self.whole_rows, self.push_rows, self.gap_ms, self.share, self.burst_max_ms]
     }
 }
 
@@ -236,6 +288,8 @@ pub enum Frame {
     Progress { req_id: u64, computed: u32, total: u32 },
     /// Front-end to rank 0: send one STATS frame.
     StatsReq,
+    /// Front-end to rank 0: interleaved prefill's settings, at once (the dashboard's live settings).
+    Config(ConfigFrame),
     Stats(EngineStats),
 }
 
@@ -317,6 +371,14 @@ impl Frame {
             Frame::StatsReq => {
                 let mut w = W::new(T_STATS_REQ);
                 w.u32(0).u32(0);
+                w.finish()
+            }
+            Frame::Config(c) => {
+                let mut w = W::new(T_CONFIG);
+                w.u32(CONFIG_VERSION).u32(CONFIG_FIELDS);
+                for x in c.fields() {
+                    w.u64(x as u64);
+                }
                 w.finish()
             }
             Frame::Stats(st) => {
@@ -472,6 +534,16 @@ impl Frame {
                 r.u32()?;
                 r.u32()?;
                 Frame::StatsReq
+            }
+            T_CONFIG => {
+                let version = r.u32()?;
+                let n = r.u32()? as usize;
+                if version != CONFIG_VERSION || n > 64 {
+                    return Err(format!("CONFIG version {version}, {n} fields"));
+                }
+                let v = (0..n).map(|_| r.u64().map(|x| x as i64)).collect::<Result<Vec<_>, _>>()?;
+                let f = |i: usize| v.get(i).copied().unwrap_or(-1);
+                Frame::Config(ConfigFrame { on: f(0), whole_rows: f(1), push_rows: f(2), gap_ms: f(3), share: f(4), burst_max_ms: f(5) })
             }
             T_STATS => {
                 let version = r.u32()?;
@@ -668,10 +740,15 @@ mod tests {
         assert_eq!(Frame::decode(T_STATS_REQ, &b[8..], |_| 0).unwrap(), Frame::StatsReq);
         let st = EngineStats { store_cap_bytes: 1 << 40, sessions_on_disk: 3, restore_wait_max_ns: 7, slots_big: 2, positions_held: 99, ..Default::default() };
         let b = Frame::Stats(st).encode();
-        assert_eq!(b.len(), 8 + 8 + 8 * 19);
-        assert_eq!(u32::from_le_bytes(b[12..16].try_into().unwrap()), 19, "n_fields after the version");
+        assert_eq!(b.len(), 8 + 8 + 8 * 27);
+        assert_eq!(u32::from_le_bytes(b[12..16].try_into().unwrap()), 27, "n_fields after the version");
         assert_eq!(u64::from_le_bytes(b[16..24].try_into().unwrap()), 1 << 40, "store_cap_bytes is the first field");
-        assert_eq!(u64::from_le_bytes(b[b.len() - 8..].try_into().unwrap()), 99, "positions_held is the last");
+        assert_eq!(u64::from_le_bytes(b[16 + 8 * 18..16 + 8 * 19].try_into().unwrap()), 99, "positions_held is the 19th");
+        let il = EngineStats { il_share: 40, il_queued: 2, ..Default::default() };
+        let bi = Frame::Stats(il).encode();
+        assert_eq!(u64::from_le_bytes(bi[bi.len() - 8..].try_into().unwrap()), 2, "il_queued is the last");
+        assert_eq!(u64::from_le_bytes(bi[16 + 8 * 23..16 + 8 * 24].try_into().unwrap()), 40, "il_share is the 24th");
+        assert_eq!(Frame::decode(T_STATS, &bi[8..], |_| 0).unwrap(), Frame::Stats(il));
         assert_eq!(Frame::decode(T_STATS, &b[8..], |_| 0).unwrap(), Frame::Stats(st));
         // a shorter or a longer field list: missing fields are 0, extra ones ignored
         let mut short = Frame::Stats(st).encode();
@@ -681,10 +758,21 @@ mod tests {
         assert_eq!((got.store_cap_bytes, got.sessions_on_disk, got.positions_held), (1 << 40, 3, 0));
         let mut long = Frame::Stats(st).encode();
         long.extend(5u64.to_le_bytes());
-        long[12..16].copy_from_slice(&20u32.to_le_bytes());
+        long[12..16].copy_from_slice(&28u32.to_le_bytes());
         assert_eq!(Frame::decode(T_STATS, &long[8..], |_| 0).unwrap(), Frame::Stats(st));
         long[8..12].copy_from_slice(&2u32.to_le_bytes());
         assert!(Frame::decode(T_STATS, &long[8..], |_| 0).is_err(), "another version");
+        // CONFIG: version, n, then i64 fields; a field not sent is -1 (kept)
+        let c = ConfigFrame { share: 40, gap_ms: 600, ..Default::default() };
+        let b = Frame::Config(c).encode();
+        assert_eq!((b.len(), u16::from_le_bytes(b[4..6].try_into().unwrap())), (8 + 8 + 8 * 6, 0x06));
+        assert_eq!(i64::from_le_bytes(b[16..24].try_into().unwrap()), -1, "on: kept");
+        assert_eq!(i64::from_le_bytes(b[16 + 8 * 4..16 + 8 * 5].try_into().unwrap()), 40, "share is the 5th");
+        assert_eq!(Frame::decode(T_CONFIG, &b[8..], |_| 0).unwrap(), Frame::Config(c));
+        let mut short = Frame::Config(c).encode();
+        short.truncate(8 + 8 + 8 * 2);
+        short[12..16].copy_from_slice(&2u32.to_le_bytes());
+        assert_eq!(Frame::decode(T_CONFIG, &short[8..], |_| 0).unwrap(), Frame::Config(ConfigFrame::default()));
         let t = Tokens { req_id: 2, ids: vec![5, 6], logprobs: Some(vec![-0.5, -1.0]), top: Some(vec![(5, -0.5), (6, -1.0)]) };
         let b = Frame::Tokens(t.clone()).encode();
         assert_eq!(Frame::decode(T_TOKENS, &b[8..], |_| 1).unwrap(), Frame::Tokens(t));

@@ -218,6 +218,13 @@ class Io {
     std::lock_guard<std::mutex> l(smu_);
     stats_ = std::move(f);
   }
+  // The latest CONFIG frame, once (the main loop applies it)
+  bool take_config(fe::Config& c) {
+    std::lock_guard<std::mutex> l(cmu_);
+    if (!cfg_new_) return false;
+    c = cfg_, cfg_new_ = false;
+    return true;
+  }
   void send(const ConnP& c, std::vector<char> f) {
     if (c->dead) return;
     {
@@ -311,6 +318,14 @@ class Io {
       e.release = true;
       e.session = x.session_id;
       push(std::move(e));
+    } else if (h.type == fe::kConfig) {  // the main loop applies it (take_config)
+      fe::Config x{};
+      std::memcpy(&x, p.data(), std::min(p.size(), sizeof x));
+      const size_t got = p.size() < 8 ? 0 : std::min<size_t>(x.n_fields, (p.size() - 8) / 8);
+      int64_t* f = &x.on;
+      for (size_t i = got; i < fe::kConfigFields; ++i) f[i] = -1;  // not sent: kept
+      std::lock_guard<std::mutex> l(cmu_);
+      cfg_ = x, cfg_new_ = true;
     } else if (h.type == fe::kStatsReq) {
       std::vector<char> f;
       {
@@ -370,6 +385,9 @@ class Io {
   std::mutex wmu_;
   std::mutex smu_;
   std::vector<char> stats_;  // the latest STATS frame (publish_stats)
+  std::mutex cmu_;
+  fe::Config cfg_{};  // the latest CONFIG frame (take_config)
+  bool cfg_new_ = false;
   std::condition_variable wcv_;
   std::deque<std::pair<ConnP, std::vector<char>>> out_;
   std::thread rd_, wr_;
@@ -482,14 +500,20 @@ void add(DecodeEnd& a, const DecodeEnd& b) {
 class Server {
  public:
   Server(model::Model& m, comm::Ring& ring, Watchdog& wd, const ServeOptions& o, Io& io, size_t budget)
-      : m_(m), ring_(ring), wd_(wd), o_(o), io_(io), budget_(budget), slot_(m.slots(), 0) {}
+      : m_(m), ring_(ring), wd_(wd), o_(o), io_(io), budget_(budget), slot_(m.slots(), 0), il_(o.interleave) {}
 
   // Requests let go after their session's last one ended first, then those that waited for a slot (when
   // one is there), then the front-end's frames, then a run of the requests decoding (run).
   void loop() {
     while (!g_stop) {
+      fe::Config cf;
+      if (io_.take_config(cf)) apply_config(cf);
       publish();
       sweep();
+      if (!pfq_.empty()) {  // interleaved prefill: long prompts and decoders take turns
+        il_pass();
+        continue;
+      }
       Event e;
       if (!ready_.empty()) {
         Request rq = std::move(ready_.front());
@@ -513,6 +537,13 @@ class Server {
     }
     // the stop ends what is paused or held with an error (Io::stopping): "the server is stopping"
     sweep();
+    while (!pfq_.empty()) {  // a long prompt being prefilled stops after its last piece; the rest never started
+      Long& L = *pfq_.front();
+      if (L.begun) L.r.cancelled = true, pf_end(L.r);
+      else end_queued(L, fe::kCancelled);
+      pfq_.pop_front();
+    }
+    push_ = nullptr;
     for (std::deque<Request>* d : {&ready_, &held_, &wait_}) {
       for (const Request& rq : *d) done(rq, fe::kCancelled, 0, 0, now_s(), 0), Io::forget(rq);
       d->clear();
@@ -943,24 +974,212 @@ class Server {
     f.sp.seed = (h.flags & fe::kFlagSeed) ? h.seed : rng_();
     f.sp.ablit = (h.flags & fe::kFlagAblit) ? 1.f : 0.f;  // the runtime abliteration on this request (--ablit)
     flying_.insert(h.session_id);
+    const int rows = il_.on ? rows_to_compute(f) : 0;
+    if (il_.on && !il::read_whole(il_, rows)) {
+      auto L = std::make_unique<Long>();  // a long prompt: read in pieces, between the decoders' windows
+      L->f = std::move(f);
+      L->rows = rows;
+      pfq_.push_back(std::move(L));
+      return;
+    }
     if (go(f, false)) {  // it decodes in the next run, first
       f.t_paused = now_s();
       rot_.push_front(std::move(f));
     }
   }
 
+  // The rows a request's prompt would compute: after the restart point its session (or base) offers now. A resume's
+  // prompt is the request's and the tokens it sent.
+  int rows_to_compute(const Flight& f, bool resume = false) {
+    const fe::SubmitHeader& h = f.rq.h;
+    std::vector<int32_t> cont;
+    if (resume) cont = f.rq.prompt, cont.insert(cont.end(), f.out.begin(), f.out.end());
+    const std::vector<int32_t>& prompt = resume ? cont : f.rq.prompt;
+    const int n = (int)prompt.size();
+    forget_evicted();
+    unspill(h);
+    const Session* src = find(h.session_id);
+    if (!src && h.base_session_id) src = find(h.base_session_id);
+    if (!src) return n;
+    const int p = std::min(lcp(src->hist, prompt), n - 1);
+    return n - choose(*src, src->slot >= 0, p, n).q;
+  }
+
+  // The decoders' step (ms) for the piece size: a line through two measured points, by the number of decoding sessions (at most 16)
+  double step_ms() const { return rot_.empty() ? 0.0 : 25.77 + 15.9 * (double)(std::min<size_t>(rot_.size(), 16) - 1); }
+
+  // One pass of the scheduler while long prompts exist (il::next): admit one request, begin the front long prompt,
+  // read a piece of it, or give the decoders their window
+  void il_pass() {
+    Long& L = *pfq_.front();
+    const il::Settings& st = il_;
+    il::State s;
+    s.decoders = !rot_.empty();
+    s.owed_ms = owed_ms_;
+    s.reader = L.begun;
+    s.queued = !L.begun;
+    s.reader_fits = !L.begun && pick_slot({}, need_clamped(L.f.rq), L.f.rq.h.session_id, L.f.rq.h.base_session_id) >= 0;
+    Long* cand = nullptr;  // the second reader's candidate: the first queued one of at most push_rows rows that fits
+    if (L.begun && !push_ && st.push_rows > 0)
+      for (size_t i = 1; i < pfq_.size() && !cand; ++i) {
+        Long& q = *pfq_[i];
+        if (!q.begun && q.rows <= st.push_rows &&
+            pick_slot({L.f.rq.h.session_id}, need_clamped(q.f.rq), q.f.rq.h.session_id, q.f.rq.h.base_session_id) >= 0)
+          cand = &q;
+      }
+    s.push_fits = cand != nullptr;
+    const bool waiting = !wait_.empty() &&
+                         pick_slot({}, need_clamped(wait_.front()), wait_.front().h.session_id, wait_.front().h.base_session_id) >= 0;
+    s.arrivals = !ready_.empty() || waiting || io_.submit_waiting();
+    s.admitted_last = il_admitted_;
+    const double t0 = now_s();
+    const il::Next nx = il::next(s);
+    il_admitted_ = nx == il::Next::Admit;
+    switch (nx) {
+      case il::Next::Admit: {
+        Event e;
+        if (!ready_.empty()) {
+          Request rq = std::move(ready_.front());
+          ready_.pop_front();
+          admit(std::move(rq));
+        } else if (waiting) {
+          Request rq = std::move(wait_.front());
+          wait_.pop_front();
+          admit(std::move(rq));
+        } else if (io_.pop(e, 0)) {
+          if (e.release) {
+            if (flying_.count(e.session)) later_.insert(e.session);
+            else release(e.session);
+          } else if (!e.rq.conn->dead) {
+            admit(std::move(e.rq));
+          }
+        }
+        if (s.decoders) owed_ms_ += il::window_ms(st, 1e3 * (now_s() - t0));  // a whole prompt read meanwhile
+        break;
+      }
+      case il::Next::BeginReader: {
+        Long& X = L.begun ? *cand : L;  // the second reader or the front one
+        if (!X.resume) X.f.t_start = t0;  // a first run's prefill starts here: its wait in the queue is queue time (DONE queue_us)
+        if (L.begun) {  // the second reader, beside the front one (whose slot it may not take)
+          if (pf_begin(cand->f, cand->resume, {L.f.rq.h.session_id}, cand->r)) cand->begun = true, push_ = cand;
+          else drop_long(cand);
+        } else if (pf_begin(L.f, L.resume, {}, L.r)) {
+          L.begun = true;
+        } else {
+          drop_long(&L);  // it ended at its start
+        }
+        // the decoders have waited since their last run (the arrival, its admission, this setup): owed before a piece
+        if (s.decoders) owed_ms_ += il::window_ms(st, 1e3 * (now_s() - std::max(dec_end_, t0 - 1.0)));
+        break;
+      }
+      case il::Next::Piece: {
+        Long& P = push_ ? *push_ : L;  // the second reader reads first
+        Reader& r = P.r;
+        const bool dec = !rot_.empty();
+        il::Settings sr = st;  // the pieces are bounded by this request's capacity, not the standing one
+        sr.prefill_rows = r.cap;
+        const int R = il::adjust_piece(il::piece_rows(sr, il_cost_, step_ms(), dec), r.pos, r.n, r.ced, r.cap);
+        const int next = il::piece_rows(sr, il_cost_, step_ms(), dec);
+        const bool ok = pf_piece(r, R, next);
+        const double ms = 1e3 * (now_s() - t0);
+        if (ok) il_cost_.k = 0.8 * il_cost_.k + 0.2 * ms / (il_cost_.fixed_ms + il_cost_.per_row_ms * R);
+        if (dec) owed_ms_ += il::window_ms(st, ms);
+        if (!ok || r.pos >= r.n) {
+          if (pf_end(r)) {  // it decodes from here, first in the next run
+            P.f.t_paused = now_s();
+            rot_.push_front(std::move(P.f));
+          }
+          drop_long(&P);
+        }
+        break;
+      }
+      case il::Next::Decode:
+        burst_ms_ = std::min<double>(owed_ms_ > 0 ? owed_ms_ : st.burst_max_ms, st.burst_max_ms);
+        burst_end_ = 0;
+        run();
+        burst_ms_ = 0;
+        owed_ms_ = std::max(0.0, owed_ms_ - 1e3 * (now_s() - t0));
+        break;
+      case il::Next::Idle: {
+        Event e;  // the front long prompt waits for a slot: wait for a request or a release
+        if (io_.pop(e, 50)) {
+          if (e.release) {
+            if (flying_.count(e.session)) later_.insert(e.session);
+            else release(e.session);
+          } else if (!e.rq.conn->dead) {
+            admit(std::move(e.rq));
+          }
+        }
+        break;
+      }
+    }
+  }
+
+  // A CONFIG frame's settings: each field in its flag's range taken (main.cpp's checks), the others kept
+  void apply_config(const fe::Config& c) {
+    il::Settings n = il_;
+    if (c.on == 0 || c.on == 1) n.on = c.on == 1;
+    if (c.whole_rows >= n.prefill_rows && c.whole_rows <= o_.max_ctx) n.whole_rows = (int)c.whole_rows;
+    if (c.push_rows >= 0 && c.push_rows <= o_.max_ctx) n.push_rows = (int)c.push_rows;
+    if (c.gap_ms >= 100 && c.gap_ms <= 60000) n.gap_ms = (int)c.gap_ms;
+    if (c.share >= 10 && c.share <= 90) n.share = (int)c.share;
+    if (c.burst_max_ms >= 50 && c.burst_max_ms <= 60000) n.burst_max_ms = (int)c.burst_max_ms;
+    if (!o_.ced) n.on = false;  // --exact reads every prompt whole
+    il_ = n;
+    published_ = 0;  // the next STATS shows it
+    std::printf("serve: interleave settings: %s, whole %d rows, push %d rows, gap %d ms, share %d %%, window at most %d ms\n",
+                il_.on ? "on" : "off", il_.whole_rows, il_.push_rows, il_.gap_ms, il_.share, il_.burst_max_ms);
+  }
+
+  // A decode run's window: set at its first step; over when a long prompt waits and the window has passed
+  bool burst_over() {
+    if (burst_ms_ <= 0 || pfq_.empty()) return false;
+    const double t = now_s();
+    if (burst_end_ == 0) burst_end_ = t + burst_ms_ / 1e3;
+    return t >= burst_end_;
+  }
+
+  // A prompt being prefilled: what go()'s setup leaves for its pieces and its end (pf_begin, pf_piece, pf_end)
+  struct Reader {
+    Flight* f = nullptr;
+    bool resume = false, ced = false, cancelled = false;
+    std::vector<int32_t> cont;  // a resume's prompt: the request's and the tokens sent so far
+    Session* S = nullptr;
+    int s = -1, n = 0, q = 0, pos = 0, first_row = 0;
+    model::SampleOut first{};
+    Turn resumed;
+    Turn* tu = nullptr;
+    double t0 = 0;
+    // The set of row-sized prefill buffers the prompt is read on (Cmd::rows_set) and the rows a piece may have at most: chosen at the
+    // prompt's begin, one value for every piece (its look-ahead lookups, its CED state and its snapshots belong to one set).
+    int rows_set = 0, cap = 0;
+    const std::vector<int32_t>& prompt() const { return resume ? cont : f->rq.prompt; }
+  };
+
   // Flight f's prompt run in a slot: the request's first (resume false), or the resume of a request whose
   // session lost its slot, which runs the prompt and the tokens sent so far (the session holds them: it
   // restarts at their last position, exact continuation, one row; `keep`: the sessions whose slots it may
   // not take). Either way it sends a token, the flight's next to feed, and leaves its session live in the
   // slot; false when that token (or a cancel) ended the request. The sampler's noise is a function of the
-  // seed and the position, so a request run in pieces samples what a single run would.
+  // seed and the position, so a request run in pieces samples what a single run would. Here the pieces run
+  // back to back: the whole-prompt path.
   bool go(Flight& f, bool resume, const std::set<uint64_t>& keep = {}) {
+    Reader r;
+    if (!pf_begin(f, resume, keep, r)) return false;
+    while (r.pos < r.n)
+      if (!pf_piece(r, std::min(r.cap, r.n - r.pos), r.cap)) break;
+    return pf_end(r);
+  }
+
+  // The prompt's setup: the slot, where the state comes from, the restart point q, the state operations and the
+  // prompt's tokens on every rank. False when the request ended here (a resume cancelled, or past the context).
+  bool pf_begin(Flight& f, bool resume, const std::set<uint64_t>& keep, Reader& r) {
+    r.f = &f, r.resume = resume;
     const fe::SubmitHeader& h = f.rq.h;
-    const double t0 = now_s();
-    std::vector<int32_t> cont;
+    const double t0 = r.t0 = now_s();
+    std::vector<int32_t>& cont = r.cont;
     if (resume) {
-      if (Io::cancelled(f.rq)) return ended(f, fe::kCancelled);
+      if (Io::cancelled(f.rq)) return ended_at_start(f, fe::kCancelled);
       cont.reserve(f.rq.prompt.size() + f.out.size());
       cont.assign(f.rq.prompt.begin(), f.rq.prompt.end());
       cont.insert(cont.end(), f.out.begin(), f.out.end());
@@ -968,8 +1187,8 @@ class Server {
     }
     const std::vector<int32_t>& prompt = resume ? cont : f.rq.prompt;
     const int n = (int)prompt.size();
-    Turn resumed;
-    Turn& tu = resume ? resumed : f.tu;  // the log splits a request's first run
+    r.tu = resume ? &r.resumed : &f.tu;  // the log splits a request's first run
+    Turn& tu = *r.tu;
     forget_evicted();
     unspill(h);
 
@@ -1104,70 +1323,96 @@ class Server {
         for (int k = std::max<int>(sp.start, c.pos0); k < (int)(sp.start + sp.rows); ++k) t[k - c.pos0] = -1;
       bcast_payload(ring_, t.data(), t.size() * 4, 0);
       m_.set_tokens(c.pos0, c.n, t.data());
-      if (!f.rq.spans.empty()) images(f.rq);
+      if (!f.rq.spans.empty()) images(f.rq, s);
       tu.ops_ms = 1e3 * (now_s() - (resume ? t0 : f.t_start));
     }
-    // ---- prefill [q, n): chunks of prefill_rows; a short remainder as one step
-    int pos = q;
-    model::SampleOut first{};
-    int first_row = 0;
-    bool cancelled = false;
-    while (pos < n) {
-      if (Io::cancelled(f.rq)) {
-        cancelled = true;
-        break;
-      }
-      const int R = std::min(o_.prefill_rows, n - pos);
-      const bool last = pos + R == n;
-      Cmd c{};
-      c.slot = s;
-      c.pos0 = pos;
-      c.rows = R;
-      c.sp = f.sp;
-      c.handle = S->h;
-      for (int sn = (pos / o_.snap_every + 1) * o_.snap_every; sn <= pos + R; sn += o_.snap_every)
-        if (sn >= 128 && c.n_snaps < kMaxSnaps && (!o_.snap_thin || keep_snap(sn, n, o_.snap_every)))
-          c.snaps[c.n_snaps++] = sn;  // none that the prompt's end would thin at once
-      wd_.started = now_s();
-      bool img = false;  // vision: rows of an image span take the chunk path (the step path has no injection)
-      for (const fe::ImageSpan& sp : f.rq.spans) img = img || (int)(sp.start + sp.rows) > pos;
-      if (R <= o_.small_rows && !ced && !img) {
-        c.op = kCmdRows;
-        std::copy(prompt.begin() + pos, prompt.begin() + pos + R, c.tokens);
-        issue(c);
-        const uint64_t k = run_rows(m_, c);
-        first = m_.wait(k);
-        tu.rows_ms += m_.last_gpu_ms();
-        first_row = R - 1;
-        S->w = std::max(S->w, pos + R + (m_.spec() ? model::ops::kDrafts : 0));  // its draft's block keys
-      } else {
-        c.op = kCmdPrefill;
-        c.flags = (last ? kPfSample : 0) | (ced ? kPfCed : 0);
-        const int rest = n - pos - R;
-        c.next = rest > o_.small_rows || (ced && rest > 0) ? std::min(o_.prefill_rows, rest) : 0;
-        for (int i = 0; i < c.n_snaps; ++i)
-          if (ced && c.snaps[i] < n) S->enc_snaps.push_back(c.snaps[i]);  // the replay covers only one at n
-        issue(c);
-        const uint64_t k = run_prefill(m_, c);
-        if (k != ~0ull) first = m_.wait(k), first_row = 0;
-        if (!last) m_.drain();  // the last chunk's tail (the draft windows' seeding) drains after tok0 is out
-        if (!last) tu.add_split(m_);
-        else tu.pending = true;
-        ++tu.chunks;
-        S->w = std::max(S->w, pos + R);
-      }
-      wd_.started = 0;
-      S->hist.insert(S->hist.end(), prompt.begin() + pos, prompt.begin() + pos + R);
-      pos += R;
-      if (!resume) {  // the dashboard: this request's prompt tokens computed, of those it computes (after the reuse)
-        const fe::Progress pr{h.req_id, (uint32_t)(pos - q), (uint32_t)(n - q)};
-        io_.send(f.rq.conn, Frame(fe::kProgress).add(&pr).take());
-      }
-      publish();
+    r.S = S, r.s = s, r.n = n, r.q = q, r.ced = ced, r.pos = q;
+    return true;
+  }
+
+  // One piece of the prompt: rows [pos, pos + R), the next piece's Engram look-ahead sized next_rows. False when
+  // the request was cancelled before it (nothing run).
+  bool pf_piece(Reader& r, int R, int next_rows) {
+    Flight& f = *r.f;
+    const fe::SubmitHeader& h = f.rq.h;
+    const std::vector<int32_t>& prompt = r.prompt();
+    Session* S = r.S;
+    const int s = r.s, n = r.n, q = r.q;
+    const bool ced = r.ced, resume = r.resume;
+    int& pos = r.pos;
+    model::SampleOut& first = r.first;
+    int& first_row = r.first_row;
+    Turn& tu = *r.tu;
+    if (Io::cancelled(f.rq)) {
+      r.cancelled = true;
+      return false;
     }
+    const bool last = pos + R == n;
+    if (R > r.cap) die("serve: a piece of %d rows on a set of %d (req %llu)", R, r.cap, (unsigned long long)h.req_id);
+    Cmd c{};
+    c.slot = s;
+    c.pos0 = pos;
+    c.rows = R;
+    c.rows_set = r.rows_set;
+    c.sp = f.sp;
+    c.handle = S->h;
+    for (int sn = (pos / o_.snap_every + 1) * o_.snap_every; sn <= pos + R; sn += o_.snap_every)
+      if (sn >= 128 && c.n_snaps < kMaxSnaps && (!o_.snap_thin || keep_snap(sn, n, o_.snap_every)))
+        c.snaps[c.n_snaps++] = sn;  // none that the prompt's end would thin at once
+    wd_.started = now_s();
+    bool img = false;  // vision: rows of an image span take the chunk path (the step path has no injection)
+    for (const fe::ImageSpan& sp : f.rq.spans) img = img || (int)(sp.start + sp.rows) > pos;
+    if (R <= o_.small_rows && !ced && !img) {
+      c.op = kCmdRows;
+      std::copy(prompt.begin() + pos, prompt.begin() + pos + R, c.tokens);
+      issue(c);
+      const uint64_t k = run_rows(m_, c);
+      first = m_.wait(k);
+      tu.rows_ms += m_.last_gpu_ms();
+      first_row = R - 1;
+      S->w = std::max(S->w, pos + R + (m_.spec() ? model::ops::kDrafts : 0));  // its draft's block keys
+    } else {
+      c.op = kCmdPrefill;
+      c.flags = (last ? kPfSample : 0) | (ced ? kPfCed : 0);
+      const int rest = n - pos - R;
+      c.next = rest > o_.small_rows || (ced && rest > 0) ? std::min(next_rows, rest) : 0;
+      for (int i = 0; i < c.n_snaps; ++i)
+        if (ced && c.snaps[i] < n) S->enc_snaps.push_back(c.snaps[i]);  // the replay covers only one at n
+      issue(c);
+      const uint64_t k = run_prefill(m_, c);
+      if (k != ~0ull) first = m_.wait(k), first_row = 0;
+      if (!last) m_.drain();  // every chunk but the last drains here; the last chunk's tail (the draft windows' seeding) drains after tok0 is out
+      if (!last) tu.add_split(m_);
+      else tu.pending = true;
+      ++tu.chunks;
+      S->w = std::max(S->w, pos + R);
+    }
+    wd_.started = 0;
+    S->hist.insert(S->hist.end(), prompt.begin() + pos, prompt.begin() + pos + R);
+    pos += R;
+    if (!resume) {  // the dashboard: this request's prompt tokens computed, of those it computes (after the reuse)
+      const fe::Progress pr{h.req_id, (uint32_t)(pos - q), (uint32_t)(n - q)};
+      io_.send(f.rq.conn, Frame(fe::kProgress).add(&pr).take());
+    }
+    return true;
+  }
+
+  // The prompt's end: images cleared, the first token sent, the prompt-end snapshot. True when the request goes on
+  // decoding; false when the token (or a cancel) ended it.
+  bool pf_end(Reader& r) {
+    Flight& f = *r.f;
+    const fe::SubmitHeader& h = f.rq.h;
+    const bool resume = r.resume, ced = r.ced, cancelled = r.cancelled;
+    const int s = r.s, n = r.n;
+    Session* S = r.S;
+    const double t0 = r.t0;
+    model::SampleOut& first = r.first;
+    const int first_row = r.first_row;
+    Turn& tu = *r.tu;
     if (!f.rq.spans.empty()) {  // vision: the spans are for this prompt's chunks only
       Cmd c{};
       c.op = kCmdImages;
+      c.slot = s;
       c.n = 0;
       issue(c);
       m_.set_images(0, nullptr, nullptr, nullptr);
@@ -1210,11 +1455,12 @@ class Server {
     return true;
   }
 
-  // Vision: rq's spans and rows to every rank (kCmdImages), for the prefill chunks that follow.
-  void images(const Request& rq) {
+  // Vision: rq's spans and rows to every rank (kCmdImages), slot s's: for its prefill chunks, whatever runs between them.
+  void images(const Request& rq, int s) {
     const double t0 = now_s();
     Cmd c{};
     c.op = kCmdImages;
+    c.slot = s;
     c.n = (int)rq.spans.size();
     issue(c);
     std::vector<int32_t> lh(2 * rq.spans.size());
@@ -1406,6 +1652,17 @@ class Server {
         continue;
       }
       f.paused_s += now_s() - f.t_paused;
+      // a resume with more rows to read than a prompt read whole: read in pieces like a long prompt, between windows
+      const int rows = !live && il_.on ? rows_to_compute(f, true) : 0;
+      if (!live && il_.on && !il::read_whole(il_, rows)) {
+        std::printf("serve: req %llu resumes in pieces: %d rows to read again\n", (unsigned long long)f.rq.h.req_id, rows);
+        auto L = std::make_unique<Long>();
+        L->f = std::move(f);
+        L->resume = true;
+        L->rows = rows;
+        pfq_.push_back(std::move(L));
+        continue;
+      }
       if (!live && !go(f, true, keep)) continue;
       keep.insert(f.rq.h.session_id);
       fl.push_back(std::move(f));
@@ -1424,6 +1681,7 @@ class Server {
       else finish(fl[k], why[k]);
     }
     for (auto it = paused.rbegin(); it != paused.rend(); ++it) rot_.push_front(std::move(*it));
+    dec_end_ = now_s();
   }
 
   // Session S's history for a run that feeds the flight's next token at pos: the positions before it (one
@@ -1478,7 +1736,8 @@ class Server {
       }
       tokens(f.rq, o, row);  // a paused request's last tokens too: the session holds them
       f.out.push_back(o.row[row].token);
-      if (!ctl && io_.submit_waiting() && admissible()) {  // a new request: this one pauses for its prefill
+      // a new request: this one pauses for its prefill; while long prompts are prefilled, at its window's end instead
+      if (!ctl && (pfq_.empty() ? io_.submit_waiting() && admissible() : burst_over())) {
         m_.set_ctl(1);
         ctl = pause = true;
       }
@@ -1570,7 +1829,8 @@ class Server {
         f.done_sent = true;
         done(f.rq, stop ? fe::kStop : fe::kLength, (uint32_t)f.q, (uint32_t)f.out.size(), f.t_start, f.t_first);
       }
-      if (!(ctl & kCtlPause) && (io_.submit_waiting() || !wait_.empty()) && (ends || admissible()))
+      if (!(ctl & kCtlPause) && (pfq_.empty() ? (io_.submit_waiting() || !wait_.empty()) && (ends || admissible())
+                                              : burst_over()))
         m_.set_ctl(ctl |= kCtlPause);
     };
     std::vector<BatchEnd> end(n);
@@ -1668,6 +1928,11 @@ class Server {
     sf.slots_total = (uint64_t)ns, sf.slots_big = big, sf.slot_ctx_big = cbig;
     sf.slot_ctx_small = big == (uint64_t)ns ? cbig : csmall;
     sf.positions_held = 0;  // the dashboard sums the requests' own positions
+    sf.il_on = il_.on, sf.il_whole_rows = (uint64_t)il_.whole_rows, sf.il_push_rows = (uint64_t)il_.push_rows;
+    sf.il_gap_ms = (uint64_t)il_.gap_ms, sf.il_share = (uint64_t)il_.share, sf.il_burst_max_ms = (uint64_t)il_.burst_max_ms;
+    uint64_t reading = 0;
+    for (const auto& L : pfq_) reading += L->begun;
+    sf.il_reading = reading, sf.il_queued = (uint64_t)pfq_.size() - reading;
     if (model::copy::mode() & model::copy::kAdapt) {
       sf.copy_adapt = 1, sf.copy_proposals_total = copy_proposals_total_, sf.copy_scored_total = copy_scored_total_;
       sf.copy_first_right_total = copy_first_right_total_, sf.copy_rows_verified_total = copy_rows_verified_total_;
@@ -1687,6 +1952,14 @@ class Server {
       done(*it, fe::kCancelled, 0, 0, now_s(), 0);
       Io::forget(*it);
       it = wait_.erase(it);
+    }
+    for (size_t i = 0; i < pfq_.size();) {  // a queued long prompt holds nothing: its cancel ends it now
+      if (pfq_[i]->begun || !Io::cancelled(pfq_[i]->f.rq)) {
+        ++i;
+        continue;
+      }
+      end_queued(*pfq_[i], fe::kCancelled);
+      pfq_.erase(pfq_.begin() + (std::ptrdiff_t)i);
     }
     for (size_t i = 0; i < rot_.size();) {
       if (!Io::cancelled(rot_[i].rq)) {
@@ -1774,6 +2047,39 @@ class Server {
   std::map<uint64_t, Session> sess_;
   std::vector<uint64_t> slot_;  // the session whose working state each slot holds (0: none)
   std::deque<Flight> rot_;      // requests between their first token and their end, in turn
+  // Interleaved prefill: long prompts, first in first out; the front is read once it holds a slot, a second one
+  // (push_) may be read beside it, the rest hold nothing. A Long lives on the heap: its Reader points at its Flight.
+  struct Long {
+    Flight f;
+    Reader r;
+    bool begun = false;
+    bool resume = false;  // a flight that lost its slot, re-reading its prompt and the tokens it sent
+    int rows = 0;         // rows to compute when it was queued (the second reader: at most push_rows)
+  };
+  Long* push_ = nullptr;  // the second reader, a short long prompt read beside the front one (D3), first
+
+  // A long prompt out of the queue (ended, or read and decoding); the second reader that is now the front is the front
+  void drop_long(Long* x) {
+    for (auto it = pfq_.begin(); it != pfq_.end(); ++it)
+      if (it->get() == x) {
+        pfq_.erase(it);
+        break;
+      }
+    if (push_ == x || (push_ && !pfq_.empty() && pfq_.front().get() == push_)) push_ = nullptr;
+  }
+  // A long prompt that ends in the queue, never read: a first run's time was all queue time (DONE queue_us)
+  void end_queued(Long& L, uint32_t why) {
+    if (!L.resume) L.f.t_start = now_s();
+    finish(L.f, why);
+  }
+  std::deque<std::unique_ptr<Long>> pfq_;
+  il::Settings il_;             // interleaved prefill's settings: the flags', then what CONFIG frames set (apply_config)
+  il::Cost il_cost_;
+  double owed_ms_ = 0;         // decode time owed to the decoders for the prompt work done while they waited
+  double burst_ms_ = 0;        // the window of the decode run in progress (0: no window)
+  double burst_end_ = 0;       // its end, set at the run's first step
+  bool il_admitted_ = false;   // the scheduler's last unit was an admission (il::State::admitted_last)
+  double dec_end_ = 0;         // when the last decode run ended: decoders owed for the time since (a long prompt's arrival)
   std::deque<Request> held_, ready_, wait_;  // submits for a session in flight; those let go when it ended;
                                              // those waiting for a slot
   std::set<uint64_t> flying_, later_;  // the sessions in flight; RELEASEs of them, applied at their end

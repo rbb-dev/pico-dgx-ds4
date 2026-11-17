@@ -7,8 +7,8 @@ fake fan tool, all started here (stdlib only; no engine, no GPU).
 Without --tokenizer a byte-level one is written by make_test_tokenizer.py beside this script. Covers: both served
 names in /v1/models, the `[ablit] ` prefix arriving only on the ablated requests (the -ablit name; never on the plain or
 any other name), the echoed model name, sessions kept apart by weights path, the dashboard's sign-in (the API key on
-every data route; the page loads without it), every dashboard route with the keys the page reads, the page itself, no
-switch route, a request's states
+every data route; the page loads without it), every dashboard route with the keys the page reads, the page itself, the
+live settings (read, changed through the mock engine, refused out of range), no switch route, a request's states
 through the requests route (queued, prefill with the prompt pass, decode), STATS asked only while the dashboard is
 watched, the series, node health and the memory ledger, and a sanity timing of a stream with and without the page
 polling.
@@ -243,9 +243,12 @@ def main():
     # ---- the sign-in: the page loads without the key and asks for it; every data route needs it
     st, raw, _ = http_("GET", "/dashboard", headers={"Authorization": None})
     check(st == 200 and "API key" in raw.decode(), "the page loads without the key and has the sign-in")
-    for route in ("status", "requests", "ledger", "series?name=decode_tps&seconds=900&step=10"):
+    for route in ("status", "requests", "ledger", "settings", "series?name=decode_tps&seconds=900&step=10"):
         check(http_("GET", "/dashboard/api/v1/" + route, headers={"Authorization": None})[0] == 401, f"GET {route} without the key is 401")
     check(http_("GET", "/dashboard/api/v1/status", headers={"Authorization": "Bearer wrong-" + KEY})[0] == 401, "a wrong key is 401")
+    check(http_("POST", "/dashboard/api/v1/settings", {"share": 60}, headers={"Authorization": None})[0] == 401, "POST settings without the key is 401")
+    check(http_("POST", "/dashboard/api/v1/settings", '{"share": 60}', headers={"Content-Type": "text/plain"})[0] == 415,
+          "POST settings as text/plain (what another site's form can send) is 415")
     check(http_("GET", "/v1/models", headers={"Authorization": None})[0] == 401, "/v1 needs the same key")
     st, s0 = get_json("/dashboard/api/v1/status")
     check(st == 200 and s0["sessions"] is None, "no STATS were asked before the dashboard was first watched (sessions is null)")
@@ -266,6 +269,21 @@ def main():
     want = 2 * 1048576 + 30 * 65536
     check(ss["slots"] == 32 and ss["slots_big"] == 2 and ss["positions"] == want and ss["usable_window"] == 1048576, f"sessions map the slots: {ss['positions']}")
     check(ss["store_cap_bytes"] == want * 890 and "bytes_per_token" not in ss and ss["sessions_resident"] >= 0, "sessions carry the store as its own bytes")
+
+    # ---- the live settings (interleaved prefill): read from STATS, changed with a CONFIG frame, refused out of range
+    il = s.get("interleave")
+    check(il == {"on": True, "whole_rows": 32768, "push_rows": 131072, "gap_ms": 600, "share": 40, "burst_max_ms": 1000,
+                 "reading": 0, "queued": 0}, f"status.interleave: the engine's settings {il}")
+    st, sv = get_json("/dashboard/api/v1/settings")
+    check(st == 200 and sv == il, "GET settings is the same object")
+    st, raw, _ = http_("POST", "/dashboard/api/v1/settings", {"share": 60, "gap_ms": 450})
+    check(st == 200 and json.loads(raw) == {"sent": {"share": 60, "gap_ms": 450}}, f"POST settings sends the change: {raw!r}")
+    got = wait_for(lambda: (lambda x: x if x and x["share"] == 60 else None)(get_json("/dashboard/api/v1/settings")[1]), 3)
+    check(bool(got) and got["gap_ms"] == 450 and got["whole_rows"] == 32768, f"the engine runs it and keeps the rest: {got}")
+    for bad in ({"share": 95}, {"share": 5}, {"gap_ms": 50}, {"whole_rows": 4096}, {"push_rows": -1}, {"on": "yes"}, {"nope": 1}, {}, [1]):
+        check(http_("POST", "/dashboard/api/v1/settings", bad)[0] == 400, f"POST settings {json.dumps(bad)} is refused (400)")
+    check(get_json("/dashboard/api/v1/settings")[1]["share"] == 60, "a refused change sends nothing")
+    check(http_("POST", "/dashboard/api/v1/settings", {"share": 40, "gap_ms": 600})[0] == 200, "the defaults back")
 
     # node health, polled while watched
     def nodes_up():
