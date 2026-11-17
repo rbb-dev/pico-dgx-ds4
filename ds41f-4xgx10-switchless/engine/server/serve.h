@@ -25,7 +25,8 @@ struct ServeOptions {
                                    // decoding and is prefilled; while more of them decode than there are
                                    // slots (Model::slots), they take turns of this many tokens. 0: no turns
                                    // (a request that would need the slot of another in flight waits)
-  int grow_ahead = 131072;         // growth (the chunk pool): a reply's reservation reaches this many positions past
+  int ssd_flush_s = 30;            // seconds between idle checkpoints; without the imager also the idle age at which a conversation's pieces are written (0: none)
+  int grow_ahead = 131072;         // growth (the chunk pool): a response's reservation reaches this many positions past
                                    // where it is, and goes further at its next run (serve.cpp need_now)
   // Kept sessions (docs/engine.md): a planned stop (SIGTERM) spills the sessions in device memory to the
   // disk tier, the most recently used first, up to keep_bytes (0: nothing is kept), and writes every
@@ -33,7 +34,7 @@ struct ServeOptions {
   // when the store reused that stop's files. Sessions unused for keep_age_s are not kept.
   std::string keep_index;
   size_t keep_bytes = 0;
-  double keep_age_s = 7 * 86400.0;
+  double keep_age_s = 30 * 86400.0;  // also while serving: an idle conversation unused this long is dropped
   std::string name = "deepseek-v4.1-flash";
   // DSpark drafts in decode (the model bound them): Cmd's spec_drafts, spec_thresh, spec_cost, spec_gate,
   // spec_row_ms

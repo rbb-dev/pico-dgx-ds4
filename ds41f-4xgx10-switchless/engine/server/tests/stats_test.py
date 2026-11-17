@@ -2,7 +2,7 @@
 """The dashboard's frames from the engine (docs/protocol.md, version 4): HELLO's keep_positions and STATS version 2, the
 chunk pool and its conversations, read off rank 0's socket while the engine does things the counts must show.
 
-  (a) at the start: version 2 and 30 fields; the pool's numbers as its startup line says (--numbers), all free, every one
+  (a) at the start: version 2 and 31 fields; the pool's numbers as its startup line says (--numbers), all free, every one
       of number_bytes (one chunk image), holding numbers x 16,384 / 5 positions; the lines (--lines); HELLO's
       keep_positions = (the pool's numbers + the disk tier's bytes / number_bytes) x 16,384 / 5.
   (b) after a request: a conversation (on a line or idle in memory) and the numbers it holds, free + held = numbers.
@@ -25,7 +25,8 @@ NAMES = ['pool_numbers', 'pool_free', 'pool_held', 'pool_shared', 'pool_reserved
          'conv_on_lines', 'conv_in_memory', 'conv_on_disk', 'conv_sharing', 'lines',
          'disk_cap_bytes', 'disk_used_bytes', 'spills_total', 'spill_bytes_total', 'spills_pending', 'restores_total',
          'restore_bytes_total', 'restored_tokens_total', 'restore_wait_ns_total', 'restore_wait_max_ns',
-         'il_on', 'il_whole_rows', 'il_push_rows', 'il_gap_ms', 'il_share', 'il_burst_max_ms', 'il_reading', 'il_queued']
+         'il_on', 'il_whole_rows', 'il_push_rows', 'il_gap_ms', 'il_share', 'il_burst_max_ms', 'il_reading', 'il_queued',
+         'keep_days']
 S0 = 0x7374617400000000  # 'stat'
 fails = 0
 
@@ -61,7 +62,7 @@ def main():
 
     print('(a) at the start')
     ver, n, s = stats(e)
-    check(e.version == 4 and ver == 2 and n == 30, 'protocol %d, STATS version %d with %d fields' % (e.version, ver, n))
+    check(e.version == 4 and ver == 2 and n == 31, 'protocol %d, STATS version %d with %d fields' % (e.version, ver, n))
     check(s['pool_numbers'] == a.numbers and s['pool_free'] == a.numbers and s['pool_held'] == 0,
           'the pool: %d numbers, %d free, %d held' % (s['pool_numbers'], s['pool_free'], s['pool_held']))
     check(s['number_bytes'] == 2916352 and s['pool_positions'] == a.numbers * 16384 // 5,

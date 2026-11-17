@@ -44,20 +44,26 @@
 //                --snap-all; every conversation's caches in one chunk pool, sized at startup by
 //                --pool-free-gib G (leave G GiB of device memory and of available host memory free on every
 //                Spark) and/or --pool-tokens N (a pool that holds N positions of conversation), with both
-//                --pool-pick smaller (default) or larger; every rank takes the smallest rank's count; LRU,
+//                --pool-pick smaller (default) or larger; every rank takes the smallest rank's count. After
+//                sizing every rank's memory ledger is printed (model/pool_rules.h): with --pool-free-gib the
+//                start is refused when the largest rank's fixed lines plus --pool-slack-gib (default 2) pass G;
+//                rank 0's lines of processes beside the engine are --front-mib (3200) and --encoder-mib (1260);
+//                LRU,
 //                the evicted spilled to a file of --disk-gib (default 32; 0: none) in --disk-dir (default the
 //                fleet file's RANK<r>_SPILL), prefill in
 //                chunks of --prefill-rows (default 8192 with CED, else 4096 as in the other modes),
 //                sampled decode. --keep-gib N: a planned stop (SIGTERM) keeps the sessions for the
 //                next start (docs/engine.md, "Kept sessions"): those in the file, and those in device
 //                memory, the most recently used first, up to N GiB written at the stop (default 0:
-//                nothing is kept), none unused for --keep-days (7); --disk-tag T names the files
+//                nothing is kept), none unused for --keep-days (30; while serving too, a mop-up); --disk-tag T names the files
 //                rank<r>.T.spill and .index (rank 0's server.T.index), so that runs of another tag
 //                never touch them (the service's: service). --slots N: up to N requests decode
 //                together, a row each per step (one alone: with drafts). --slice N: a request that
 //                comes while others decode pauses them and is prefilled; while more requests decode
 //                than there are slots, they take turns of N tokens (default 64; 0: no turns, and a
 //                request that would need the slot of another in flight waits for one to free).
+//                --ssd-flush-s S: a conversation idle for S seconds gets its pieces written to the disk tier (its tail
+//                chunk and bookmarks; full chunks are written at their turn's save; default 30, 0: never).
 //                --grow-ahead N: a request reserves its prompt and N positions of reply (default 131072,
 //                at most its max_new); a reply reaches past them a horizon at a time, when the pool can hold it.
 //                Interleaved prefill (docs/interleave.md): a prompt with more than --interleave-whole-rows
@@ -152,6 +158,8 @@
 #include "dspark/dspark.h"
 #include "engram/engram.h"
 #include "model/model.h"
+#include "model/pool_rules.h"
+#include "server/bounds.h"
 #include "server/node_stats.h"
 #include "server/cmd.h"
 #include "server/golden.h"
@@ -314,12 +322,15 @@ struct Args {
   uint32_t seed = 1;
   std::string socket = "/tmp/dsgb10-engine.sock";
   double pool_free_gib = -1;    // serve: the chunk pool leaves this many GiB free on every Spark (< 0: not given)
+  double pool_slack_gib = 2.0;  // serve: the start check's margin beside the ledger's fixed lines (page cache the kernel gives back, slab)
+  int front_mib = 3200;         // serve, rank 0: what the front-end process may hold (its table and request rows), a ledger line
+  int encoder_mib = 1260;       // serve, rank 0: what the image encoder process holds (device and host), a ledger line
   int64_t pool_tokens = -1;      // serve: the chunk pool holds this many positions of conversation (< 0: not given)
   std::string pool_pick = "smaller";  // serve: with both, the smaller pool or the larger
   double disk_gib = 32;  // serve: the store's disk tier (0: none)
   std::string disk_dir;  // its directory (default: the fleet's RANK<r>_SPILL)
   std::string disk_tag;  // its files' tag: rank<r>.<tag>.spill (none: rank<r>.spill)
-  double keep_gib = 0, keep_days = 7;  // kept sessions: written at a planned stop, at most; their age
+  double keep_gib = 0, keep_days = 30;  // kept sessions: written at a planned stop, at most; their age
   int snap_every = 1024, small_rows = 8;
   int slots = 1, slot = 0;
   int big_slots = 0;  // --big-slots B: slots [0, B) hold --max-ctx, the others --max-ctx / 8 (model::Options::big_slots)  // session slots (model::Options::slots); the golden modes' slot
@@ -328,7 +339,8 @@ struct Args {
   bool bgraph_check = false;  // DIAGNOSTICS (B3 phase 2a): the one-session draft of every entry after the batch
                               // step's pass over them, and the words that differ, printed by --mode batch
   int slice = 64;  // serve: time-slicing's turns, in tokens (0: none)
-  int grow_ahead = 131072;  // serve: positions of reply a reservation reaches past where it is
+  int grow_ahead = 131072;  // serve: positions of response a reservation reaches past where it is
+  int ssd_flush_s = 30;     // serve: seconds between checkpoints while idle; without the imager also the idle age for writing a conversation's pieces
   il::Settings il;  // serve: interleaved prefill's settings (--interleave-*)
   bool snap_all = false;
   size_t ring_cap = 4u << 20;  // the ring's per-rank collective size (prefill's bulk collectives post cap / 4)
@@ -411,6 +423,9 @@ Args parse(int argc, char** argv) {
     else if (s == "--top-k") a.top_k = std::atoi(val().c_str());
     else if (s == "--socket") a.socket = val();
     else if (s == "--pool-free-gib") a.pool_free_gib = std::atof(val().c_str());
+    else if (s == "--pool-slack-gib") a.pool_slack_gib = std::atof(val().c_str());
+    else if (s == "--front-mib") a.front_mib = std::atoi(val().c_str());
+    else if (s == "--encoder-mib") a.encoder_mib = std::atoi(val().c_str());
     else if (s == "--pool-tokens") a.pool_tokens = std::atoll(val().c_str());
     else if (s == "--pool-pick") a.pool_pick = val();
     else if (s == "--slot-gib" || s == "--session-gib" || s == "--session-margin-gib" || s == "--no-vmm")
@@ -433,6 +448,7 @@ Args parse(int argc, char** argv) {
     else if (s == "--batch-rows") a.batch_rows = std::atoi(val().c_str());
     else if (s == "--slice") a.slice = std::atoi(val().c_str());
     else if (s == "--grow-ahead") a.grow_ahead = std::atoi(val().c_str());
+    else if (s == "--ssd-flush-s") a.ssd_flush_s = std::atoi(val().c_str());
     else if (s == "--interleave") a.il.on = true;
     else if (s == "--no-interleave") a.il.on = false;
     else if (s == "--interleave-whole-rows") a.il.whole_rows = std::atoi(val().c_str());
@@ -542,6 +558,8 @@ Args parse(int argc, char** argv) {
   if (a.mode == "serve" && a.pool_free_gib < 0 && a.pool_tokens < 0)
     die("serve: the chunk pool's size: --pool-free-gib G (leave G GiB free on every Spark) and/or --pool-tokens N "
         "(a pool of N positions of conversation)");
+  if (a.pool_slack_gib < 0 || a.front_mib < 0 || a.encoder_mib < 0)
+    die("--pool-slack-gib, --front-mib and --encoder-mib must be >= 0");
   if (a.pool_pick != "smaller" && a.pool_pick != "larger") die("--pool-pick smaller or larger");
   if (a.mode == "spectf") a.spec = true;
   if ((!a.tree_probe.empty() || a.tree_sib) && (a.mode != "spectf" || a.tree_probe.empty() || a.tree_sib < 0))
@@ -806,17 +824,27 @@ int main(int argc, char** argv) {
     uint64_t by_free = UINT64_MAX, by_tokens = UINT64_MAX;
     if (a.pool_free_gib >= 0) {
       const size_t keep = (size_t)(a.pool_free_gib * gib);
-      by_free = have + std::min(dfree > keep ? dfree - keep : 0, avail > keep + cache ? avail - keep - cache : 0) / img;
+      by_free = model::rules::pool_offer(have, dfree, avail, keep, cache, img);
     }
     if (a.pool_tokens >= 0) by_tokens = ((uint64_t)a.pool_tokens * 5 + 16383) / 16384;
     const uint64_t want = a.pool_free_gib < 0 ? by_tokens
                           : a.pool_tokens < 0 ? by_free
                           : a.pool_pick == "larger" ? std::max(by_free, by_tokens) : std::min(by_free, by_tokens);
-    const uint64_t mine[3] = {dfree, avail, std::max(want, have)};
-    uint64_t all[4][3];
-    ring.allgather_host(mine, all, sizeof mine);
-    uint64_t pool = mine[2];
-    for (const auto& r : all) pool = std::min(pool, r[2]);
+    struct Mine {
+      uint64_t dfree, avail, offer;
+      rules::Ledger ledger;
+    } mine{dfree, avail, std::max(want, have), {}};
+    mine.ledger.bytes[rules::kHeap] = std::max<uint64_t>(heap::kCap, heap::in_use());
+    mine.ledger.bytes[rules::kEngramCache] = cache;
+    if (a.rank == 0) {
+      mine.ledger.bytes[rules::kFront] = (uint64_t)a.front_mib << 20;
+      mine.ledger.bytes[rules::kEncoder] = (uint64_t)a.encoder_mib << 20;
+      mine.ledger.bytes[rules::kOutQueue] = bounds::kOutCap;
+    }
+    Mine all[model::rules::kRanks];
+    ring.allgather_host(&mine, all, sizeof mine);
+    uint64_t pool = mine.offer;
+    for (const auto& r : all) pool = std::min(pool, r.offer);
     m.state_reserve((size_t)(pool - have) * img);
     if (a.rank == 0) {
       std::printf("chunk pool: %llu numbers of %.2f MiB (%.2f GiB, %.1fM positions) on every rank (", (unsigned long long)pool,
@@ -863,6 +891,7 @@ int main(int argc, char** argv) {
     so.snap_every = a.snap_every;
     so.slice = a.slice;
     so.grow_ahead = a.grow_ahead;
+    so.ssd_flush_s = a.ssd_flush_s;
     so.interleave = a.il;
     so.interleave.prefill_rows = a.prefill_rows;
     if (a.exact) so.interleave.on = false;  // --exact reads every prompt whole

@@ -46,6 +46,7 @@
 // whose store reused those files reads them back in (load_kept), and the front-end's session ids find
 // their sessions as before the stop.
 #include "server/serve.h"
+#include "server/bounds.h"
 #include "server/cancel.h"
 #include "server/reclaim.h"
 
@@ -125,6 +126,7 @@ struct Conn {
   std::atomic<bool> dead{false};
   std::mutex mu;
   cancel::Set reqs;  // the requests in flight and the CANCELs received for them (ids are per connection; under mu)
+  bounds::OutQueue outq;  // the bytes queued for the writer; past bounds::kOutCap the connection is dropped (Io::send)
   explicit Conn(int f) : fd(f) {}
   ~Conn() { close(fd); }
   void kill() {
@@ -227,8 +229,14 @@ class Io {
     c = cfg_, cfg_new_ = false;
     return true;
   }
+  // Queues a frame for c's writer. A connection whose queue passes bounds::kOutCap (its reader stopped) is dropped.
   void send(const ConnP& c, std::vector<char> f) {
     if (c->dead) return;
+    if (!c->outq.add(f.size())) {
+      std::printf("serve: front-end dropped: %zu MiB of frames waiting for it\n", c->outq.queued() >> 20);
+      c->kill();
+      return;
+    }
     {
       std::lock_guard<std::mutex> l(wmu_);
       out_.emplace_back(c, std::move(f));
@@ -377,7 +385,9 @@ class Io {
         f = std::move(out_.front());
         out_.pop_front();
       }
-      if (!f.first->dead && !write_all(f.first->fd, f.second.data(), f.second.size())) f.first->kill();
+      const size_t n = f.second.size();
+      if (!f.first->dead && !write_all(f.first->fd, f.second.data(), n)) f.first->kill();
+      f.first->outq.done(n);
     }
   }
 
@@ -412,6 +422,7 @@ struct Session {
   int dec_lo = 0, end_dec_lo = 0;
   std::vector<int> enc_snaps;
   double t_used = 0;  // unix time of its last request (kept sessions age out by it)
+  uint64_t flushed = 0;  // the LRU clock at its last flush to the disk tier (flush_idle)
 };
 
 // The server's index of a planned stop's kept sessions (keep(); keepfile.h: 0600 in a 0700 directory,
@@ -507,7 +518,7 @@ void add(DecodeEnd& a, const DecodeEnd& b) {
 class Server {
  public:
   Server(model::Model& m, comm::Ring& ring, Watchdog& wd, const ServeOptions& o, Io& io, size_t budget)
-      : m_(m), ring_(ring), wd_(wd), o_(o), io_(io), budget_(budget), slot_(m.slots(), 0), il_(o.interleave) {}
+      : m_(m), ring_(ring), wd_(wd), o_(o), io_(io), budget_(budget), slot_(m.slots(), 0), il_(o.interleave), keep_age_s_(o.keep_age_s) {}
 
   // Requests let go after their session's last one ended first, then those that waited for a slot (when
   // one is there), then the front-end's frames, then a run of the requests decoding (run).
@@ -540,6 +551,9 @@ class Server {
         }
       } else if (!rot_.empty()) {
         run();
+      } else {
+        resize_idle();
+        flush_idle();
       }
     }
     // the stop ends what is paused or held with an error (Io::stopping): "the server is stopping"
@@ -602,7 +616,7 @@ class Server {
         for (int32_t& t : s.hist) t = r.get<int32_t>();
         s.enc_snaps.resize(ne);
         for (int& e : s.enc_snaps) e = r.get<int32_t>();
-        bool ok = r.ok && id && !kept.count(id) && s.h > 0 && wall - s.t_used <= o_.keep_age_s;
+        bool ok = r.ok && id && !kept.count(id) && s.h > 0 && wall - s.t_used <= keep_age_s_;
         for (const int32_t t : s.hist) ok = ok && t >= 0 && t < model::kVocab;
         const model::Model::StateInfo si = m_.state_info(s.h);
         ok = ok && si.on_disk && si.saved <= nh && si.end_pos <= nh;
@@ -682,7 +696,7 @@ class Server {
     std::vector<std::pair<uint64_t, uint64_t>> ram;  // (used, id): the sessions in device memory
     int old = 0, before = 0;
     for (auto it = sess_.begin(); it != sess_.end();) {
-      if (wall - it->second.t_used > o_.keep_age_s) {
+      if (wall - it->second.t_used > keep_age_s_) {
         v.push_back({kStFree, it->second.h, 0, 0});
         it = sess_.erase(it);
         ++old;
@@ -738,10 +752,53 @@ class Server {
                 "%.1f GiB, %d unused for %.0f days), the ranks' files synced and indexed in %.2f s; histories %.1f KiB "
                 "in %.1f ms%s%s\n",
                 ok ? n : 0, before, spilled, bytes / 1073741824.0, freed, o_.keep_bytes / 1073741824.0, old,
-                o_.keep_age_s / 86400, t1 - t0, f.size() / 1024.0, 1e3 * (now_s() - t1), ok ? "" : ": NOT WRITTEN, ",
+                keep_age_s_ / 86400, t1 - t0, f.size() / 1024.0, 1e3 * (now_s() - t1), ok ? "" : ": NOT WRITTEN, ",
                 why.c_str());
   }
 
+  // The disk tier's size the dashboard asked for (CONFIG ssd_gib), when no request is in flight or paused between turns:
+  // a smaller size drops the conversations that need a piece past it (state_disk_resize; forget_evicted), and none of
+  // them may be one a flight still uses.
+  void resize_idle() {
+    if (!ssd_pending_ || !flying_.empty() || !rot_.empty() || !pfq_.empty()) return;
+    const int64_t g = ssd_pending_;
+    ssd_pending_ = 0;
+    if ((size_t)g << 30 == m_.state_disk_capacity()) return;
+    state({{kStDiskSize, -1, (int32_t)(g << 14), 0}});  // in 64 KiB grains, every rank alike
+    forget_evicted();
+    published_ = 0;
+  }
+
+  // While nothing runs: conversations idle for --ssd-flush-s get their pieces without an image written (once per use),
+  // so an eviction or a planned stop writes nothing for them; conversations unused for --keep-days are dropped.
+  // One command for all of them.
+  void flush_idle() {
+    const double now = unix_now();
+    std::vector<StateOp> v;
+    int expired = 0;
+    for (auto it = sess_.begin(); it != sess_.end() && v.size() < 64;) {
+      Session& S = it->second;
+      if (flying_.count(it->first)) {
+        ++it;
+        continue;
+      }
+      if (S.slot < 0 && keep_age_s_ > 0 && S.t_used > 0 && now - S.t_used > keep_age_s_) {  // a line's is kept
+        v.push_back({kStFree, S.h, 0, 0});
+        drop_ids(S);
+        it = sess_.erase(it);
+        ++expired;
+        continue;
+      }
+      if (o_.ssd_flush_s > 0 && S.flushed != S.used && now - S.t_used >= o_.ssd_flush_s) {
+        v.push_back({kStFlush, S.h, 0, 0});
+        S.flushed = S.used;
+      }
+      ++it;
+    }
+    if (v.empty()) return;
+    state(v);
+    if (expired) std::printf("serve: %d sessions unused for %.0f days dropped\n", expired, keep_age_s_ / 86400);
+  }
   // Operations that move session x's working state (its slot's) into the store: its compressed caches as
   // far as its history goes, and its end snapshot. They act on its slot (the command's).
   void persist_ops(Session& x, std::vector<StateOp>& v) {
@@ -848,6 +905,22 @@ class Server {
     const model::Model::StateInfo si = m_.state_info(x->h);
     if (!si.on_disk) return;
     const double t0 = now_s();
+    // room for what comes back: idle lines let their conversations go first (they stay in the pool, now evictable), as
+    // make_room does for a request's own need, so that the read-back does not find the pool held by idle lines
+    const int64_t want = (int64_t)m_.state_restore_chunks(x->h);
+    const std::set<uint64_t> none;
+    while ((int64_t)m_.slot_uncommitted() + giveable(none, h.session_id, h.base_session_id, true) < want) {
+      int best = -1;
+      uint64_t used = UINT64_MAX;
+      for (int t = 0; t < (int)slot_.size(); ++t) {
+        if (!slot_[t] || !idle_slot(t, none, h.session_id, h.base_session_id)) continue;
+        const auto it = sess_.find(slot_[t]);
+        const uint64_t u = it == sess_.end() ? 0 : it->second.used;
+        if (u < used) best = t, used = u;
+      }
+      if (best < 0) break;  // nothing more to let go: the read-back takes what fits
+      persist_slot(best, true, holds(h.session_id, h.base_session_id));
+    }
     state({{kStUnspill, x->h, 0, 0}});
     m_.drain();
     const model::Model::StateInfo back = m_.state_info(x->h);  // what came back: the room decides how much
@@ -1147,6 +1220,15 @@ class Server {
     if (c.burst_max_ms >= 50 && c.burst_max_ms <= 60000) n.burst_max_ms = (int)c.burst_max_ms;
     if (!o_.ced) n.on = false;  // --exact reads every prompt whole
     il_ = n;
+    if (c.keep_days >= 1 && c.keep_days <= 3650 && c.keep_days * 86400.0 != keep_age_s_) {
+      keep_age_s_ = c.keep_days * 86400.0;
+      std::printf("serve: sessions unused for %lld days are dropped\n", (long long)c.keep_days);
+    }
+    if (c.ssd_gib >= 1 && c.ssd_gib <= 131071 && m_.state_disk_capacity() &&  // the disk tier's size: when nothing runs
+        (size_t)c.ssd_gib << 30 != m_.state_disk_capacity()) {
+      ssd_pending_ = c.ssd_gib;
+      std::printf("serve: the disk tier goes to %lld GiB when no request is in flight\n", (long long)c.ssd_gib);
+    }
     published_ = 0;  // the next STATS shows it
     std::printf("serve: interleave settings: %s, whole %d rows, push %d rows, gap %d ms, share %d %%, window at most %d ms\n",
                 il_.on ? "on" : "off", il_.whole_rows, il_.push_rows, il_.gap_ms, il_.share, il_.burst_max_ms);
@@ -2003,6 +2085,7 @@ class Server {
     uint64_t reading = 0;
     for (const auto& L : pfq_) reading += L->begun;
     sf.il_reading = reading, sf.il_queued = (uint64_t)pfq_.size() - reading;
+    sf.keep_days = (uint64_t)(keep_age_s_ / 86400);
     if (model::copy::mode() & model::copy::kAdapt) {
       sf.copy_adapt = 1, sf.copy_proposals_total = copy_proposals_total_, sf.copy_scored_total = copy_scored_total_;
       sf.copy_first_right_total = copy_first_right_total_, sf.copy_rows_verified_total = copy_rows_verified_total_;
@@ -2054,6 +2137,19 @@ class Server {
     forget_evicted();
     Session* S = (h.flags & fe::kFlagKeep) && !released ? find(h.session_id) : nullptr;
     if (S) thin(*S);
+    if (S && S->slot >= 0) {  // the turn saved where its line holds it: its full chunks get their images (write-behind)
+      const int saved = m_.state_info(S->h).saved, E = (int)S->hist.size();
+      Cmd c{};
+      c.op = kCmdState;
+      c.slot = S->slot;
+      if (saved < E) c.ops[c.n_ops++] = {kStSave, S->h, saved, E};
+      // the line stays attached, but the request is over: its reservation was a reservation for it, and nothing else
+      if (reclaim::unreserve_at_finish()) c.ops[c.n_ops++] = {kStUnreserve, 0, S->slot, 0};
+      if (c.n_ops > 0) {
+        issue(c);
+        if (reclaim::unreserve_at_finish()) digest("unreserve");
+      }
+    }
     const model::Model::StateInfo si = S ? m_.state_info(S->h) : model::Model::StateInfo{};
     const DecodeEnd* de = &f.de;
     if (de->vsteps) {
@@ -2116,6 +2212,8 @@ class Server {
   comm::Ring& ring_;
   Watchdog& wd_;
   const ServeOptions& o_;
+  double keep_age_s_;  // --keep-days, changed live (CONFIG keep_days)
+  int64_t ssd_pending_ = 0;  // a disk tier size the dashboard asked for (GiB), applied when nothing runs (resize_idle)
   Io& io_;
   const size_t budget_;  // the store's bytes kept between requests (the rest: room for the next one)
   std::map<uint64_t, Session> sess_;

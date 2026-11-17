@@ -336,6 +336,7 @@ struct Model::Impl {
   void ensure_mapped(int s, int upto);
   void slot_release(int s);
   void slot_reserve(int s, int need);
+  void slot_unreserve(int s);
   int slot_chunks_for(int s, int need) const;
   // A step's view of the state: with one slot, its pointers (the kernels' one-session code, no table); with
   // more, slot 0's and the step's slot table (in_d->slot), so that one captured step serves rows in any slots.
@@ -431,12 +432,25 @@ struct Model::Impl {
   bool take_nums(int h, size_t n, std::vector<uint32_t>* out);
   // take_extra: the same for a bookmark of session h, only from room no line's reservation needs (false: none taken)
   bool take_extra(int h, size_t n, std::vector<uint32_t>* out);
+  // numbers for a piece read back from the disk tier: only what no running request has reserved (take_extra's rule)
+  bool take_restore(int h, size_t n, std::vector<uint32_t>* out);
   void give_nums(std::vector<uint32_t>& v);
   // share_nums: the first n numbers of `from` appended to *out, each counted once more (nothing copied). own_tail: session
   // h's numbers from the one holding position pos on become its own (refs 1) before anything writes them: a shared one
   // holding pos is copied (its entries below pos), shared ones above it are replaced; false when the pool has no room.
   void share_nums(const std::vector<uint32_t>& from, size_t n, std::vector<uint32_t>* out);
   bool own_tail(int h, int pos);
+  // The disk tier per piece: img_write / bk_write put an image of a number / a bookmark on disk (kNone without room);
+  // img_drop drops a reference to an image (its file space is freed at none); drop_images / free_lists: all of a session's
+  // images / its entries out of the pool and the disk; write_sealed: a turn's full entries and bookmarks, write-behind.
+  size_t img_write(int h, uint32_t c);
+  size_t bk_write(int h, const std::vector<uint32_t>& b, size_t bytes);
+  void img_drop(size_t off, size_t bytes);
+  void drop_images(int h);
+  void free_lists(int h);
+  void write_sealed(int h);
+  bool evict_piece(int v, int h);  // one piece of session v out of the pool (the last first)
+  void cut_at(int h, int pos);     // session h cut to [0, pos)
   bool own_bk(int h, std::vector<uint32_t>& b);
   bool store_evict_step(int h);
   uint8_t* bk_at(const std::vector<uint32_t>& n, size_t off) const;
@@ -458,10 +472,6 @@ struct Model::Impl {
   void state_snap_end(int h, int pos);
   void state_restore(int h, int pos);
   void state_restore_end(int h);
-  void state_drop(int h, int from);
-  void state_free(int h);
-  void state_copy_snaps(int src, int dst, int upto);
-  void state_drop_snap(int h, int pos);
   void state_snap_spec(int h, int pos);  // the draft module's windows at positions [pos - 128, pos)
 
   // ---- DSpark (spec.cu) -----------------------------------------------------------------------

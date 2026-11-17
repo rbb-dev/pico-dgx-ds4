@@ -281,14 +281,19 @@ def main():
     # ---- the live settings (interleaved prefill): read from STATS, changed with a CONFIG frame, refused out of range
     il = s.get("interleave")
     check(il == {"on": True, "whole_rows": 32768, "push_rows": 131072, "gap_ms": 600, "share": 40, "burst_max_ms": 1000,
-                 "reading": 0, "queued": 0}, f"status.interleave: the engine's settings {il}")
+                 "reading": 0, "queued": 0, "ssd_gib": 256, "keep_days": 30}, f"status.interleave: the engine's settings {il}")
     st, sv = get_json("/dashboard/api/v1/settings")
     check(st == 200 and sv == il, "GET settings is the same object")
     st, raw, _ = http_("POST", "/dashboard/api/v1/settings", {"share": 60, "gap_ms": 450})
     check(st == 200 and json.loads(raw) == {"sent": {"share": 60, "gap_ms": 450}}, f"POST settings sends the change: {raw!r}")
     got = wait_for(lambda: (lambda x: x if x and x["share"] == 60 else None)(get_json("/dashboard/api/v1/settings")[1]), 3)
     check(bool(got) and got["gap_ms"] == 450 and got["whole_rows"] == 32768, f"the engine runs it and keeps the rest: {got}")
-    for bad in ({"share": 95}, {"share": 5}, {"gap_ms": 50}, {"whole_rows": 4096}, {"push_rows": -1}, {"on": "yes"}, {"nope": 1}, {}, [1]):
+    st, raw, _ = http_("POST", "/dashboard/api/v1/settings", {"ssd_gib": 128, "keep_days": 14})
+    got = wait_for(lambda: (lambda x: x if x and x["ssd_gib"] == 128 else None)(get_json("/dashboard/api/v1/settings")[1]), 3)
+    check(st == 200 and bool(got) and got["keep_days"] == 14 and got["share"] == 60, f"the SSD tier's size and expiry change live: {got}")
+    check(http_("POST", "/dashboard/api/v1/settings", {"ssd_gib": 256, "keep_days": 30})[0] == 200, "and back")
+    for bad in ({"share": 95}, {"share": 5}, {"gap_ms": 50}, {"whole_rows": 4096}, {"push_rows": -1}, {"on": "yes"}, {"nope": 1}, {},
+                [1], {"ssd_gib": 0}, {"keep_days": 0}):
         check(http_("POST", "/dashboard/api/v1/settings", bad)[0] == 400, f"POST settings {json.dumps(bad)} is refused (400)")
     check(get_json("/dashboard/api/v1/settings")[1]["share"] == 60, "a refused change sends nothing")
     check(http_("POST", "/dashboard/api/v1/settings", {"share": 40, "gap_ms": 600})[0] == 200, "the defaults back")

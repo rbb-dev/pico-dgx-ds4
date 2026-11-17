@@ -72,6 +72,9 @@ void apply_state(model::Model& m, const StateOp& o) {
     case kStRelease: m.slot_release(o.a); break;
     case kStPin: break;  // apply_ops pinned its session
     case kStAttach: m.slot_attach(o.a, o.h); break;
+    case kStFlush: m.state_flush(o.h); break;
+    case kStDiskSize: m.state_disk_resize((size_t)(uint32_t)o.a << 16); break;
+    case kStUnreserve: m.slot_unreserve(o.a); break;
     default: die("state: unknown operation %d", o.op);
   }
 }
@@ -93,6 +96,7 @@ void apply_ops(model::Model& m, const Cmd& c) {
   m.trim_history();
   std::vector<int> pin;
   for (int i = 0; i < c.n_ops; ++i) {
+    if (c.ops[i].op == kStUnreserve) continue;  // names a slot, no session
     pin.push_back(c.ops[i].h);
     if (c.ops[i].op == kStCopySnaps) pin.push_back(c.ops[i].a);
   }

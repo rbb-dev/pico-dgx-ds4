@@ -152,11 +152,13 @@ struct MockIl {
     gap_ms: u64,
     share: u64,
     burst_max_ms: u64,
+    ssd_gib: u64,
+    keep_days: u64,
 }
 
 impl Default for MockIl {
     fn default() -> Self {
-        MockIl { on: 1, whole_rows: 32768, push_rows: 131072, gap_ms: 600, share: 40, burst_max_ms: 1000 }
+        MockIl { on: 1, whole_rows: 32768, push_rows: 131072, gap_ms: 600, share: 40, burst_max_ms: 1000, ssd_gib: 256, keep_days: 30 }
     }
 }
 
@@ -173,6 +175,12 @@ impl MockIl {
         }
         if (100..=60000).contains(&c.gap_ms) {
             self.gap_ms = c.gap_ms as u64;
+        }
+        if (1..=256).contains(&c.ssd_gib) {  // at most the file made at the start (256 GiB)
+            self.ssd_gib = c.ssd_gib as u64;
+        }
+        if (1..=3650).contains(&c.keep_days) {
+            self.keep_days = c.keep_days as u64;
         }
         if (10..=90).contains(&c.share) {
             self.share = c.share as u64;
@@ -207,7 +215,7 @@ fn stats(cfg: &MockConfig, sessions: &Sessions, il: &MockIl) -> EngineStats {
         conv_on_disk: n / 2,
         conv_sharing: (n - n / 2) / 4,
         lines: 32,
-        disk_cap_bytes: 256 << 30,
+        disk_cap_bytes: il.ssd_gib << 30,
         disk_used_bytes: (n / 2) * (100 << 20),
         spills_total: finished,
         spill_bytes_total: computed * BYTES_PER_POSITION,
@@ -225,6 +233,7 @@ fn stats(cfg: &MockConfig, sessions: &Sessions, il: &MockIl) -> EngineStats {
         il_burst_max_ms: il.burst_max_ms,
         il_reading: 0,
         il_queued: 0,
+        keep_days: il.keep_days,
     }
 }
 

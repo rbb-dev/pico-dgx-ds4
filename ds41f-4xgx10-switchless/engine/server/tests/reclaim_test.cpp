@@ -1,6 +1,6 @@
 // reclaim.h's decisions against tables of cases (host only, no GPU): which line gives way first, the loop that detaches lines
-// while a consumer is short, the live set. Built with -DPICO_OLD_RULES the cases that describe the rule fail (exit 1): the
-// live set is every slot's session.
+// while a consumer is short, the live set, the reservation at a request's end. Built with -DPICO_OLD_RULES the cases that
+// describe the rule fail (exit 1): the live set is every slot's session, a finished request keeps its reservation.
 // Exit 0 when every case passes.
 #include <cstdint>
 #include <cstdio>
@@ -70,11 +70,21 @@ int main() {
     eq(n, 0, "not short: nothing detaches");
   }
 
-  // ---- the live set: running sessions only, so an idle line's conversation is cache (eviction)
+  // ---- the live set: running sessions only, so an idle line's conversation is cache (disk file space, eviction)
   {
     check(reclaim::counts_as_live(true, false), "a running request's session is live");
     check(!reclaim::counts_as_live(false, false), "a finished request's session on its line is not live");
     check(!reclaim::counts_as_live(true, true), "a paused request's session is not live");
+  }
+
+  // ---- a finished request's reservation
+  {
+    check(reclaim::unreserve_at_finish(), "finish() zeroes the reservation of the line it keeps");
+    // two lines finished with their horizon left over; a third is held by a running request
+    std::vector<reclaim::SlotNums> s = {{300, 120}, {200, 200}, {50, 10}};
+    eq(reclaim::idle_reserves(s), 180 + 0 + 40, "the reservations over the slots: committed beyond mapped");
+    std::vector<reclaim::SlotNums> z = {{120, 120}, {200, 200}, {10, 10}};
+    eq(reclaim::idle_reserves(z), 0, "nothing reserved once the reservations are zeroed");
   }
 
   std::printf("%d cases, %d failed\n", g_n, g_bad);

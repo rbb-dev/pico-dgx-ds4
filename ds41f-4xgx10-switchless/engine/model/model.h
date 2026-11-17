@@ -193,6 +193,7 @@ class Model {
   int slot_chunks_total() const;               // chunks the pool made
   int slot_chunks_peak() const;                // most chunks mapped at once
   void slot_reserve(int s, int need);
+  void slot_unreserve(int s);  // slot s's reservation to 0: its request has finished (the line keeps what it holds)
   void slot_release(int s);
   void slot_attach(int s, int h);  // slot s's unit holds stored session h from now on (no copy: its rows are h's)
 
@@ -328,6 +329,12 @@ class Model {
   void state_free(int h);
   void state_copy_snaps(int src, int dst, int upto);  // session src's window snapshots at <= upto -> dst
   void state_drop_snap(int h, int pos);
+  // Session h's pieces in the pool that have no image on the disk tier get one (an idle conversation: its tail chunk and
+  // bookmarks; the full chunks were written at their save). Nothing without a disk tier.
+  void state_flush(int h);
+  // The disk tier's size while serving, at most the file made at the start (every rank alike; state.cu): false when
+  // nothing changed.
+  bool state_disk_resize(size_t bytes);
   // The store's disk tier: base.spill of `bytes` (the same on every rank; an earlier file is removed
   // first, and this one at exit), with `staging` bytes of pinned memory for writes in flight. A session
   // the store evicts is then spilled to it: its blocks are copied out after the work queued on the

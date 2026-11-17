@@ -1,7 +1,7 @@
-// Which memory of the pool gives way: the decisions of the server's reclaim and its live set, with no engine state (tested
-// by tests/reclaim_test.cpp). The rule: everything in the pool that no running request uses is cache and gives way, to the
-// disk tier or dropped; a request never waits on, fails on or is degraded by cache; memory is given back only when a
-// consumer asks.
+// Which memory of the pool gives way: the decisions of the server's reclaim, its live set and a finished request's
+// reservation, with no engine state (tested by tests/reclaim_test.cpp and tests/resv_test.cpp). The rule: everything in
+// the pool that no running request uses is cache and gives way, to the disk tier or dropped; a request never waits on,
+// fails on or is degraded by cache; memory is given back only when a consumer asks.
 //
 // A request is running when it is in flight and not paused between turns. A paused request (time-slicing) holds nothing a
 // step is using: its line can be detached, and it resumes through go() when its line did not survive.
@@ -18,7 +18,7 @@ namespace reclaim {
 inline bool running(bool in_flight, bool paused) { return in_flight && !paused; }
 
 // Whether a slot's session goes into Cmd::live: the store never evicts the sessions of the slots a command names live
-// (state_pin).
+// (state_pin), and drops the images of none of them to make room in the disk tier's file.
 inline bool counts_as_live(bool in_flight, bool paused) {
 #ifdef PICO_OLD_RULES
   (void)in_flight, (void)paused;
@@ -26,6 +26,27 @@ inline bool counts_as_live(bool in_flight, bool paused) {
 #else
   return running(in_flight, paused);
 #endif
+}
+
+// Whether finish() zeroes a kept session's reservation on its line. The reservation is a reservation for a running request;
+// a finished one has none, and a leftover one (up to --grow-ahead positions) is counted as reserved by every sum that
+// refuses a consumer (Model::slot_uncommitted, take_extra, the dashboard's reserved).
+inline bool unreserve_at_finish() {
+#ifdef PICO_OLD_RULES
+  return false;  // without the rule: finish() issues kStSave only, and the reservation stays until the line is released
+#else
+  return true;
+#endif
+}
+
+// The numbers the lines are reserved but do not hold, summed over the slots. Zero whenever no request is in flight.
+struct SlotNums {
+  int64_t committed = 0, mapped = 0;
+};
+inline int64_t idle_reserves(const std::vector<SlotNums>& slots) {
+  int64_t n = 0;
+  for (const SlotNums& s : slots) n += s.committed > s.mapped ? s.committed - s.mapped : 0;
+  return n;
 }
 
 // A line whose conversation a consumer may take (idle: no running request uses it, and it is not the consumer's own

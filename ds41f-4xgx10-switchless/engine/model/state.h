@@ -1,28 +1,7 @@
-// Sessions' saved state (state.cu): what a session needs to continue from a position without recomputing what it
-// already holds. Its compressed caches are its own chunk lists in the chunk pool (attn.h Compressed, model.cu "the
-// chunk pool"): a line (a slot's unit) that holds the session points its rows at them, so taking a session into a
-// line or out of one copies no cache. The window rings and the compressor carries are per position mod 256 / 16, so
-// they are snapshotted into bookmarks: a window bookmark (the 128 positions before a restart point) and an end
-// bookmark (whole rings and carries), each in whole chunk numbers of the pool, used as raw bytes in their 2 MiB KV
-// slices (2 and 3 numbers). The draft module's windows (DSpark, spec.cu) go with them.
-//
-// Every rank runs the same operations in the same order and takes the same chunk numbers (lowest free first), so
-// every rank holds the same numbers for the same sessions. When the pool has too few free numbers, the least
-// recently used session that no line holds and the current command does not use is evicted (the same one on every
-// rank): spilled to the disk tier, or freed without one. A bookmark that still finds no room is not taken. Nothing
-// in the store fails a request: admission (serve.cpp) counts the numbers a request needs first.
-//
-// With a disk tier (Model::state_disk, spill.h) an evicted session is spilled: its compressed caches go out as pages
-// of kPagePos positions (gathered from its chunks), its bookmarks as blocks, into a file of the same size on every
-// rank at the same offsets. When the file is full, its least recently used sessions are dropped. A spilled session
-// comes back (state_unspill, or any operation that needs it) as far as the pool has room, latest restart point first:
-// the end bookmark with the pages it needs, else the latest window bookmark whose pages fit, then the earlier ones
-// those pages serve; never a block no restart can use. A session is spilled as what it can restart from
-// (StateInfo::restart).
-//
-// Kept sessions (state.cu): a planned stop keeps the file and writes an index of the sessions in it beside it; the
-// next start that finds both as this run would have left them (the same run id, not too old, on every rank alike)
-// opens the file as it is, and its sessions sit in the disk tier as spilled ones until a request reads them back.
+// Sessions' saved state (state.cu): what a session needs to continue from a position without recomputing. Its
+// compressed caches are its own chunk lists in the chunk pool; a line holding it points its rows at them, so no cache is
+// copied. Window rings and compressor carries are snapshotted into bookmarks (window bookmark: the 128 positions before a
+// restart point, 2 numbers; end bookmark: whole rings and carries, 3). Details: docs/engine.md "The chunk pool", "Kept sessions".
 #pragma once
 #include <cstdint>
 #include <functional>
@@ -37,9 +16,6 @@
 
 namespace model::detail {
 
-constexpr int kPagePos = 4096;  // positions per page of compressed caches
-constexpr size_t kEntryBytes = 256 + 32 + 64 + 4;  // KV entry + scales, index key + scales
-constexpr size_t kPageBytes = (size_t)(kPagePos / 2 * 3 + kPagePos) * kEntryBytes;  // sources 2, 8, 14 (ratio 2), 20
 constexpr size_t kRingBytes = (size_t)attn::kRing * (kHead + kHead / 32);
 constexpr size_t kCarryBytes = (size_t)16 * kHead * 4 * 2;
 constexpr size_t kEndBytes = kLayers * kRingBytes + kKvSlots * kCarryBytes;
@@ -70,41 +46,45 @@ using Nums = std::vector<uint32_t>;  // chunk numbers (model/chunks.h)
 
 struct Store {
   struct Sess {
-    Nums lists[kKvSlots];   // compressed caches: kv source k's chunk numbers (attn.h Compressed), its own
+    Nums lists[kKvSlots];   // compressed caches: kv source k's chunk numbers (attn.h Compressed); 0: that entry is only on
+                            // the disk tier (dl), read back before use
+    std::vector<size_t> dl[kKvSlots];  // each entry's image in the disk tier's file (Pool::kNone: none), beside lists
     int saved = 0;          // positions [0, saved) are in them
-    std::map<int, Nums> snaps;  // window bookmarks by position: their chunk numbers (the draft module's windows after)
-    Nums end;               // every layer's ring and the carries (and the draft module's windows); empty: none
-    int end_pos = -1;       // at this position
+    std::map<int, Nums> snaps;  // window bookmarks by position: their chunk numbers (empty: only on the disk tier)
+    Nums end;               // every layer's ring and the carries (and the draft module's windows); empty: none in the pool
+    int end_pos = -1;       // its position (-1: no end bookmark, in the pool or on the disk tier)
     int line = -1;          // the unit whose rows are its lists (-1: in no line)
     uint64_t used = 0;      // the clock when an operation last used the session
-    // spilled: its caches as pages and its bookmarks as blocks at offsets in the disk tier's file, nothing in the pool
-    bool disk = false;
-    std::vector<size_t> dpages;
-    std::map<int, size_t> dsnaps;
-    size_t dend = Pool::kNone;
-    uint64_t dseq = 0;  // its last write (reading it back waits for that)
-    bool kept = false;  // as an earlier run kept it, not read back since: a block that differs is fatal
-    size_t numbers() const {  // chunk numbers it names (a shared one counts in every session naming it)
+    std::map<int, size_t> dsnaps;  // window bookmarks' images in the file (a bookmark with a copy)
+    size_t dend = Pool::kNone;     // the end bookmark's image
+    bool kept = false;  // as an earlier run kept it, not read back since: a piece that differs is fatal
+    bool out() const;   // a piece is only on the disk tier: read back before the session is used (state.cu)
+    size_t numbers() const {  // chunk numbers it names in the pool (a shared one counts in every session naming it)
       size_t n = end.size();
-      for (const Nums& l : lists) n += l.size();
+      for (const Nums& l : lists)
+        for (const uint32_t c : l) n += c != 0;
       for (const auto& sn : snaps) n += sn.second.size();
       return n;
     }
   };
-  // A session in a kept file's index: its blocks' offsets and their checksums as they went out.
+  // A session in a kept file's index: its pieces' images and their checksums as they went out.
   struct Kept {
     int h = 0, saved = 0, end_pos = -1;
     uint64_t used = 0;
-    std::vector<std::pair<size_t, uint64_t>> pages;
+    std::vector<std::pair<size_t, uint64_t>> ents[kKvSlots];
     std::map<int, std::pair<size_t, uint64_t>> snaps;
     size_t dend = Pool::kNone;
     uint64_t dend_sum = 0;
   };
   std::map<int, Sess> sess;
-  uint8_t* gather = nullptr;        // device: one page or bookmark at a time, between the chunks and the disk tier
+  uint8_t* gather = nullptr;        // device: one image at a time, between the pool and the disk tier
   std::unique_ptr<SpillFile> disk;  // the disk tier (none: evicted sessions are freed)
   Pool dpool;                       // its file's offsets
-  size_t dbytes = 0;                // the file's bytes in spilled sessions' blocks
+  size_t dbytes = 0;                // the file's bytes in images
+  uint64_t wseq = 0;                // the last write queued (a read-back waits for it)
+  std::vector<size_t> ndisk;        // [number]: the image of its present content (Pool::kNone: none); shared holders share it
+  std::map<size_t, uint32_t> dnum;  // image -> the number holding its content, while one does
+  std::map<size_t, uint32_t> drefs; // image -> the entries and bookmarks naming it
   std::string base;                 // the file is base.spill, its index base.index
   uint64_t run_id = 0;              // what the kept sessions' state depends on (main.cpp run_id)
   std::vector<Kept> kept;           // a kept index as state_kept_check read it, for state_disk

@@ -498,7 +498,8 @@ pub fn settings_json(s: Option<&EngineStats>) -> Value {
     match s {
         Some(s) if s.il_share > 0 => json!({"on": s.il_on == 1, "whole_rows": s.il_whole_rows, "push_rows": s.il_push_rows,
                                             "gap_ms": s.il_gap_ms, "share": s.il_share, "burst_max_ms": s.il_burst_max_ms,
-                                            "reading": s.il_reading, "queued": s.il_queued}),
+                                            "reading": s.il_reading, "queued": s.il_queued,
+                                            "ssd_gib": s.disk_cap_bytes >> 30, "keep_days": s.keep_days}),
         _ => Value::Null,
     }
 }
@@ -520,7 +521,9 @@ pub fn parse_settings(v: &Value, max_ctx: i64) -> Result<ConfigFrame, String> {
             "burst_max_ms" => c.burst_max_ms = int(50, 60000)?,
             "whole_rows" => c.whole_rows = int(8192, max_ctx)?,
             "push_rows" => c.push_rows = int(0, max_ctx)?,
-            _ => return Err(format!("{k}: not a setting (on, share, gap_ms, burst_max_ms, whole_rows, push_rows)")),
+            "ssd_gib" => c.ssd_gib = int(1, 131071)?,
+            "keep_days" => c.keep_days = int(1, 3650)?,
+            _ => return Err(format!("{k}: not a setting (on, share, gap_ms, burst_max_ms, whole_rows, push_rows, ssd_gib, keep_days)")),
         }
     }
     if c == ConfigFrame::default() {
@@ -792,7 +795,10 @@ mod settings_tests {
         assert_eq!((c.share, c.gap_ms, c.on, c.whole_rows), (40, 600, -1, -1), "only the given fields change");
         assert_eq!(parse_settings(&json!({"on": false}), 1 << 20).unwrap().on, 0);
         assert_eq!(parse_settings(&json!({"push_rows": 131072, "whole_rows": 32768}), 1 << 20).unwrap().push_rows, 131072);
-        for bad in [json!({"share": 95}), json!({"share": 5}), json!({"gap_ms": 50}), json!({"whole_rows": 4096}),
+        let c = parse_settings(&json!({"ssd_gib": 128, "keep_days": 14}), 1 << 20).unwrap();
+        assert_eq!((c.ssd_gib, c.keep_days, c.share), (128, 14, -1), "the SSD tier's size and expiry");
+        for bad in [json!({"ssd_gib": 0}), json!({"keep_days": 0}), json!({"keep_days": 4000}), json!({"ssd_gib": "big"}),
+                    json!({"share": 95}), json!({"share": 5}), json!({"gap_ms": 50}), json!({"whole_rows": 4096}),
                     json!({"whole_rows": 2_000_000}), json!({"share": "40"}), json!({"on": 1}), json!({"speed": 1}),
                     json!({}), json!([1])] {
             assert!(parse_settings(&bad, 1 << 20).is_err(), "{bad} must be refused");
@@ -803,9 +809,11 @@ mod settings_tests {
     fn settings_json_reads_the_stats() {
         assert_eq!(settings_json(None), Value::Null);
         assert_eq!(settings_json(Some(&EngineStats::default())), Value::Null, "an engine without interleave");
-        let s = EngineStats { il_on: 1, il_share: 40, il_gap_ms: 600, il_reading: 1, il_queued: 2, ..Default::default() };
+        let s = EngineStats { il_on: 1, il_share: 40, il_gap_ms: 600, il_reading: 1, il_queued: 2, disk_cap_bytes: 128 << 30,
+                              keep_days: 30, ..Default::default() };
         let v = settings_json(Some(&s));
         assert_eq!((v["on"].as_bool(), v["share"].as_u64(), v["queued"].as_u64()), (Some(true), Some(40), Some(2)));
+        assert_eq!((v["ssd_gib"].as_u64(), v["keep_days"].as_u64()), (Some(128), Some(30)));
     }
 }
 

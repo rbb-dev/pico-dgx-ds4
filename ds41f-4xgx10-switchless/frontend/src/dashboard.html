@@ -774,6 +774,8 @@ function settingsBox() {
     ['gap_ms', 'MAX PAUSE FOR OTHERS', 'The longest a decoding user waits between tokens while a long prompt is read; it sets the piece size (shorter: smaller pieces, the prompt a little slower).', [300, 450, 600, 800, 1000, 1500].map((v) => [v, v + ' ms'])],
     ['push_rows', 'READ 2 AT ONCE UP TO', 'A long prompt with at most this many tokens to compute reads beside one already being read, instead of waiting behind it.', [32768, 65536, 131072, 262144, 524288].map((v) => [v, (v / 1024) + 'K tokens'])],
     ['whole_rows', 'NO SPLIT UP TO', 'A prompt with at most this many tokens to compute (after what is cached) is read whole: the decoding users wait for it.', [8192, 16384, 32768, 65536, 131072].map((v) => [v, (v / 1024) + 'K tokens'])],
+    ['ssd_gib', 'SSD CACHE SIZE', 'How much of each Spark\'s SSD the conversations kept on disk may use: at most the file made when the engine started (a larger one takes a restart). Smaller drops the least recently used conversations\' copies to fit.', [16, 32, 64, 128, 256].map((v) => [v, v + ' GiB'])],
+    ['keep_days', 'FORGET UNUSED AFTER', 'A conversation unused this long is dropped (from memory and the SSD).', [1, 3, 7, 14, 30, 60, 90].map((v) => [v, v + (v === 1 ? ' day' : ' days')])],
   ];
   const note = h('span', { class: 'note' });
   const copyLine = h('span', { class: 'note', hidden: true });
@@ -790,7 +792,7 @@ function settingsBox() {
     sels[key] = sel;
     return h('label', { class: 'field', title: tip }, h('span', { class: 'k', text: label }), sel);
   }), note, copyLine);
-  const b = box('reading', 'PROMPT READING', 'How the engine reads long prompts while others decode (interleaved prefill). Changes apply at once and last until the engine restarts; its start flags set them again.', grid);
+  const b = box('reading', 'LONG PROMPTS AND SSD', 'How the engine reads long prompts while others decode (interleaved prefill), and how much SSD its kept conversations may use and for how long. Changes apply at once and last until the engine restarts; its start flags set them again.', grid);
   function update(st) {
     const il = st && st.interleave;
     for (const [key, sel] of Object.entries(sels)) {

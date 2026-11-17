@@ -135,7 +135,7 @@ pub struct Done {
 
 /// The fields of a STATS frame, in wire order (docs/protocol.md, "The dashboard's frames"); a frame of another version is refused.
 pub const STATS_VERSION: u32 = 2;
-pub const STATS_FIELDS: usize = 30;
+pub const STATS_FIELDS: usize = 31;
 
 /// The engine's own counters for the dashboard: the chunk pool and its conversations (rank 0's; every rank's are the same),
 /// the disk tier, interleaved prefill. Counters count from the engine's start.
@@ -184,6 +184,8 @@ pub struct EngineStats {
     pub il_burst_max_ms: u64,
     pub il_reading: u64,
     pub il_queued: u64,
+    /// a conversation unused this many days is dropped (CONFIG keep_days)
+    pub keep_days: u64,
 }
 
 impl EngineStats {
@@ -219,6 +221,7 @@ impl EngineStats {
             self.il_burst_max_ms,
             self.il_reading,
             self.il_queued,
+            self.keep_days,
             self.copy_adapt,
             self.copy_proposals_total,
             self.copy_scored_total,
@@ -267,14 +270,15 @@ impl EngineStats {
             il_burst_max_ms: f(27),
             il_reading: f(28),
             il_queued: f(29),
+            keep_days: f(30),
         }
     }
 }
 
 /// Interleaved prefill's settings for rank 0 (docs/protocol.md, CONFIG): a field < 0 keeps the engine's value; the engine
 /// takes each one in its flag's range and ignores the others; its next STATS shows what it runs.
-pub const CONFIG_VERSION: u32 = 1;
-pub const CONFIG_FIELDS: u32 = 6;
+pub const CONFIG_VERSION: u32 = 2;
+pub const CONFIG_FIELDS: u32 = 8;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConfigFrame {
     pub on: i64,
@@ -283,17 +287,21 @@ pub struct ConfigFrame {
     pub gap_ms: i64,
     pub share: i64,
     pub burst_max_ms: i64,
+    /// the disk tier's size in GiB (at most the file the engine made at its start; smaller evicts to fit)
+    pub ssd_gib: i64,
+    /// a conversation unused this many days is dropped
+    pub keep_days: i64,
 }
 
 impl Default for ConfigFrame {
     fn default() -> Self {
-        ConfigFrame { on: -1, whole_rows: -1, push_rows: -1, gap_ms: -1, share: -1, burst_max_ms: -1 }
+        ConfigFrame { on: -1, whole_rows: -1, push_rows: -1, gap_ms: -1, share: -1, burst_max_ms: -1, ssd_gib: -1, keep_days: -1 }
     }
 }
 
 impl ConfigFrame {
     fn fields(&self) -> [i64; CONFIG_FIELDS as usize] {
-        [self.on, self.whole_rows, self.push_rows, self.gap_ms, self.share, self.burst_max_ms]
+        [self.on, self.whole_rows, self.push_rows, self.gap_ms, self.share, self.burst_max_ms, self.ssd_gib, self.keep_days]
     }
 }
 
@@ -567,7 +575,7 @@ impl Frame {
                 }
                 let v = (0..n).map(|_| r.u64().map(|x| x as i64)).collect::<Result<Vec<_>, _>>()?;
                 let f = |i: usize| v.get(i).copied().unwrap_or(-1);
-                Frame::Config(ConfigFrame { on: f(0), whole_rows: f(1), push_rows: f(2), gap_ms: f(3), share: f(4), burst_max_ms: f(5) })
+                Frame::Config(ConfigFrame { on: f(0), whole_rows: f(1), push_rows: f(2), gap_ms: f(3), share: f(4), burst_max_ms: f(5), ssd_gib: f(6), keep_days: f(7) })
             }
             T_STATS => {
                 let version = r.u32()?;
@@ -764,14 +772,15 @@ mod tests {
         assert_eq!(Frame::decode(T_STATS_REQ, &b[8..], |_| 0).unwrap(), Frame::StatsReq);
         let st = EngineStats { pool_numbers: 8913, conv_on_disk: 3, restore_wait_max_ns: 7, conv_sharing: 2, lines: 32, ..Default::default() };
         let b = Frame::Stats(st).encode();
-        assert_eq!(b.len(), 8 + 8 + 8 * 30);
+        assert_eq!(b.len(), 8 + 8 + 8 * 31);
         assert_eq!(u32::from_le_bytes(b[8..12].try_into().unwrap()), 2, "version 2");
-        assert_eq!(u32::from_le_bytes(b[12..16].try_into().unwrap()), 30, "n_fields after the version");
+        assert_eq!(u32::from_le_bytes(b[12..16].try_into().unwrap()), 31, "n_fields after the version");
         assert_eq!(u64::from_le_bytes(b[16..24].try_into().unwrap()), 8913, "pool_numbers is the first field");
         assert_eq!(u64::from_le_bytes(b[16 + 8 * 11..16 + 8 * 12].try_into().unwrap()), 32, "lines is the 12th");
-        let il = EngineStats { il_share: 40, il_queued: 2, ..Default::default() };
+        let il = EngineStats { il_share: 40, il_queued: 2, keep_days: 30, ..Default::default() };
         let bi = Frame::Stats(il).encode();
-        assert_eq!(u64::from_le_bytes(bi[bi.len() - 8..].try_into().unwrap()), 2, "il_queued is the last");
+        assert_eq!(u64::from_le_bytes(bi[bi.len() - 8..].try_into().unwrap()), 30, "keep_days is the last");
+        assert_eq!(u64::from_le_bytes(bi[bi.len() - 16..bi.len() - 8].try_into().unwrap()), 2, "il_queued before it");
         assert_eq!(u64::from_le_bytes(bi[16 + 8 * 26..16 + 8 * 27].try_into().unwrap()), 40, "il_share is the 27th");
         assert_eq!(Frame::decode(T_STATS, &bi[8..], |_| 0).unwrap(), Frame::Stats(il));
         assert_eq!(Frame::decode(T_STATS, &b[8..], |_| 0).unwrap(), Frame::Stats(st));
@@ -783,7 +792,7 @@ mod tests {
         assert_eq!((got.pool_numbers, got.conv_on_disk, got.lines), (8913, 0, 0));
         let mut long = Frame::Stats(st).encode();
         long.extend(5u64.to_le_bytes());
-        long[12..16].copy_from_slice(&31u32.to_le_bytes());
+        long[12..16].copy_from_slice(&32u32.to_le_bytes());
         assert_eq!(Frame::decode(T_STATS, &long[8..], |_| 0).unwrap(), Frame::Stats(st));
         long[8..12].copy_from_slice(&1u32.to_le_bytes());
         assert!(Frame::decode(T_STATS, &long[8..], |_| 0).is_err(), "another version");
@@ -797,11 +806,14 @@ mod tests {
         assert_eq!(&b[8 + 32..], b"pico");
         assert_eq!(Frame::decode(T_HELLO_ENGINE, &b[8..], |_| 0).unwrap(), Frame::HelloEngine(he));
         // CONFIG: version, n, then i64 fields; a field not sent is -1 (kept)
-        let c = ConfigFrame { share: 40, gap_ms: 600, ..Default::default() };
+        let c = ConfigFrame { share: 40, gap_ms: 600, ssd_gib: 128, keep_days: 14, ..Default::default() };
         let b = Frame::Config(c).encode();
-        assert_eq!((b.len(), u16::from_le_bytes(b[4..6].try_into().unwrap())), (8 + 8 + 8 * 6, 0x06));
+        assert_eq!((b.len(), u16::from_le_bytes(b[4..6].try_into().unwrap())), (8 + 8 + 8 * 8, 0x06));
+        assert_eq!(u32::from_le_bytes(b[8..12].try_into().unwrap()), 2, "CONFIG version 2");
         assert_eq!(i64::from_le_bytes(b[16..24].try_into().unwrap()), -1, "on: kept");
         assert_eq!(i64::from_le_bytes(b[16 + 8 * 4..16 + 8 * 5].try_into().unwrap()), 40, "share is the 5th");
+        assert_eq!(i64::from_le_bytes(b[16 + 8 * 6..16 + 8 * 7].try_into().unwrap()), 128, "ssd_gib is the 7th");
+        assert_eq!(i64::from_le_bytes(b[16 + 8 * 7..16 + 8 * 8].try_into().unwrap()), 14, "keep_days is the 8th");
         assert_eq!(Frame::decode(T_CONFIG, &b[8..], |_| 0).unwrap(), Frame::Config(c));
         let mut short = Frame::Config(c).encode();
         short.truncate(8 + 8 + 8 * 2);
