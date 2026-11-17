@@ -128,6 +128,7 @@ struct AttnLayer {
       poolkey;
   Dev<float> sink, fn[2], hsc[2], hbase[2], carry_kv, carry_sc;
   Dev<int> cand, pcand, top, pool;
+  ChunkLists lists;  // the slots' identity rows (each slot's cache cap entries, whole chunks)
   attn::CompressorWeights cw() const { return {ratio, wkv.p, wgate.p, cnorm.p, wk.p, knorm.p}; }
   // the state holds g_nslots slots, each a 1/g_nslots of every buffer
   attn::CompressorCarry carry() const {
@@ -137,15 +138,17 @@ struct AttnLayer {
   }
   attn::Compressed ckv() const {
     attn::Compressed c{ckv_kv.p, ckv_sc.p, cap};
-    if (g_slot) c.slot = g_slot, c.kv_stride = ckv_kv.n / g_nslots, c.sc_stride = ckv_sc.n / g_nslots;
+    c.list = lists.d.p, c.list_stride = lists.len;
+    if (g_slot) c.slot = g_slot;
     return c;
   }
   attn::IndexKeys ik_one(int slot = 0) const {  // index_score: one session (slot), no table
-    return {ik_k.p + slot * (ik_k.n / g_nslots), ik_sc.p + slot * (ik_sc.n / g_nslots), cap};
+    return listed(attn::IndexKeys{ik_k.p + slot * (ik_k.n / g_nslots), ik_sc.p + slot * (ik_sc.n / g_nslots), cap}, cap);
   }
   attn::IndexKeys ik() const {
     attn::IndexKeys k{ik_k.p, ik_sc.p, cap};
-    if (g_slot) k.slot = g_slot, k.k_stride = ik_k.n / g_nslots, k.sc_stride = ik_sc.n / g_nslots;
+    k.list = lists.d.p, k.list_stride = lists.len;
+    if (g_slot) k.slot = g_slot;
     return k;
   }
   attn::Window win() const {
@@ -314,7 +317,8 @@ struct Bench {
         fill::f32(l.hbase[h], 1.f);
       }
       if (kv_src(L)) {  // this rank's 128 output rows of the compressor projections
-        l.cap = ctx_max / l.ratio + 64;
+        l.cap = whole_chunks(ctx_max / l.ratio + 64) * attn::kChunkEntries;  // whole chunks: identity rows
+        l.lists = ChunkLists(g_nslots, l.cap / attn::kChunkEntries);
         l.wkv = Dev<uint16_t>((size_t)128 * kDim);
         fill::bf16(l.wkv, 0.02f);
         if (l.ratio > 1) {

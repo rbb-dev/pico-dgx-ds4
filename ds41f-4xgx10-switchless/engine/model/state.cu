@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <unordered_map>
 #include <iterator>
 #include <set>
 
@@ -365,218 +366,347 @@ void Model::Impl::state_keep(uint64_t gen) {
 
 void Model::Impl::state_reserve(size_t bytes) {
   Store& s = store_of();
-  if (s.pool.base) die("state: the store's pool is reserved once");
-  bytes = bytes / kPoolGrain * kPoolGrain;
-  if (!bytes) return;
-  if (slot_pool) {
-    // The store on the slot pool (below): its chunks are made now, once, with the slots', and its pool is a range
-    // of address space over all of them. Every rank is told the same size (main.cpp), so every rank makes the same
-    // number of chunks; one that cannot stops the process, as the plain allocation's CUDA_CHECK did.
-    const size_t want = std::max<size_t>(1, bytes / vmm::kChunk);
-    const auto t0 = std::chrono::steady_clock::now();
-    const size_t made = slot_pool->add_chunks(want);
-    if (made != want || !slot_pool->ok())
-      die("state: the store's %zu chunks: %s (%zu made): lower --session-gib", want, slot_pool->error().c_str(), made);
-    const int r = slot_pool->add_region(slot_pool->total());
-    if (r < 0) die("state: the store's address space: %s", slot_pool->error().c_str());
-    const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    s.region = r;
-    s.share = want * vmm::kChunk;
-    s.pool.base = reinterpret_cast<uint8_t*>(slot_pool->region_base(r));
-    s.pool.size = slot_pool->region_chunks(r) * vmm::kChunk;
-    s.pool.free.emplace(0, s.pool.size);
-    if (rank == 0)
-      std::printf("state: the store shares the slot memory: %zu more chunks (%.2f GiB) made once in %.2f s, %zu chunks (%.2f GiB) "
-                  "in all; a block's chunks are mapped when it is taken and given back to the slots when they need them\n",
-                  made, (double)s.share / 1073741824.0, dt, slot_pool->total(), (double)s.pool.size / 1073741824.0);
-    return;
+  if (s.gather) die("state: the store is reserved once");
+  if (!calloc) die("state: the store needs the chunk pool");
+  // a page or a bookmark at a time between the chunks and the disk tier (the draft module's windows counted in)
+  s.gather = dalloc<uint8_t>(Pool::round(std::max({kPageBytes, end_bytes(true), snap_bytes(true)})));
+  const size_t more = bytes / chunk_image();
+  if (!more) return;
+  const double t0 = wall_s();
+  pool_grow(more);
+  store_numbers = more;
+  if (rank == 0)
+    std::printf("state: the store's %zu chunk numbers (%.2f GiB) join the pool, made and mapped in %.2f s: %u numbers (%.2f GiB) "
+                "for the lines and the sessions kept between requests together\n",
+                more, more * (double)chunk_image() / 1073741824.0, wall_s() - t0, calloc->total(),
+                calloc->total() * (double)chunk_image() / 1073741824.0);
+}
+
+size_t Model::Impl::chunk_image() const {
+  return (size_t)attn::kChunkEntries * (kKvEntryBytes[0] + kKvEntryBytes[1] + kKvEntryBytes[2] + kKvEntryBytes[3]);
+}
+
+namespace {
+constexpr size_t kBk = (size_t)attn::kChunkEntries * 256;  // a bookmark number's bytes: its KV slice, 2 MiB
+size_t bk_nums(size_t bytes) { return (bytes + kBk - 1) / kBk; }
+bool in(const std::vector<int>& v, int k) { return std::find(v.begin(), v.end(), k) != v.end(); }
+// session h (made if new) for an operation that needs its blocks: back from the disk tier first
+Store::Sess& use_blocks(Model::Impl& m, int h) {
+  Store& s = m.store_of();
+  const auto it = s.sess.find(h);
+  if (it != s.sess.end() && it->second.disk) m.state_unspill(h);
+  return s.use(h);
+}
+// numbers kv source k's list needs for positions [0, pos): its entries and the step's reach past them (model.cu)
+int nums_for_pos(int k, int pos) {
+  if (pos <= 0) return 0;
+  const int ratio = k < 3 ? 2 : 1, entries = (pos - 1) / ratio + 1 + 64;
+  return (entries + attn::kChunkEntries - 1) / attn::kChunkEntries;
+}
+}  // namespace
+
+uint8_t* Model::Impl::bk_at(const Nums& n, size_t off) const {
+  return pool_arr[0] + ((size_t)n[off / kBk] << attn::kChunkShift) * kKvEntryBytes[0] + off % kBk;
+}
+
+void Model::Impl::bk_copy(const Nums& n, size_t off, uint8_t* dev, size_t bytes, bool to_bk) {
+  while (bytes) {
+    const size_t m = std::min(bytes, kBk - off % kBk);
+    uint8_t* b = bk_at(n, off);
+    CUDA_CHECK(cudaMemcpyAsync(to_bk ? b : dev, to_bk ? dev : b, m, cudaMemcpyDeviceToDevice, st));
+    off += m, dev += m, bytes -= m;
   }
-  void* p = nullptr;
-  CUDA_CHECK(cudaMalloc(&p, bytes));
-  s.pool.base = static_cast<uint8_t*>(p);
-  s.pool.size = bytes;
-  s.pool.free.emplace(0, bytes);
-  s.share = bytes;
 }
 
-// ---- the store on the slot pool ---------------------------------------------------------------------
-//
-// With Options::vmm the store has no memory of its own. Its pool (Store::pool, the byte allocator) is a range of
-// address space over every chunk the slot pool made (a vmm region: model/vmm.h), and a block's chunks are mapped
-// when the block is taken (store_take) and counted on every chunk the block overlaps; a chunk no block is left on
-// stays mapped, idle, until store_trim. The store's chunks and the slots' commitments never exceed the pool
-// together (vmm::Pool::uncommitted), so a request inside its commitment still never finds the free list empty,
-// and the store maps only what no slot has committed.
-//
-// Why an idle chunk is not unmapped at once. A block is freed on the host while copies that read it are still
-// queued on the model's stream (a spill's copy to staging is queued, then the block is released; whatever reads
-// or writes a block later is queued after what used it before). Unmapping then would fault those copies. Every
-// device access to a block is queued on that one stream (state.cu copies, the disk tier's staging and read-back
-// copies, the checksum kernels), so a trim waits for it (cudaStreamSynchronize) and then unmaps: slot_release has
-// waited already and trims for free; store_take trims when a block finds no chunk, and store_give_back when a
-// slot's reservation or a map finds the pool short. Reusing an idle chunk needs no wait: the block is queued
-// after what used it.
-//
-// Every rank runs the same operations in the same order, so every rank maps, trims and gives back the same chunks
-// at the same points: the decisions read only the allocator, the reference counts and the slots' commitments, never
-// timing or free memory (the waits change when a call returns, not what it does).
+bool Model::Impl::take_nums(int h, size_t n, Nums* out) {
+  while (calloc->free() < n)
+    if (!store_evict_step(h)) return false;
+  const size_t i0 = out->size();
+  calloc->take((uint32_t)n, out);
+  if (refs.size() < calloc->numbers()) refs.resize(calloc->numbers(), 0);
+  for (size_t i = i0; i < out->size(); ++i) refs[(*out)[i]] = 1;
+  if (pool_poison)  // a taken number holds 0xFF until written: a read of what was not written shows
+    for (size_t i = i0; i < out->size(); ++i)
+      for (int a = 0; a < 4; ++a)
+        CUDA_CHECK(cudaMemsetAsync(pool_arr[a] + ((size_t)(*out)[i] << attn::kChunkShift) * kKvEntryBytes[a], 0xFF,
+                                   (size_t)attn::kChunkEntries * kKvEntryBytes[a], st));
+  held_peak = std::max(held_peak, (size_t)calloc->held());
+  return true;
+}
 
-bool Model::Impl::store_shared() const { return store_s && store_s->region >= 0; }
-
-uint8_t* Model::Impl::store_take(size_t bytes) {
-  Store& s = store_of();
-  if (s.region < 0) return s.pool.take(bytes);
-  const size_t n = Pool::round(bytes);
-  for (int pass = 0; pass < 2; ++pass) {
-    // first fit from the bottom, where the block's chunks are mapped already or can be mapped from what no slot has
-    const size_t off = s.pool.take_fit(bytes, [&](size_t o, size_t len) {
-      return slot_pool->region_need(s.region, o, len) <= slot_pool->uncommitted();
-    });
-    if (off != Pool::kNone) {
-      if (!slot_pool->region_acquire(s.region, off, n))
-        die("state: the store's block at %zu (%zu bytes): %s", off, n, slot_pool->error().c_str());
-      return s.pool.base + off;
-    }
-    if (pass == 0 && slot_pool->region_idle(s.region)) store_trim();  // idle chunks are chunks the block may need
-    else break;
+void Model::Impl::give_nums(Nums& v) {
+  for (const uint32_t c : v) {
+    if (c >= refs.size() || !refs[c]) die("state: number %u given back with no list naming it", c);
+    if (--refs[c]) continue;  // another list or bookmark still names it
+    if (pool_poison)  // a number given back holds 0xFD until taken again: a read through a stale list shows
+      for (int a = 0; a < 4; ++a)
+        CUDA_CHECK(cudaMemsetAsync(pool_arr[a] + ((size_t)c << attn::kChunkShift) * kKvEntryBytes[a], 0xFD,
+                                   (size_t)attn::kChunkEntries * kKvEntryBytes[a], st));
+    calloc->give(c);
   }
-  return nullptr;
+  v.clear();
 }
 
-// The idle chunks back to the slots' free list, once every copy queued so far has finished.
-size_t Model::Impl::store_trim() {
-  Store& s = store_of();
-  if (s.region < 0 || !slot_pool->region_idle(s.region)) return 0;
-  CUDA_CHECK(cudaStreamSynchronize(st));  // the copies that read the blocks that were freed
-  const size_t n = slot_pool->region_trim(s.region);
-  ++s.trims, s.trimmed_chunks += n;
-  return n;
+void Model::Impl::share_nums(const Nums& from, size_t n, Nums* out) {
+  if (n > from.size()) die("state: %zu numbers shared from a list of %zu", n, from.size());
+  for (size_t i = 0; i < n; ++i) {
+    const uint32_t c = from[i];
+    if (c >= refs.size() || !refs[c]) die("state: number %u shared with no list naming it", c);
+    ++refs[c];
+    out->push_back(c);
+  }
 }
 
-// One step of making room for a block of session h: first the compressed-cache pages of the least recently used
-// session live in a slot (and not used by the current command), because the slot holds what they hold (the
-// session's persist saves them again from position 0 when its slot is let go); then the least recently used session
-// that the current command does not use and no slot holds is evicted (every rank does the same): spilled to the
-// disk tier, or freed without one. False when none is left.
+// One step of making room for session h: the least recently used session that the current command does not use and
+// no line holds is evicted (every rank does the same): spilled to the disk tier, or freed without one. False when
+// none is left.
 bool Model::Impl::store_evict_step(int h) {
   Store& s = store_of();
-  const auto in = [](const std::vector<int>& v, int k) { return std::find(v.begin(), v.end(), k) != v.end(); };
-  int redundant = -1;
-  uint64_t oldest_live = UINT64_MAX;
-  for (const auto& [k, ss] : s.sess)
-    if (k != h && !ss.disk && !ss.pages.empty() && ss.used < oldest_live && in(s.live, k) && !in(s.pinned, k))
-      redundant = k, oldest_live = ss.used;
-  if (redundant >= 0) {
-    Store::Sess& ls = s.sess.at(redundant);
-    if (rank == 0)
-      std::printf("state: session %d is live in a slot: its %zu stored pages (%.1f MiB) released to make room\n",
-                  redundant, ls.pages.size(), ls.pages.size() * Pool::round(kPageBytes) / 1048576.0);
-    for (uint8_t* p : ls.pages) store_release(p, kPageBytes);
-    ls.pages.clear();
-    ls.saved = 0;
-    return true;
-  }
   int victim = -1;
   uint64_t oldest = UINT64_MAX;
   for (const auto& [k, ss] : s.sess)
-    if (k != h && !ss.disk && ss.used < oldest && !in(s.pinned, k) && !in(s.live, k)) victim = k, oldest = ss.used;
+    if (k != h && k > 0 && !ss.disk && ss.line < 0 && ss.numbers() && ss.used < oldest && !in(s.pinned, k) && !in(s.live, k))
+      victim = k, oldest = ss.used;
   if (victim < 0) return false;
   state_spill(victim);
   return true;
 }
 
-// A slot's reservation (slot_reserve) or a map (ensure_mapped) found the pool short because the store holds chunks:
-// idle chunks go back first, then sessions are made room of one step at a time, until fits() (which tries what
-// was short) or nothing is left to give. The sessions the current command uses and those live in a slot stay.
-bool Model::Impl::store_give_back(const std::function<bool()>& fits) {
-  if (!store_shared()) return fits();
-  Store& s = store_of();
-  const size_t m0 = slot_pool->region_mapped(s.region);
-  const uint64_t spills0 = tier.spills, live0 = s.bytes;
-  int steps = 0;
-  bool ok = false;
-  for (;;) {
-    if (fits()) {
-      ok = true;
-      break;
-    }
-    if (slot_pool->region_idle(s.region)) {
-      store_trim();
-      if (fits()) {
-        ok = true;
-        break;
-      }
-    }
-    if (!store_evict_step(-1)) break;
-    ++steps;
-  }
-  const size_t m1 = slot_pool->region_mapped(s.region);
-  if (m1 < m0) {
-    ++s.give_backs;
-    if (rank == 0)
-      std::printf("state: the store gives %zu chunks (%.1f MiB) back to the slots: %d eviction steps (%llu sessions spilled), "
-                  "%.1f MiB of blocks left in %zu mapped chunks\n",
-                  m0 - m1, (m0 - m1) * (double)vmm::kChunk / 1048576.0, steps, (unsigned long long)(tier.spills - spills0),
-                  s.bytes / 1048576.0, m1);
-  }
-  (void)live0;
-  return ok;
-}
-
-// The chunks the store would have mapped if it held nothing but the blocks of the sessions in `keep` (those in
-// RAM; a spilled session has none): what the store can give back to the slots without touching them. Counted
-// from the blocks' offsets, so it is the same on every rank.
+// The chunk numbers of sessions no line holds and `keep` does not name: what eviction can give back. The same on
+// every rank (it reads only the store's records).
 size_t Model::Impl::state_giveable(const std::vector<int>& keep) const {
-  if (!store_s || store_s->region < 0) return 0;
-  const Store& s = *store_s;
-  const bool sp = spec != nullptr;
-  std::vector<size_t> held;
-  const auto add = [&](const uint8_t* p, size_t bytes) {
-    if (!p) return;
-    const size_t off = (size_t)(p - s.pool.base), n = Pool::round(bytes);
-    for (size_t i = off / vmm::kChunk; i <= (off + n - 1) / vmm::kChunk; ++i) held.push_back(i);
+  if (!store_s) return 0;
+  std::unordered_map<uint32_t, uint32_t> seen;  // a shared number goes back only when every list naming it does
+  const auto add = [&](const Nums& v) {
+    for (const uint32_t c : v) ++seen[c];
   };
-  for (const int h : keep) {
-    const auto it = s.sess.find(h);
-    if (it == s.sess.end() || it->second.disk) continue;
-    for (const uint8_t* p : it->second.pages) add(p, kPageBytes);
-    for (const auto& sn : it->second.snaps) add(sn.second, snap_bytes(sp));
-    add(it->second.end, end_bytes(sp));
-  }
-  std::sort(held.begin(), held.end());
-  const size_t n = (size_t)(std::unique(held.begin(), held.end()) - held.begin());
-  const size_t mapped = slot_pool->region_mapped(s.region);
-  return mapped > n ? mapped - n : 0;
+  for (const auto& [k, ss] : store_s->sess)
+    if (k > 0 && !ss.disk && ss.line < 0 && !in(keep, k)) {
+      for (const Nums& l : ss.lists) add(l);
+      for (const auto& sn : ss.snaps) add(sn.second);
+      add(ss.end);
+    }
+  size_t n = 0;
+  for (const auto& [c, m] : seen) n += m == refs[c];
+  return n;
 }
 
 size_t Model::state_restore_chunks(int h) const {
-  if (!d_->store_shared()) return 0;
+  if (!d_->store_s) return 0;
   const auto it = d_->store_s->sess.find(h);
   if (it == d_->store_s->sess.end() || !it->second.disk) return 0;
   const Store::Sess& ss = it->second;
   const bool sp = d_->spec != nullptr;
-  const auto c = [](size_t b) { return (Pool::round(b) + vmm::kChunk - 1) / vmm::kChunk + 1; };  // a block maps at most this many
-  return ss.dpages.size() * c(kPageBytes) + ss.dsnaps.size() * c(snap_bytes(sp)) +
-         (ss.dend != Pool::kNone ? c(end_bytes(sp)) : 0);
+  size_t n = 0;
+  for (int k = 0; k < kKvSlots; ++k) n += (size_t)nums_for_pos(k, std::min(ss.saved, (int)ss.dpages.size() * kPagePos));
+  return n + ss.dsnaps.size() * bk_nums(snap_bytes(sp)) + (ss.dend != Pool::kNone ? bk_nums(end_bytes(sp)) : 0);
 }
 
-// A block for session h. While none is free (store_take): make room (store_evict_step); nullptr when none is left.
-uint8_t* Model::Impl::store_alloc(int h, size_t bytes) {
-  Store& s = store_of();
-  for (;;) {
-    if (uint8_t* p = store_take(bytes)) {
-      s.bytes += Pool::round(bytes);
-      return p;
+// ---- lines: a slot's unit holds a session (its rows are the session's lists) ------------------------------------
+
+namespace {
+
+// slot s's session: steps with no session named (tools, tests) get one of the unit's own, freed at release
+Store::Sess& line_sess(Model::Impl& m, int s) {
+  Store& st_ = m.store_of();
+  const int u = m.unit_of[s];
+  if (m.line_h[u] == Model::Impl::kNoLine) {
+    m.line_h[u] = -1 - u;
+    st_.sess[m.line_h[u]].line = u;
+  }
+  return st_.sess.at(m.line_h[u]);
+}
+
+// unit u's rows from session x's lists (the guard past their ends); the stream waits first, so no queued copy of the
+// mirror reads an entry being rewritten
+void write_rows(Model::Impl& m, int u, const Store::Sess* x) {
+  CUDA_CHECK(cudaStreamSynchronize(m.st));
+  for (int k = 0; k < kKvSlots; ++k) {
+    uint32_t* row = m.lists_h + ((size_t)k * m.nunits + u) * m.list_len;
+    std::fill(row, row + m.list_len, 0u);
+    if (x && x->lists[k].size() > (size_t)m.list_len)
+      die("model: kv source %d's list of %zu numbers is longer than a row (%d)", k, x->lists[k].size(), m.list_len);
+    if (x) std::copy(x->lists[k].begin(), x->lists[k].end(), row);
+    CUDA_CHECK(cudaMemcpyAsync(m.lists_d + ((size_t)k * m.nunits + u) * m.list_len, row, m.list_len * sizeof(uint32_t),
+                               cudaMemcpyHostToDevice, m.st));
+  }
+}
+
+}  // namespace
+
+int Model::Impl::held(int s) const {
+  const int h = line_h[unit_of[s]];
+  if (h == kNoLine || !store_s) return 0;
+  const auto it = store_s->sess.find(h);
+  if (it == store_s->sess.end()) return 0;
+  int n = 0;
+  for (const Nums& l : it->second.lists) n += (int)l.size();
+  return n;
+}
+
+bool Model::Impl::grow(int s, int upto) {
+  const int u = unit_of[s];
+  upto = std::max(0, std::min(upto, slot_ctx_[s] - 1));
+  Store::Sess& x = line_sess(*this, s);
+  const int h = line_h[u];
+  int want[kKvSlots];
+  size_t total = 0;
+  for (int k = 0; k < kKvSlots; ++k) {
+    want[k] = std::max(0, std::min(list_len, nums_for_pos(k, upto + 1)) - (int)x.lists[k].size());
+    total += want[k];
+  }
+  if (!total) return true;
+  Nums got;
+  store_of().pinned.push_back(h);
+  const bool ok = take_nums(h, total, &got);
+  store_of().pinned.pop_back();
+  if (!ok) return false;
+  size_t g = 0;
+  for (int k = 0; k < kKvSlots; ++k) {
+    if (!want[k]) continue;
+    const size_t i0 = x.lists[k].size(), row = ((size_t)k * nunits + u) * list_len;
+    for (int i = 0; i < want[k]; ++i, ++g) {
+      x.lists[k].push_back(got[g]);
+      lists_h[row + i0 + i] = got[g];  // an entry no queued copy reads yet (rewrites wait: write_rows)
     }
-    if (!store_evict_step(h)) {
-      const size_t cap = s.region >= 0 ? (slot_pool->total() - std::min(slot_pool->total(), slot_pool->committed_total())) * vmm::kChunk
-                                       : s.pool.size;
-      if (rank == 0)
-        std::printf("state: no room for %.1f MiB of session %d's state (%.2f of %.2f GiB in use)\n",
-                    bytes / 1048576.0, h, s.bytes / 1073741824.0, cap / 1073741824.0);
-      return nullptr;
+    CUDA_CHECK(cudaMemcpyAsync(lists_d + row + i0, lists_h + row + i0, want[k] * sizeof(uint32_t), cudaMemcpyHostToDevice, st));
+  }
+  return true;
+}
+
+uint8_t* Model::Impl::ent_addr(int k, int a, int j) const {
+  const int h = line_h[cur_unit];
+  if (h == kNoLine) die("model: entry %d of kv source %d in slot %d, which holds no session", j, k, cur_slot);
+  const Nums& l = store_s->sess.at(h).lists[k];
+  if ((size_t)(j >> attn::kChunkShift) >= l.size()) die("model: entry %d of kv source %d past slot %d's list", j, k, cur_slot);
+  return pool_arr[a] + (((size_t)l[j >> attn::kChunkShift] << attn::kChunkShift) | (j & (attn::kChunkEntries - 1))) * kKvEntryBytes[a];
+}
+
+void Model::Impl::ensure_mapped(int s, int upto) {
+  if (s < 0 || s >= nslots) die("model: ensure_mapped in slot %d of %d", s, nslots);
+  upto = std::max(0, std::min(upto, slot_ctx_[s] - 1));
+  if (upto <= mapped_upto[s]) return;  // the whole check of a step that needs nothing new
+  int got = std::min(upto + kMapLookahead, slot_ctx_[s] - 1);
+  if (!grow(s, got)) {  // no room for the lookahead: what the step needs (inside its reservation, there with eviction)
+    got = upto;
+    if (!grow(s, got))
+      die("model: slot %d cannot hold positions up to %d: %u of %u chunk numbers free, %d held by its session", s, upto,
+          calloc->free(), calloc->total(), held(s));
+  }
+  mapped_upto[s] = got;
+}
+
+void Model::Impl::slot_reserve(int s, int need) {
+  if (s < 0 || s >= nslots) die("model: slot_reserve in slot %d of %d", s, nslots);
+  resv[s] = slot_chunks_for(s, need);  // the server counted the pool first (serve.cpp mem_ok)
+}
+
+// The slot's unit holds session h from now on (its rows are h's lists): the session it held leaves it (keeping its
+// numbers; a unit's own session is freed). h comes back from the disk tier first.
+void Model::Impl::slot_attach(int s, int h) {
+  if (s < 0 || s >= nslots || h <= 0) die("model: session %d attaches to slot %d", h, s);
+  const int u = unit_of[s];
+  if (line_h[u] == h) return;
+  const int r = resv[s];  // the request's reservation (kStReserve comes first) stays with the slot
+  slot_release(s);
+  resv[s] = r;
+  Store::Sess& x = use_blocks(*this, h);
+  if (x.line >= 0) die("model: session %d attaches to slot %d while unit %d holds it", h, s, x.line);
+  x.line = u;
+  line_h[u] = h;
+  write_rows(*this, u, &x);
+  mapped_upto[s] = -1;  // the next step grows from the lists as they are
+}
+
+// Slot s's unit leaves its session (which keeps its numbers: no copy, no drain); a unit's own session is freed.
+void Model::Impl::slot_release(int s) {
+  if (s < 0 || s >= nslots) die("model: slot_release of slot %d of %d", s, nslots);
+  const int u = unit_of[s];
+  const int h = line_h[u];
+  if (h != kNoLine) {
+    Store& st_ = store_of();
+    write_rows(*this, u, nullptr);
+    if (h < 0) {
+      Store::Sess& x = st_.sess.at(h);
+      for (Nums& l : x.lists) give_nums(l);
+      st_.sess.erase(h);
+    } else if (auto it = st_.sess.find(h); it != st_.sess.end()) {
+      it->second.line = -1;
+    }
+    line_h[u] = kNoLine;
+  }
+  mapped_upto[s] = -1;
+  resv[s] = 0;
+}
+
+namespace {
+// entries [0, n) of number `from` into number `to`, all four arrays (a fork's partial number; copy on write)
+void copy_entries(Model::Impl& m, uint32_t to, uint32_t from, int n) {
+  for (int a = 0; a < 4; ++a)
+    CUDA_CHECK(cudaMemcpyAsync(m.pool_arr[a] + ((size_t)to << attn::kChunkShift) * kKvEntryBytes[a],
+                               m.pool_arr[a] + ((size_t)from << attn::kChunkShift) * kKvEntryBytes[a], (size_t)n * kKvEntryBytes[a],
+                               cudaMemcpyDeviceToDevice, m.st));
+}
+}  // namespace
+
+bool Model::Impl::own_tail(int h, int pos) {
+#ifdef DSGB10_POOL_NOCOW
+  (void)h, (void)pos;
+  return true;  // the negative control: shared numbers are written in place (fork_test must fail)
+#else
+  Store::Sess& x = store_of().sess.at(h);
+  bool rows = false;
+  for (int k = 0; k < kKvSlots; ++k) {
+    const int e = std::max(0, pos) / (k < 3 ? 2 : 1), i0 = e >> attn::kChunkShift;
+    Nums& l = x.lists[k];
+    for (size_t i = (size_t)i0; i < l.size(); ++i) {
+      if (refs[l[i]] < 2) continue;
+      Nums fresh;
+      store_of().pinned.push_back(h);
+      const bool ok = take_nums(h, 1, &fresh);
+      store_of().pinned.pop_back();
+      if (!ok) return false;
+      const int below = (int)i == i0 ? (e & (attn::kChunkEntries - 1)) : 0;  // the entries under pos stay valid
+      if (below) copy_entries(*this, fresh[0], l[i], below);
+      Nums old{l[i]};
+      give_nums(old);
+      l[i] = fresh[0];
+      rows = true;
     }
   }
+  if (rows && x.line >= 0) write_rows(*this, x.line, &x);
+  return true;
+#endif
+}
+
+// A bookmark is a restart point, not something a step needs: it takes only numbers that leave every line's reservation
+// covered (a reservation past what its lists hold may count on what evicting idle sessions gives back, serve.cpp mem_ok).
+// With none to spare the bookmark is not taken: a later restart starts at an earlier one.
+bool Model::Impl::take_extra(int h, size_t n, Nums* out) {
+  Store& s = store_of();
+  const int64_t reserved = rules::unheld_sum(nslots, [&](int t) { return resv[t]; }, [&](int t) { return held(t); });
+  const auto giveable = [&]() {  // what store_evict_step can still give back counts too
+    std::vector<int> keep = s.pinned;
+    keep.insert(keep.end(), s.live.begin(), s.live.end());
+    keep.push_back(h);
+    return state_giveable(keep);
+  };
+  if (!rules::covers((int64_t)calloc->free(), reserved, (int64_t)n, giveable)) return false;
+  s.pinned.push_back(h);
+  const bool ok = take_nums(h, n, out);
+  s.pinned.pop_back();
+  return ok;
+}
+
+bool Model::Impl::own_bk(int h, Nums& b) {
+  bool shared = false;
+  for (const uint32_t c : b) shared |= refs[c] > 1;
+  if (!shared) return true;
+  Nums fresh;  // the whole bookmark is written again: nothing to copy
+  if (!take_extra(h, b.size(), &fresh)) return false;
+  give_nums(b);
+  b = std::move(fresh);
+  return true;
 }
 
 // ---- the disk tier --------------------------------------------------------------------------------
@@ -608,8 +738,7 @@ size_t Model::Impl::disk_take(int h, size_t bytes) {
     int victim = -1;
     uint64_t oldest = UINT64_MAX;
     for (const auto& [k, ss] : s.sess)
-      if (k != h && ss.disk && ss.used < oldest && std::find(s.pinned.begin(), s.pinned.end(), k) == s.pinned.end())
-        victim = k, oldest = ss.used;
+      if (k != h && ss.disk && ss.used < oldest && !in(s.pinned, k)) victim = k, oldest = ss.used;
     if (victim < 0) return Pool::kNone;
     if (rank == 0) std::printf("state: session %d dropped from the disk tier to make room\n", victim);
     state_free(victim);
@@ -617,42 +746,61 @@ size_t Model::Impl::disk_take(int h, size_t bytes) {
   }
 }
 
-// Session h's blocks into the disk tier: each one's checksum is taken, then it is copied to staging after
-// the work queued so far and released at once, and the writer thread writes them out. Without a disk tier, or without room in it,
-// h is freed (gone: state_evicted).
+namespace {
+
+// page i of session x (positions [i, i + 1) * kPagePos of every kv source) between its chunks and the gather buffer:
+// a page's run of a source's entries lies in one chunk number (kPagePos / ratio divides kChunkEntries)
+void page_copy(Model::Impl& m, const Store::Sess& x, int i, bool to_gather) {
+  uint8_t* g = m.store_of().gather;
+  for (int k = 0; k < kKvSlots; ++k) {
+    const int ratio = k < 3 ? 2 : 1, E = kPagePos / ratio, j = i * E;
+    if ((size_t)(j >> attn::kChunkShift) >= x.lists[k].size()) die("state: page %d of a session past its kv source %d's list", i, k);
+    const size_t c = x.lists[k][j >> attn::kChunkShift], e = ((size_t)c << attn::kChunkShift) | (j & (attn::kChunkEntries - 1));
+    for (int a = 0; a < 4; ++a) {
+      uint8_t* p = m.pool_arr[a] + e * kArr[a];
+      uint8_t* q = g + page_off(k, a);
+      CUDA_CHECK(cudaMemcpyAsync(to_gather ? q : p, to_gather ? p : q, (size_t)E * kArr[a], cudaMemcpyDeviceToDevice, m.st));
+    }
+  }
+}
+
+}  // namespace
+
+// Session h's state into the disk tier: its pages and bookmarks, each gathered, its checksum taken, then copied to
+// staging after the work queued so far; its numbers are given back at once, and the writer thread writes the file.
+// Without a disk tier, or without room in it, h is freed (gone: state_evicted).
 void Model::Impl::state_spill(int h) {
   Store& s = store_of();
   const auto it = s.sess.find(h);
   if (it == s.sess.end() || it->second.disk) return;
   Store::Sess& ss = it->second;
+  if (ss.line >= 0) die("state: session %d spilled while unit %d holds it", h, ss.line);
   const bool sp = spec != nullptr;
   const double t0 = wall_s();
+  const size_t n0 = ss.numbers();
   if (s.disk) {
-    // A squeezed store leaves a session with blocks no restart can use (an end snapshot or snapshots beyond
-    // its saved pages, pages beyond its latest restart point). They are not written; what goes out is
-    // what the session can restart from, and its saved, end_pos and snapshots say so.
-    if (ss.end && !end_usable(ss.end_pos, ss.saved)) store_release(ss.end, end_bytes(sp)), ss.end = nullptr, ss.end_pos = -1;
+    // what goes out is what the session can restart from: bookmarks no restart can use, and pages past its latest
+    // restart point, are not written
+    if (!ss.end.empty() && !end_usable(ss.end_pos, ss.saved)) give_nums(ss.end), ss.end_pos = -1;
     for (auto i = ss.snaps.begin(); i != ss.snaps.end();)
       if (snap_usable(i->first, ss.saved)) ++i;
-      else store_release(i->second, snap_bytes(sp)), i = ss.snaps.erase(i);
-    const int keep = std::max(0, restart_of(ss.saved, ss.end ? ss.end_pos : -1, ss.snaps));
-    while ((int)ss.pages.size() > pages_for(keep)) store_release(ss.pages.back(), kPageBytes), ss.pages.pop_back();
-    ss.saved = std::min(ss.saved, (int)ss.pages.size() * kPagePos);
+      else give_nums(i->second), i = ss.snaps.erase(i);
+    const int keep = std::max(0, restart_of(ss.saved, ss.end.empty() ? -1 : ss.end_pos, ss.snaps));
+    ss.saved = std::min(ss.saved, pages_for(keep) * kPagePos);
   }
+  const int np = pages_for(ss.saved);
   std::vector<size_t> dp;
   std::map<int, size_t> ds;
   size_t de = Pool::kNone;
   bool room = s.disk != nullptr;
-  for (size_t i = 0; room && i < ss.pages.size(); ++i)
-    room = (dp.emplace_back(disk_take(h, kPageBytes)), dp.back() != Pool::kNone);
+  for (int i = 0; room && i < np; ++i) room = (dp.emplace_back(disk_take(h, kPageBytes)), dp.back() != Pool::kNone);
   for (auto i = ss.snaps.begin(); room && i != ss.snaps.end(); ++i)
     room = (ds[i->first] = disk_take(h, snap_bytes(sp))) != Pool::kNone;
-  if (room && ss.end) room = (de = disk_take(h, end_bytes(sp))) != Pool::kNone;
+  if (room && !ss.end.empty()) room = (de = disk_take(h, end_bytes(sp))) != Pool::kNone;
   if (!room) {
     if (s.disk) {
       if (!dp.empty() && dp.back() == Pool::kNone) dp.pop_back();
-      for (auto i = ds.begin(); i != ds.end();)
-        i = i->second == Pool::kNone ? ds.erase(i) : std::next(i);
+      for (auto i = ds.begin(); i != ds.end();) i = i->second == Pool::kNone ? ds.erase(i) : std::next(i);
       Store::Sess tmp;
       tmp.dpages = dp, tmp.dsnaps = ds, tmp.dend = de;
       disk_release(s, tmp, sp);
@@ -661,46 +809,45 @@ void Model::Impl::state_spill(int h) {
     s.evicted.push_back(h);
     return;
   }
-  const size_t b0 = s.bytes;  // spilling only releases blocks
   s.disk->begin(st);  // the checksums of what goes out, then the copies (each timed: spill.cpp)
-  for (size_t i = 0; i < ss.pages.size(); ++i) sum_block(ss.pages[i], kPageBytes, s.disk->sum(dp[i], false), st);
-  for (const auto& sn : ss.snaps) sum_block(sn.second, snap_bytes(sp), s.disk->sum(ds.at(sn.first), false), st);
-  if (ss.end) sum_block(ss.end, end_bytes(sp), s.disk->sum(de, false), st);
-  for (size_t i = 0; i < ss.pages.size(); ++i) {
-    ss.dseq = s.disk->write(ss.pages[i], kPageBytes, dp[i], st);
-    store_release(ss.pages[i], kPageBytes);
+  for (int i = 0; i < np; ++i) {
+    page_copy(*this, ss, i, true);
+    sum_block(s.gather, kPageBytes, s.disk->sum(dp[i], false), st);
+    ss.dseq = s.disk->write(s.gather, kPageBytes, dp[i], st);
   }
   for (const auto& sn : ss.snaps) {
-    ss.dseq = s.disk->write(sn.second, snap_bytes(sp), ds.at(sn.first), st);
-    store_release(sn.second, snap_bytes(sp));
+    bk_copy(sn.second, 0, s.gather, snap_bytes(sp), false);
+    sum_block(s.gather, snap_bytes(sp), s.disk->sum(ds.at(sn.first), false), st);
+    ss.dseq = s.disk->write(s.gather, snap_bytes(sp), ds.at(sn.first), st);
   }
-  if (ss.end) {
-    ss.dseq = s.disk->write(ss.end, end_bytes(sp), de, st);
-    store_release(ss.end, end_bytes(sp));
+  if (!ss.end.empty()) {
+    bk_copy(ss.end, 0, s.gather, end_bytes(sp), false);
+    sum_block(s.gather, end_bytes(sp), s.disk->sum(de, false), st);
+    ss.dseq = s.disk->write(s.gather, end_bytes(sp), de, st);
   }
   s.disk->flush(st);
-  ss.pages.clear();
+  for (Nums& l : ss.lists) give_nums(l);
+  for (auto& sn : ss.snaps) give_nums(sn.second);
+  give_nums(ss.end);
   ss.snaps.clear();
-  ss.end = nullptr;
   ss.disk = true;
   ss.dpages = std::move(dp);
   ss.dsnaps = std::move(ds);
   ss.dend = de;
-  ++tier.spills, tier.spill_bytes += b0 - s.bytes;
+  ++tier.spills, tier.spill_bytes += n0 * chunk_image();
   if (rank == 0)
-    std::printf("state: session %d spilled to disk (%.1f MiB, restart point %d; %.2f of %.2f GiB of the file in use; "
-                "host %.2f ms)\n", h, (b0 - s.bytes) / 1048576.0, restart_of(ss.saved, ss.dend != Pool::kNone ? ss.end_pos : -1, ss.dsnaps),
+    std::printf("state: session %d spilled to disk (%zu chunk numbers given back, restart point %d; %.2f of %.2f GiB of the file in "
+                "use; host %.2f ms)\n", h, n0, restart_of(ss.saved, ss.dend != Pool::kNone ? ss.end_pos : -1, ss.dsnaps),
                 s.dbytes / 1073741824.0, s.dpool.size / 1073741824.0, 1e3 * (wall_s() - t0));
 }
 
-// Session h back from the disk tier (after its writes), as far as the store has room, taking what gives
-// the latest restart point first. The candidates are the end snapshot and the window snapshots, latest
-// first, each usable when the pages up to its restart position are in the record (end_usable, snap_usable);
-// the first whose block and pages all find room is restored with exactly those pages (saved shrinks to
-// them), then every earlier snapshot those pages serve for as long as room lasts. When no candidate fits,
-// nothing comes back: pages alone restart nothing. Every block that comes back is checked against its
-// checksum from the way out; every rank logs a mismatch, and rank 0 the time it took and the restart
-// point that came back against the one that was spilled.
+// Session h back from the disk tier (after its writes), as far as the pool has room, taking what gives the latest
+// restart point first. The candidates are the end bookmark and the window bookmarks, latest first, each usable when
+// the pages up to its restart position are in the record (end_usable, snap_usable); the first whose numbers all find
+// room is restored with exactly those pages (saved shrinks to them), then every earlier window bookmark those pages
+// serve for as long as room lasts. When no candidate fits, nothing comes back: pages alone restart nothing. Every
+// block that comes back is checked against its checksum from the way out; every rank logs a mismatch, and rank 0 the
+// time it took and the restart point that came back against the one that was spilled.
 void Model::Impl::state_unspill(int h) {
   Store& s = store_of();
   const auto it = s.sess.find(h);
@@ -713,66 +860,67 @@ void Model::Impl::state_unspill(int h) {
   const double t1 = wall_s();
   size_t got = 0;
   std::vector<size_t> back;  // the file offsets of the blocks that came back
-  const auto read = [&](uint8_t* dst, size_t bytes, size_t off) {
-    s.disk->read(dst, bytes, off, st);
-    sum_block(dst, bytes, s.disk->sum(off, true), st);
+  const auto read_block = [&](size_t bytes, size_t off) {  // into the gather buffer, checked
+    s.disk->read(s.gather, bytes, off, st);
+    sum_block(s.gather, bytes, s.disk->sum(off, true), st);
     back.push_back(off);
     got += Pool::round(bytes);
   };
   const int spilled_restart = restart_of(ss.saved, ss.dend != Pool::kNone ? ss.end_pos : -1, ss.dsnaps);
   struct Cand {
-    int q;       // the restart position
-    int snap;    // the window snapshot's position (-1: the end snapshot)
+    int q;     // the restart position
+    int snap;  // the window bookmark's position (-1: the end bookmark)
   };
   std::vector<Cand> cand;
   if (ss.dend != Pool::kNone && end_usable(ss.end_pos, ss.saved)) cand.push_back({ss.end_pos, -1});
   for (auto i = ss.dsnaps.rbegin(); i != ss.dsnaps.rend(); ++i)
     if (snap_usable(i->first, ss.saved)) cand.push_back({snap_q(i->first), i->first});
   std::stable_sort(cand.begin(), cand.end(), [](const Cand& a, const Cand& b) { return a.q > b.q; });
-  s.pinned.push_back(h);  // its own blocks' allocations never evict it
-  std::vector<uint8_t*> pg;
-  uint8_t* blk = nullptr;
-  int pick = -1;
+  s.pinned.push_back(h);  // its own numbers' allocations never evict it
+  int pick = -1, np = 0;
+  Nums lists[kKvSlots], blk;
   size_t failed = SIZE_MAX;  // the fewest pages a candidate needed that found no room: it and any needing more fail
   for (size_t c = 0; c < cand.size() && pick < 0; ++c) {
-    const size_t np = std::min(ss.dpages.size(), (size_t)pages_for(cand[c].q));
-    if (np >= failed) continue;
-    bool ok = (blk = store_alloc(h, cand[c].snap < 0 ? end_bytes(sp) : snap_bytes(sp))) != nullptr;
-    while (ok && pg.size() < np) {
-      uint8_t* p = store_alloc(h, kPageBytes);
-      if (!p) ok = false;
-      else pg.push_back(p);
-    }
-    if (ok) {
+    np = std::min((int)ss.dpages.size(), pages_for(cand[c].q));
+    if ((size_t)np >= failed) continue;
+    size_t want = bk_nums(cand[c].snap < 0 ? end_bytes(sp) : snap_bytes(sp));
+    for (int k = 0; k < kKvSlots; ++k) want += (size_t)nums_for_pos(k, np * kPagePos);
+    Nums all;
+    if (take_nums(h, want, &all)) {
       pick = (int)c;
-    } else {  // a candidate that does not fit whole is given back; a smaller one may
-      for (uint8_t* p : pg) store_release(p, kPageBytes);
-      pg.clear();
-      if (blk) store_release(blk, cand[c].snap < 0 ? end_bytes(sp) : snap_bytes(sp));
-      blk = nullptr;
-      failed = np;
+      size_t g = 0;
+      for (int k = 0; k < kKvSlots; ++k)
+        for (int i = 0, n = nums_for_pos(k, np * kPagePos); i < n; ++i) lists[k].push_back(all[g++]);
+      blk.assign(all.begin() + g, all.end());
+    } else {
+      failed = (size_t)np;
     }
   }
-  ss.pages.clear();
-  ss.snaps.clear();
-  ss.end = nullptr;
   if (pick >= 0) {
-    for (size_t i = 0; i < pg.size(); ++i) read(pg[i], kPageBytes, ss.dpages[i]);
-    ss.pages = pg;
-    ss.saved = std::min(ss.saved, (int)pg.size() * kPagePos);
-    if (cand[pick].snap < 0) read(blk, end_bytes(sp), ss.dend), ss.end = blk;
-    else read(blk, snap_bytes(sp), ss.dsnaps.at(cand[pick].snap)), ss.snaps.emplace(cand[pick].snap, blk);
-    for (auto i = ss.dsnaps.rbegin(); i != ss.dsnaps.rend(); ++i) {  // the earlier snapshots these pages serve
+    for (int k = 0; k < kKvSlots; ++k) ss.lists[k] = std::move(lists[k]);
+    for (int i = 0; i < np; ++i) read_block(kPageBytes, ss.dpages[i]), page_copy(*this, ss, i, false);
+    ss.saved = std::min(ss.saved, np * kPagePos);
+    if (cand[pick].snap < 0) {
+      read_block(end_bytes(sp), ss.dend);
+      bk_copy(blk, 0, s.gather, end_bytes(sp), true);
+      ss.end = std::move(blk);
+    } else {
+      read_block(snap_bytes(sp), ss.dsnaps.at(cand[pick].snap));
+      bk_copy(blk, 0, s.gather, snap_bytes(sp), true);
+      ss.snaps.emplace(cand[pick].snap, std::move(blk));
+    }
+    for (auto i = ss.dsnaps.rbegin(); i != ss.dsnaps.rend(); ++i) {  // the earlier window bookmarks these pages serve
       if (i->first == cand[pick].snap || !snap_usable(i->first, ss.saved)) continue;
-      uint8_t* b = store_alloc(h, snap_bytes(sp));
-      if (!b) break;
-      read(b, snap_bytes(sp), i->second);
-      ss.snaps.emplace(i->first, b);
+      Nums b;
+      if (!take_nums(h, bk_nums(snap_bytes(sp)), &b)) break;
+      read_block(snap_bytes(sp), i->second);
+      bk_copy(b, 0, s.gather, snap_bytes(sp), true);
+      ss.snaps.emplace(i->first, std::move(b));
     }
   } else {
     ss.saved = 0;
   }
-  if (!ss.end) ss.end_pos = -1;
+  if (ss.end.empty()) ss.end_pos = -1;
   s.pinned.pop_back();
   CUDA_CHECK(cudaStreamSynchronize(st));
   const double t2 = wall_s();
@@ -796,193 +944,177 @@ void Model::Impl::state_unspill(int h) {
     std::printf("state: session %d back from disk: %.1f MiB in %.1f ms (%.2f GB/s; %.1f ms waiting for its writes; "
                 "%zu blocks checked, %016llx); restart point %d of the %d spilled\n", h, got / 1048576.0, 1e3 * (t2 - t0),
                 got / std::max(1e-9, t2 - t1) / 1e9, 1e3 * (t1 - t0), back.size(), (unsigned long long)fp,
-                restart_of(ss.saved, ss.end ? ss.end_pos : -1, ss.snaps), spilled_restart);
+                restart_of(ss.saved, ss.end.empty() ? -1 : ss.end_pos, ss.snaps), spilled_restart);
 }
 
-namespace {
-
-// session h (made if new) for an operation that needs its blocks: back from the disk tier first
-Store::Sess& use_blocks(Model::Impl& m, int h) {
-  Store& s = m.store_of();
-  const auto it = s.sess.find(h);
-  if (it != s.sess.end() && it->second.disk) m.state_unspill(h);
-  return s.use(h);
-}
-
-}  // namespace
-
-void Model::Impl::store_release(uint8_t* p, size_t bytes) {
-  if (!p) return;
-  Store& s = store_of();
-  s.pool.give(p, bytes);
-  s.bytes -= Pool::round(bytes);
-  if (s.region >= 0) slot_pool->region_drop(s.region, (size_t)(p - s.pool.base), Pool::round(bytes));
-}
-
-// Compressed caches of positions [from, to): entries [from / ratio, to / ratio) of every kv source
-// (an entry is complete once its last position is in). Without room for every page, as far as the
-// pages go.
+// Compressed caches of positions [from, to) into session h: the line holding h writes into h's own numbers, so what it
+// holds up to `to` is h's already.
 void Model::Impl::state_save(int h, int from, int to) {
   Store::Sess& ss = use_blocks(*this, h);
   if (from > ss.saved) die("state: session %d saves [%d, %d) with %d saved", h, from, to, ss.saved);
-  while ((int)ss.pages.size() * kPagePos < to) {
-    uint8_t* p = store_alloc(h, kPageBytes);
-    if (!p) break;
-    ss.pages.push_back(p);
-  }
-  to = std::min(to, (int)ss.pages.size() * kPagePos);
-  // the copies read the slot's arrays: what the session wrote is mapped (steps map before they run); a slot
-  // released since holds nothing to save
-  if (slot_pool && to > from && mapped_upto[cur_slot] < to - 1)
-    die("state: session %d saves [%d, %d) from slot %d, which is mapped up to %d", h, from, to, cur_slot, mapped_upto[cur_slot]);
-  for (int k = 0; k < kKvSlots; ++k) {
-    const int ratio = k < 3 ? 2 : 1, E = kPagePos / ratio;
-    const KvSrc& src = kvs[k];
-    uint8_t* const arr[4] = {src.ckv, src.csc, src.ik, src.iksc};
-    for (int j = from / ratio, j1 = to / ratio; j < j1;) {
-      const int pi = j / E, n = std::min(j1, (pi + 1) * E) - j;
-      for (int a = 0; a < 4; ++a)
-        CUDA_CHECK(cudaMemcpyAsync(ss.pages[pi] + page_off(k, a) + (size_t)(j - pi * E) * kArr[a], arr[a] + (size_t)j * kArr[a],
-                                   (size_t)n * kArr[a], cudaMemcpyDeviceToDevice, st));
-      j += n;
-    }
-  }
+  if (to > from && ss.line != cur_unit) die("state: session %d saves [%d, %d) from unit %d, which does not hold it", h, from, to, cur_unit);
+  for (int k = 0; k < kKvSlots; ++k)  // the chunk of the last entry saved is the session's
+    if (to > from && (int)ss.lists[k].size() <= ((to - 1) / (k < 3 ? 2 : 1) >> attn::kChunkShift))
+      die("state: session %d saves up to %d past its kv source %d's numbers", h, to, k);
   ss.saved = std::max(ss.saved, to);
 }
 
+// Session h's compressed caches of positions [0, to) for the current slot's session. h itself is cut to `to` (the numbers
+// from the one holding `to` on made its own: own_tail). A fork's base: the slot's session gives its lists back and takes
+// the base's numbers wholly below `to`, shared by count, and a copy of the entries below `to` of the one holding it.
 void Model::Impl::state_load(int h, int to) {
   if (!store_of().sess.count(h)) die("state: session %d loads with nothing stored", h);
-  Store::Sess& ss = use_blocks(*this, h);
-  if (to > ss.saved) die("state: session %d loads %d positions of %d", h, to, ss.saved);
-  ensure_mapped(cur_slot, to);  // the copy-in writes entries [0, to / ratio): mapped first
+  Store::Sess& src = use_blocks(*this, h);
+  if (to > src.saved) die("state: session %d loads %d positions of %d", h, to, src.saved);
+  const int hd = line_h[cur_unit];
+  if (hd == h) {
+    src.saved = std::min(src.saved, to);
+    if (!own_tail(h, to)) die("state: no room to copy session %d's shared numbers from %d on", h, to);
+    return;
+  }
+  if (hd == kNoLine || hd < 0) die("state: a fork of %d into slot %d, which holds no session", h, cur_slot);
+  Store::Sess& dst = store_of().sess.at(hd);
+  for (Nums& l : dst.lists) give_nums(l);
+  dst.saved = 0;
+  store_of().pinned.push_back(h);  // the partial copies' numbers never evict the base
+  size_t shared = 0, copied = 0;
   for (int k = 0; k < kKvSlots; ++k) {
-    const int ratio = k < 3 ? 2 : 1, E = kPagePos / ratio;
-    const KvSrc& dst = kvs[k];
-    uint8_t* const arr[4] = {dst.ckv, dst.csc, dst.ik, dst.iksc};
-    for (int j = 0, j1 = to / ratio; j < j1;) {
-      const int pi = j / E, n = std::min(j1, (pi + 1) * E) - j;
-      for (int a = 0; a < 4; ++a)
-        CUDA_CHECK(cudaMemcpyAsync(arr[a] + (size_t)j * kArr[a], ss.pages[pi] + page_off(k, a) + (size_t)(j - pi * E) * kArr[a],
-                                   (size_t)n * kArr[a], cudaMemcpyDeviceToDevice, st));
-      j += n;
+    const int e = to / (k < 3 ? 2 : 1), full = e >> attn::kChunkShift, part = e & (attn::kChunkEntries - 1);
+    share_nums(src.lists[k], (size_t)full, &dst.lists[k]);
+    shared += full;
+    if (part) {
+      Nums one;
+      if (!take_nums(hd, 1, &one)) die("state: no room for a fork of %d at %d (one number of kv source %d)", h, to, k);
+      copy_entries(*this, one[0], src.lists[k][full], part);
+      dst.lists[k].push_back(one[0]);
+      copied += part;
     }
   }
+  store_of().pinned.pop_back();
+  write_rows(*this, cur_unit, &dst);
+  mapped_upto[cur_slot] = -1;  // the next step grows the lists past `to`
+  if (rank == 0)
+    std::printf("state: session %d forks %d at %d: %zu numbers shared, %zu entries copied\n", hd, h, to, shared, copied);
 }
 
 namespace {
 
-// positions [p0, p1) between a ring and a linear buffer (row bytes per position), at most 256 of them
-void ring_rows(uint8_t* ring, uint8_t* lin, size_t row, int p0, int p1, bool to_lin, cudaStream_t st) {
+// positions [p0, p1) between a ring and bookmark bytes from `off` on (row bytes per position), at most 256 of them
+void ring_rows(Model::Impl& m, uint8_t* ring, const Nums& b, size_t off, size_t row, int p0, int p1, bool to_bk) {
   for (int q = p0; q < p1;) {
     const int slot = q & (attn::kRing - 1), n = std::min(p1 - q, attn::kRing - slot);
-    uint8_t* r = ring + (size_t)slot * row;
-    uint8_t* l = lin + (size_t)(q - p0) * row;
-    CUDA_CHECK(cudaMemcpyAsync(to_lin ? l : r, to_lin ? r : l, (size_t)n * row, cudaMemcpyDeviceToDevice, st));
+    m.bk_copy(b, off + (size_t)(q - p0) * row, ring + (size_t)slot * row, (size_t)n * row, to_bk);
     q += n;
   }
 }
 
-// the draft module's windows, positions [p0, p1) or whole (p0 < 0), to or from b
-void spec_windows(const Spec& sp, uint8_t* b, int p0, int p1, bool to_buf, cudaStream_t st) {
+// the draft module's windows, positions [p0, p1) or whole (p0 < 0), to or from bookmark bytes from `off` on
+void spec_windows(Model::Impl& m, const Spec& sp, const Nums& b, size_t off, int p0, int p1, bool to_bk) {
   const size_t n = p0 < 0 ? attn::kRing : (size_t)(p1 - p0);
   for (int k = 0; k < dspark::kBlocks; ++k) {
     const attn::Window w = sp.draft->window(k);
-    uint8_t* kv = b + (size_t)k * n * kSpecSlot;
-    uint8_t* sc = kv + n * kHead;
+    const size_t kv = off + (size_t)k * n * kSpecSlot, sc = kv + n * kHead;
     if (p0 < 0) {
-      CUDA_CHECK(cudaMemcpyAsync(to_buf ? kv : w.kv, to_buf ? w.kv : kv, n * kHead, cudaMemcpyDeviceToDevice, st));
-      CUDA_CHECK(cudaMemcpyAsync(to_buf ? sc : w.sc, to_buf ? w.sc : sc, n * kHead / 32, cudaMemcpyDeviceToDevice, st));
+      m.bk_copy(b, kv, w.kv, n * kHead, to_bk);
+      m.bk_copy(b, sc, w.sc, n * kHead / 32, to_bk);
     } else {
-      ring_rows(w.kv, kv, kHead, p0, p1, to_buf, st);
-      ring_rows(w.sc, sc, kHead / 32, p0, p1, to_buf, st);
+      ring_rows(m, w.kv, b, kv, kHead, p0, p1, to_bk);
+      ring_rows(m, w.sc, b, sc, kHead / 32, p0, p1, to_bk);
     }
   }
 }
 
 }  // namespace
 
-// A snapshot's block (the caller fills it), or nullptr when the store has no room for it.
-uint8_t* Model::Impl::state_snap_buf(int h, int pos) {
+// A window bookmark's numbers (the caller fills them, bk_copy), or nullptr when the pool has no room for it.
+const Nums* Model::Impl::state_snap_buf(int h, int pos) {
   Store::Sess& ss = use_blocks(*this, h);
   const auto it = ss.snaps.find(pos);
-  if (it != ss.snaps.end()) return it->second;
-  uint8_t* b = store_alloc(h, snap_bytes(spec != nullptr));
-  if (b) ss.snaps.emplace(pos, b);
-  return b;
+  if (it != ss.snaps.end()) return own_bk(h, it->second) ? &it->second : nullptr;  // shared: fresh numbers first
+  Nums b;
+  if (!take_extra(h, bk_nums(snap_bytes(spec != nullptr)), &b)) {
+    if (rank == 0) std::printf("state: no room for a bookmark of session %d at %d\n", h, pos);
+    return nullptr;
+  }
+  return &ss.snaps.emplace(pos, std::move(b)).first->second;
 }
 
 void Model::Impl::state_snap(int h, int pos) {
   if (pos < kSnapRows) die("state: snapshot at %d", pos);
-  uint8_t* b = state_snap_buf(h, pos);
+  const Nums* b = state_snap_buf(h, pos);
   if (!b) return;
   for (int L = 0; L < kLayers; ++L) {
-    ring_rows(ring_kv[L], snap_kv(b, L), kHead, pos - kSnapRows, pos, true, st);
-    ring_rows(ring_sc[L], snap_sc(b, L), kHead / 32, pos - kSnapRows, pos, true, st);
+    ring_rows(*this, ring_kv[L], *b, snap_kv_off(L), kHead, pos - kSnapRows, pos, true);
+    ring_rows(*this, ring_sc[L], *b, snap_sc_off(L), kHead / 32, pos - kSnapRows, pos, true);
   }
-  if (spec) spec_windows(*spec, b + kSnapBytes, pos - kSnapRows, pos, true, st);
+  if (spec) spec_windows(*this, *spec, *b, kSnapBytes, pos - kSnapRows, pos, true);
 }
 
-// The draft module's windows into the snapshot at pos, which the prefill took (none: not taken).
+// The draft module's windows into the bookmark at pos, which the prefill took (none: not taken).
 void Model::Impl::state_snap_spec(int h, int pos) {
   const Store& s = store_of();
   const auto it = s.sess.find(h);
   if (it == s.sess.end() || it->second.disk) return;
   const auto b = it->second.snaps.find(pos);
-  if (b != it->second.snaps.end()) spec_windows(*spec, b->second + kSnapBytes, pos - kSnapRows, pos, true, st);
+  if (b != it->second.snaps.end()) spec_windows(*this, *spec, b->second, kSnapBytes, pos - kSnapRows, pos, true);
 }
 
 void Model::Impl::state_restore(int h, int pos) {
   if (!store_of().sess.count(h)) die("state: session %d restores with nothing stored", h);
   Store::Sess& ss = use_blocks(*this, h);
   if (!ss.snaps.count(pos)) die("state: session %d has no snapshot at %d", h, pos);
-  uint8_t* b = ss.snaps.at(pos);
+  const Nums& b = ss.snaps.at(pos);
   for (int L = 0; L < kLayers; ++L) {
-    ring_rows(ring_kv[L], snap_kv(b, L), kHead, pos - kSnapRows, pos, false, st);
-    ring_rows(ring_sc[L], snap_sc(b, L), kHead / 32, pos - kSnapRows, pos, false, st);
+    ring_rows(*this, ring_kv[L], b, snap_kv_off(L), kHead, pos - kSnapRows, pos, false);
+    ring_rows(*this, ring_sc[L], b, snap_sc_off(L), kHead / 32, pos - kSnapRows, pos, false);
   }
-  if (spec) spec_windows(*spec, b + kSnapBytes, pos - kSnapRows, pos, false, st);
+  if (spec) spec_windows(*this, *spec, b, kSnapBytes, pos - kSnapRows, pos, false);
 }
 
 void Model::Impl::state_snap_end(int h, int pos) {
   Store::Sess& ss = use_blocks(*this, h);
-  if (!ss.end) ss.end = store_alloc(h, end_bytes(spec != nullptr));
-  if (!ss.end) {
+  if (ss.end.empty()) {
+    if (!take_extra(h, bk_nums(end_bytes(spec != nullptr)), &ss.end)) {
+      ss.end_pos = -1;
+      return;
+    }
+  } else if (!own_bk(h, ss.end)) {  // shared and no room for its own: no end bookmark
+    give_nums(ss.end);
     ss.end_pos = -1;
     return;
   }
   ss.end_pos = pos;
-  uint8_t* b = ss.end;
-  for (int L = 0; L < kLayers; ++L, b += kRingBytes) {
-    CUDA_CHECK(cudaMemcpyAsync(b, ring_kv[L], (size_t)attn::kRing * kHead, cudaMemcpyDeviceToDevice, st));
-    CUDA_CHECK(cudaMemcpyAsync(b + (size_t)attn::kRing * kHead, ring_sc[L], (size_t)attn::kRing * kHead / 32,
-                               cudaMemcpyDeviceToDevice, st));
+  size_t off = 0;
+  for (int L = 0; L < kLayers; ++L, off += kRingBytes) {
+    bk_copy(ss.end, off, ring_kv[L], (size_t)attn::kRing * kHead, true);
+    bk_copy(ss.end, off + (size_t)attn::kRing * kHead, ring_sc[L], (size_t)attn::kRing * kHead / 32, true);
   }
-  for (int k = 0; k < kKvSlots; ++k, b += kCarryBytes) {
-    CUDA_CHECK(cudaMemcpyAsync(b, kvs[k].carry_kv, kCarryBytes / 2, cudaMemcpyDeviceToDevice, st));
-    CUDA_CHECK(cudaMemcpyAsync(b + kCarryBytes / 2, kvs[k].carry_sc, kCarryBytes / 2, cudaMemcpyDeviceToDevice, st));
+  for (int k = 0; k < kKvSlots; ++k, off += kCarryBytes) {
+    bk_copy(ss.end, off, reinterpret_cast<uint8_t*>(kvs[k].carry_kv), kCarryBytes / 2, true);
+    bk_copy(ss.end, off + kCarryBytes / 2, reinterpret_cast<uint8_t*>(kvs[k].carry_sc), kCarryBytes / 2, true);
   }
-  if (spec) spec_windows(*spec, ss.end + kEndBytes, -1, 0, true, st);
+  if (spec) spec_windows(*this, *spec, ss.end, kEndBytes, -1, 0, true);
 }
 
 void Model::Impl::state_restore_end(int h) {
   if (!store_of().sess.count(h)) die("state: session %d restores its end with nothing stored", h);
   Store::Sess& ss = use_blocks(*this, h);
-  if (!ss.end) die("state: session %d has no end snapshot", h);
-  const uint8_t* b = ss.end;
-  for (int L = 0; L < kLayers; ++L, b += kRingBytes) {
-    CUDA_CHECK(cudaMemcpyAsync(ring_kv[L], b, (size_t)attn::kRing * kHead, cudaMemcpyDeviceToDevice, st));
-    CUDA_CHECK(cudaMemcpyAsync(ring_sc[L], b + (size_t)attn::kRing * kHead, (size_t)attn::kRing * kHead / 32,
-                               cudaMemcpyDeviceToDevice, st));
+  if (ss.end.empty()) die("state: session %d has no end snapshot", h);
+  size_t off = 0;
+  for (int L = 0; L < kLayers; ++L, off += kRingBytes) {
+    bk_copy(ss.end, off, ring_kv[L], (size_t)attn::kRing * kHead, false);
+    bk_copy(ss.end, off + (size_t)attn::kRing * kHead, ring_sc[L], (size_t)attn::kRing * kHead / 32, false);
   }
-  for (int k = 0; k < kKvSlots; ++k, b += kCarryBytes) {
-    CUDA_CHECK(cudaMemcpyAsync(kvs[k].carry_kv, b, kCarryBytes / 2, cudaMemcpyDeviceToDevice, st));
-    CUDA_CHECK(cudaMemcpyAsync(kvs[k].carry_sc, b + kCarryBytes / 2, kCarryBytes / 2, cudaMemcpyDeviceToDevice, st));
+  for (int k = 0; k < kKvSlots; ++k, off += kCarryBytes) {
+    bk_copy(ss.end, off, reinterpret_cast<uint8_t*>(kvs[k].carry_kv), kCarryBytes / 2, false);
+    bk_copy(ss.end, off + kCarryBytes / 2, reinterpret_cast<uint8_t*>(kvs[k].carry_sc), kCarryBytes / 2, false);
   }
-  if (spec) spec_windows(*spec, ss.end + kEndBytes, -1, 0, false, st);
+  if (spec) spec_windows(*this, *spec, ss.end, kEndBytes, -1, 0, false);
 }
 
-// What session h holds from position `from` on no longer belongs to its history: snapshots above it,
-// the end snapshot if it is above, and saved positions from it on.
+// What session h holds from position `from` on no longer belongs to its history: bookmarks above it, the end bookmark
+// if it is above, and saved positions from it on (the numbers past them go back unless a line holds the session: the
+// line writes over them as it goes on).
 void Model::Impl::state_drop(int h, int from) {
   Store& s = store_of();
   const auto it = s.sess.find(h);
@@ -1008,19 +1140,22 @@ void Model::Impl::state_drop(int h, int from) {
     return;
   }
   for (auto i = ss.snaps.upper_bound(from); i != ss.snaps.end();) {
-    store_release(i->second, snap_bytes(sp));
+    give_nums(i->second);
     i = ss.snaps.erase(i);
   }
   if (ss.end_pos > from) {
-    store_release(ss.end, end_bytes(sp));
-    ss.end = nullptr;
+    give_nums(ss.end);
     ss.end_pos = -1;
   }
   ss.saved = std::min(ss.saved, from);
-  while ((int)ss.pages.size() > (ss.saved + kPagePos - 1) / kPagePos) {
-    store_release(ss.pages.back(), kPageBytes);
-    ss.pages.pop_back();
-  }
+  if (ss.line >= 0 && !own_tail(h, from)) die("state: no room to copy session %d's shared numbers from %d on", h, from);
+  if (ss.line < 0)
+    for (int k = 0; k < kKvSlots; ++k)
+      while ((int)ss.lists[k].size() > nums_for_pos(k, ss.saved)) {
+        Nums last{ss.lists[k].back()};
+        ss.lists[k].pop_back();
+        give_nums(last);
+      }
 }
 
 void Model::Impl::state_free(int h) {
@@ -1028,14 +1163,21 @@ void Model::Impl::state_free(int h) {
   const auto it = s.sess.find(h);
   if (it == s.sess.end()) return;
   Store::Sess& ss = it->second;
-  for (uint8_t* p : ss.pages) store_release(p, kPageBytes);
-  for (auto& sn : ss.snaps) store_release(sn.second, snap_bytes(spec != nullptr));
-  store_release(ss.end, end_bytes(spec != nullptr));
+  if (ss.line >= 0) {  // a line still holds it (a release frees it first): the line leaves it
+    const int u = ss.line;
+    write_rows(*this, u, nullptr);
+    line_h[u] = kNoLine;
+    for (int t = 0; t < nslots; ++t)
+      if (unit_of[t] == u) mapped_upto[t] = -1, resv[t] = 0;
+  }
+  for (Nums& l : ss.lists) give_nums(l);
+  for (auto& sn : ss.snaps) give_nums(sn.second);
+  give_nums(ss.end);
   disk_release(s, ss, spec != nullptr);  // a spilled session's writes may still be queued: harmless
   s.sess.erase(it);
 }
 
-// src's snapshots up to upto into dst (src is kept while they are copied); those without room are not.
+// src's bookmarks up to upto are dst's too: the same numbers, shared by count (a fork's; immutable until one is written again).
 void Model::Impl::state_copy_snaps(int src, int dst, int upto) {
   Store& s = store_of();
   const auto it = s.sess.find(src);
@@ -1046,12 +1188,16 @@ void Model::Impl::state_copy_snaps(int src, int dst, int upto) {
     s.pinned.pop_back();
   }
   it->second.used = ++s.clock;
-  const std::vector<std::pair<int, uint8_t*>> from(it->second.snaps.begin(), it->second.snaps.upper_bound(upto));
   s.pinned.push_back(src);
-  for (const auto& sn : from)
-    if (uint8_t* b = state_snap_buf(dst, sn.first))
-      CUDA_CHECK(cudaMemcpyAsync(b, sn.second, snap_bytes(spec != nullptr), cudaMemcpyDeviceToDevice, st));
+  Store::Sess& d = use_blocks(*this, dst);
   s.pinned.pop_back();
+  for (auto i = it->second.snaps.begin(); i != it->second.snaps.upper_bound(upto); ++i) {  // shared by count
+    const auto j = d.snaps.find(i->first);
+    if (j != d.snaps.end()) give_nums(j->second), d.snaps.erase(j);
+    Nums b;
+    share_nums(i->second, i->second.size(), &b);
+    d.snaps.emplace(i->first, std::move(b));
+  }
 }
 
 void Model::Impl::state_drop_snap(int h, int pos) {
@@ -1068,31 +1214,79 @@ void Model::Impl::state_drop_snap(int h, int pos) {
   }
   const auto i = it->second.snaps.find(pos);
   if (i == it->second.snaps.end()) return;
-  store_release(i->second, snap_bytes(spec != nullptr));
+  give_nums(i->second);
   it->second.snaps.erase(i);
 }
 
 void Model::state_reserve(size_t bytes) { d_->state_reserve(bytes); }
-size_t Model::state_capacity() const {
-  if (!d_->store_s) return 0;
-  return d_->store_s->region >= 0 ? d_->store_s->share : d_->store_s->pool.size;
-}
-size_t Model::state_ceiling() const { return d_->store_s ? d_->store_s->pool.size : 0; }
-bool Model::state_shared() const { return d_->store_shared(); }
+size_t Model::state_capacity() const { return d_->store_numbers * d_->chunk_image(); }  // the store's share of the pool
+size_t Model::state_ceiling() const { return d_->calloc ? d_->calloc->total() * d_->chunk_image() : 0; }  // all of it
 size_t Model::state_giveable(const std::vector<int>& keep) const { return d_->state_giveable(keep); }
-Model::StoreChunks Model::state_chunks() const {
+Model::StoreChunks Model::state_chunks() const {  // the chunk pool: numbers in all, held by the sessions no line holds
   StoreChunks c;
-  if (!d_->store_shared()) return c;
-  const detail::Store& s = *d_->store_s;
-  const vmm::Pool& p = *d_->slot_pool;
-  c.total = p.total(), c.committed = p.committed_total(), c.mapped = p.region_mapped(s.region), c.idle = p.region_idle(s.region);
-  c.live_bytes = s.bytes, c.trimmed = s.trimmed_chunks, c.give_backs = s.give_backs;
+  if (!d_->calloc || !d_->store_s) return c;
+  c.total = d_->calloc->total();
+  for (const auto& kv : d_->store_s->sess)
+    if (kv.first > 0 && !kv.second.disk && kv.second.line < 0) c.mapped += kv.second.numbers();
+  c.live_bytes = c.mapped * d_->chunk_image();
   return c;
 }
 void Model::state_pin(const std::vector<int>& h, const std::vector<int>& live) {
   auto& s = d_->store_of();
   s.pinned = h;
   s.live = live;
+}
+
+// Numbers a copy on write at position `pos` takes: with h_own == h_src, own_tail's count (every list's numbers from the
+// cut's chunk on that another list or bookmark also names, one fresh number each); with h_own another session (a fork of
+// h_src at pos), one number per list for the partial chunk at pos. Reads the store's records only (the same on every rank).
+int Model::state_cow_numbers(int h_src, int h_own, int pos) const {
+  const Impl& m = *d_;
+  if (!m.store_s) return 0;
+  const auto it = m.store_s->sess.find(h_src);
+  if (it == m.store_s->sess.end()) return 0;
+  const Store::Sess& x = it->second;
+  int n = 0;
+  for (int k = 0; k < kKvSlots; ++k) {
+    const int e = std::max(0, pos) / (k < 3 ? 2 : 1);
+    if (h_own != h_src) {
+      n += (e & (attn::kChunkEntries - 1)) != 0;
+      continue;
+    }
+    for (size_t i = (size_t)(e >> attn::kChunkShift); i < x.lists[k].size(); ++i) {
+      const uint32_t c = x.lists[k][i];
+      n += c && c < m.refs.size() && m.refs[c] >= 2;
+    }
+  }
+  return n;
+}
+
+// A hash of the state every rank must hold alike (sessions with their lists, bookmarks and images, the numbers' counts and
+// images, the reservations, the evict-last list): compared across the ranks' logs under DSGB10_STORE_CHECK=1.
+uint64_t Model::store_digest() const {
+  const Impl& m = *d_;
+  uint64_t h = 1469598103934665603ull;
+  const auto mix = [&](uint64_t v) { h = (h ^ v) * 1099511628211ull; };
+  if (m.store_s) {
+    const Store& s = *m.store_s;
+    for (const auto& [k, x] : s.sess) {
+      mix((uint64_t)(uint32_t)k), mix((uint64_t)(uint32_t)x.line), mix((uint64_t)(uint32_t)x.saved), mix((uint64_t)(uint32_t)x.end_pos);
+      for (int a = 0; a < kKvSlots; ++a) {
+        mix(x.lists[a].size());
+        for (const uint32_t c : x.lists[a]) mix(c);
+      }
+      for (const auto& [pos, b] : x.snaps) {
+        mix((uint64_t)(uint32_t)pos), mix(b.size());
+        for (const uint32_t c : b) mix(c);
+      }
+      for (const auto& [pos, o] : x.dsnaps) mix((uint64_t)(uint32_t)pos), mix(o);
+      for (const uint32_t c : x.end) mix(c);
+      mix(x.dend);
+    }
+  }
+  for (const uint32_t r : m.refs) mix(r);
+  for (int t = 0; t < m.nslots; ++t) mix((uint64_t)(uint32_t)m.resv[t]);
+  return h;
 }
 std::vector<int> Model::state_evicted() {
   std::vector<int> v;
@@ -1121,7 +1315,8 @@ uint64_t Model::state_kept() const { return d_->store_s ? d_->store_s->loaded_ge
 std::vector<int> Model::state_sessions() const {
   std::vector<int> v;
   if (d_->store_s)
-    for (const auto& kv : d_->store_s->sess) v.push_back(kv.first);
+    for (const auto& kv : d_->store_s->sess)
+      if (kv.first > 0) v.push_back(kv.first);  // not a unit's own (tools' steps)
   return v;
 }
 size_t Model::state_disk_capacity() const { return d_->store_s && d_->store_s->disk ? d_->store_s->dpool.size : 0; }
@@ -1139,7 +1334,7 @@ Model::StateInfo Model::state_info(int h) const {
   r.saved = ss.saved;
   r.on_disk = ss.disk;
   r.restart = ss.disk ? restart_of(ss.saved, ss.dend != Pool::kNone ? ss.end_pos : -1, ss.dsnaps)
-                      : restart_of(ss.saved, ss.end ? ss.end_pos : -1, ss.snaps);
+                      : restart_of(ss.saved, ss.end.empty() ? -1 : ss.end_pos, ss.snaps);
   if (ss.disk) {
     r.end_pos = ss.dend != Pool::kNone ? ss.end_pos : -1;
     for (const auto& sn : ss.dsnaps) r.snaps.push_back(sn.first);
@@ -1147,25 +1342,41 @@ Model::StateInfo Model::state_info(int h) const {
                    (ss.dend != Pool::kNone ? Pool::round(end_bytes(spec)) : 0);
     return r;
   }
-  r.end_pos = ss.end ? ss.end_pos : -1;
+  r.end_pos = ss.end.empty() ? -1 : ss.end_pos;
   for (const auto& sn : ss.snaps) r.snaps.push_back(sn.first);
-  r.bytes = ss.pages.size() * Pool::round(kPageBytes) + ss.snaps.size() * Pool::round(snap_bytes(spec)) +
-            (ss.end ? Pool::round(end_bytes(spec)) : 0);
+  r.bytes = ss.numbers() * d_->chunk_image();
   return r;
 }
-size_t Model::state_bytes() const { return d_->store_s ? d_->store_s->bytes : 0; }
+size_t Model::state_bytes() const {  // device memory the store's sessions hold (no line holds them)
+  return state_chunks().live_bytes;
+}
 Model::TierStats Model::tier_stats() const {
   TierStats t = d_->tier;
   if (const detail::Store* s = d_->store_s.get()) {
-    t.store_cap = s->pool.size, t.store_used = s->bytes;
-    if (s->region >= 0) {  // the store may hold what the slots have not committed
-      const size_t total = d_->slot_pool->total(), c = d_->slot_pool->committed_total();
-      t.store_cap = (total > c ? total - c : 0) * vmm::kChunk;
-    }
-    for (const auto& kv : s->sess) ++(kv.second.disk ? t.on_disk : t.resident);
+    t.store_cap = state_ceiling(), t.store_used = state_bytes();  // one pool: the lines and the sessions kept
+    for (const auto& kv : s->sess)
+      if (kv.first > 0) ++(kv.second.disk ? t.on_disk : t.resident);
     if (s->disk) t.disk_cap = s->dpool.size, t.disk_used = s->dbytes;
   }
   return t;
+}
+Model::PoolStats Model::pool_stats() const {
+  PoolStats p;
+  const Impl& m = *d_;
+  if (!m.calloc) return p;
+  p.numbers = m.calloc->total(), p.free = m.calloc->free(), p.held = m.calloc->held(), p.number_bytes = m.chunk_image();
+  for (const uint32_t r : m.refs) p.shared += r > 1;
+  for (int s = 0; s < m.nslots; ++s) p.reserved += (uint64_t)std::max(0, m.resv[s] - m.held(s));
+  if (const detail::Store* st = m.store_s.get())
+    for (const auto& [k, ss] : st->sess) {
+      if (k <= 0) continue;  // a line's own session (tools, tests)
+      ++(ss.line >= 0 ? p.on_lines : ss.disk ? p.on_disk : p.in_memory);
+      bool sh = false;
+      for (const detail::Nums& l : ss.lists)
+        for (const uint32_t c : l) sh = sh || m.refs[c] > 1;
+      p.sharing += sh;
+    }
+  return p;
 }
 void Model::drain() { d_->drain(); }
 

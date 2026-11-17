@@ -236,8 +236,8 @@ struct CompState {  // a kv-source layer's compressor weights and caches
     return {ratio, wkv, wgate, norm.p, wk.p, knorm.p};
   }
   attn::CompressorCarry carry() const { return {carry_kv.p, carry_sc.p}; }
-  attn::Compressed ckv() const { return {ckv_kv.p, ckv_sc.p, cap}; }
-  attn::IndexKeys ik() const { return {ik_k.p, ik_sc.p, cap}; }
+  attn::Compressed ckv() const { return listed(attn::Compressed{ckv_kv.p, ckv_sc.p, cap}, cap); }
+  attn::IndexKeys ik() const { return listed(attn::IndexKeys{ik_k.p, ik_sc.p, cap}, cap); }
   void check(const CompState& o, const char* tag) const {
     std::string t(tag);
     same((t + " ckv").c_str(), ckv_kv, o.ckv_kv);
@@ -476,7 +476,7 @@ struct IdxCase {
     }
   }
   int kstride() const { return (max_scan + attn::kScoreAlign - 1) / attn::kScoreAlign * attn::kScoreAlign; }
-  attn::IndexKeys ik() const { return {ik_k.p, ik_sc.p, 0}; }
+  attn::IndexKeys ik() const { return listed(attn::IndexKeys{ik_k.p, ik_sc.p, 0}, (int)(ik_k.n / 64)); }
 };
 
 // separate: q prep, scores, top-k (+ pool) into slot `slot` of the outputs (stride top_stride / pool_stride)
@@ -671,7 +671,7 @@ void test_attn(int rows, int kmax, int splits) {
   const int max_splits = 16;
   Dev<float> po((size_t)rows * max_splits * attn::kHeads * kHead), pml((size_t)rows * max_splits * attn::kHeads * 2);
   attn::AttnScratch scratch{po.p, pml.p, max_splits};
-  attn::Compressed ckv{ckv_kv.p, ckv_sc.p, cap};
+  const attn::Compressed ckv = listed(attn::Compressed{ckv_kv.p, ckv_sc.p, cap}, cap);
   Dev<uint16_t> ou((size_t)rows * attn::kHeads * kHead), of((size_t)rows * attn::kHeads * kHead);
   attn::sparse_attn(q.p, pos.p, {}, rows, tab.p, ring.win(), ckv, topk.p, kmax, sink.p, ou.p, splits, scratch, g_s);
   attn::sparse_attn(q.p, pos.p, {}, rows, tab.p, ring.win(), ckv, topk.p, kmax, sink.p, of.p, splits, scratch, g_s,
@@ -862,6 +862,7 @@ int main() {
     const bool one_session = rows <= attn::kDecodeGroup;  // decode_prep: at most 8 rows a session
     test_mhc(rows);
     test_dspark(rows);
+    test_hc_quarter(rows);
     test_comp_proj(rows);
     if (one_session) {
       for (int last : {1001, 1002}) {

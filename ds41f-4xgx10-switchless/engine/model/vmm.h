@@ -1,4 +1,4 @@
-// Session-slot memory made once and mapped on demand (docs/engine.md, "Session slots mapped on demand").
+// The memory behind the chunk pool's arrays, made once and mapped before serving (docs/engine.md, "The chunk pool").
 //
 // A Pool owns B physical chunks of kChunk bytes, all created when it is built and never released while it
 // lives, and any number of virtual address ranges ("arrays"), one per per-session array, each reserved
@@ -19,12 +19,6 @@
 //    every chunk it maps with 0xFF, to prove that.
 //  - Commitments (reserve) are a host-side account: the sum of every slot's max(reserved, mapped) chunks
 //    never exceeds the pool, so a slot that stays within its reservation can always be mapped.
-//  - Regions (add_region) are ranges of the same pool that map chunk by chunk, in any order, under a reference count
-//    per chunk: the session store's block space (state.cu). A chunk is mapped while any live block overlaps it,
-//    stays mapped (idle) when the last block leaves, and goes back to the free list only at region_trim(), which
-//    the caller calls once nothing queued can still read it. The store's mapped chunks count against the same
-//    budget as the slots' commitments: committed_total() + regions_mapped() never exceeds total(), so a slot that
-//    stays within its reservation can always be mapped, and the store maps only chunks no slot has committed.
 //  - Chunks are made at the start only: the constructor, and add_chunks() before serving. Nothing is created or
 //    destroyed after that.
 //  - Not thread safe: one caller (the model's host thread).
@@ -131,42 +125,19 @@ class Pool {
   size_t mapped(int slot) const { return slots_[slot].mapped; }
   size_t mapped(int slot, int array) const { return slots_[slot].held.size() > (size_t)array ? slots_[slot].held[array].size() : 0; }
   // Commitments: reserve(slot, n) sets the slot's reservation to n chunks when the sum of every slot's
-  // max(reserved, mapped), and the chunks the regions have mapped, stays within the pool (else false, nothing
-  // changed).
+  // max(reserved, mapped) stays within the pool (else false, nothing changed).
   bool reserve(int slot, size_t chunks);
   size_t reserved(int slot) const { return slots_[slot].reserved; }
   size_t committed(int slot) const { return std::max(slots_[slot].reserved, slots_[slot].mapped); }
   size_t committed_total() const;
-  // chunks no slot has committed and no region has mapped
+  // chunks no slot has committed
   size_t uncommitted() const {
-    const size_t c = committed_total() + regions_mapped_;
+    const size_t c = committed_total();
     return total() > c ? total() - c : 0;
   }
 
-  // ---- regions (the session store's block space)
   // Makes `n` more chunks now, for the start-up (the pool's ok() then covers them); returns how many were made.
   size_t add_chunks(size_t n);
-  // A range of `chunks` chunks of address space, nothing mapped (the address space costs nothing). Returns its id,
-  // or -1 (error()).
-  int add_region(size_t chunks);
-  uint64_t region_base(int r) const { return regions_[r].base; }
-  size_t region_chunks(int r) const { return regions_[r].chunks; }
-  size_t region_mapped(int r) const { return regions_[r].mapped; }  // chunks mapped (blocks over them, or idle)
-  size_t region_idle(int r) const { return regions_[r].idle; }      // mapped with no block over them
-  size_t regions_mapped() const { return regions_mapped_; }
-  bool region_is_mapped(int r, size_t i) const { return regions_[r].held[i] != kNone; }
-  size_t region_refs(int r, size_t i) const { return regions_[r].refs[i]; }
-  // Chunks a block of `bytes` at byte offset `off` of the region would map (those of its span not mapped yet).
-  size_t region_need(int r, size_t off, size_t bytes) const;
-  // A block at [off, off + bytes): maps the chunks of its span that are not mapped (an idle one is taken again
-  // as it is) and counts the block on each. False, with nothing changed, when the span is past the region, fewer
-  // chunks are uncommitted() than it needs, or the driver fails.
-  bool region_acquire(int r, size_t off, size_t bytes);
-  // The block at [off, off + bytes) is gone: a chunk no block is left on stays mapped, idle.
-  void region_drop(int r, size_t off, size_t bytes);
-  // Unmaps every idle chunk of the region (back to the free list); returns how many. The caller guarantees that
-  // nothing queued on the device reads them.
-  size_t region_trim(int r);
 
  private:
   struct Array {
@@ -174,15 +145,6 @@ class Pool {
     size_t stride;
     int nunits;
   };
-  static constexpr uint32_t kNone = UINT32_MAX;
-  struct Region {
-    uint64_t base = 0;
-    size_t chunks = 0, mapped = 0, idle = 0;
-    std::vector<uint32_t> held;  // [chunk]: the chunk id mapped there, kNone when none
-    std::vector<uint32_t> refs;  // [chunk]: blocks over it
-  };
-  bool map_region_chunk(Region& g, size_t i);
-  void unmap_region_chunk(Region& g, size_t i);
   struct Slot {
     int first_unit, units;
     size_t mapped = 0, reserved = 0;
@@ -197,8 +159,6 @@ class Pool {
   std::vector<uint32_t> free_;     // chunk ids not mapped, the next to map last
   std::vector<Array> arrays_;
   std::vector<Slot> slots_;
-  std::vector<Region> regions_;
-  size_t regions_mapped_ = 0;
   size_t peak_ = 0;
   bool poison_ = false;
   std::string err_;

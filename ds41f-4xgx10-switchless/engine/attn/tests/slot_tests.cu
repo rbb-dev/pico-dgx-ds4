@@ -192,14 +192,16 @@ struct WinAlone {
   }
 };
 
-struct CompSlots {  // a kv-source layer's compressor state
+struct CompSlots {  // a kv-source layer's compressor state (each slot's cache whole chunks: identity rows read it)
   int ratio, cap;
   Slots<float> ckv_c, csc_c;
   Slots<uint8_t> kv, sc, k, ksc;
+  ChunkLists lists;
   CompSlots(int ratio_)
-      : ratio(ratio_), cap(kMaxCtx / ratio_ + 64), ckv_c(slots_f32(16 * kHead, 1.f)), csc_c(slots_f32(16 * kHead, 1.f)),
-        kv(slots_u8((size_t)cap * kHead / 2, 0xFF, 0)), sc(slots_u8((size_t)cap * 32, 0x1F, 0x28)),
-        k(slots_u8((size_t)cap * 64, 0xFF, 0)), ksc(slots_u8((size_t)cap * 4, 7, 120)) {}
+      : ratio(ratio_), cap(whole_chunks(kMaxCtx / ratio_ + 64) * attn::kChunkEntries), ckv_c(slots_f32(16 * kHead, 1.f)),
+        csc_c(slots_f32(16 * kHead, 1.f)), kv(slots_u8((size_t)cap * kHead / 2, 0xFF, 0)),
+        sc(slots_u8((size_t)cap * 32, 0x1F, 0x28)), k(slots_u8((size_t)cap * 64, 0xFF, 0)),
+        ksc(slots_u8((size_t)cap * 4, 7, 120)), lists(kSlots, cap / attn::kChunkEntries) {}
   attn::CompressorCarry carry(const Step& st) const {
     attn::CompressorCarry c{ckv_c.d.p, csc_c.d.p};
     c.slot = st.table(), c.stride = ckv_c.n;
@@ -207,12 +209,12 @@ struct CompSlots {  // a kv-source layer's compressor state
   }
   attn::Compressed ckv(const Step& st) const {
     attn::Compressed c{kv.d.p, sc.d.p, cap};
-    c.slot = st.table(), c.kv_stride = kv.stride(), c.sc_stride = sc.stride();
+    c.slot = st.table(), c.list = lists.d.p, c.list_stride = lists.len;
     return c;
   }
   attn::IndexKeys ik(const Step& st) const {
     attn::IndexKeys i{k.d.p, ksc.d.p, cap};
-    i.slot = st.table(), i.k_stride = k.stride(), i.sc_stride = ksc.stride();
+    i.slot = st.table(), i.list = lists.d.p, i.list_stride = lists.len;
     return i;
   }
 };
@@ -224,8 +226,8 @@ struct CompAlone {
       : ckv_c(c.ckv_c.take(s)), csc_c(c.csc_c.take(s)), ckv_c0(c.ckv_c.take(s)), kv(c.kv.take(s)), sc(c.sc.take(s)),
         k(c.k.take(s)), ksc(c.ksc.take(s)), kv0(c.kv.take(s)), k0(c.k.take(s)), cap(c.cap) {}
   attn::CompressorCarry carry() const { return {ckv_c.p, csc_c.p}; }
-  attn::Compressed ckv() const { return {kv.p, sc.p, cap}; }
-  attn::IndexKeys ik() const { return {k.p, ksc.p, cap}; }
+  attn::Compressed ckv() const { return listed(attn::Compressed{kv.p, sc.p, cap}, cap); }
+  attn::IndexKeys ik() const { return listed(attn::IndexKeys{k.p, ksc.p, cap}, cap); }
   // entries: the session completes one (else the entries and keys stay as they were)
   void check(const CompSlots& c, int s, const std::string& t, bool entries) const {
     same(t + " entries", c.kv.at(s), kv.p, kv.n);
@@ -426,11 +428,17 @@ void test_attn(const Step& st) {
     for (int i = 0; i < k; ++i) ht[(size_t)r * kmax + i] = all[i];
   }
   Dev<int> topk(ht.data(), ht.size());
+  std::vector<int> hp = ht;  // the step's picks: pool entries (a session's entry e at slot * cap + e, attn.h)
+  for (size_t i = 0; i < st.ss.size(); ++i)
+    for (int r = st.first[i]; r < st.first[i] + st.ss[i].rows; ++r)
+      for (int k = 0; k < kmax; ++k)
+        if (hp[(size_t)r * kmax + k] >= 0) hp[(size_t)r * kmax + k] += st.ss[i].slot * cs.cap;
+  Dev<int> ptopk(hp.data(), hp.size());
   const int ms = 16;
   Dev<float> po((size_t)R * ms * attn::kHeads * kHead), pml((size_t)R * ms * attn::kHeads * 2);
   const attn::AttnScratch scratch{po.p, pml.p, ms};
   Dev<uint16_t> out((size_t)R * attn::kHeads * kHead);
-  attn::sparse_attn(q.p, st.pos.p, {}, R, rope_table(), win.all(st), cs.ckv(st), topk.p, kmax, sink.p, out.p, splits,
+  attn::sparse_attn(q.p, st.pos.p, {}, R, rope_table(), win.all(st), cs.ckv(st), ptopk.p, kmax, sink.p, out.p, splits,
                     scratch, g_s, true);
   for (size_t i = 0; i < st.ss.size(); ++i) {
     const int f = st.first[i], n = st.ss[i].rows, s = st.ss[i].slot;
@@ -458,10 +466,16 @@ struct IdxOut {  // one run's scan keys and selections, rows `kstride` / kTopk /
   attn::IndexSel tsel() const { return {kTopk, top.p, tkey.p, kTopk}; }
   attn::IndexSel psel() const { return {kPool, pool.p, pkey.p, kPool}; }
   // rows [f, f + n) of this against all of o; `empty`: o's scan held no entries (part_empty), so o wrote
-  // positions -1 and keys 0
-  void check(const IdxOut& o, int f, int n, bool bk, bool pl, const std::string& t, bool empty = false) const {
+  // positions -1 and keys 0. off: where the session's entries start among this run's pool entries (its slot's
+  // identity row, slot * cap; o, alone, reads entries as they are): this run's picks are taken back by it.
+  void check(const IdxOut& o, int f, int n, bool bk, bool pl, const std::string& t, bool empty = false,
+             int off = 0) const {
     same(t + " keys", keys.p + (size_t)f * kstride, o.keys.p, (size_t)n * kstride);
-    same(t + " top", top.p + (size_t)f * kTopk, o.top.p, (size_t)n * kTopk);
+    std::vector<int> h((size_t)n * kTopk);
+    CUDA_CHECK(cudaMemcpy(h.data(), top.p + (size_t)f * kTopk, h.size() * sizeof(int), cudaMemcpyDeviceToHost));
+    for (int& v : h) v = v >= 0 ? v - off : v;
+    const Dev<int> mine(h.data(), h.size());
+    same(t + " top", mine.p, o.top.p, (size_t)n * kTopk);
     same(t + " top keys", tkey.p + (size_t)f * kTopk, o.tkey.p, (size_t)n * kTopk);
     if (empty) nonzero(t + " top (empty)", o.top.p, (size_t)n * kTopk);
     else nonzero(t + " top keys", o.tkey.p, (size_t)n * kTopk);
@@ -522,7 +536,7 @@ void test_dense(const Step& st, int ratio, bool pool, int cand) {
     IdxOut o(n, ks);
     attn::index_dense(in.q(f), in.w(f), st.pos.p + f, rope_table(), n, ratio, ca.ik(), max_scan, o.keys.p, ks,
                       o.bkeys.p, ks / 8, o.tsel(), pool ? o.psel() : attn::IndexSel{}, scratch.p, true, g_s, cand);
-    all.check(o, f, n, true, pool, "session " + std::to_string(i));
+    all.check(o, f, n, true, pool, "session " + std::to_string(i), false, st.ss[i].slot * cs.cap);
   }
   end();
   if (ratio != 1) return;
@@ -537,7 +551,7 @@ void test_dense(const Step& st, int ratio, bool pool, int cand) {
     attn::index_dense_blocks(in.q(f), in.w(f), st.pos.p + f, rope_table(), n, 1, ca.ik(),
                              in.blocks.p + (size_t)f * kPool, kPool, o.keys.p, kPool * 8, o.tsel(), scratch.p, true,
                              g_s, cand);
-    ball.check(o, f, n, false, false, "session " + std::to_string(i));
+    ball.check(o, f, n, false, false, "session " + std::to_string(i), false, st.ss[i].slot * cs.cap);
   }
   same("scratch left zero", scratch.p, Dev<uint32_t>(scratch.n).p, scratch.n);
   end();
@@ -577,7 +591,8 @@ void test_fused(const Step& st, int ratio, int part, bool blocks) {
     attn::index_fused(in.q(f), in.w(f), st.pos.p + f, rope_table(), n, ratio, ca.ik(), sc, max_scan, o.keys.p, ks,
                       pool ? o.bkeys.p : nullptr, ks / 8, o.tsel(), pool ? o.psel() : attn::IndexSel{}, counters.p,
                       true, g_s);
-    all.check(o, f, n, pool, pool, "session " + std::to_string(i), pool && part_empty(st.ss[i].last, ratio, part));
+    all.check(o, f, n, pool, pool, "session " + std::to_string(i), pool && part_empty(st.ss[i].last, ratio, part),
+              st.ss[i].slot * cs.cap);
   }
   end();
   if (blocks) return;

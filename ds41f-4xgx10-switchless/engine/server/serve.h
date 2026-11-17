@@ -8,6 +8,7 @@
 #include "model/model.h"
 #include "server/cmd.h"
 #include "server/interleave.h"
+#include "server/reclaim.h"
 
 namespace srv {
 
@@ -19,14 +20,13 @@ struct ServeOptions {
   int snap_every = 1024;           // a window snapshot every this many positions (exact reuse)
   bool snap_thin = true;           // keep them dense near a session's end only (serve.cpp keep_snap); false
                                    // (--snap-all): every one kept
-  size_t budget = 12ull << 30;     // --session-gib: at most this much of the store's pool (main.cpp reserves
-                                   // it, model.h state_reserve) holds sessions' saved state (on the slot pool, the store's
-                                   // share at the start: serve() holds the store to the whole pool); LRU eviction
   bool ced = true;                 // CED prefill (docs/ced.md) for turns of at least 128 new positions
   int slice = 64;                  // time-slicing (docs/batching.md, B1): a new request pauses the requests
                                    // decoding and is prefilled; while more of them decode than there are
                                    // slots (Model::slots), they take turns of this many tokens. 0: no turns
                                    // (a request that would need the slot of another in flight waits)
+  int grow_ahead = 131072;         // growth (the chunk pool): a reply's reservation reaches this many positions past
+                                   // where it is, and goes further at its next run (serve.cpp need_now)
   // Kept sessions (docs/engine.md): a planned stop (SIGTERM) spills the sessions in device memory to the
   // disk tier, the most recently used first, up to keep_bytes (0: nothing is kept), and writes every
   // kept session's history to keep_index (beside the disk tier's files); the next start takes them back

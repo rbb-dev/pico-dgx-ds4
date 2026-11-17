@@ -266,9 +266,17 @@ def main():
     check(all(k in t0 for k in ("stored_bytes", "cap_bytes", "points", "writes_committed", "written_bytes", "writes_pending")), "prompt_cache.spill[0] keys")
     check(all(k in pc for k in ("restores_begun", "disk_hits", "restored_tokens", "restore_waits", "restore_wait_ns", "restore_wait_max_ns")), "prompt_cache counters")
     ss = s["sessions"]
-    want = 2 * 1048576 + 30 * 65536
-    check(ss["slots"] == 32 and ss["slots_big"] == 2 and ss["positions"] == want and ss["usable_window"] == 1048576, f"sessions map the slots: {ss['positions']}")
-    check(ss["store_cap_bytes"] == want * 890 and "bytes_per_token" not in ss and ss["sessions_resident"] >= 0, "sessions carry the store as its own bytes")
+    pool, conv = ss.get("pool") or {}, ss.get("conversations") or {}
+    check(ss.get("lines") == 32 and ss.get("usable_window") == 1048576, f"sessions carry the lines and the window: {ss.get('lines')}")
+    check(pool.get("numbers") == 8913 and pool.get("number_bytes") == 2916352 and pool.get("positions") == 8913 * 16384 // 5
+          and pool.get("free", -1) + pool.get("held", -1) == 8913, f"sessions carry the chunk pool: {pool}")
+    check(all(k in conv for k in ("on_lines", "in_memory", "on_disk", "sharing")), f"sessions carry the conversations: {conv}")
+    page = http_("GET", "/dashboard", headers={"Authorization": None})[1].decode()
+    for label in ("'Pool memory'", "'KV pool'", "'Max context'", "'In use'", "'Shared starts'", "'For replies'", "'Running'",
+                  "'Paused in memory'", "'Paused on SSD'", "'Sharing a start'", "the conversation memory (the chunk pool)"):
+        check(label in page, f"the CONVERSATION MEMORY card has {label}")
+    check(all(k not in ss for k in ("slots", "slots_big", "positions", "store_cap_bytes", "store_used_bytes")),
+          "no fixed slots, no slots x window sum, no store of its own memory")
 
     # ---- the live settings (interleaved prefill): read from STATS, changed with a CONFIG frame, refused out of range
     il = s.get("interleave")

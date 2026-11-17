@@ -1,4 +1,4 @@
-// The slot memory pool (vmm.h): chunks made once, mapped into slots' regions on demand. Host only.
+// The memory behind the chunk pool's arrays (vmm.h): chunks made once and mapped before serving. Host only.
 #include "model/vmm.h"
 
 #include <cstdio>
@@ -86,11 +86,6 @@ Pool::Pool(std::unique_ptr<Backend> be, size_t chunks) : be_(std::move(be)), wan
 
 Pool::~Pool() {
   for (int s = 0; s < (int)slots_.size(); ++s) release(s);
-  for (Region& g : regions_) {
-    for (size_t i = 0; i < g.chunks; ++i)
-      if (g.held[i] != kNone) unmap_region_chunk(g, i);
-    be_->release_va(g.base, g.chunks * kChunk);
-  }
   for (const uint64_t h : handles_) be_->destroy(h);
   for (const Array& a : arrays_) be_->release_va(a.base, a.stride * (size_t)a.nunits);
 }
@@ -208,12 +203,12 @@ size_t Pool::committed_total() const {
 bool Pool::reserve(int slot, size_t chunks) {
   Slot& s = slots_[slot];
   const size_t others = committed_total() - committed(slot);
-  if (others + std::max(chunks, s.mapped) + regions_mapped_ > total()) return false;
+  if (others + std::max(chunks, s.mapped) > total()) return false;
   s.reserved = chunks;
   return true;
 }
 
-// ---- regions ----------------------------------------------------------------------------------------
+// ---- more chunks at the start --------------------------------------------------------------------------
 
 size_t Pool::add_chunks(size_t n) {
   want_ += n;
@@ -232,116 +227,6 @@ size_t Pool::add_chunks(size_t n) {
   // the new chunks map after the ones there are: the lowest of them first
   free_.insert(free_.begin(), made.rbegin(), made.rend());
   return made.size();
-}
-
-int Pool::add_region(size_t chunks) {
-  if (chunks == 0) {
-    err_ = "add_region: no chunks";
-    return -1;
-  }
-  uint64_t va = 0;
-  if (!be_->reserve(chunks * kChunk, &va)) {
-    err_ = "reserve of " + std::to_string(chunks * kChunk) + " bytes: " + be_->error();
-    return -1;
-  }
-  Region g;
-  g.base = va, g.chunks = chunks;
-  g.held.assign(chunks, kNone);
-  g.refs.assign(chunks, 0);
-  regions_.push_back(std::move(g));
-  return (int)regions_.size() - 1;
-}
-
-bool Pool::map_region_chunk(Region& g, size_t i) {
-  if (free_.empty()) {
-    err_ = "region chunk " + std::to_string(i) + ": no chunk free";
-    return false;
-  }
-  const uint64_t va = g.base + i * kChunk;
-  const uint32_t id = free_.back();
-  if (!be_->map(va, handles_[id])) {
-    err_ = "map of region chunk " + std::to_string(i) + ": " + be_->error();
-    return false;
-  }
-  if (!be_->allow(va, kChunk)) {
-    err_ = "access of region chunk " + std::to_string(i) + ": " + be_->error();
-    be_->unmap(va);
-    return false;
-  }
-  free_.pop_back();
-  g.held[i] = id;
-  ++g.mapped;
-  ++regions_mapped_;
-  peak_ = std::max(peak_, used_chunks());
-  return true;
-}
-
-void Pool::unmap_region_chunk(Region& g, size_t i) {
-  be_->unmap(g.base + i * kChunk);
-  free_.push_back(g.held[i]);
-  g.held[i] = kNone;
-  --g.mapped;
-  --regions_mapped_;
-}
-
-size_t Pool::region_need(int r, size_t off, size_t bytes) const {
-  const Region& g = regions_[r];
-  if (!bytes) return 0;
-  size_t n = 0;
-  const size_t last = std::min((off + bytes - 1) / kChunk, g.chunks - 1);
-  for (size_t i = off / kChunk; i <= last; ++i) n += g.held[i] == kNone;
-  return n;
-}
-
-bool Pool::region_acquire(int r, size_t off, size_t bytes) {
-  Region& g = regions_[r];
-  if (!bytes) return true;
-  const size_t first = off / kChunk, last = (off + bytes - 1) / kChunk;
-  if (last >= g.chunks) {
-    err_ = "region " + std::to_string(r) + ": a block at " + std::to_string(off) + " of " + std::to_string(bytes) +
-           " bytes is past its " + std::to_string(g.chunks) + " chunks";
-    return false;
-  }
-  const size_t need = region_need(r, off, bytes);
-  if (need > uncommitted()) {
-    err_ = "region " + std::to_string(r) + ": a block needs " + std::to_string(need) + " chunks, " +
-           std::to_string(uncommitted()) + " uncommitted";
-    return false;
-  }
-  size_t revived = 0;
-  for (size_t i = first; i <= last; ++i) revived += g.held[i] != kNone && g.refs[i] == 0;
-  std::vector<size_t> fresh;
-  for (size_t i = first; i <= last; ++i)
-    if (g.held[i] == kNone) {
-      if (!map_region_chunk(g, i)) {
-        for (const size_t j : fresh) unmap_region_chunk(g, j);  // all or nothing
-        return false;
-      }
-      fresh.push_back(i);
-    }
-  for (size_t i = first; i <= last; ++i) ++g.refs[i];
-  g.idle -= revived;
-  return true;
-}
-
-void Pool::region_drop(int r, size_t off, size_t bytes) {
-  Region& g = regions_[r];
-  if (!bytes) return;
-  const size_t last = std::min((off + bytes - 1) / kChunk, g.chunks - 1);
-  for (size_t i = off / kChunk; i <= last; ++i) {
-    if (g.refs[i] == 0) continue;  // a block dropped twice: nothing to take off
-    if (--g.refs[i] == 0 && g.held[i] != kNone) ++g.idle;
-  }
-}
-
-size_t Pool::region_trim(int r) {
-  Region& g = regions_[r];
-  size_t n = 0;
-  if (!g.idle) return 0;
-  for (size_t i = 0; i < g.chunks; ++i)
-    if (g.held[i] != kNone && g.refs[i] == 0) unmap_region_chunk(g, i), ++n;
-  g.idle = 0;
-  return n;
 }
 
 }  // namespace model::vmm

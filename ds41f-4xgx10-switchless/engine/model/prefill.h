@@ -1,5 +1,9 @@
 // The many-row path (prefill.cu): buffers for chunks of up to `cap` rows, made on the first prefill.
 #pragma once
+#include <atomic>
+#include <thread>
+#include <vector>
+
 #include "model/impl.h"
 
 namespace model::detail {
@@ -9,8 +13,9 @@ constexpr int kSnapRows = 128;
 constexpr size_t kSnapKv = (size_t)kSnapRows * kHead;       // bytes per layer
 constexpr size_t kSnapSc = (size_t)kSnapRows * kHead / 32;
 constexpr size_t kSnapBytes = kLayers * (kSnapKv + kSnapSc);
-inline uint8_t* snap_kv(uint8_t* b, int L) { return b + L * kSnapKv; }
-inline uint8_t* snap_sc(uint8_t* b, int L) { return b + kLayers * kSnapKv + L * kSnapSc; }
+// a layer's rows within a bookmark (its numbers' bytes: Model::Impl::bk_copy)
+inline size_t snap_kv_off(int L) { return (size_t)L * kSnapKv; }
+inline size_t snap_sc_off(int L) { return (size_t)kLayers * kSnapKv + (size_t)L * kSnapSc; }
 
 // Sequence parallel: of a chunk of M rows, rank r owns rows [r q, r q + n) with q = q_rows(M) (n = q
 // but for the last ranks): their residual stream, mixes, sublayer boundaries and the row-split work.

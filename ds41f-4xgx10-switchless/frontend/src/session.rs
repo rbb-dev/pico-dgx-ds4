@@ -61,6 +61,8 @@ struct Session {
     ablit: bool,
     /// The images of its prompt, in order.
     images: Vec<ImageKey>,
+    /// Its text's prefix keys (`prefix_keys`), as the index holds them.
+    keys: Vec<u64>,
 }
 
 pub struct Plan {
@@ -89,17 +91,39 @@ impl Plan {
         } else if self.matched != 0 {
             format!("session {}, new: the best match, session {}, shares {} bytes (under {MIN_SHARED})", self.session_id, self.matched, self.shared)
         } else {
-            format!("session {}, new: no session shares a byte", self.session_id)
+            format!("session {}, new: no session shares {MIN_SHARED} bytes", self.session_id)
         }
     }
 }
 
 pub struct SessionTable {
     sessions: HashMap<u64, Session>,
+    /// The sessions by the hashes of their text's prefixes (`prefix_keys`): a prompt finds its best match among those
+    /// sharing its longest indexed prefix, not by reading every session's text.
+    index: HashMap<u128, Vec<u64>>,
     next_id: u64,
     clock: u64,
     max_sessions: usize,
     max_tokens: usize,
+}
+
+/// The prefix lengths a text is indexed at: MIN_SHARED bytes, then four times longer each (64, 256, 1 KiB, ... 4 MiB at
+/// level 8). A prompt and a session that share at least a level's length are in one bucket at that level.
+fn level_len(level: usize) -> usize {
+    MIN_SHARED << (2 * level)
+}
+
+/// The hash of `text`'s first `level_len(i)` bytes, with the level in it, for every level the text reaches: one pass.
+fn prefix_keys(text: &[u8]) -> Vec<u64> {
+    let mut out = Vec::new();
+    let mut h = 1469598103934665603u64;
+    for (i, &b) in text.iter().enumerate() {
+        h = (h ^ b as u64).wrapping_mul(1099511628211);
+        if i + 1 == level_len(out.len()) {
+            out.push(h ^ (out.len() as u64 + 1).wrapping_mul(0x9e3779b97f4a7c15));
+        }
+    }
+    out
 }
 
 fn common_prefix(a: &[u8], b: &[u8]) -> usize {
@@ -170,7 +194,7 @@ impl SessionTable {
     /// so that a table begun afresh never reuses an earlier one's ids, whose sessions the engine may
     /// still keep.
     pub fn new(max_sessions: usize, max_tokens: usize) -> Self {
-        SessionTable { sessions: HashMap::new(), next_id: (unix_now() << 20).max(1), clock: 0, max_sessions, max_tokens }
+        SessionTable { sessions: HashMap::new(), index: HashMap::new(), next_id: (unix_now() << 20).max(1), clock: 0, max_sessions, max_tokens }
     }
 
     /// The table for the next start: the sessions not in a request and used within `max_age_s`,
@@ -300,7 +324,7 @@ impl SessionTable {
                 continue;
             }
             let ablit = flags & TABLE_FLAG_ABLIT != 0;
-            got.insert(id, Session { text: text.to_string(), ids, ends, prompt_len, busy: false, last_used, t_used, ablit, images });
+            got.insert(id, Session { text: text.to_string(), ids, ends, prompt_len, busy: false, last_used, t_used, ablit, images, keys: Vec::new() });
         }
         if r.at != body.len() {
             return Err("a bad body".into());
@@ -309,6 +333,11 @@ impl SessionTable {
         self.next_id = self.next_id.max(next_id).max(got.keys().max().map_or(0, |m| m + 1));
         self.clock = self.clock.max(clock);
         self.sessions = got;
+        self.index.clear();
+        let ids: Vec<u64> = self.sessions.keys().copied().collect();
+        for id in ids {
+            self.enter(id);
+        }
         let _ = self.evict(0);
         Ok(k)
     }
@@ -331,19 +360,7 @@ impl SessionTable {
     /// images inside the shared text are not these (see the module comment) is no candidate.
     pub fn plan_images(&mut self, text: &str, tok: &Tokenizer, threads: usize, ablit: bool, images: &[ImageKey]) -> (Plan, Vec<u64>) {
         self.clock += 1;
-        let mut top: Option<(u64, usize)> = None;
-        for (&id, s) in &self.sessions {
-            if s.ablit != ablit {
-                continue;
-            }
-            let n = common_prefix(text.as_bytes(), s.text.as_bytes());
-            if !images_agree(&s.images, images, n) {
-                continue;
-            }
-            if n > 0 && top.map_or(true, |(_, bn)| n > bn) {
-                top = Some((id, n));
-            }
-        }
+        let top = self.best(text, ablit, images);
         let best = top.filter(|&(_, n)| n >= MIN_SHARED);
         let (mut plan, cut) = match best {
             None => (Plan { session_id: self.new_id(), base_session_id: 0, reused: 0, ids: Vec::new(), matched: 0, shared: 0, common: 0 }, 0),
@@ -395,6 +412,7 @@ impl SessionTable {
             t_used: 0,
             ablit,
             images: Vec::new(),
+            keys: Vec::new(),
         });
         s.busy = true;
         s.last_used = clock;
@@ -432,12 +450,70 @@ impl SessionTable {
         s.prompt_len = prompt_text.len();
         s.images = images.to_vec();
         s.busy = false;
+        self.leave(session_id);
+        self.enter(session_id);
+    }
+
+    /// The session of the weights path `ablit` whose text shares the longest prefix with `text` (at least MIN_SHARED
+    /// bytes), with the images inside it the same, and how many bytes it shares. The deepest level the prompt shares
+    /// with some session holds it: every session sharing at least that level's length is in that bucket (a hash that
+    /// only collides shares less, and the next level down is tried).
+    fn best(&self, text: &str, ablit: bool, images: &[ImageKey]) -> Option<(u64, usize)> {
+        let pk = prefix_keys(text.as_bytes());
+        let mut top: Option<(u64, usize)> = None;
+        for level in (0..pk.len()).rev() {
+            for &id in self.index.get(&pk[level]).map_or(&[][..], |v| &v[..]) {
+                let s = &self.sessions[&id];
+                if s.ablit != ablit {
+                    continue;
+                }
+                let n = common_prefix(text.as_bytes(), s.text.as_bytes());
+                if !images_agree(&s.images, images, n) {
+                    continue;
+                }
+                if top.map_or(true, |(_, bn)| n > bn) {
+                    top = Some((id, n));
+                }
+            }
+            if top.map_or(false, |(_, n)| n >= level_len(level)) {
+                break;
+            }
+        }
+        top
+    }
+
+    /// Session `id`'s text into the index at every level it reaches.
+    fn enter(&mut self, id: u64) {
+        let Some(s) = self.sessions.get_mut(&id) else { return };
+        s.keys = prefix_keys(s.text.as_bytes());
+        for &k in &s.keys {
+            self.index.entry(k).or_default().push(id);
+        }
+    }
+
+    /// Session `id` out of the index (before its text changes or it goes).
+    fn leave(&mut self, id: u64) {
+        let Some(s) = self.sessions.get_mut(&id) else { return };
+        for k in std::mem::take(&mut s.keys) {
+            if let Some(v) = self.index.get_mut(&k) {
+                v.retain(|&x| x != id);
+                if v.is_empty() {
+                    self.index.remove(&k);
+                }
+            }
+        }
+    }
+
+    /// Remove session `id` from the table and the index.
+    fn remove(&mut self, id: u64) {
+        self.leave(id);
+        self.sessions.remove(&id);
     }
 
     /// The request failed: forget the session (the engine's copy is in an unknown state; the
     /// caller releases it).
     pub fn abandon(&mut self, session_id: u64) {
-        self.sessions.remove(&session_id);
+        self.remove(session_id);
     }
 
     /// Drop least recently used idle sessions over the limits; returns their ids.
@@ -451,7 +527,7 @@ impl SessionTable {
             let victim = self.sessions.iter().filter(|(&id, s)| id != keep && !s.busy).min_by_key(|(_, s)| s.last_used).map(|(&id, _)| id);
             match victim {
                 Some(id) => {
-                    self.sessions.remove(&id);
+                    self.remove(id);
                     out.push(id);
                 }
                 None => return out,
@@ -462,6 +538,13 @@ impl SessionTable {
     pub fn len(&self) -> usize {
         self.sessions.len()
     }
+
+    /// The table's limits from what the engine can keep (HELLO keep_positions: its pool and disk tier), so that a
+    /// conversation is matched for as long as the engine holds its state; never under 256 sessions and 16M ids.
+    pub fn keep_for(&mut self, keep_positions: u64) {
+        self.max_tokens = (keep_positions as usize).max(16 << 20);
+        self.max_sessions = (keep_positions as usize / 4096).max(256);
+    }
 }
 
 #[cfg(test)]
@@ -469,6 +552,74 @@ mod tests {
     use super::*;
 
     const TOKENIZER: &str = "/data/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8/tokenizer.json";
+
+    /// A session of `text` straight into the table and its index (no tokenizer: the index reads only the text).
+    fn put(t: &mut SessionTable, id: u64, text: &str, ablit: bool) {
+        t.sessions.insert(id, Session { text: text.into(), ids: Vec::new(), ends: Vec::new(), prompt_len: text.len(), busy: false,
+                                        last_used: 0, t_used: 0, ablit, images: Vec::new(), keys: Vec::new() });
+        t.enter(id);
+    }
+
+    #[test]
+    fn the_index_finds_the_longest_shared_prefix() {
+        // conversations that share beginnings of every length (a common system prompt, then branches), against every
+        // session read whole: the index's best match shares as many bytes as the best of all (ids may differ on ties)
+        let mut seed = 7u64;
+        let mut rnd = |n: u64| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) % n
+        };
+        let alpha = |r: u64| (b'a' + (r % 3) as u8) as char;  // three letters: long accidental agreements
+        let sys: String = (0..300).map(|i| alpha(i * 7)).collect();
+        let mut t = SessionTable::new(1 << 20, 1 << 30);
+        let mut texts: Vec<(u64, String, bool)> = Vec::new();
+        for id in 1..=400u64 {
+            let base = if texts.is_empty() || rnd(4) == 0 { sys.clone() } else {
+                let (_, b, _) = &texts[rnd(texts.len() as u64) as usize];
+                b[..rnd(b.len() as u64 + 1) as usize].to_string()
+            };
+            let tail: String = (0..rnd(6000)).map(|_| alpha(rnd(3))).collect();
+            let text = base + &tail;
+            let ablit = rnd(5) == 0;
+            put(&mut t, id, &text, ablit);
+            texts.push((id, text, ablit));
+        }
+        // half of them change their text (a finished turn): out of the index, the new text in
+        for k in 0..200 {
+            let (id, old, ablit) = texts[k * 2].clone();
+            let text = old.clone() + &(0..rnd(3000)).map(|_| alpha(rnd(3))).collect::<String>();
+            t.leave(id);
+            t.sessions.get_mut(&id).unwrap().text = text.clone();
+            t.enter(id);
+            texts[k * 2] = (id, text, ablit);
+        }
+        for q in 0..2000 {
+            let (_, b, _) = &texts[rnd(texts.len() as u64) as usize];
+            let p = b[..rnd(b.len() as u64 + 1) as usize].to_string() + &(0..rnd(800)).map(|_| alpha(rnd(3))).collect::<String>();
+            let ablit = q % 7 == 0;
+            let brute = texts.iter().filter(|x| x.2 == ablit).map(|x| common_prefix(p.as_bytes(), x.1.as_bytes())).max().unwrap_or(0);
+            let got = t.best(&p, ablit, &[]).map_or(0, |(_, n)| n);
+            if brute >= MIN_SHARED {
+                assert_eq!(got, brute, "prompt {q} of {} bytes", p.len());
+            } else {
+                assert!(got < MIN_SHARED, "prompt {q}: {got} found where nothing shares {MIN_SHARED} bytes");
+            }
+        }
+        // removed sessions leave the index: nothing names them
+        for id in 1..=300u64 {
+            t.remove(id);
+        }
+        assert!(t.index.is_empty() && t.sessions.is_empty());
+    }
+
+    #[test]
+    fn the_table_keeps_what_the_engine_keeps() {
+        let mut t = SessionTable::new(256, 16 << 20);
+        t.keep_for(0);  // an engine that keeps nothing (or an echo engine): the table's own limits, never less
+        assert_eq!((t.max_sessions, t.max_tokens), (256, 16 << 20));
+        t.keep_for(300_000_000);  // a pool and a 256 GiB disk tier: about 300M positions
+        assert_eq!((t.max_sessions, t.max_tokens), (300_000_000 / 4096, 300_000_000));
+    }
 
     #[test]
     fn reuses_the_models_own_ids() {
@@ -510,7 +661,7 @@ mod tests {
         };
         let a = conv("09:14:08 AM", "fix the build");
         let (pa, _) = t.plan(&a, &tok, 1, false);
-        assert_eq!(pa.describe(a.len()), format!("session {}, new: no session shares a byte", pa.session_id));
+        assert_eq!(pa.describe(a.len()), format!("session {}, new: no session shares {MIN_SHARED} bytes", pa.session_id));
         t.finish(pa.session_id, &a, &pa.ids, &tok.encode("Done."), &tok);
         // another conversation, a minute later: a fork of the first, which has every id before the time
         let b = conv("09:15:31 AM", "write the tests");

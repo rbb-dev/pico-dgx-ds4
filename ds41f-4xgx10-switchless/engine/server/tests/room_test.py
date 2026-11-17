@@ -1,19 +1,10 @@
 #!/usr/bin/env python3
-"""A request whose own slot cannot get the memory it needs moves to a slot that can (docs/engine.md, session
-slots mapped on demand); the engine never stops for it.
+"""A request whose own slot cannot get the memory it needs moves to a slot that can (docs/engine.md, "The chunk pool"); the
+engine never stops for it. Session X holds a slot with a short turn's memory, three long requests commit most of the pool,
+X's next turn asks for more than its slot and the free chunks can hold: it must run (state saved, read back in the slot it
+gets, history reused) while the long requests go on and the engine stays up.
 
-The case: session X holds a slot with a short turn's memory; three long requests decode in the other slots and
-commit most of the pool; X's next turn asks for more than its own slot and the pool's free chunks can hold, while
-a decoding request's slot (time-slicing takes it at that request's turn) can. X's turn must run (its state saved
-to the store and read back in the slot it gets, so its history is reused), the long requests go on, and the engine
-stays up. A server that takes X's own slot without checking the pool stops at `serve: no slot memory for ...`.
-
-Start the server so that the pool holds the three long requests and X's short turn, and X's long turn only with a
-long request's slot. With the defaults (--m 500000): --slots 4 --big-slots 0 --slot-gib 1.5 (768 chunks of 2 MiB;
-the window, printed below from the engine's chunk formula, is 673 to 875 chunks), time-slicing on (--slice 64, the
-default).
-
-  dsgb10_rank --mode serve --slots 4 --big-slots 0 --slot-gib 1.5 ...
+  dsgb10_rank --mode serve --slots 4 --big-slots 0 --pool-tokens 1808793 ...
   python3 engine/server/tests/room_test.py [--socket S] [--tokens tokens.npy] [--m 500000]
 """
 import argparse

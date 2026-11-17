@@ -28,7 +28,8 @@ def stats(e):
         if t == STATS:
             version, n = struct.unpack('<II', p[:8])
             v = struct.unpack('<%dQ' % n, p[8:8 + 8 * n])
-            return dict(zip(IL, v[19:27])) if n >= 27 else {}
+            lo = 22 if version >= 2 else 19  # interleave's fields: after the pool's in version 2 (docs/protocol.md)
+            return dict(zip(IL, v[lo:lo + 8])) if n >= lo + 8 else {}
 
 
 def decoder_rate(e, S, T, share):

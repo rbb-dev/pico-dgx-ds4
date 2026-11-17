@@ -60,6 +60,7 @@ struct Out {
 
 struct Case {
   int rows, ratio, ctx, max_scan, kstride, sessions, cap;
+  ChunkLists lists;  // the sessions' identity rows (each session's keys cap entries, whole chunks)
   bool pool, blk;  // blk: the Reindex layers' scan of layer 20's pool (ratio 1)
   Dev<int> pos, top, pl, counters, blocks, slot;
   Dev<float2> tab;
@@ -79,7 +80,8 @@ struct Case {
     slot = Dev<int>(hs.data(), hs.size());
     tab = Dev<float2>((size_t)(ctx + 1) * 32);
     attn::rope_table_build(tab.p, ctx + 1, true, g_s);
-    cap = bucket / ratio + 64;
+    cap = whole_chunks(bucket / ratio + 64) * attn::kChunkEntries;  // whole chunks: identity rows read the sessions
+    lists = ChunkLists(sessions, cap / attn::kChunkEntries);
     ik_k = Dev<uint8_t>((size_t)cap * 64 * sessions);
     ik_sc = Dev<uint8_t>((size_t)cap * 4 * sessions);
     iq = Dev<uint16_t>((size_t)rows * attn::kIdxHeads * attn::kIdxDim);
@@ -122,8 +124,8 @@ struct Case {
   }
   attn::IndexKeys ik() const {
     attn::IndexKeys k{ik_k.p, ik_sc.p, 0};
-    if ((sessions > 1 || g_table) && rows <= attn::kMaxDecodeRows)
-      k.slot = slot.p, k.k_stride = (size_t)cap * 64, k.sc_stride = (size_t)cap * 4;
+    k.list = lists.d.p, k.list_stride = lists.len;
+    if ((sessions > 1 || g_table) && rows <= attn::kMaxDecodeRows) k.slot = slot.p;
     return k;
   }
   void fused() {

@@ -4,7 +4,7 @@
 
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 pub const DEFAULT_SOCKET: &str = "/tmp/dsgb10-engine.sock";
 /// Up to 100 image spans, plus room for a 1M-token prompt and framing.
 pub const MAX_FRAME: usize = crate::vision::MAX_IMAGES * crate::vision::MAX_IMAGE_ROWS * crate::vision::IMAGE_DIM * 2 + (8 << 20);
@@ -106,6 +106,8 @@ pub struct HelloEngine {
     pub vocab_size: u32,
     pub eos_id: u32,
     pub max_sessions: u32,
+    /// positions of conversation the engine can keep (its pool and disk tier): the session table keeps as much
+    pub keep_positions: u64,
     pub name: String,
 }
 
@@ -131,18 +133,38 @@ pub struct Done {
     pub error: String,
 }
 
-/// The fields of a STATS frame, in wire order (docs/protocol.md, "The dashboard's frames").
-pub const STATS_VERSION: u32 = 1;
-pub const STATS_FIELDS: usize = 27;
+/// The fields of a STATS frame, in wire order (docs/protocol.md, "The dashboard's frames"); a frame of another version is refused.
+pub const STATS_VERSION: u32 = 2;
+pub const STATS_FIELDS: usize = 30;
 
-/// The engine's own counters for the dashboard. Byte counts are rank 0's store; counters count from the
-/// engine's start.
+/// The engine's own counters for the dashboard: the chunk pool and its conversations (rank 0's; every rank's are the same),
+/// the disk tier, interleaved prefill. Counters count from the engine's start.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct EngineStats {
-    pub store_cap_bytes: u64,
-    pub store_used_bytes: u64,
-    pub sessions_resident: u64,
-    pub sessions_on_disk: u64,
+    /// the chunk pool: its numbers (each one slice of every cache array on each rank)
+    pub pool_numbers: u64,
+    /// of them no conversation names
+    pub pool_free: u64,
+    /// named by a conversation's caches or bookmarks
+    pub pool_held: u64,
+    /// of those, named by more than one (shared beginnings)
+    pub pool_shared: u64,
+    /// kept for the running requests' horizons, not yet held
+    pub pool_reserved: u64,
+    /// one number's bytes on each rank
+    pub number_bytes: u64,
+    /// positions of conversation the whole pool holds
+    pub pool_positions: u64,
+    /// conversations held by a line
+    pub conv_on_lines: u64,
+    /// idle, their chunks in the pool
+    pub conv_in_memory: u64,
+    /// in the disk tier
+    pub conv_on_disk: u64,
+    /// naming at least one shared number
+    pub conv_sharing: u64,
+    /// sequences the engine decodes at once
+    pub lines: u64,
     pub disk_cap_bytes: u64,
     pub disk_used_bytes: u64,
     pub spills_total: u64,
@@ -153,11 +175,6 @@ pub struct EngineStats {
     pub restored_tokens_total: u64,
     pub restore_wait_ns_total: u64,
     pub restore_wait_max_ns: u64,
-    pub slots_total: u64,
-    pub slots_big: u64,
-    pub slot_ctx_big: u64,
-    pub slot_ctx_small: u64,
-    pub positions_held: u64,
     /// interleaved prefill: the settings the engine runs now (ConfigFrame), and the long prompts being processed and waiting
     pub il_on: u64,
     pub il_whole_rows: u64,
@@ -172,10 +189,18 @@ pub struct EngineStats {
 impl EngineStats {
     fn fields(&self) -> [u64; STATS_FIELDS] {
         [
-            self.store_cap_bytes,
-            self.store_used_bytes,
-            self.sessions_resident,
-            self.sessions_on_disk,
+            self.pool_numbers,
+            self.pool_free,
+            self.pool_held,
+            self.pool_shared,
+            self.pool_reserved,
+            self.number_bytes,
+            self.pool_positions,
+            self.conv_on_lines,
+            self.conv_in_memory,
+            self.conv_on_disk,
+            self.conv_sharing,
+            self.lines,
             self.disk_cap_bytes,
             self.disk_used_bytes,
             self.spills_total,
@@ -186,11 +211,6 @@ impl EngineStats {
             self.restored_tokens_total,
             self.restore_wait_ns_total,
             self.restore_wait_max_ns,
-            self.slots_total,
-            self.slots_big,
-            self.slot_ctx_big,
-            self.slot_ctx_small,
-            self.positions_held,
             self.il_on,
             self.il_whole_rows,
             self.il_push_rows,
@@ -217,33 +237,36 @@ impl EngineStats {
     fn from_fields(v: &[u64]) -> EngineStats {
         let f = |i: usize| v.get(i).copied().unwrap_or(0);
         EngineStats {
-            store_cap_bytes: f(0),
-            store_used_bytes: f(1),
-            sessions_resident: f(2),
-            sessions_on_disk: f(3),
-            disk_cap_bytes: f(4),
-            disk_used_bytes: f(5),
-            spills_total: f(6),
-            spill_bytes_total: f(7),
-            spills_pending: f(8),
-            restores_total: f(9),
-            restore_bytes_total: f(10),
-            restored_tokens_total: f(11),
-            restore_wait_ns_total: f(12),
-            restore_wait_max_ns: f(13),
-            slots_total: f(14),
-            slots_big: f(15),
-            slot_ctx_big: f(16),
-            slot_ctx_small: f(17),
-            positions_held: f(18),
-            il_on: f(19),
-            il_whole_rows: f(20),
-            il_push_rows: f(21),
-            il_gap_ms: f(22),
-            il_share: f(23),
-            il_burst_max_ms: f(24),
-            il_reading: f(25),
-            il_queued: f(26),
+            pool_numbers: f(0),
+            pool_free: f(1),
+            pool_held: f(2),
+            pool_shared: f(3),
+            pool_reserved: f(4),
+            number_bytes: f(5),
+            pool_positions: f(6),
+            conv_on_lines: f(7),
+            conv_in_memory: f(8),
+            conv_on_disk: f(9),
+            conv_sharing: f(10),
+            lines: f(11),
+            disk_cap_bytes: f(12),
+            disk_used_bytes: f(13),
+            spills_total: f(14),
+            spill_bytes_total: f(15),
+            spills_pending: f(16),
+            restores_total: f(17),
+            restore_bytes_total: f(18),
+            restored_tokens_total: f(19),
+            restore_wait_ns_total: f(20),
+            restore_wait_max_ns: f(21),
+            il_on: f(22),
+            il_whole_rows: f(23),
+            il_push_rows: f(24),
+            il_gap_ms: f(25),
+            il_share: f(26),
+            il_burst_max_ms: f(27),
+            il_reading: f(28),
+            il_queued: f(29),
         }
     }
 }
@@ -392,7 +415,7 @@ impl Frame {
             Frame::HelloEngine(h) => {
                 let mut w = W::new(T_HELLO_ENGINE);
                 w.u32(h.version).u32(h.max_context).u32(h.vocab_size).u32(h.eos_id).u32(h.max_sessions);
-                w.u32(h.name.len() as u32);
+                w.u32(h.name.len() as u32).u64(h.keep_positions);
                 w.0.extend_from_slice(h.name.as_bytes());
                 w.finish()
             }
@@ -498,8 +521,9 @@ impl Frame {
                 let eos_id = r.u32()?;
                 let max_sessions = r.u32()?;
                 let n = r.u32()? as usize;
+                let keep_positions = r.u64()?;
                 let name = String::from_utf8_lossy(r.bytes(n)?).into_owned();
-                Frame::HelloEngine(HelloEngine { version, max_context, vocab_size, eos_id, max_sessions, name })
+                Frame::HelloEngine(HelloEngine { version, max_context, vocab_size, eos_id, max_sessions, keep_positions, name })
             }
             T_TOKENS => {
                 let req_id = r.u64()?;
@@ -738,16 +762,17 @@ mod tests {
         let b = Frame::StatsReq.encode();
         assert_eq!((b.len(), u16::from_le_bytes(b[4..6].try_into().unwrap())), (8 + 8, 0x05));
         assert_eq!(Frame::decode(T_STATS_REQ, &b[8..], |_| 0).unwrap(), Frame::StatsReq);
-        let st = EngineStats { store_cap_bytes: 1 << 40, sessions_on_disk: 3, restore_wait_max_ns: 7, slots_big: 2, positions_held: 99, ..Default::default() };
+        let st = EngineStats { pool_numbers: 8913, conv_on_disk: 3, restore_wait_max_ns: 7, conv_sharing: 2, lines: 32, ..Default::default() };
         let b = Frame::Stats(st).encode();
-        assert_eq!(b.len(), 8 + 8 + 8 * 27);
-        assert_eq!(u32::from_le_bytes(b[12..16].try_into().unwrap()), 27, "n_fields after the version");
-        assert_eq!(u64::from_le_bytes(b[16..24].try_into().unwrap()), 1 << 40, "store_cap_bytes is the first field");
-        assert_eq!(u64::from_le_bytes(b[16 + 8 * 18..16 + 8 * 19].try_into().unwrap()), 99, "positions_held is the 19th");
+        assert_eq!(b.len(), 8 + 8 + 8 * 30);
+        assert_eq!(u32::from_le_bytes(b[8..12].try_into().unwrap()), 2, "version 2");
+        assert_eq!(u32::from_le_bytes(b[12..16].try_into().unwrap()), 30, "n_fields after the version");
+        assert_eq!(u64::from_le_bytes(b[16..24].try_into().unwrap()), 8913, "pool_numbers is the first field");
+        assert_eq!(u64::from_le_bytes(b[16 + 8 * 11..16 + 8 * 12].try_into().unwrap()), 32, "lines is the 12th");
         let il = EngineStats { il_share: 40, il_queued: 2, ..Default::default() };
         let bi = Frame::Stats(il).encode();
         assert_eq!(u64::from_le_bytes(bi[bi.len() - 8..].try_into().unwrap()), 2, "il_queued is the last");
-        assert_eq!(u64::from_le_bytes(bi[16 + 8 * 23..16 + 8 * 24].try_into().unwrap()), 40, "il_share is the 24th");
+        assert_eq!(u64::from_le_bytes(bi[16 + 8 * 26..16 + 8 * 27].try_into().unwrap()), 40, "il_share is the 27th");
         assert_eq!(Frame::decode(T_STATS, &bi[8..], |_| 0).unwrap(), Frame::Stats(il));
         assert_eq!(Frame::decode(T_STATS, &b[8..], |_| 0).unwrap(), Frame::Stats(st));
         // a shorter or a longer field list: missing fields are 0, extra ones ignored
@@ -755,13 +780,22 @@ mod tests {
         short.truncate(8 + 8 + 8 * 4);
         short[12..16].copy_from_slice(&4u32.to_le_bytes());
         let Frame::Stats(got) = Frame::decode(T_STATS, &short[8..], |_| 0).unwrap() else { panic!() };
-        assert_eq!((got.store_cap_bytes, got.sessions_on_disk, got.positions_held), (1 << 40, 3, 0));
+        assert_eq!((got.pool_numbers, got.conv_on_disk, got.lines), (8913, 0, 0));
         let mut long = Frame::Stats(st).encode();
         long.extend(5u64.to_le_bytes());
-        long[12..16].copy_from_slice(&28u32.to_le_bytes());
+        long[12..16].copy_from_slice(&31u32.to_le_bytes());
         assert_eq!(Frame::decode(T_STATS, &long[8..], |_| 0).unwrap(), Frame::Stats(st));
-        long[8..12].copy_from_slice(&2u32.to_le_bytes());
+        long[8..12].copy_from_slice(&1u32.to_le_bytes());
         assert!(Frame::decode(T_STATS, &long[8..], |_| 0).is_err(), "another version");
+        // HELLO from the engine (version 4): the C struct's 32 bytes, keep_positions after name_len, then the name
+        let he = HelloEngine { version: VERSION, max_context: 1 << 20, vocab_size: 129280, eos_id: 1, max_sessions: 16,
+                               keep_positions: 21_004_288, name: "pico".into() };
+        let b = Frame::HelloEngine(he.clone()).encode();
+        assert_eq!((VERSION, b.len()), (4, 8 + 32 + 4));
+        assert_eq!(u32::from_le_bytes(b[8 + 20..8 + 24].try_into().unwrap()), 4, "name_len");
+        assert_eq!(u64::from_le_bytes(b[8 + 24..8 + 32].try_into().unwrap()), 21_004_288, "keep_positions at byte 24");
+        assert_eq!(&b[8 + 32..], b"pico");
+        assert_eq!(Frame::decode(T_HELLO_ENGINE, &b[8..], |_| 0).unwrap(), Frame::HelloEngine(he));
         // CONFIG: version, n, then i64 fields; a field not sent is -1 (kept)
         let c = ConfigFrame { share: 40, gap_ms: 600, ..Default::default() };
         let b = Frame::Config(c).encode();

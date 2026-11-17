@@ -190,7 +190,7 @@ void test_attn_synth(int R, int ctx, int kmax, int winscale_lo, int win_lo = 0) 
   }
   Dev<int> topk(th.data(), th.size());
   attn::Window win{wkv.p, wsc.p, -1, p0 - 127};
-  attn::Compressed cc{ckv.p, csc.p, ncap};
+  const attn::Compressed cc = listed(attn::Compressed{ckv.p, csc.p, ncap}, ncap);
   Dev<float> po((size_t)16 * 16 * 512), pml((size_t)16 * 16 * 2);
   std::vector<int> lh(R);
   for (int r = 0; r < R; ++r) lh[r] = std::max(win_lo, ph[r] - 127);
@@ -313,7 +313,8 @@ struct CompState {
     }
     attn::CompressorWeights w{ratio, wkv.p, wgate.p, norm.p, wk.p, knorm.p};
     attn::compressor_emit(kv.p, score.p, pos, rows, w, {carry_kv.p, carry_score.p}, table.p,
-                          {ckv_kv.p, ckv_sc.p, cap}, {ik_k.p, ik_sc.p, cap}, nullptr, 0, 0);
+                          listed(attn::Compressed{ckv_kv.p, ckv_sc.p, cap}, cap),
+                          listed(attn::IndexKeys{ik_k.p, ik_sc.p, cap}, cap), nullptr, 0, 0);
     CUDA_CHECK(cudaDeviceSynchronize());
   }
 };
@@ -347,7 +348,7 @@ void test_attn_case(const std::string& dir) {
     int kmax = 0;
     if (cs.ratio(L) > 0) {
       CompState& src = comp.at(kv_source(L));
-      ckv = attn::Compressed{src.ckv_kv.p, src.ckv_sc.p, src.cap};
+      ckv = listed(attn::Compressed{src.ckv_kv.p, src.ckv_sc.p, src.cap}, src.cap);
       auto it = cs.get(P(index_source(L), 0, "itopk"));
       int kr = (int)it.shape[1];
       kmax = kmax_c;
@@ -460,7 +461,7 @@ void test_index_synth(int R, int ctx, int ratio, bool pool, int batch) {
   rnd_u8(qsc8, 7, 122);
   fill_w<<<512, 256>>>(qw.p, qw.n, g_seed++);
   attn::IndexQ q{qq.p, reinterpret_cast<uint32_t*>(qsc8.p), qw.p};
-  attn::IndexKeys ik{kk.p, ksc.p, cap};
+  const attn::IndexKeys ik = listed(attn::IndexKeys{kk.p, ksc.p, cap}, cap);
   Dev<uint16_t> kref((size_t)R * stride), kgot((size_t)R * stride), bref((size_t)R * stride / 8),
       bgot((size_t)R * stride / 8);
   attn::index_score(q, pos.p, R, ratio, ik, attn::IndexScan{}, n, kref.p, stride, pool ? bref.p : nullptr, stride / 8, 0);
@@ -511,7 +512,7 @@ void test_index_case(const std::string& dir) {
     attn::IndexQ q{qq.p, qsc.p, qw.p};
     attn::index_q_prep(iq_pre.p, wp.p, pos.p, src.table.p, q, nullptr, rows, 0);
     const bool pool = L == 20;
-    attn::IndexKeys ik{src.ik_k.p, src.ik_sc.p, src.cap};
+    const attn::IndexKeys ik = listed(attn::IndexKeys{src.ik_k.p, src.ik_sc.p, src.cap}, src.cap);
     Dev<uint16_t> kref((size_t)rows * stride), kgot((size_t)rows * stride), bref((size_t)rows * stride / 8),
         bgot((size_t)rows * stride / 8);
     attn::index_score(q, pos.p, rows, ratio, ik, attn::IndexScan{}, maxc, kref.p, stride, pool ? bref.p : nullptr,
@@ -583,8 +584,8 @@ struct CompCaches {
   Dev<float> ckv, csc;
   explicit CompCaches(int c) : cap(c), kv((size_t)c * 256), sc((size_t)c * 32), ik((size_t)c * 64), isc((size_t)c * 4),
                                ckv(16 * 512), csc(16 * 512) {}
-  attn::Compressed ckvs() const { return {kv.p, sc.p, cap}; }
-  attn::IndexKeys iks() const { return {ik.p, isc.p, cap}; }
+  attn::Compressed ckvs() const { return listed(attn::Compressed{kv.p, sc.p, cap}, cap); }
+  attn::IndexKeys iks() const { return listed(attn::IndexKeys{ik.p, isc.p, cap}, cap); }
   attn::CompressorCarry carry() const { return {ckv.p, csc.p}; }
 };
 // compressor_emit_p against attn::compressor_emit on the same projections and carry: KV entries and the

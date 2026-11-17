@@ -421,7 +421,7 @@ const RAIL_TIP = [
 // the columns: key, group, head, unit, tip, and whether the temperature colour scale paints the value
 const NODE_COLS = [
   ['mem', 'MEMORY', 'Free / total', 'GiB', `Memory this Spark has free now (MemAvailable) of its total, in GiB. From /proc/meminfo on this Spark, as it last reported it.`],
-  ['split', 'MEMORY', 'Weights · work · KV', 'GiB', `How the memory was divided when the engine started, in GiB: the model weights, the engine's working memory (the slots among it), the session store (as the sampler reports it).`],
+  ['split', 'MEMORY', 'Weights · work · KV', 'GiB', `How the memory was divided when the engine started, in GiB: the model weights, the engine's working memory, the conversation memory (the chunk pool).`],
   ['tz', 'TEMP.', 'Hot', '°C', `The hottest of this Spark's ACPI thermal zones, in °C (/sys/class/thermal). ${TEMP_TIP}`, true],
   ['tg', 'TEMP.', 'GPU', '°C', `The GPU die temperature in °C (NVML). ${TEMP_TIP}`, true],
   ['gb', 'GPU', 'Busy', '%', `GPU utilisation in per cent over NVML's last sample window.`],
@@ -472,7 +472,7 @@ function nodeRow(rank) {
       const led = ledger && ledger.get(rank);
       if (led) {
         setText(wN, gib(led.w)); setText(mN, gib(led.m)); setText(kN, gib(led.k));
-        setTip(td.split, `How the memory was divided when the engine started: the model weights ${gib(led.w)} GiB, the engine's working memory ${gib(led.m)} GiB, the session store ${gib(led.k)} GiB.`);
+        setTip(td.split, `How the memory was divided when the engine started: the model weights ${gib(led.w)} GiB, the engine's working memory ${gib(led.m)} GiB, the conversation memory (the chunk pool) ${gib(led.k)} GiB.`);
       }
       if (!have) return;
       const gpu = r.gpu || {}, nv = r.nvme || {};
@@ -562,8 +562,8 @@ function linesBox() {
   return {
     el: b.el,
     update(st, inflight, seen) {
-      // one line per slot: the requests the engine runs at once (HELLO's max_sessions is what the store can keep, not lines)
-      const max = st.sessions ? Number(st.sessions.slots) : null;
+      // one row per line: the requests the engine runs at once (HELLO's max_sessions is what the pool can keep, not lines)
+      const max = st.sessions ? Number(st.sessions.lines) : null;
       const used = inflight.length;
       const n = Math.max(none(max) ? 0 : max, used);
       while (rows.length < n) { const r = mkRow(rows.length); rows.push(r); grid.append(r.el); }
@@ -627,13 +627,16 @@ function healthBox() {
     el: b.el,
     update(st, ledger) {
       const nh = st.node_health, list = nh && nh.ranks ? nh.ranks : [];
+      // the ledger's store is the store's share of the chunk pool: the split shows the whole pool as the conversations' memory
+      const pp = st.sessions && st.sessions.pool, pool = pp ? Number(pp.numbers) * Number(pp.number_bytes) : 0;
+      const led = ledger && { get: (rk) => { const e = ledger.get(rk); return e && pool > e.k ? { w: e.w, k: pool, m: Math.max(0, e.m - (pool - e.k)), total: e.total } : e; } };
       b.el.hidden = false;
       none_.hidden = list.length > 0;
       const shape = `${list.length}`;
       table.hidden = !list.length;
       for (const r of list) {
         if (!rows.has(r.rank)) { const c = nodeRow(r.rank); rows.set(r.rank, c); tbody.append(c.el); }
-        rows.get(r.rank).update(r, nh, ledger);
+        rows.get(r.rank).update(r, nh, led);
       }
       if (shape !== lastShape) { lastShape = shape; fit(); }
     },
@@ -684,38 +687,46 @@ function rateCard() {
     },
   };
 }
+const tokFmt = (v) => posFmt(v).replace(' ', '') + ' tokens';
 function sessionsCard() {
   const fill = h('div', { class: 'fill' }), meter = h('div', { class: 'meter vmeter', role: 'img' }, fill);
   const c = vcard('kv', 'CONVERSATION MEMORY', [
-    ['SLOTS', [['slots', 'Slots', 'Requests the engine runs at once: each holds one slot for its whole context, reserved when the engine starts.'],
-      ['long', 'Long', 'The slots that take a context up to the full window; the others take shorter ones.'],
-      ['positions', 'Positions', 'The positions (tokens) all the slots hold together.'],
-      ['window', 'Window', 'The longest context one request may use.']]],
-    ['IN USE', [['busy', 'Busy', 'The slots the requests in flight hold.'], ['use', 'Held', 'The positions the requests in flight hold (their prompt and the output so far).'],
-      ['pct', 'Of slots', 'The share of all the slots\' positions the requests in flight hold.']], meter],
-    ['STORE', [['store', 'Store', 'Finished sessions kept in memory for their next turn, of the space the store may use on each Spark (its own memory, not the slots\').'],
-      ['kept', 'Sessions', 'The sessions the store keeps in memory now; older ones move to the SSD tier.']]],
+    ['POOL', [['chunks', 'Pool memory', 'The memory every conversation\'s caches live in, on the four Sparks together: chunks of one size, taken as a conversation grows and given back when it ends.'],
+      ['holds', 'KV pool', 'The tokens of conversation the pool holds, every conversation together.'],
+      ['free', 'Free', 'The pool memory no conversation holds, on the four Sparks together.'],
+      ['window', 'Max context', 'The longest context one request may use.']]],
+    ['IN USE', [['held', 'In use', 'The pool memory the conversations hold (their caches and their bookmarks), on the four Sparks together.'],
+      ['shared', 'Shared starts', 'The pool memory more than one conversation holds: a beginning they share, kept once.'],
+      ['reserved', 'For replies', 'The pool memory kept for the running replies to grow into.'],
+      ['pct', 'Used', 'The share of the pool\'s chunks the conversations hold.']], meter],
+    ['CONVERSATIONS', [['lines', 'Running', 'The conversations a line holds now (decoding, or reading their prompt), of the lines.'],
+      ['memory', 'Paused in memory', 'Idle conversations whose chunks are in the pool: their next turn starts at once.'],
+      ['disk', 'Paused on SSD', 'Conversations kept on the SSD tier: their next turn reads them back first.'],
+      ['sharing', 'Sharing a start', 'Conversations that share their beginning with another.']]],
   ]);
   return {
     el: c.el,
-    update(st, inflight) {
+    update(st) {
       const ss = st.sessions;
       c.el.hidden = !ss;
       if (!ss) return;
-      const tot = Number(ss.positions), slots = Number(ss.slots), big = Number(ss.slots_big);
-      const used = inflight.reduce((a, x) => a + Number(x.kv_tokens), 0), pct = 100 * used / Math.max(1, tot);
-      setText(c.sub, 'fixed slots');
-      c.set('slots', whole.format(slots), `${whole.format(slots)} requests run at once; a request beyond them waits for a slot of its size.`);
-      c.set('long', `${whole.format(big)} × ${posFmt(Number(ss.ctx_big))}`, `${whole.format(big)} slots of ${whole.format(Number(ss.ctx_big))} positions and ${whole.format(slots - big)} of ${whole.format(Number(ss.ctx_small))}: at most ${whole.format(big)} contexts longer than ${whole.format(Number(ss.ctx_small))} run at once.`);
-      c.set('positions', posFmt(tot), `The slots hold ${whole.format(tot)} positions together.`);
-      c.set('window', posFmt(ss.usable_window), `The longest context one request may use: ${whole.format(ss.usable_window)} tokens.`);
-      c.set('busy', `${whole.format(inflight.length)} of ${whole.format(slots)}`);
-      c.set('use', posFmt(used), `The requests in flight hold ${whole.format(used)} positions (their prompt and the output so far).`);
+      const p = ss.pool || {}, cv = ss.conversations || {};
+      const n = Number(p.numbers), nb = Number(p.number_bytes), held = Number(p.held), pct = 100 * held / Math.max(1, n);
+      setText(c.sub, 'one pool');
+      c.set('chunks', gib(SPARKS * n * nb) + ' GiB', `${whole.format(n)} chunks of ${one.format(nb / 2 ** 20)} MiB on each of the ${SPARKS} Sparks: ${gib(n * nb)} GiB a Spark, ${gib(SPARKS * n * nb)} GiB in all.`);
+      c.set('holds', tokFmt(Number(p.positions)), `The pool holds ${whole.format(Number(p.positions))} tokens of conversation: a chunk holds 16,384 positions of the half-rate layers or 8,192 of the others.`);
+      c.set('free', gib(SPARKS * Number(p.free) * nb) + ' GiB', `${whole.format(Number(p.free))} of ${whole.format(n)} chunks a Spark are free.`);
+      c.set('window', tokFmt(ss.usable_window), `The longest context one request may use: ${whole.format(ss.usable_window)} tokens.`);
+      c.set('held', gib(SPARKS * held * nb) + ' GiB', `The conversations hold ${whole.format(held)} chunks a Spark: ${gib(SPARKS * held * nb)} GiB in all.`);
+      c.set('shared', gib(SPARKS * Number(p.shared) * nb) + ' GiB', `${whole.format(Number(p.shared))} chunks a Spark are held by more than one conversation, kept once.`);
+      c.set('reserved', gib(SPARKS * Number(p.reserved) * nb) + ' GiB', `${whole.format(Number(p.reserved))} chunks a Spark are kept for the running replies to grow into.`);
       c.set('pct', one.format(pct) + ' %');
-      c.set('store', `${gib(ss.store_used_bytes)} of ${gib(ss.store_cap_bytes)} GiB`, `The session store holds ${gib(ss.store_used_bytes)} GiB of ${gib(ss.store_cap_bytes)} GiB on each Spark.`);
-      c.set('kept', whole.format(Number(ss.sessions_resident)));
+      c.set('lines', `${whole.format(Number(cv.on_lines))} of ${whole.format(Number(ss.lines))}`);
+      c.set('memory', whole.format(Number(cv.in_memory)));
+      c.set('disk', whole.format(Number(cv.on_disk)));
+      c.set('sharing', whole.format(Number(cv.sharing)));
       setWidth(fill, pct);
-      meter.setAttribute('aria-label', `${one.format(pct)} % of the slots' positions in use`);
+      meter.setAttribute('aria-label', `${one.format(pct)} % of the pool's chunks held`);
     },
   };
 }
@@ -948,7 +959,6 @@ function onStatus() {
   const stale = !st || Date.now() - S.statusAt > STALE_MS || S.fails > 0;
   refs.blind.hidden = !(S.fails > 0);
   if (S.fails > 0) setText(refs.blind, `The front-end has not answered for ${Math.round((Date.now() - S.statusAt) / 1000)} s: what is shown is the last good reading, dimmed.`);
-  if (st) setText(refs.sub, [st.model_name, st.sessions && st.sessions.slots ? `${st.sessions.slots} lines` : null].filter(Boolean).join(' · '));
   refs.head(st, stale);
   if (refs.update) refs.update(stale);
 }

@@ -872,8 +872,10 @@ async fn start(app: &Arc<App>, p: &Prepared, pass: Pass) -> Result<Gen, ApiError
     let (plan, released) = {
         let app2 = app.clone();
         let text = p.prompt.clone();
+        let keep = info.keep_positions;
         tokio::task::spawn_blocking(move || {
             let mut t = app2.sessions.lock().unwrap();
+            t.keep_for(keep);
             t.plan(&text, &app2.tok, app2.cfg.tokenize_threads, ablit)
         })
         .await
@@ -964,9 +966,10 @@ async fn start_images(app: &Arc<App>, p: &Prepared, pass: Pass, info: crate::pro
     let keys: Vec<ImageKey> = (0..ats.len()).map(|i| ImageKey { at: ats[i], rows: enc.rows[i], hash: enc.hashes[i] }).collect();
     let ablit = p.ablit.unwrap_or(false);
     let (plan, released) = {
-        let (app2, text, keys) = (app.clone(), text.clone(), keys.clone());
+        let (app2, text, keys, keep) = (app.clone(), text.clone(), keys.clone(), info.keep_positions);
         tokio::task::spawn_blocking(move || {
             let mut t = app2.sessions.lock().unwrap();
+            t.keep_for(keep);
             t.plan_images(&text, &app2.tok, app2.cfg.tokenize_threads, ablit, &keys)
         })
         .await

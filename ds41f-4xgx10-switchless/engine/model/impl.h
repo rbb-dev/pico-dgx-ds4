@@ -20,9 +20,11 @@
 #include "common/check.h"
 #include "kernels/dsk.h"
 #include "model/ablit.h"
+#include "model/chunks.h"
 #include "model/tokwin.h"
 #include "model/model.h"
 #include "model/ops.h"
+#include "model/pool_rules.h"
 #include "model/vmm.h"
 
 namespace model {
@@ -80,6 +82,7 @@ struct LayerW {
 
 // Bytes per entry of a kv source's four arrays: compressed KV, its scales, index keys, their scales.
 constexpr size_t kKvEntryBytes[4] = {256, 32, 64, 4};
+constexpr int kMapLookahead = 4096;  // positions a line's lists grow beyond what a step needs: a growth in the host gap, not every step
 
 struct KvSrc {  // a kv-source layer's compressed KV, index keys and compressor carry (replicated)
   uint8_t *ckv, *csc, *ik, *iksc;
@@ -91,8 +94,13 @@ struct KvSrc {  // a kv-source layer's compressed KV, index keys and compressor 
   // ik's stride is a multiple of kChunk * 16 so that iksc's (ik's / 16, attn_common.cuh check_slots) is one too
   static constexpr int kStrideEntries = (int)(vmm::kChunk * 16 / kKvEntryBytes[2]);
   float *carry_kv, *carry_sc;
-  attn::Compressed compressed() const { return attn::Compressed{ckv, csc, cap}; }
-  attn::IndexKeys keys() const { return attn::IndexKeys{ik, iksc, cap}; }
+  // the kernels' view (attn.h Compressed): the arrays' bases and this source's chunk lists, [units][list_len]
+  // (at(u): unit u's row); ckv..iksc above stay the unit's own region, for the store's copies (state.cu)
+  uint8_t *pkv = nullptr, *psc = nullptr, *pik = nullptr, *pisc = nullptr;
+  const uint32_t* list = nullptr;  // device
+  int list_len = 0;
+  attn::Compressed compressed() const { return attn::Compressed{pkv, psc, cap, nullptr, list, list_len}; }
+  attn::IndexKeys keys() const { return attn::IndexKeys{pik, pisc, cap, nullptr, list, list_len}; }
   // session slots: slot s's buffers are slot 0's + s strides (whole caches of cap entries, or of stride_cap
   // when padded; the carries' 16 rows of kHead floats)
   size_t stride_entries() const { return (size_t)(stride_cap ? stride_cap : cap); }
@@ -103,8 +111,10 @@ struct KvSrc {  // a kv-source layer's compressed KV, index keys and compressor 
   static constexpr size_t kCarryStride = 16 * kHead;  // floats
   KvSrc at(int s) const {
     KvSrc k = *this;
-    k.ckv += s * ckv_stride(), k.csc += s * csc_stride(), k.ik += s * ik_stride(), k.iksc += s * iksc_stride();
+    if (ckv)  // per-unit arrays (kernel tests and benches); the chunk pool's are reached through the lists
+      k.ckv += s * ckv_stride(), k.csc += s * csc_stride(), k.ik += s * ik_stride(), k.iksc += s * iksc_stride();
     k.carry_kv += s * kCarryStride, k.carry_sc += s * kCarryStride;
+    k.list += (size_t)s * list_len;
     return k;
   }
 };
@@ -156,6 +166,24 @@ struct Model::Impl {
   // (kKvEntryBytes order); mapped_upto[s]: the position up to which every array of slot s is mapped (-1: none)
   std::unique_ptr<vmm::Pool> slot_pool;
   int mapped_upto[kMaxSlots] = {};
+  // The chunk pool (attn.h Compressed): slot_pool holds four pool-wide arrays (pool_arr: KV, KV scales, index keys, key
+  // scales) cut into chunk numbers of attn::kChunkEntries entries, taken from the allocator `calloc` (chunks.h), lowest free first. line_h[u]: the
+  // session unit u holds (kNoLine: none; negative: the unit's own); its rows of lists_d [kKvSlots][nunits][list_len] are
+  // that session's lists, lists_h the pinned mirror. resv[s]: numbers reserved for slot s's request; store_numbers: the store's share.
+  std::unique_ptr<chunks::Alloc> calloc;
+  std::vector<uint32_t> refs;  // refs[c]: the lists and bookmarks naming number c (forks share numbers by count)
+  uint8_t* pool_arr[4] = {};
+  uint32_t *lists_d = nullptr, *lists_h = nullptr;
+  int list_len = 0;
+  static constexpr int kNoLine = -2147483647 - 1;  // no session (a unit's own are -1 - u)
+  int line_h[kMaxUnits];
+  size_t store_numbers = 0, pool_max = 0;  // the store's share; the numbers the arrays' address space holds
+  int resv[kMaxSlots] = {};
+  size_t held_peak = 0;
+  bool pool_poison = false;
+  int held(int s) const;                 // chunk numbers slot s's session's lists hold
+  int numbers_for(int s, int upto) const;  // chunk numbers slot s needs to hold positions [0, upto]
+  uint8_t* ent_addr(int k, int a, int j) const;  // the current unit's entry j of kv source k's array a
   float2 *rope_plain, *rope_yarn;
   int kstride;
 
@@ -309,7 +337,6 @@ struct Model::Impl {
   void slot_release(int s);
   void slot_reserve(int s, int need);
   int slot_chunks_for(int s, int need) const;
-  void slot_bytes(int s, int upto, size_t bytes[16]) const;
   // A step's view of the state: with one slot, its pointers (the kernels' one-session code, no table); with
   // more, slot 0's and the step's slot table (in_d->slot), so that one captured step serves rows in any slots.
   attn::Window step_win(int L) const;
@@ -381,7 +408,7 @@ struct Model::Impl {
   void index_p(int L, int a, int M);
   // win_lo >= 0: CED's decoder replay (the window starts at win_lo with nothing before it; layer 20's
   // compressor ran in the encoder chunks)
-  void attention_p(int L, int a, int M, const std::vector<std::pair<int, uint8_t*>>& snaps, int win_lo = -1);
+  void attention_p(int L, int a, int M, const std::vector<std::pair<int, const std::vector<uint32_t>*>>& snaps, int win_lo = -1);
   void ffn_p(int L, int M);
   void wave_probe(int L, int a, int M);
   // positions [p0, p1) between layer L's ring and the linear window buffer that starts at position base
@@ -392,25 +419,30 @@ struct Model::Impl {
   // positions' layer-20 input; the decoder replay of [P - 128, P)
   void ced_project(int M);
   void ced_keep(int a, int M);
-  void ced_replay(int P, const std::vector<std::pair<int, uint8_t*>>& snaps);
+  void ced_replay(int P, const std::vector<std::pair<int, const std::vector<uint32_t>*>>& snaps);
 
   // ---- sessions' saved state (state.cu) -----------------------------------------------------
   detail::Store& store_of();
   void state_reserve(size_t bytes);
-  uint8_t* store_alloc(int h, size_t bytes);  // a block of the pool for session h (evicting), or nullptr
-  void store_release(uint8_t* p, size_t bytes);
-  // The shared budget (Options::vmm: the store's pool is a region of slot_pool; state.cu "the store on the slot
-  // pool"). store_take: a block's range from the allocator with its chunks mapped, nullptr when no free range
-  // fits within the uncommitted chunks (an idle chunk is unmapped first, store_trim). store_evict_step: one step
-  // of making room for session h's block (a live session's redundant pages, else the least recently used
-  // session that nothing pins, spilled), false when there is none. store_trim: idle chunks back to the slots'
-  // free list once every queued copy has finished. store_give_back: for a slot's reservation or a map that
-  // finds the pool short: idle chunks, then sessions, until `fits()` or nothing is left to give.
-  uint8_t* store_take(size_t bytes);
+  // The store in the chunk pool. take_nums: n numbers for session h, lowest free first, evicting the least recently used
+  // idle session (store_evict_step) while too few are free; false, nothing taken, when none is left. give_nums: back to
+  // the pool. bk_at / bk_copy: a bookmark's byte `off` (its numbers' KV slices, 2 MiB each), copies split at their edges.
+  size_t chunk_image() const;  // bytes a chunk number holds across the four arrays
+  bool take_nums(int h, size_t n, std::vector<uint32_t>* out);
+  // take_extra: the same for a bookmark of session h, only from room no line's reservation needs (false: none taken)
+  bool take_extra(int h, size_t n, std::vector<uint32_t>* out);
+  void give_nums(std::vector<uint32_t>& v);
+  // share_nums: the first n numbers of `from` appended to *out, each counted once more (nothing copied). own_tail: session
+  // h's numbers from the one holding position pos on become its own (refs 1) before anything writes them: a shared one
+  // holding pos is copied (its entries below pos), shared ones above it are replaced; false when the pool has no room.
+  void share_nums(const std::vector<uint32_t>& from, size_t n, std::vector<uint32_t>* out);
+  bool own_tail(int h, int pos);
+  bool own_bk(int h, std::vector<uint32_t>& b);
   bool store_evict_step(int h);
-  size_t store_trim();
-  bool store_give_back(const std::function<bool()>& fits);
-  bool store_shared() const;  // state.cu: the store is a region of slot_pool
+  uint8_t* bk_at(const std::vector<uint32_t>& n, size_t off) const;
+  void bk_copy(const std::vector<uint32_t>& n, size_t off, uint8_t* dev, size_t bytes, bool to_bk);
+  void slot_attach(int s, int h);  // slot s's unit holds session h (its rows are h's lists)
+  void pool_grow(size_t more);     // model.cu: more numbers in the pool, made and mapped
   size_t state_giveable(const std::vector<int>& keep) const;
   uint64_t state_kept_check(const std::string& base, uint64_t run_id, double max_age_s, size_t* bytes, std::string* why);
   void state_disk(const std::string& base, size_t bytes, size_t staging, bool reuse, uint64_t run_id);
@@ -420,7 +452,8 @@ struct Model::Impl {
   void state_unspill(int h);
   void state_save(int h, int from, int to);
   void state_load(int h, int to);
-  uint8_t* state_snap_buf(int h, int pos);  // a new snapshot's block (the caller fills it), nullptr: no room
+  // a new bookmark's numbers (the caller fills them: bk_copy), nullptr: no room
+  const std::vector<uint32_t>* state_snap_buf(int h, int pos);
   void state_snap(int h, int pos);
   void state_snap_end(int h, int pos);
   void state_restore(int h, int pos);

@@ -136,13 +136,11 @@ struct Options {
                             // kMaxSlots; ~240 MB a slot at 262,144 positions
   int big_slots = 0;        // with 0 < big_slots < slots: slots [0, big_slots) cover max_ctx, the others
                             // max_ctx / kUnitMul (slot_ctx); 0: every slot covers max_ctx
-  // The kv sources' arrays (compressed KV, index keys and their scales) as one pool of 2 MiB chunks made at
-  // the start, mapped into a slot's range of each array as its session grows and unmapped when it leaves
-  // (model/vmm.h, docs/engine.md "Session slots mapped on demand"). The pool holds what the slots would take
-  // whole, or slot_gib GiB of it (> 0): slots then hold only what their sessions use, and how many can be
-  // live is bounded by the pool. false: one plain allocation per array, every slot whole (the earlier layout).
-  bool vmm = true;
+  // The kv sources' arrays (compressed KV, index keys and their scales) as one chunk pool made at the start
+  // (docs/engine.md, "The chunk pool"): what the slots would take whole, or slot_gib GiB of it (> 0), or with
+  // pool_one_line one line's worth (serve: the pool grows to its chosen size before serving, state_reserve).
   double slot_gib = 0;
+  bool pool_one_line = false;
   int bgraph_bodies = 0;    // DIAGNOSTICS (spec.cu, 2026-10-13): the batch spec graph's switch bodies (0: kMaxRows)
   bool bgraph_noif = false; // DIAGNOSTICS: the entries' accepts at the top level, without if nodes
   bool bgraph_check = false;  // DIAGNOSTICS (B3 phase 2a): after the batch step's draft pass over the entries, every
@@ -185,14 +183,9 @@ class Model {
   int slot() const;
   int slots() const;
   int slot_ctx(int s) const;  // positions slot s holds (Options::big_slots)
-  // Slot memory (Options::vmm; every call is a no-op or zero without it). Every launch and copy maps what it
-  // needs itself; these let the server keep admission inside the pool. A chunk is vmm::kChunk bytes.
-  //  slot_reserve: commit the chunks a request of `need` positions (its prompt and every token it may
-  //    generate) can use in slot s, replacing slot s's earlier reservation; dies when the pool's other
-  //    commitments leave too little (check slot_chunks_for against slot_uncommitted + slot_committed first).
-  //  slot_release: slot s's session has left: its state is saved, nothing is queued for it; every chunk
-  //    goes back to the free list. Waits for the work queued.
-  bool slot_vmm() const;
+  // Slot memory (Options::vmm; every call is a no-op or zero without it). slot_reserve: commit the chunks a request of
+  // `need` positions can use in slot s, replacing its earlier reservation; dies when other commitments leave too little
+  // (check slot_chunks_for first). slot_release: slot s's session has left (state saved, nothing queued): its chunks go back.
   int slot_chunks_for(int s, int need) const;  // chunks slot s needs from empty to hold `need` positions
   int slot_committed(int s) const;             // chunks slot s holds or has reserved, whichever is more
   int slot_mapped(int s) const;                // chunks mapped in slot s
@@ -201,6 +194,7 @@ class Model {
   int slot_chunks_peak() const;                // most chunks mapped at once
   void slot_reserve(int s, int need);
   void slot_release(int s);
+  void slot_attach(int s, int h);  // slot s's unit holds stored session h from now on (no copy: its rows are h's)
 
   // Queue one step of R rows at positions pos0 .. pos0 + R - 1 on every rank, without waiting for it;
   // returns its number. tokens[r] >= 0 is the token; -1 - j stands for row j of the previous step's
@@ -304,7 +298,6 @@ class Model {
   // state_evicted() returns the sessions evicted since it was last called.
   void state_reserve(size_t bytes);
   size_t state_capacity() const;
-  bool state_shared() const;     // the store shares the slot memory pool
   size_t state_ceiling() const;  // the most the store could hold: its pool (shared: every chunk of the slot pool)
   // Chunks the store could give back to the slots without touching the sessions in `keep` (handles): the chunks
   // it has mapped less those under their blocks in RAM. 0 when it does not share the pool.
@@ -317,9 +310,13 @@ class Model {
   };
   StoreChunks state_chunks() const;  // the pool's chunks; the slots' commitments; the store's mapped and idle; the
                                      // bytes of its blocks; the chunks it handed back since the start; how many times
-  // h: the sessions the command uses (never evicted); live: the sessions live in the slots (never evicted, and
-  // their stored pages, which the slots hold too, are released first when the pool is full).
+  // h: the sessions the command uses (never evicted); live: the sessions running in the slots (never evicted; a session on
+  // an idle or paused line is not named, so it is cache).
   void state_pin(const std::vector<int>& h, const std::vector<int>& live = {});
+  // Numbers a copy on write at pos would take (see state.cu): the server makes room for them before the command.
+  int state_cow_numbers(int h_src, int h_own, int pos) const;
+  // A hash of the replicated store state, printed by the server under DSGB10_STORE_CHECK=1 and compared across the ranks.
+  uint64_t store_digest() const;
   std::vector<int> state_evicted();
   void state_save(int h, int from, int to);    // compressed caches of positions [from, to) -> session h
   void state_load(int h, int to);              // session h's compressed caches of positions [0, to) -> working
@@ -373,6 +370,14 @@ class Model {
     uint64_t spills = 0, spill_bytes = 0, restores = 0, restore_bytes = 0, restored_pos = 0, wait_ns = 0, wait_max_ns = 0;
   };
   TierStats tier_stats() const;
+  // The chunk pool for rank 0's dashboard (the StatsFrame, common/frontend_protocol.h): numbers in all, free, held by conversations,
+  // shared by more than one, reserved for the running requests' horizons and not yet held; one number's bytes; the
+  // conversations on lines, idle in memory, in the disk tier, and those naming a shared number.
+  struct PoolStats {
+    uint64_t numbers = 0, free = 0, held = 0, shared = 0, reserved = 0, number_bytes = 0;
+    uint64_t on_lines = 0, in_memory = 0, on_disk = 0, sharing = 0;
+  };
+  PoolStats pool_stats() const;
   // Wait for everything queued.
   void drain();
 

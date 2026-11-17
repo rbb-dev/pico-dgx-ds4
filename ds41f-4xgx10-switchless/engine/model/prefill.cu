@@ -434,7 +434,7 @@ static void rs_join(Prefill& p, cudaStream_t st) {
 // ---- attention ---------------------------------------------------------------------------------------
 
 // On entry y / yq / ys hold this rank's rows' normed input and a_pre / a_post / a_comb their mixes.
-void Model::Impl::attention_p(int L, int a, int M, const std::vector<std::pair<int, uint8_t*>>& snaps, int win_lo) {
+void Model::Impl::attention_p(int L, int a, int M, const std::vector<std::pair<int, const std::vector<uint32_t>*>>& snaps, int win_lo) {
   NVTX_RANGE("attn L%02d", L);
   Prefill& p = *pf;
   const LayerW& w = lw[L];
@@ -484,8 +484,8 @@ void Model::Impl::attention_p(int L, int a, int M, const std::vector<std::pair<i
   ring_copy(L, std::max(base, a + M - attn::kRing), a + M, base, false);
   for (const auto& sn : snaps) {
     const size_t off = (size_t)(sn.first - kSnapRows - base);
-    CUDA_CHECK(cudaMemcpyAsync(snap_kv(sn.second, L), p.lin_kv + off * kHead, kSnapKv, cudaMemcpyDeviceToDevice, st));
-    CUDA_CHECK(cudaMemcpyAsync(snap_sc(sn.second, L), p.lin_sc + off * (kHead / 32), kSnapSc, cudaMemcpyDeviceToDevice, st));
+    bk_copy(*sn.second, snap_kv_off(L), p.rs->lin_kv + off * kHead, kSnapKv, true);
+    bk_copy(*sn.second, snap_sc_off(L), p.rs->lin_sc + off * (kHead / 32), kSnapSc, true);
   }
   // output projections: wo_a on every row (this rank's heads); then wo_b on this rank's rows with every
   // rank's slice of it, whose inputs (every rank's wo_a outputs for these rows) an all-to-all brings on
@@ -635,7 +635,7 @@ void Model::Impl::ced_keep(int a, int M) {
 
 // The decoder replay: layers 20-39 over [P - 128, P) as a chunk of 128 rows (this rank's 32 from the
 // records of the ranks that ran them), the window truncated at P - 128, the decoder rings rewritten.
-void Model::Impl::ced_replay(int P, const std::vector<std::pair<int, uint8_t*>>& snaps) {
+void Model::Impl::ced_replay(int P, const std::vector<std::pair<int, const std::vector<uint32_t>*>>& snaps) {
   NVTX_RANGE("replay P=%d", P);
   Prefill& p = *pf;
   const int s = P - kReplay, M = kReplay;
@@ -701,10 +701,10 @@ uint64_t Model::Impl::prefill(int a, int M, const Sampling* sp, int handle, cons
     prefill_engram(a, M, set);
   }
   p.rs->e_last = set;
-  std::vector<std::pair<int, uint8_t*>> snaps;
+  std::vector<std::pair<int, const std::vector<uint32_t>*>> snaps;
   for (int s : snap_pos) {
     if (s <= a || s > a + M || s < kSnapRows) die("model: snapshot at %d outside (%d, %d]", s, a, a + M);
-    if (uint8_t* b = state_snap_buf(handle, s)) snaps.emplace_back(s, b);  // none: the store had no room
+    if (const std::vector<uint32_t>* b = state_snap_buf(handle, s)) snaps.emplace_back(s, b);  // none: no room
   }
   p.rq = q_rows(M), p.r0 = rank * p.rq, p.n = std::max(0, std::min(p.rq, M - p.r0));
   const int slot = (int)(n_steps % ops::kOutSlots);
@@ -755,7 +755,7 @@ uint64_t Model::Impl::prefill(int a, int M, const Sampling* sp, int handle, cons
     ced_project(M);
     ced_keep(a, M);
     if (sp) {  // the replay; of the snapshots only one at its end covers the decoder layers
-      std::vector<std::pair<int, uint8_t*>> at_end;
+      std::vector<std::pair<int, const std::vector<uint32_t>*>> at_end;
       for (const auto& sn : snaps)
         if (sn.first == a + M) at_end.push_back(sn);
       ced_replay(a + M, at_end);

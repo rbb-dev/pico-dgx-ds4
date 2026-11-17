@@ -78,6 +78,7 @@ async fn connection(stream: UnixStream, cfg: MockConfig, sessions: Sessions) {
         vocab_size: cfg.tok.vocab_size() as u32,
         eos_id: 1,
         max_sessions: 64,
+        keep_positions: 8913 * 16384 / 5,
         name: "mock".into(),
     };
     let _ = tx.send(Frame::HelloEngine(hello).encode());
@@ -182,20 +183,30 @@ impl MockIl {
     }
 }
 
-/// Plausible numbers: 32 slots (two with the whole context), a 256 GiB disk tier holding half the sessions.
+/// Plausible numbers: 32 lines and a pool of 8,913 numbers; a disk tier of the configured size holding half the
+/// conversations; a quarter of the other half (those in memory) sharing a beginning.
 fn stats(cfg: &MockConfig, sessions: &Sessions, il: &MockIl) -> EngineStats {
     let (n, held) = {
         let ss = sessions.lock().unwrap();
         (ss.len() as u64, ss.values().map(|h| h.0.len() as u64).sum::<u64>())
     };
     let (finished, computed) = (FINISHED.load(Ordering::Relaxed), COMPUTED.load(Ordering::Relaxed));
-    let (slots_total, slots_big, slot_ctx_big, slot_ctx_small) = (32u64, 2u64, cfg.max_context as u64, 65_536u64);
-    let positions = slots_big * slot_ctx_big + (slots_total - slots_big) * slot_ctx_small;
+    let _ = cfg;
+    let numbers = 8913u64;
+    let used = (held * 5 / 16384).min(numbers);
     EngineStats {
-        store_cap_bytes: positions * BYTES_PER_POSITION,
-        store_used_bytes: held * BYTES_PER_POSITION,
-        sessions_resident: n - n / 2,
-        sessions_on_disk: n / 2,
+        pool_numbers: numbers,
+        pool_free: numbers - used,
+        pool_held: used,
+        pool_shared: used / 8,
+        pool_reserved: 0,
+        number_bytes: 2_916_352,
+        pool_positions: numbers * 16384 / 5,
+        conv_on_lines: 0,
+        conv_in_memory: n - n / 2,
+        conv_on_disk: n / 2,
+        conv_sharing: (n - n / 2) / 4,
+        lines: 32,
         disk_cap_bytes: 256 << 30,
         disk_used_bytes: (n / 2) * (100 << 20),
         spills_total: finished,
@@ -206,11 +217,6 @@ fn stats(cfg: &MockConfig, sessions: &Sessions, il: &MockIl) -> EngineStats {
         restored_tokens_total: computed / 4,
         restore_wait_ns_total: finished / 4 * 12_000_000,
         restore_wait_max_ns: if finished >= 4 { 35_000_000 } else { 0 },
-        slots_total,
-        slots_big,
-        slot_ctx_big,
-        slot_ctx_small,
-        positions_held: held,
         il_on: il.on,
         il_whole_rows: il.whole_rows,
         il_push_rows: il.push_rows,

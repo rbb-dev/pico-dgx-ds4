@@ -140,22 +140,21 @@ __device__ __forceinline__ Window win_at(Window w, int r) {
   }
   return w;
 }
+// --- the chunk pool (attn.h Compressed): row r's chunk list, and a session's entry e as a pool entry ---
+__device__ __forceinline__ const uint32_t* list_row(const uint32_t* list, int stride, const int* slot, int r) {
+  return slot ? list + (size_t)slot[r] * stride : list;
+}
+__device__ __forceinline__ size_t pool_ent(const uint32_t* lrow, uint32_t e) {
+  return ((size_t)__ldg(lrow + (e >> kChunkShift)) << kChunkShift) | (e & (kChunkEntries - 1));
+}
 __device__ __forceinline__ Compressed ckv_at(Compressed c, int r) {
-  if (c.slot) {
-    const size_t s = (size_t)c.slot[r];
-    c.kv += s * c.kv_stride;
-    c.sc += s * c.sc_stride;
-    c.slot = nullptr;
-  }
+  c.list = list_row(c.list, c.list_stride, c.slot, r);
+  c.slot = nullptr;
   return c;
 }
 __device__ __forceinline__ IndexKeys ik_at(IndexKeys k, int r) {
-  if (k.slot) {
-    const size_t s = (size_t)k.slot[r];
-    k.k += s * k.k_stride;
-    k.sc += s * k.sc_stride;
-    k.slot = nullptr;
-  }
+  k.list = list_row(k.list, k.list_stride, k.slot, r);
+  k.slot = nullptr;
   return k;
 }
 __device__ __forceinline__ CompressorCarry carry_at(CompressorCarry c, int r) {
@@ -186,17 +185,14 @@ inline void check_slots(const Window& w, const char* who) {
   if (w.slot && (w.kv_stride % 16 || w.sc_stride % 16))
     die("%s: window slot strides %zu/%zu (bytes, multiples of 16)", who, w.kv_stride, w.sc_stride);
 }
-inline void check_slots(const Compressed& c, const char* who) {
-  if (c.slot && (c.kv_stride % 16 || c.sc_stride % 16))
-    die("%s: compressed slot strides %zu/%zu (bytes, multiples of 16)", who, c.kv_stride, c.sc_stride);
+inline void check_slots(const Compressed& c, const char* who) {  // a list and its row length, always
+  if (!c.list || c.list_stride < 1) die("%s: compressed cache without a chunk list (or its row length)", who);
 }
 inline void check_slots(const CompressorCarry& c, const char* who) {
   if (c.slot && c.stride % 4) die("%s: carry slot stride %zu (floats, a multiple of 4)", who, c.stride);
 }
-inline void check_slots(const IndexKeys& k, const char* who) {  // whole entries: the indexer adds entry offsets
-  if (k.slot && (k.k_stride % 64 || k.k_stride != 16 * k.sc_stride || k.k_stride / 64 > (1u << 24)))
-    die("%s: index key slot strides %zu/%zu are not whole entries (k_stride = 16 * sc_stride)", who, k.k_stride,
-        k.sc_stride);
+inline void check_slots(const IndexKeys& k, const char* who) {
+  if (!k.list || k.list_stride < 1) die("%s: index keys without a chunk list (or its row length)", who);
 }
 
 }  // namespace attn

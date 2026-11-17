@@ -146,8 +146,9 @@ __global__ void __launch_bounds__(kEThreads) emit_p_kernel(const float* __restri
       const float s = attn::fp4_e8m0_scale(attn::warp_max(fabsf(x)));
       const uint32_t code = attn::fp4_code(x, s);
       const uint32_t hi = __shfl_down_sync(0xffffffffu, code, 1);
-      if ((lane & 1) == 0) ik.k[(size_t)j * (kIdxDim / 2) + attn::fp4x128_byte(tid / 2)] = (uint8_t)(code | (hi << 4));
-      if (lane == 0) ik.sc[(size_t)j * 4 + warp] = attn::f_to_ue8m0(s);
+      const size_t pj = attn::pool_ent(ik.list, (uint32_t)j);
+      if ((lane & 1) == 0) ik.k[pj * (kIdxDim / 2) + attn::fp4x128_byte(tid / 2)] = (uint8_t)(code | (hi << 4));
+      if (lane == 0) ik.sc[pj * 4 + warp] = attn::f_to_ue8m0(s);
     }
     // KV entry: RoPE on the latent's last 64 dims at j * ratio, fp4 with an e4m3 scale per 16; thread t
     // owns channels 4t..4t+3
@@ -172,9 +173,10 @@ __global__ void __launch_bounds__(kEThreads) emit_p_kernel(const float* __restri
       const float s = attn::fp4_e4m3_scale(am);
       const uint32_t c0 = attn::fp4_code(ev[0], s), c1 = attn::fp4_code(ev[1], s), c2 = attn::fp4_code(ev[2], s),
                      c3 = attn::fp4_code(ev[3], s);
-      *reinterpret_cast<uint16_t*>(ckv.kv + (size_t)j * (kHead / 2) + 2 * tid) =
+      const size_t pj = attn::pool_ent(ckv.list, (uint32_t)j);
+      *reinterpret_cast<uint16_t*>(ckv.kv + pj * (kHead / 2) + 2 * tid) =
           (uint16_t)((c0 | (c1 << 4)) | ((c2 | (c3 << 4)) << 8));
-      if ((tid & 3) == 0) ckv.sc[(size_t)j * 32 + tid / 4] = attn::f_to_e4m3(s);
+      if ((tid & 3) == 0) ckv.sc[pj * 32 + tid / 4] = attn::f_to_e4m3(s);
     }
     __syncthreads();
   }

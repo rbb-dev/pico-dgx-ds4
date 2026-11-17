@@ -7,7 +7,7 @@ line, so that the front-end finds no session to continue, gives the cold prefill
 
   python3 engine/server/tests/revisit.py --key-file ~/dsgb10-data/dev-api-key [--sizes 32000,150000]
 
-Run it against a server whose store keeps little (e.g. --session-gib 0.5) so that one session pushes the
+Run it against a server whose pool keeps little (e.g. --pool-tokens 600000) so that one session pushes the
 other out; rank 0's log says where each revisit came from ("back from disk", "reused N (end)").
 """
 import argparse

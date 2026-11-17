@@ -3,7 +3,7 @@
 client). A session's turns, each after a filler request in another session; the same requests run on
 two servers:
   - one whose store keeps everything (the default store, --disk-gib 0): the session waits in the store;
-  - one whose store keeps nothing between requests (--session-gib 0.25: its budget is 0), with a disk
+  - one whose pool holds one long session at a time (--pool-tokens 110000), with a disk
     tier: the filler's request spills the session, and its next turn reads it back.
 --out writes each request's tokens, logprobs and restart point; --compare A B checks them equal, bit
 for bit: a session back from disk continues exactly as if it had stayed. The turns: a long one (CED
@@ -20,6 +20,7 @@ decoded positions, whose roundings a cold prefill does not reproduce (docs/engin
 import argparse
 import json
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))

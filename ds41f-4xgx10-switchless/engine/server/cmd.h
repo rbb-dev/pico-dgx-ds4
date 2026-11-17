@@ -44,6 +44,7 @@ enum : int32_t {
   kStReserve,      // slot_reserve(a, b): slot a's memory committed for b positions (the request's prompt and every token)
   kStRelease,      // slot_release(a): slot a's session has left (its state saved first): its memory back to the pool
   kStPin,          // nothing: names session h, which the command's operations (and the store, when it gives chunks back) leave alone
+  kStAttach,       // slot_attach(a, h): slot a's unit holds session h from now on (its rows are h's chunk lists, no copy)
 };
 struct StateOp {
   int32_t op = 0, h = -1, a = 0, b = 0;

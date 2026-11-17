@@ -71,9 +71,22 @@ void apply_state(model::Model& m, const StateOp& o) {
     case kStReserve: m.slot_reserve(o.a, o.b); break;
     case kStRelease: m.slot_release(o.a); break;
     case kStPin: break;  // apply_ops pinned its session
+    case kStAttach: m.slot_attach(o.a, o.h); break;
     default: die("state: unknown operation %d", o.op);
   }
 }
+
+namespace {
+// DSGB10_STORE_CHECK=1: every rank prints a digest of the replicated store state after a window or state command; the
+// four ranks' logs must show the same value on the same line (a rank-local input to a replicated decision shows as a split).
+bool store_check() {
+  static const bool on = [] {
+    const char* e = std::getenv("DSGB10_STORE_CHECK");
+    return e && std::atoi(e) != 0;
+  }();
+  return on;
+}
+}  // namespace
 
 void apply_ops(model::Model& m, const Cmd& c) {
   if (c.slot >= 0) m.use_slot(c.slot);
@@ -89,6 +102,9 @@ void apply_ops(model::Model& m, const Cmd& c) {
     if (h > 0) live.push_back(h);
   m.state_pin(pin, live);
   for (int i = 0; i < c.n_ops; ++i) apply_state(m, c.ops[i]);
+  if (c.n_ops > 0 && store_check())
+    std::printf("store-check: rank %d state command (%d ops, first %d) digest %016llx\n", m.rank(), c.n_ops, c.ops[0].op,
+                (unsigned long long)m.store_digest());
 }
 
 Cmd bcast(comm::Ring& ring, const Cmd& mine) {

@@ -129,7 +129,7 @@ void bench_attn(Timer& T, int R, int ctx, bool ref, const std::vector<int>& kmax
   rnd_u8(csc, 0x1F, 0x28);
   rnd_f32(sink, 1.0f);
   attn::Window win{wkv.p, wsc.p, -1, ctx - R - 128};
-  attn::Compressed cc{ckv.p, csc.p, cap};
+  const attn::Compressed cc = listed(attn::Compressed{ckv.p, csc.p, cap}, cap);
   for (int share : {0, 3}) {
     fill_topk<<<R, 256>>>(topk.p, R, 512, pos.p, 2, share, 77);
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -178,7 +178,7 @@ void bench_index(Timer& T, int R, int ctx, bool ref, const std::vector<int>& bat
     rnd_u8(qsc8, 7, 122);
     fill_w<<<512, 256>>>(qw.p, qw.n, g_seed++);
     attn::IndexQ q{qq.p, reinterpret_cast<uint32_t*>(qsc8.p), qw.p};
-    attn::IndexKeys ik{kk.p, ksc.p, cap};
+    const attn::IndexKeys ik = listed(attn::IndexKeys{kk.p, ksc.p, cap}, cap);
     Dev<uint16_t> keys((size_t)rows * stride), bkeys((size_t)rows * stride / 8), ky((size_t)rows * K),
         pk((size_t)rows * KB);
     Dev<int> top((size_t)rows * K), pl((size_t)rows * KB);
@@ -237,8 +237,8 @@ void bench_comp(Timer& T, int R, bool ref) {
       Dev<int> pos(ph.data(), rows);
       Dev<float> kv((size_t)rows * 512), score((size_t)rows * 512), ck(16 * 512), cs(16 * 512);
       Dev<uint8_t> ckv((size_t)cap * 256), csc((size_t)cap * 32), ik((size_t)cap * 64), isc((size_t)cap * 4);
-      attn::Compressed cc{ckv.p, csc.p, cap};
-      attn::IndexKeys ii{ik.p, isc.p, cap};
+      const attn::Compressed cc = listed(attn::Compressed{ckv.p, csc.p, cap}, cap);
+      const attn::IndexKeys ii = listed(attn::IndexKeys{ik.p, isc.p, cap}, cap);
       CUDA_CHECK(cudaDeviceSynchronize());
       dsk::compressor_project_p(x.p, w, kv.p, score.p, rows, 0);
       CUDA_CHECK(cudaDeviceSynchronize());
@@ -455,7 +455,7 @@ void bench_decoder(Timer& T, int P) {
     fill_topk<<<R, 256>>>(topk.p, R, K, pos.p, 1, 0, 78);
     CUDA_CHECK(cudaDeviceSynchronize());
     attn::Window win{wkv.p, wsc.p, -1, s};
-    attn::Compressed cc{ckv.p, csc.p, cap};
+    const attn::Compressed cc = listed(attn::Compressed{ckv.p, csc.p, cap}, cap);
     const float ta = T.us([&] { dsk::sparse_attn_p(q.p, pos.p, R, tab.p, win, cc, topk.p, K, sink.p, out.p, T.s, s); });
     const float tr = T.us([&] {
       attn::sparse_attn(q.p, pos.p, attn::WinBounds{lo.p, nullptr}, R, tab.p, win, cc, topk.p, K, sink.p, out.p, 10,
@@ -478,7 +478,7 @@ void bench_decoder(Timer& T, int P) {
     rnd_u8(qsc8, 7, 122);
     fill_w<<<512, 256>>>(qw.p, qw.n, g_seed++);
     attn::IndexQ q{qq.p, reinterpret_cast<uint32_t*>(qsc8.p), qw.p};
-    attn::IndexKeys ik{kk.p, ksc.p, cap};
+    const attn::IndexKeys ik = listed(attn::IndexKeys{kk.p, ksc.p, cap}, cap);
     Dev<uint16_t> keys((size_t)nr * stride), bkeys((size_t)nr * stride / 8), ky((size_t)nr * K), pk((size_t)nr * KB),
         rkeys((size_t)nr * ms);
     Dev<int> top((size_t)nr * K), pl((size_t)nr * KB);

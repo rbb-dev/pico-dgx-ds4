@@ -77,7 +77,7 @@ bool done(int fd, uint64_t req_id, fe::DoneReason reason, uint32_t prompt, uint3
 // Serves one front-end connection until it closes or sends a malformed frame.
 void serve(int fd) {
   const std::string name = "echo";
-  fe::HelloEngine hello{fe::kVersion, 1 << 20, 129280, kEos, 16, uint32_t(name.size())};
+  fe::HelloEngine hello{fe::kVersion, 1 << 20, 129280, kEos, 16, uint32_t(name.size()), 1 << 20};
   if (!Out(fe::kHelloEngine).add(&hello).add(name.data(), name.size()).send(fd)) return;
   for (;;) {
     fe::FrameHeader h;
@@ -123,13 +123,14 @@ void serve(int fd) {
       }
       if (!done(fd, s.req_id, reason, s.n_prompt, sent)) return;
     } else if (h.type == fe::kStatsReq) {
-      // no store, no disk tier: one slot of the whole context
+      // no disk tier: one line, and a pool of one whole context
       fe::StatsFrame st{};
       st.version = fe::kStatsVersion;
       st.n_fields = fe::kStatsFields;
-      st.store_cap_bytes = uint64_t(hello.max_context) * 890;
-      st.slots_total = st.slots_big = 1;
-      st.slot_ctx_big = hello.max_context;
+      st.pool_positions = hello.max_context;
+      st.pool_numbers = st.pool_free = (hello.max_context * 5ull + 16383) / 16384;
+      st.number_bytes = 2916352;
+      st.lines = 1;
       if (!Out(fe::kStats).add(&st).send(fd)) return;
     }  // CANCEL and RELEASE: nothing is in flight between frames and no session is kept
   }

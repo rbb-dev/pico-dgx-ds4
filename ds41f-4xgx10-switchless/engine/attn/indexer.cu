@@ -130,14 +130,14 @@ struct ScoreArgs {
   int keys_stride;
   uint16_t* bkeys;
   int bkeys_stride;
-  const int* slot;    // IndexKeys' session slots (attn.h): slot s's keys from entry s * slot_entries on
-  int slot_entries;  // (slot_entries below)
+  const int* slot;        // IndexKeys' session slots and chunk lists (attn.h)
+  const uint32_t* list;
+  int list_stride;
 };
 
-// Row r's session's first key entry: an offset in entries, so that the key pointers stay kernel parameters
-// (pointers held in registers cost index_dense spills)
-__device__ __forceinline__ uint32_t keys_of(const ScoreArgs& a, int r) {
-  return a.slot ? (uint32_t)a.slot[r] * a.slot_entries : 0u;
+// Row r's session's chunk list.
+__device__ __forceinline__ const uint32_t* keys_list(const ScoreArgs& a, int r) {
+  return list_row(a.list, a.list_stride, a.slot, r);
 }
 
 // A 16-position tile's keys as one lane holds them: the positions of MMA rows g and g + 8 (-1 for none),
@@ -147,8 +147,8 @@ struct TileKeys {
   uint4 k0, k1;
   uint32_t sa;
 };
-__device__ __forceinline__ TileKeys load_tile(const ScoreArgs& a, uint32_t e0, const int* blist, int i0, int n, int lo,
-                                              int lane) {
+__device__ __forceinline__ TileKeys load_tile(const ScoreArgs& a, const uint32_t* lrow, const int* blist, int i0, int n,
+                                              int lo, int lane) {
   int g = lane >> 2, t = lane & 3;
   TileKeys k;
   if (blist) {
@@ -162,14 +162,14 @@ __device__ __forceinline__ TileKeys load_tile(const ScoreArgs& a, uint32_t e0, c
   k.k0 = make_uint4(0, 0, 0, 0);
   k.k1 = k.k0;
   uint32_t s0 = 0x7f7f7f7fu, s1 = 0x7f7f7f7fu;
-  if (k.p0 >= 0) {  // entry e0 + p0, unsigned: one wide multiply-add per address
-    const uint32_t e = e0 + k.p0;
-    k.k0 = __ldg(reinterpret_cast<const uint4*>(a.k + (size_t)e * 64) + t);
+  if (k.p0 >= 0) {  // entry p0 of the session, as a pool entry
+    const size_t e = pool_ent(lrow, (uint32_t)k.p0);
+    k.k0 = __ldg(reinterpret_cast<const uint4*>(a.k + e * 64) + t);
     s0 = __ldg(a.ksc + e);
   }
   if (k.p1 >= 0) {
-    const uint32_t e = e0 + k.p1;
-    k.k1 = __ldg(reinterpret_cast<const uint4*>(a.k + (size_t)e * 64) + t);
+    const size_t e = pool_ent(lrow, (uint32_t)k.p1);
+    k.k1 = __ldg(reinterpret_cast<const uint4*>(a.k + e * 64) + t);
     s1 = __ldg(a.ksc + e);
   }
   k.sa = (t & 1) ? s1 : s0;
@@ -260,7 +260,7 @@ __global__ void __launch_bounds__(128) score_kernel(ScoreArgs a) {
   for (int tile = 0; tile < kScoreTiles; ++tile) {
     int i0 = base + (warp * kScoreTiles + tile) * 16;
     if (i0 >= n) break;
-    TileKeys k = load_tile(a, 0, blist, i0, n, lo, lane);  // one session (index_score)
+    TileKeys k = load_tile(a, a.list, blist, i0, n, lo, lane);
     for (int rr = 0; rr < nr; ++rr)
       score_tile_row(k, sq[rr], ssc[rr], sw[rr], slen[rr], i0, lo, a.keys + (size_t)(r0 + rr) * a.keys_stride,
                      a.bkeys ? a.bkeys + (size_t)(r0 + rr) * a.bkeys_stride : nullptr, lane);
@@ -290,6 +290,9 @@ struct SelectArgs {
   uint16_t* out_key;
   int out_stride;
   const int* slot;  // session slots (attn.h): a dense part's length is the row's session's
+  // the rows' chunk lists (attn.h): positions picked from the scan (unit 1, no cand) are written as pool entries
+  const uint32_t* list;
+  int list_stride;
 };
 
 __device__ __forceinline__ int scan_pos(const SelectArgs& a, int r, int i, int lo) {
@@ -395,6 +398,12 @@ __device__ __forceinline__ void select_bins(const SelectArgs& a, int r, int lo, 
   __shared__ uint32_t tmp[64];
   __shared__ uint32_t info[5];  // threshold bin, keys above it, threshold key, ties to take, keys in the bin
   int tid = threadIdx.x;
+  // a pick from the scan as attention reads it: a pool entry through the row's list (its first 256 chunks held here)
+  __shared__ uint32_t xl[256];
+  const bool xl_on = a.list && a.unit == 1 && !a.cand;
+  const uint32_t* xrow = xl_on ? list_row(a.list, a.list_stride, a.slot, r) : nullptr;
+  const int xn = xl_on ? min(256, a.list_stride) : 0;  // list_stride: a row's length
+  const uint32_t xv = tid < xn ? __ldg(xrow + tid) : 0u;
   const uint16_t* row = a.keys + (size_t)r * a.keys_stride;
   if (tid < 32) h2[tid] = 0;
   uint32_t total, pre = block_excl_scan(top + next, tmp, &total);
@@ -410,8 +419,18 @@ __device__ __forceinline__ void select_bins(const SelectArgs& a, int r, int lo, 
       info[4] = next;
     }
   }
+  if (tid < xn) xl[tid] = xv;
   __syncthreads();
   int* opos = a.out_pos + (size_t)r * a.out_stride;
+  auto xlt = [&](int p) {
+    if (!xl_on || p < 0) return p;
+    uint32_t e = (uint32_t)p;
+#ifdef DSGB10_POOL_CORRUPT  // the negative control: chunk 0's picks read the neighbouring entry
+    if ((e >> kChunkShift) == 0) e ^= 1u;
+#endif
+    const uint32_t c = (int)(e >> kChunkShift) < xn ? xl[e >> kChunkShift] : __ldg(xrow + (e >> kChunkShift));
+    return (int)((c << kChunkShift) | (e & (kChunkEntries - 1)));
+  };
   uint16_t* okey = a.out_key + (size_t)r * a.out_stride;
   if (K > 0 && info[1] + info[4] <= (uint32_t)cap) {
     // the candidates, in scan order, and the threshold bin's histogram
@@ -489,7 +508,7 @@ __device__ __forceinline__ void select_bins(const SelectArgs& a, int r, int lo, 
     for (uint32_t i = c0; i < c1; ++i) {
       uint32_t k = ckey[i];
       if (k > theta || (k == theta && tie++ < need)) {
-        opos[o] = scan_pos(a, r, cidx[i], lo);
+        opos[o] = xlt(scan_pos<kRM>(a, r, cidx[i], lo));
         okey[o] = (uint16_t)k;
         ++o;
       }
@@ -523,7 +542,7 @@ __device__ __forceinline__ void select_bins(const SelectArgs& a, int r, int lo, 
       for (int j = 0; j < 16; ++j) {
         bool take = k[j] > theta || (k[j] == theta && tie++ < need);
         if (take) {
-          opos[o] = scan_pos(a, r, i0 + j, lo);
+          opos[o] = xlt(scan_pos<kRM>(a, r, i0 + j, lo));
           okey[o] = (uint16_t)k[j];
           ++o;
         }
@@ -600,12 +619,12 @@ __global__ void __launch_bounds__(kSelThreads) index_fused_kernel(IndexFusedArgs
   int base = blockIdx.x * kFusedPos, p = s.pos[r];
   if (base < n) {
     const int* blist = s.blocks ? s.blocks + (size_t)r * s.nblocks : nullptr;
-    const uint32_t e0 = kSlots ? keys_of(s, r) : 0u;
+    const uint32_t* lrow = kSlots ? keys_list(s, r) : s.list;
     TileKeys k[kScoreTiles];
 #pragma unroll
     for (int tile = 0; tile < kScoreTiles; ++tile) {
       int i0 = base + (warp * kScoreTiles + tile) * 16;
-      if (i0 < n) k[tile] = load_tile(s, e0, blist, i0, n, lo, lane);
+      if (i0 < n) k[tile] = load_tile(s, lrow, blist, i0, n, lo, lane);
     }
     q_prep_head(a.iq_pre + ((size_t)r * kIdxHeads + warp) * kIdxDim, a.wproj[(size_t)r * kIdxHeads + warp], p,
                 a.table, lane, sq[warp], &ssc[warp], &sw[warp], nullptr);
@@ -768,8 +787,8 @@ __global__ void __launch_bounds__(kSelThreads) index_dense_kernel(IndexDenseArgs
       hb[i] = 0;
     }
     const int* rb = s.blocks ? s.blocks + (size_t)r0 * s.nblocks : nullptr;  // a block list: the group's one row
-    const uint32_t e0 = kSlots ? (uint32_t)sslot[r0] * s.slot_entries : 0u;  // the group's session's keys
-    TileKeys cur = load_tile(s, e0, rb, c * kDensePos + warp * 16, n, 0, lane);
+    const uint32_t* lrow = kSlots ? s.list + (size_t)sslot[r0] * s.list_stride : s.list;  // the group's session's keys
+    TileKeys cur = load_tile(s, lrow, rb, c * kDensePos + warp * 16, n, 0, lane);
     QIn qi = q_load(a.iq_pre + ((size_t)r0 * kIdxHeads + warp) * kIdxDim, s.pos[r0], a.table, lane);
     float wq = a.wproj[r0 * kIdxHeads + warp];
     for (int r = r0; r < r1; ++r) {  // the queries (warp h: head h of each row), the next row's loading
@@ -788,7 +807,7 @@ __global__ void __launch_bounds__(kSelThreads) index_dense_kernel(IndexDenseArgs
     for (; c < nchunks; c += stride) {
       const int i0 = c * kDensePos + warp * 16;
       TileKeys nxt = cur;
-      if (c + stride < nchunks) nxt = load_tile(s, e0, rb, i0 + stride * kDensePos, n, 0, lane);
+      if (c + stride < nchunks) nxt = load_tile(s, lrow, rb, i0 + stride * kDensePos, n, 0, lane);
       if (i0 < n)
         for (int r = r0; r < r1; ++r)
           score_tile_row(cur, sq[r - q0], ssc + (r - q0) * kIdxHeads, sw + (r - q0) * kIdxHeads, slen[r], i0, 0,
@@ -855,8 +874,10 @@ void index_score(const IndexQ& q, const int* pos, int rows, int ratio, IndexKeys
   int padded = (nscan + kScorePos - 1) / kScorePos * kScorePos;
   if (keys_stride < padded || (bkeys && (scan.blocks || bkeys_stride < padded / 8)) || ik.slot)
     die("index_score: strides %d/%d for %d (or a slot table)", keys_stride, bkeys_stride, nscan);
+  check_slots(ik, "index_score");
   ScoreArgs a{q.q, q.sc, q.w, pos, rows, ratio, ik.k, reinterpret_cast<const uint32_t*>(ik.sc), scan.part,
-              scan.nparts, scan.blocks, scan.nblocks, keys, keys_stride, bkeys, bkeys_stride, nullptr, 0};
+              scan.nparts, scan.blocks, scan.nblocks, keys, keys_stride, bkeys, bkeys_stride, nullptr, ik.list,
+              ik.list_stride};
   if (scan.blocks || rows == 1) {
     score_kernel<1><<<dim3(padded / kScorePos, rows), 128, 0, s>>>(a);
   } else {
@@ -910,9 +931,12 @@ SelectArgs merge_args(const int* cand_pos, const uint16_t* cand_key, int n, int 
 }  // namespace
 
 void index_topk(const uint16_t* keys, int keys_stride, const int* pos, int rows, int ratio, const IndexScan& scan,
-                int max_scan, bool pool, int kmax, int* out_pos, uint16_t* out_key, int out_stride, cudaStream_t s) {
+                int max_scan, bool pool, int kmax, int* out_pos, uint16_t* out_key, int out_stride, cudaStream_t s,
+                const uint32_t* list, int list_len) {
   (void)max_scan;
+  if (list && list_len < 1) die("index_topk: a chunk list needs its length");
   SelectArgs a = topk_args(keys, keys_stride, pos, rows, ratio, scan, pool, kmax, out_pos, out_key, out_stride);
+  if (!pool) a.list = list, a.list_stride = list_len;  // one session: its list (no slot table)
   select_kernel<<<rows, kSelThreads, 0, s>>>(a);
   CUDA_CHECK(cudaGetLastError());
 }
@@ -924,12 +948,6 @@ void index_merge(const int* cand_pos, const uint16_t* cand_key, int n, int rows,
   CUDA_CHECK(cudaGetLastError());
 }
 
-// IndexKeys' slot stride in whole entries: k_stride = 64 x entries = 16 x sc_stride (each slot [entries][64] and
-// [entries][4])
-static int slot_entries(const IndexKeys& ik, const char* who) {
-  check_slots(ik, who);
-  return ik.slot ? (int)(ik.k_stride / 64) : 0;
-}
 
 void index_fused(const uint16_t* iq_pre, const float* wproj, const int* pos, const float2* table, int rows, int ratio,
                  IndexKeys ik, const IndexScan& scan, int max_scan, uint16_t* keys, int keys_stride, uint16_t* bkeys,
@@ -942,11 +960,13 @@ void index_fused(const uint16_t* iq_pre, const float* wproj, const int* pos, con
   a.iq_pre = iq_pre;
   a.wproj = wproj;
   a.table = table;
+  check_slots(ik, "index_fused");
   a.sc = ScoreArgs{nullptr, nullptr, nullptr, pos, rows, ratio, ik.k, reinterpret_cast<const uint32_t*>(ik.sc),
                    scan.part, scan.nparts, scan.blocks, scan.nblocks, keys, keys_stride, bkeys, bkeys_stride,
-                   ik.slot, slot_entries(ik, "index_fused")};
+                   ik.slot, ik.list, ik.list_stride};
   a.top = topk_args(keys, keys_stride, pos, rows, ratio, scan, false, top.kmax, top.pos, top.key, top.stride);
   a.top.slot = ik.slot;
+  a.top.list = ik.list, a.top.list_stride = ik.list_stride;
   if (pool.pos) {
     a.pool = topk_args(bkeys, bkeys_stride, pos, rows, ratio, scan, true, pool.kmax, pool.pos, pool.key, pool.stride);
     a.pool.slot = ik.slot;
@@ -994,9 +1014,12 @@ void index_dense(const uint16_t* iq_pre, const float* wproj, const int* pos, con
   a.iq_pre = iq_pre;
   a.wproj = wproj;
   a.table = table;
+  check_slots(ik, "index_dense");
   a.sc = ScoreArgs{nullptr, nullptr, nullptr, pos, rows, ratio, ik.k, reinterpret_cast<const uint32_t*>(ik.sc), 0, 1,
-                   nullptr, 0, keys, keys_stride, bkeys, bkeys_stride, ik.slot, slot_entries(ik, "index_dense")};
+                   nullptr, 0, keys, keys_stride, bkeys, bkeys_stride, ik.slot, ik.list, ik.list_stride};
   a.top = topk_args(keys, keys_stride, pos, rows, ratio, whole, false, top.kmax, top.pos, top.key, top.stride);
+  a.top.slot = ik.slot;  // the rows' lists (the length comes from the scan: select_dense)
+  a.top.list = ik.list, a.top.list_stride = ik.list_stride;
   if (pool.pos)
     a.pool = topk_args(bkeys, bkeys_stride, pos, rows, ratio, whole, true, pool.kmax, pool.pos, pool.key, pool.stride);
   a.scratch = scratch;
@@ -1017,9 +1040,12 @@ void index_dense_blocks(const uint16_t* iq_pre, const float* wproj, const int* p
   a.iq_pre = iq_pre;
   a.wproj = wproj;
   a.table = table;
+  check_slots(ik, "index_dense_blocks");
   a.sc = ScoreArgs{nullptr, nullptr, nullptr, pos, rows, ratio, ik.k, reinterpret_cast<const uint32_t*>(ik.sc), 0, 1,
-                   blocks, nblocks, keys, keys_stride, nullptr, 0, ik.slot, slot_entries(ik, "index_dense_blocks")};
+                   blocks, nblocks, keys, keys_stride, nullptr, 0, ik.slot, ik.list, ik.list_stride};
   a.top = topk_args(keys, keys_stride, pos, rows, ratio, scan, false, top.kmax, top.pos, top.key, top.stride);
+  a.top.slot = ik.slot;
+  a.top.list = ik.list, a.top.list_stride = ik.list_stride;
   a.scratch = scratch;
   a.cap = cand < 0 ? kDenseCand : std::min(cand, kDenseCand);
   launch(dense_kernel(ik.slot, rows), dim3(sms), dim3(kSelThreads), kDenseSmem, s, pdl, a);

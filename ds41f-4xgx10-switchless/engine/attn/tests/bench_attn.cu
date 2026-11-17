@@ -80,8 +80,8 @@ struct Layer {
   Dev<float> sink, fn[2], hsc[2], hbase[2], carry_kv, carry_sc;
   Dev<int> cand, top, pcand, pool;
   attn::CompressorWeights cw() const { return {ratio, wkv.p, wgate.p, cnorm.p, wk.p, knorm.p}; }
-  attn::Compressed ckv() const { return {ckv_kv.p, ckv_sc.p, cap}; }
-  attn::IndexKeys ik() const { return {ik_k.p, ik_sc.p, cap}; }
+  attn::Compressed ckv() const { return listed(attn::Compressed{ckv_kv.p, ckv_sc.p, cap}, cap); }
+  attn::IndexKeys ik() const { return listed(attn::IndexKeys{ik_k.p, ik_sc.p, cap}, cap); }
 };
 
 enum : unsigned { kPrep = 1, kComp = 2, kIdxQ = 4, kScore = 8, kSelect = 16, kMerge = 32, kAttn = 64, kAll = 127 };

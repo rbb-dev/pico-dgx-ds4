@@ -46,8 +46,13 @@ class Engine:
         t, p = self.frame()
         assert t == HELLO_E, t
         ver, self.max_ctx, vocab, eos, max_sess, nl = struct.unpack('<6I', p[:24])
-        self.name = p[24:24 + nl].decode()
-        self.send(HELLO, struct.pack('<II', 3, 0))
+        # version 4 (the chunk pool) carries keep_positions after name_len; the answer is the engine's own version, so
+        # one client speaks to an engine of either
+        self.keep_positions = struct.unpack('<Q', p[24:32])[0] if ver >= 4 else 0
+        at = 32 if ver >= 4 else 24
+        self.name = p[at:at + nl].decode()
+        self.version = ver
+        self.send(HELLO, struct.pack('<II', ver, 0))
         self.next_id = 1
 
     def send(self, t, payload):

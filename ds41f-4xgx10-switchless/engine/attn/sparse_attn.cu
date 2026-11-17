@@ -151,7 +151,7 @@ __global__ void __launch_bounds__(128) attn_kernel(AttnArgs a) {
 #pragma unroll
       for (int kk = 0; kk < 16; ++kk) {
         int kp = __shfl_sync(0xffffffffu, my_kp, kk);
-        const uint2 v = kp >= 0 ? *reinterpret_cast<const uint2*>(ckv.kv + (size_t)kp * (kHead / 2) + lane * 8)
+        const uint2 v = kp >= 0 ? *reinterpret_cast<const uint2*>(ckv.kv + (size_t)kp * (kHead / 2) + lane * 8)  // kp: a pool entry
                                 : make_uint2(0, 0);
         kc[kk] = make_uint4(v.x, v.y, 0u, 0u);
         ke[kk] = kp >= 0 ? ckv.sc[(size_t)kp * 32 + lane] : 0u;
@@ -363,7 +363,7 @@ void sparse_attn(const uint16_t* q_pre, const int* pos, WinBounds wb, int rows, 
   (void)once;
   if (kmax % kBlk) die("sparse_attn: kmax %d", kmax);
   check_slots(win, "sparse_attn");
-  check_slots(ckv, "sparse_attn");
+  if (kmax > 0) check_slots(ckv, "sparse_attn");  // layers without compression take no cache
   AttnArgs a{};
   a.q = q_pre;
   a.pos = pos;

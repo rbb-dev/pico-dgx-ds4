@@ -44,6 +44,7 @@ fn fake_engine(tag: &str, vocab: usize) -> FakeEngine {
                 vocab_size: vocab as u32,
                 eos_id: 1,
                 max_sessions: 64,
+                keep_positions: 1 << 20,
                 name: "fake".into(),
             };
             if wr.write_all(&Frame::HelloEngine(hello).encode()).await.is_err() {

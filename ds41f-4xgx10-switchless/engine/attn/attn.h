@@ -44,19 +44,26 @@ struct Window {          // sliding-window KV, slot = (position - base) & mask: 
   const int* slot = nullptr;  // session slots (above)
   size_t kv_stride = 0, sc_stride = 0;
 };
+// The compressed caches and their index keys live in a pool of chunks of kChunkEntries entries. Entry e of a session's
+// cache is pool entry (list[e >> kChunkShift] << kChunkShift) | (e & (kChunkEntries - 1)); `list` is the session's chunk
+// list: row slot[r] of [sessions][list_stride] with a slot table, else the list itself. The selection writes top-k
+// picks as pool entries; attention reads them as given.
+inline constexpr int kChunkShift = 13, kChunkEntries = 1 << kChunkShift;
 struct Compressed {      // a kv-source layer's compressed KV: entry j stands for tokens [j*ratio, (j+1)*ratio)
-  uint8_t* kv;           // [cap][256] e2m1 pairs, low nibble = even element
-  uint8_t* sc;           // [cap][32]  e4m3, one per 16
-  int cap;
-  const int* slot = nullptr;  // session slots (above)
-  size_t kv_stride = 0, sc_stride = 0;
+  uint8_t* kv;           // pool [entries][256] e2m1 pairs, low nibble = even element
+  uint8_t* sc;           // pool [entries][32]  e4m3, one per 16
+  int cap;               // entries a session can hold
+  const int* slot = nullptr;       // session slots (above)
+  const uint32_t* list = nullptr;  // chunk lists (above)
+  int list_stride = 0;             // a row's length (and the rows' stride)
 };
-struct IndexKeys {       // the indexer keys of the same entries
-  uint8_t* k;            // [cap][64] e2m1 pairs, words transposed 4x4 (attn_common.cuh fp4x128_byte)
-  uint8_t* sc;           // [cap][4]  ue8m0, one per 32
+struct IndexKeys {       // the indexer keys of the same entries, through the same lists
+  uint8_t* k;            // pool [entries][64] e2m1 pairs, words transposed 4x4 (attn_common.cuh fp4x128_byte)
+  uint8_t* sc;           // pool [entries][4]  ue8m0, one per 32
   int cap;
-  const int* slot = nullptr;  // session slots (above); the indexer's sessions are this table's
-  size_t k_stride = 0, sc_stride = 0;  // whole entries apart: k_stride = 16 * sc_stride
+  const int* slot = nullptr;       // session slots (above); the indexer's sessions are this table's
+  const uint32_t* list = nullptr;  // chunk lists (above)
+  int list_stride = 0;
 };
 
 // ---- q / kv preparation -------------------------------------------------------------------------
@@ -142,11 +149,14 @@ void index_score(const IndexQ& q, const int* pos, int rows, int ratio, IndexKeys
                  int max_scan, uint16_t* keys, int keys_stride, uint16_t* bkeys, int bkeys_stride, cudaStream_t s);
 // Top-k per row as torch.topk picks it (highest key, ties to the lowest position): the
 // min(kmax, candidates) chosen positions in ascending order with their keys, then -1 / 0 padding.
-// From a scan's keys: positions. From block maxima (pool = true): block indices.
+// From a scan's keys: positions, written as pool entries through `list` (the session's chunk list, attn.h
+// Compressed, list_len entries) when one is given. From block maxima (pool = true): block indices.
 void index_topk(const uint16_t* keys, int keys_stride, const int* pos, int rows, int ratio, const IndexScan& scan,
-                int max_scan, bool pool, int kmax, int* out_pos, uint16_t* out_key, int out_stride, cudaStream_t s);
+                int max_scan, bool pool, int kmax, int* out_pos, uint16_t* out_key, int out_stride, cudaStream_t s,
+                const uint32_t* list = nullptr, int list_len = 0);
 // The same selection over gathered candidates: cand_pos/cand_key [rows][n] (each part's list in rank
-// order, so positions ascend), e.g. 4 ranks x 512 positions or 4 x 2048 pool blocks.
+// order, so positions ascend), e.g. 4 ranks x 512 positions or 4 x 2048 pool blocks. The candidates are
+// written as they are (pool entries stay pool entries: the order of the lists, not their values, breaks ties).
 void index_merge(const int* cand_pos, const uint16_t* cand_key, int n, int rows, int kmax, int* out_pos,
                  uint16_t* out_key, int out_stride, cudaStream_t s);
 

@@ -10,6 +10,7 @@
 
 #include <cuda_runtime.h>
 
+#include "attn/attn.h"
 #include "common/check.h"
 
 namespace attn_test {
@@ -100,6 +101,34 @@ struct Dev {
 };
 
 template <class T> Dev<T> to_dev(const Npy& a) { return Dev<T>(a.as<T>(), a.data.size() / sizeof(T)); }
+
+// The chunk lists of attn.h Compressed. Identity rows: `rows` sessions of `len` chunks each, laid end to end (row s
+// names chunks s * len .. s * len + len - 1), so caches of `rows` regions of len * kChunkEntries entries each read as
+// they are laid out. A test with its own placement writes its own list into `d`.
+inline int whole_chunks(int entries) { return (entries + attn::kChunkEntries - 1) / attn::kChunkEntries; }
+struct ChunkLists {
+  Dev<uint32_t> d;
+  int len = 0;  // a row's length (and the rows' stride)
+  ChunkLists() = default;
+  ChunkLists(int rows, int len_) : d((size_t)rows * len_), len(len_) {
+    std::vector<uint32_t> h((size_t)rows * len_);
+    for (size_t i = 0; i < h.size(); ++i) h[i] = (uint32_t)i;
+    CUDA_CHECK(cudaMemcpy(d.p, h.data(), h.size() * sizeof(uint32_t), cudaMemcpyHostToDevice));
+  }
+};
+// one session's identity list covering `entries` entries (shared: made once, 1024 chunks = 8M entries, never moved,
+// so the structs that hold it stay valid)
+inline const ChunkLists& ident_list(int entries) {
+  static ChunkLists l(1, 1024);
+  if (whole_chunks(entries) + 1 > l.len) die("ident_list: %d entries is more than %d chunks", entries, l.len - 1);
+  return l;
+}
+// a cache struct (attn::Compressed, attn::IndexKeys) of one session's `entries`, read through the identity list
+template <class C> C listed(C c, int entries) {
+  const ChunkLists& l = ident_list(entries);
+  c.list = l.d.p, c.list_stride = l.len;
+  return c;
+}
 
 inline float bf2f(uint16_t b) {
   uint32_t u = (uint32_t)b << 16;

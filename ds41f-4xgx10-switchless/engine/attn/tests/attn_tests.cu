@@ -179,8 +179,8 @@ void test_compressor(const Case& cs, int L) {
   attn::CompressorWeights w{ratio, wkv.p, wgate.p, norm.p, wk.p, knorm.p};
   Dev<float> carry_kv(16 * 512), carry_score(16 * 512);
   Dev<uint8_t> ckv_kv((size_t)cap * 256), ckv_sc((size_t)cap * 32), ik_k((size_t)cap * 64), ik_sc((size_t)cap * 4);
-  attn::Compressed ckv{ckv_kv.p, ckv_sc.p, cap};
-  attn::IndexKeys ik{ik_k.p, ik_sc.p, cap};
+  const attn::Compressed ckv = listed(attn::Compressed{ckv_kv.p, ckv_sc.p, cap}, cap);
+  const attn::IndexKeys ik = listed(attn::IndexKeys{ik_k.p, ik_sc.p, cap}, cap);
   for (int call = 0; call <= cs.D; ++call) {
     int rows = cs.rows(call);
     auto pos_h = cs.pos(call);
@@ -300,8 +300,8 @@ struct CompState {
     ik_k = Dev<uint8_t>((size_t)cap * 64);
     ik_sc = Dev<uint8_t>((size_t)cap * 4);
   }
-  attn::IndexKeys ik() const { return {ik_k.p, ik_sc.p, cap}; }
-  attn::Compressed ckv() const { return {ckv_kv.p, ckv_sc.p, cap}; }
+  attn::IndexKeys ik() const { return listed(attn::IndexKeys{ik_k.p, ik_sc.p, cap}, cap); }
+  attn::Compressed ckv() const { return listed(attn::Compressed{ckv_kv.p, ckv_sc.p, cap}, cap); }
   void step(const Case& cs, int call, const int* pos, int rows) {
     Dev<float> kv((size_t)rows * 512), score((size_t)rows * 512);
     if (ratio > 1) {

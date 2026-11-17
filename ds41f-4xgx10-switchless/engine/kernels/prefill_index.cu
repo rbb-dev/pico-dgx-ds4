@@ -37,6 +37,7 @@ struct SArgs {
   int keys_stride;
   uint16_t* bkeys;
   int bkeys_stride;
+  const uint32_t* list;  // the session's chunk list (attn.h Compressed)
 };
 
 __device__ __forceinline__ uint32_t key_from_bf16(uint32_t b) { return (b & 0x8000) ? (~b & 0xFFFF) : (b | 0x8000); }
@@ -91,12 +92,14 @@ __global__ void __launch_bounds__(kSThreads) score_p_kernel(SArgs a) {
     k0[j] = k1[j] = make_uint4(0, 0, 0, 0);
     uint32_t s0 = 0x7f7f7f7fu, s1 = 0x7f7f7f7fu;
     if (p0 < n) {
-      k0[j] = __ldg(reinterpret_cast<const uint4*>(a.k + (size_t)p0 * 64) + t);
-      s0 = __ldg(a.ksc + p0);
+      const size_t e = attn::pool_ent(a.list, (uint32_t)p0);
+      k0[j] = __ldg(reinterpret_cast<const uint4*>(a.k + e * 64) + t);
+      s0 = __ldg(a.ksc + e);
     }
     if (p1 < n) {
-      k1[j] = __ldg(reinterpret_cast<const uint4*>(a.k + (size_t)p1 * 64) + t);
-      s1 = __ldg(a.ksc + p1);
+      const size_t e = attn::pool_ent(a.list, (uint32_t)p1);
+      k1[j] = __ldg(reinterpret_cast<const uint4*>(a.k + e * 64) + t);
+      s1 = __ldg(a.ksc + e);
     }
     sa[j] = (t & 1) ? s1 : s0;  // a lane supplies the scales of MMA row g + 8(t&1)
   }
@@ -208,8 +211,10 @@ void index_score_p(const attn::IndexQ& q, const int* pos, int rows, int ratio, a
   const int rchunks = (rows + kSRows - 1) / kSRows;
   const int ysplit = std::min(rchunks, std::max(1, (8 * nsm + nblk - 1) / nblk));
   const int rows_per_cta = (rchunks + ysplit - 1) / ysplit * kSRows;
+  if (ik.slot) die("index_score_p: one session (no slot table)");
+  attn::check_slots(ik, "index_score_p");
   SArgs a{q.q, q.sc, q.w, pos, rows, ratio, rows_per_cta, ik.k, reinterpret_cast<const uint32_t*>(ik.sc),
-          keys, keys_stride, bkeys, bkeys_stride};
+          keys, keys_stride, bkeys, bkeys_stride, ik.list};
   dim3 grid(nblk, (rows + rows_per_cta - 1) / rows_per_cta);
   if (bkeys)
     score_p_kernel<true><<<grid, kSThreads, 0, s>>>(a);
@@ -226,7 +231,7 @@ void index_topk_p(const attn::IndexQ& q, const int* pos, int rows, int ratio, at
     const attn::IndexQ qb{q.q + (size_t)r0 * kIdxHeads * 64, q.sc + (size_t)r0 * kIdxHeads, q.w + (size_t)r0 * kIdxHeads};
     index_score_p(qb, pos + r0, nr, ratio, ik, max_n, keys, keys_stride, bkeys, keys_stride / 8, s);
     attn::index_topk(keys, keys_stride, pos + r0, nr, ratio, attn::IndexScan{}, max_n, false, kmax,
-                     out_pos + (size_t)r0 * kmax, out_key + (size_t)r0 * kmax, kmax, s);
+                     out_pos + (size_t)r0 * kmax, out_key + (size_t)r0 * kmax, kmax, s, ik.list, ik.list_stride);
     if (bkeys)
       attn::index_topk(bkeys, keys_stride / 8, pos + r0, nr, ratio, attn::IndexScan{}, max_n, true, pool_k,
                        pool_pos + (size_t)r0 * pool_k, pool_key + (size_t)r0 * pool_k, pool_k, s);

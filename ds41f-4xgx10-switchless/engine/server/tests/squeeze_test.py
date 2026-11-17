@@ -1,19 +1,10 @@
 #!/usr/bin/env python3
-"""A squeezed session store keeps every restored session's restart point (docs/engine.md, the store).
+"""A squeezed session store keeps every restored session's restart point (docs/engine.md, "The chunk pool"): long sessions
+reloaded into slots, spilled and read back into what is left must still resume at their end (or at their newest snapshot
+when the end does not fit), never at 0 and never at an old snapshot. Checks per agent: cached >= history - --tolerance; the
+first agent's second turn equals the same prompt prefilled cold.
 
-Long sessions reloaded into slots keep their stored pages in a small store; a session spilled and read
-back into what is left must still resume at its end (or at its newest snapshot when the end does not
-fit), never at 0 and never at an old snapshot. The same requests that left 6 agents of 698k positions
-at `reused 0 (cold)` and `reused 196608 (snapshot)` with --session-gib 3.
-
-Start the server so that two sessions of --n positions fit the store's budget (pool less 256 MiB or 1/16),
-and a third read back does not fit beside them unless the live sessions' pages are released:
-a session of n positions holds about n * 896 B * 1.14 (n = 300000: 290 MiB), so with --slots 4 and
---session-gib 0.85 the budget holds two. Pass/fail does not depend on hitting that window exactly: the
-checks below hold at any size (a store that fits everything just never squeezes); rank 0's log shows
-whether it did (`state: no room for`, `is live in a slot`, `restart point N of the M spilled`).
-
-  dsgb10_rank --mode serve --slots 4 --session-gib 0.85 ...
+  dsgb10_rank --mode serve --slots 4 --pool-tokens 1507328 ...
   python3 engine/server/tests/squeeze_test.py [--socket S] [--tokens tokens.npy] [--n 300000] [--agents 4]
 """
 import argparse

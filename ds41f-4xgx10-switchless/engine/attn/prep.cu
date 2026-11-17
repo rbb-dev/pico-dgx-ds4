@@ -236,8 +236,7 @@ void decode_prep(const DecodePrep& a, int rows, bool pdl, cudaStream_t s) {
     die("decode_prep: %d rows of one session, at most %d", rows, kDecodeGroup);
   check_slots(a.win, "decode_prep");
   check_slots(a.carry, "decode_prep");
-  check_slots(a.ckv, "decode_prep");
-  check_slots(a.ik, "decode_prep");
+  if (a.ckv_proj) check_slots(a.ckv, "decode_prep"), check_slots(a.ik, "decode_prep");  // a layer that emits entries
   int grid = rows + (a.ckv_proj ? rows : 0) + (a.wproj ? kIdxHeads / 4 : 0);
   launch(rows > kDecodeGroup ? decode_prep_kernel<true> : decode_prep_kernel<false>, dim3(grid), dim3(128), 0, s, pdl,
          a, rows);

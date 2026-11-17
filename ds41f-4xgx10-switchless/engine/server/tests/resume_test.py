@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Interleaved prefill and resumes: more sessions decode than there are slots (--slots 2), taking turns, with a small
-store (--session-gib small, --disk-gib 0). Checks that every session's reply equals the same session decoding alone
-(greedy). Through rank 0's socket. It aims at a resume that reads its whole context again in pieces (more rows than
---interleave-whole-rows); with the shared session store a paused session's state is kept and the resume continues
-from it, so whether a run reached that branch shows only in the engine's log ("resumes in pieces").
+"""Interleaved prefill and resumes: more sessions decode than there are slots (--slots 2), taking turns, with a small pool
+(--pool-tokens small, --disk-gib 0). Checks that every session's response equals the same session decoding alone (greedy).
+It aims at a resume that reads its whole context again in pieces; whether a run reached that branch shows only in the
+engine's log ("resumes in pieces"). Through rank 0's socket.
 
   resume_test.py --socket S --tokens T.npy [--ctx 40000] [--new 400]      exit 0 when every response is bit-equal
 """

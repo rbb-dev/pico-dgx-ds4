@@ -384,14 +384,16 @@ pub fn requests_json(t: &Telemetry) -> Value {
     json!({"in_flight": in_flight, "recent": recent})
 }
 
-/// The engine's sessions as the page's card reads them: its fixed slots (a request holds one for its whole context;
-/// `slots_big` of them take up to `ctx_big` positions, the rest up to `ctx_small`), and the session store a finished
-/// request's state moves to (its own memory on each rank, never counted against the slots).
+/// The engine's sessions as the page's card reads them (STATS version 2): the chunk pool every conversation's caches
+/// live in (its numbers, free, held, shared by more than one conversation, reserved for the running replies' horizons;
+/// one number's bytes and the positions the whole pool holds), the conversations (on lines, idle in memory, on the SSD,
+/// sharing a beginning) and the lines.
 pub fn sessions_json(s: &EngineStats, usable_window: u32) -> Value {
-    let positions = s.slots_big.saturating_mul(s.slot_ctx_big).saturating_add(s.slots_total.saturating_sub(s.slots_big).saturating_mul(s.slot_ctx_small));
-    json!({"slots": s.slots_total, "slots_big": s.slots_big, "ctx_big": s.slot_ctx_big, "ctx_small": s.slot_ctx_small,
-           "positions": positions, "usable_window": usable_window,
-           "store_used_bytes": s.store_used_bytes, "store_cap_bytes": s.store_cap_bytes, "sessions_resident": s.sessions_resident})
+    json!({"lines": s.lines, "usable_window": usable_window,
+           "pool": {"numbers": s.pool_numbers, "free": s.pool_free, "held": s.pool_held, "shared": s.pool_shared,
+                    "reserved": s.pool_reserved, "number_bytes": s.number_bytes, "positions": s.pool_positions},
+           "conversations": {"on_lines": s.conv_on_lines, "in_memory": s.conv_in_memory, "on_disk": s.conv_on_disk,
+                             "sharing": s.conv_sharing}})
 }
 
 /// The SSD tier as the page's card reads it: `spill` (its state) and `prompt_cache` (its counters).
@@ -399,7 +401,7 @@ pub fn tier_json(s: Option<&EngineStats>) -> (Value, Value) {
     let Some(s) = s else { return (json!({"state": "unknown"}), Value::Null) };
     let state = if s.disk_cap_bytes > 0 { "on" } else { "off" };
     let cache = json!({
-        "spill": [{"stored_bytes": s.disk_used_bytes, "cap_bytes": s.disk_cap_bytes, "points": s.sessions_on_disk,
+        "spill": [{"stored_bytes": s.disk_used_bytes, "cap_bytes": s.disk_cap_bytes, "points": s.conv_on_disk,
                    "writes_committed": s.spills_total, "written_bytes": s.spill_bytes_total, "writes_pending": s.spills_pending}],
         "restores_begun": s.restores_total, "disk_hits": s.restores_total, "restored_tokens": s.restored_tokens_total,
         "restore_waits": s.restores_total, "restore_wait_ns": s.restore_wait_ns_total, "restore_wait_max_ns": s.restore_wait_max_ns});
@@ -883,10 +885,12 @@ mod tests {
 
     fn stats() -> EngineStats {
         EngineStats {
-            store_cap_bytes: 890 * 1_000_000,
+            pool_numbers: 8913,
+            number_bytes: 2_916_352,
+            pool_positions: 8913 * 16384 / 5,
             disk_cap_bytes: 256 << 30,
             disk_used_bytes: 5 << 30,
-            sessions_on_disk: 41,
+            conv_on_disk: 41,
             spills_total: 400,
             spill_bytes_total: 9 << 30,
             spills_pending: 2,
@@ -894,26 +898,28 @@ mod tests {
             restored_tokens_total: 123456,
             restore_wait_ns_total: 50_000_000,
             restore_wait_max_ns: 9_000_000,
-            slots_total: 16,
-            slots_big: 2,
-            slot_ctx_big: 400_000,
-            slot_ctx_small: 14_285,
+            lines: 32,
             ..Default::default()
         }
     }
 
     #[test]
     fn stats_map_to_the_sessions_and_the_ssd_tier() {
-        let s = EngineStats { store_used_bytes: 300 * 1_000_000, sessions_resident: 7, ..stats() };
+        let s = EngineStats { pool_free: 8000, pool_held: 913, pool_shared: 40, pool_reserved: 120, conv_on_lines: 3, conv_in_memory: 7,
+                              conv_sharing: 2, ..stats() };
         let ss = sessions_json(&s, 1_048_576);
-        let positions = 2 * 400_000 + 14 * 14_285;
-        assert_eq!((ss["slots"].as_u64(), ss["slots_big"].as_u64()), (Some(16), Some(2)));
-        assert_eq!((ss["ctx_big"].as_u64(), ss["ctx_small"].as_u64()), (Some(400_000), Some(14_285)));
-        assert_eq!(ss["positions"], positions);
-        assert_eq!(ss["usable_window"], 1_048_576);
-        // the session store is its own memory: its bytes are never spread over the slots' positions
-        assert_eq!((ss["store_used_bytes"].as_u64(), ss["store_cap_bytes"].as_u64(), ss["sessions_resident"].as_u64()), (Some(300_000_000), Some(890_000_000), Some(7)));
-        assert!(ss.get("bytes_per_token").is_none());
+        assert_eq!((ss["lines"].as_u64(), ss["usable_window"].as_u64()), (Some(32), Some(1_048_576)));
+        let p = &ss["pool"];
+        assert_eq!((p["numbers"].as_u64(), p["free"].as_u64(), p["held"].as_u64()), (Some(8913), Some(8000), Some(913)));
+        assert_eq!((p["shared"].as_u64(), p["reserved"].as_u64(), p["number_bytes"].as_u64()), (Some(40), Some(120), Some(2_916_352)));
+        assert_eq!(p["positions"].as_u64(), Some(29_206_118), "8,913 numbers hold 29.2M positions (5 numbers each 16,384)");
+        let c = &ss["conversations"];
+        assert_eq!((c["on_lines"].as_u64(), c["in_memory"].as_u64(), c["on_disk"].as_u64(), c["sharing"].as_u64()),
+                   (Some(3), Some(7), Some(41), Some(2)));
+        // nothing of the fixed slots: no slots x window sum, no store of its own memory
+        for gone in ["slots", "slots_big", "ctx_big", "positions", "store_cap_bytes", "store_used_bytes"] {
+            assert!(ss.get(gone).is_none(), "{gone}");
+        }
         let (spill, cache) = tier_json(Some(&s));
         assert_eq!(spill["state"], "on");
         let t = &cache["spill"][0];
@@ -924,7 +930,7 @@ mod tests {
         // no disk tier, and no STATS yet
         assert_eq!(tier_json(Some(&EngineStats { disk_cap_bytes: 0, ..s })).0["state"], "off");
         assert_eq!(tier_json(None), (json!({"state": "unknown"}), Value::Null));
-        assert_eq!(sessions_json(&EngineStats::default(), 5)["positions"], 0);
+        assert_eq!(sessions_json(&EngineStats::default(), 5)["pool"]["positions"], 0);
     }
 
     #[test]

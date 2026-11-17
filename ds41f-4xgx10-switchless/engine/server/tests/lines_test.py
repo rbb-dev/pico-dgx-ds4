@@ -12,13 +12,68 @@ sessions decode together and each reaches --tokens-each tokens before --limit se
 """
 import argparse
 import os
+import select
 import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from budget_test import Log, Stalled, pump  # noqa: E402
 from room_test import Flights  # noqa: E402
 from serve_test import Engine, load_npy_i32  # noqa: E402
+
+
+class Log:
+    """The engine's log file, read in slices: what was written since the last call."""
+
+    def __init__(self, path):
+        self.path = path
+        self.at = os.path.getsize(path) if path else 0
+
+    def since(self):
+        if not self.path:
+            return ''
+        time.sleep(1.5)  # a request's DONE goes out before its last log lines are written
+        with open(self.path, 'rb') as f:
+            f.seek(self.at)
+            d = f.read()
+        self.at += len(d)
+        return d.decode(errors='replace')
+
+    def whole(self):
+        if not self.path:
+            return ''
+        with open(self.path, 'rb') as f:
+            return f.read().decode(errors='replace')
+
+
+class Stalled(Exception):
+    pass
+
+
+def pump(F, until, what, limit=300):
+    """Flights.pump with progress (each request's token count every 10 s, flushed) and a deadline: past `limit` seconds
+    the counts are printed and Stalled is raised instead of waiting for ever."""
+    t0 = last = time.time()
+    once = [0]
+
+    def one():
+        once[0] += 1
+        return once[0] > 1
+
+    def counts():
+        return {rid & 0xff: (len(o['ids']), 'done' if o['done'] else '') for rid, o in F.out.items()}
+
+    while not until():
+        now = time.time()
+        if now - t0 > limit:
+            print('STALLED in %s after %d s: tokens per request %s' % (what, limit, counts()), flush=True)
+            raise Stalled(what)
+        if now - last >= 10:
+            print('  %s: %d s, tokens per request %s' % (what, now - t0, counts()), flush=True)
+            last = now
+        if not F.e.buf and not select.select([F.e.s], [], [], 1.0)[0]:
+            continue
+        once[0] = 0
+        F.pump(one)  # exactly one frame
 
 BAD = ('no slot for request', 'no slot memory')
 MOVES = ('back from disk', 'spilled to disk')

@@ -7,7 +7,7 @@
 
 namespace fe {
 
-constexpr uint32_t kVersion = 3;
+constexpr uint32_t kVersion = 4;
 constexpr const char* kDefaultSocket = "/tmp/dsgb10-engine.sock";
 
 enum MsgType : uint16_t {
@@ -94,6 +94,8 @@ struct HelloEngine {
   uint32_t eos_id;
   uint32_t max_sessions;  // resident sessions rank 0 can hold (advisory)
   uint32_t name_len;      // bytes of model/engine name that follow
+  uint64_t keep_positions;  // positions of conversation the engine can keep (the pool and the disk tier): the
+                            // front-end's session table keeps as much (its matches live as long as the engine's state)
 };
 
 enum TokensFlags : uint32_t {
@@ -163,18 +165,29 @@ struct Config {
   int64_t burst_max_ms;  // one decode window, at most
 };
 
-// The engine's own counters for the dashboard: version, the number of u64 fields that follow, then the
-// fields in this order. A front-end reads min(n_fields, kStatsFields) of them; a field it does not get
-// is 0. Byte counts are per rank 0's own store; the counters count from the engine's start.
-constexpr uint32_t kStatsVersion = 1;
-constexpr uint32_t kStatsFields = 27;
+// The engine's own counters for the dashboard: version, the number of u64 fields that follow, then the fields in this
+// order. A front-end reads min(n_fields, kStatsFields) of them; a field it does not get is 0. The pool's counts are
+// rank 0's (every rank's are equal); counters count from the engine's start.
+constexpr uint32_t kStatsVersion = 2;
+constexpr uint32_t kStatsFields = 30;
 struct StatsFrame {
   uint32_t version;   // kStatsVersion
   uint32_t n_fields;  // kStatsFields
-  uint64_t store_cap_bytes;         // device memory the session store may use (the KV pool)
-  uint64_t store_used_bytes;
-  uint64_t sessions_resident;       // sessions held in device memory
-  uint64_t sessions_on_disk;        // session states in the disk tier
+  // the chunk pool (docs/engine.md, "The chunk pool"): numbers, each one slice of every cache array on each rank
+  uint64_t pool_numbers;            // numbers the pool holds
+  uint64_t pool_free;               // of them no conversation names
+  uint64_t pool_held;               // named by a conversation's caches or bookmarks
+  uint64_t pool_shared;             // of those, named by more than one (shared beginnings)
+  uint64_t pool_reserved;           // kept for the running requests' horizons, not yet held
+  uint64_t number_bytes;            // one number's bytes on each rank
+  uint64_t pool_positions;          // positions of conversation the whole pool holds (a conversation takes 5 numbers per 16,384 positions)
+  // conversations
+  uint64_t conv_on_lines;           // held by a line (decoding, or reading its prompt)
+  uint64_t conv_in_memory;          // idle, their chunks in the pool
+  uint64_t conv_on_disk;            // in the disk tier
+  uint64_t conv_sharing;            // naming at least one shared number
+  uint64_t lines;                   // sequences the engine decodes at once
+  // the disk tier
   uint64_t disk_cap_bytes;          // 0: no disk tier
   uint64_t disk_used_bytes;
   uint64_t spills_total;            // session states written to disk
@@ -185,12 +198,7 @@ struct StatsFrame {
   uint64_t restored_tokens_total;   // prompt tokens restored from disk instead of computed
   uint64_t restore_wait_ns_total;   // time requests waited for restores
   uint64_t restore_wait_max_ns;     // the longest single wait
-  uint64_t slots_total;             // sequences the engine decodes at once
-  uint64_t slots_big;               // of them with a context of slot_ctx_big
-  uint64_t slot_ctx_big;            // positions of a big slot
-  uint64_t slot_ctx_small;          // positions of each other slot
-  uint64_t positions_held;          // positions the resident sessions hold
-  // interleaved prefill: the settings it runs now (Config), and the long prompts being read and waiting
+  // interleaved prefill: the settings in force (Config), and the long prompts being read and waiting
   uint64_t il_on;
   uint64_t il_whole_rows;
   uint64_t il_push_rows;
@@ -206,7 +214,8 @@ static_assert(sizeof(HelloFe) == 8);
 static_assert(sizeof(SubmitHeader) == 72);
 static_assert(offsetof(SubmitHeader, temperature) == 32);
 static_assert(offsetof(SubmitHeader, n_prompt) == 64);
-static_assert(sizeof(HelloEngine) == 24);
+static_assert(sizeof(HelloEngine) == 32);
+static_assert(offsetof(HelloEngine, keep_positions) == 24);
 static_assert(sizeof(TokensHeader) == 16);
 static_assert(sizeof(TopLogprob) == 8);
 static_assert(sizeof(ImageSpan) == 16);
@@ -215,8 +224,8 @@ static_assert(offsetof(DoneHeader, queue_us) == 24);
 static_assert(sizeof(Progress) == 16);
 static_assert(sizeof(StatsReq) == 8);
 static_assert(sizeof(StatsFrame) == 8 + 8 * kStatsFields);
-static_assert(offsetof(StatsFrame, store_cap_bytes) == 8);
-static_assert(offsetof(StatsFrame, positions_held) == 8 + 8 * 18);
+static_assert(offsetof(StatsFrame, pool_numbers) == 8);
+static_assert(offsetof(StatsFrame, lines) == 8 + 8 * 11);
 static_assert(offsetof(StatsFrame, il_queued) == 8 + 8 * (kStatsFields - 1));
 static_assert(sizeof(Config) == 8 + 8 * kConfigFields);
 
