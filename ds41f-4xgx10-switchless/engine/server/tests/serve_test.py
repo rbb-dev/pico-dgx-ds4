@@ -23,7 +23,7 @@ import sys
 import time
 
 HELLO, SUBMIT, CANCEL, RELEASE = 0x01, 0x02, 0x03, 0x04
-HELLO_E, TOKENS, DONE = 0x81, 0x82, 0x83
+HELLO_E, TOKENS, DONE, PROGRESS = 0x81, 0x82, 0x83, 0x84
 F_SEED, F_KEEP, F_LOGPROBS = 1, 2, 4
 REASONS = ['stop', 'length', 'cancelled', 'context', 'error']
 

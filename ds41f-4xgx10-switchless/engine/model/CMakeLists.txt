@@ -30,3 +30,9 @@ option(DSGB10_NVTX "NVTX ranges in the model and the server, for nsys" OFF)
 if(DSGB10_NVTX)
   target_compile_definitions(dsmodel PUBLIC DSGB10_NVTX)
 endif()
+
+# The windowed token history (tokwin.h): Engram hashes from a trimmed window against the full vector, and memory over
+# 32 units of 2M-token prompts; host only
+add_executable(tokwin_test tests/tokwin_test.cpp)
+target_include_directories(tokwin_test PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(tokwin_test PRIVATE engram)

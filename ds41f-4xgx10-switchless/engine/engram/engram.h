@@ -40,13 +40,15 @@ struct HashMap {
   static HashMap load(const std::string& path);
 };
 
-// Row ids for positions [first, first + n) of a sequence whose raw token ids are tokens[0 ..
-// first + n). Only tokens[first - 3 ..] are read. `live` may be null; a position with live == 0
-// (an image span; never for text) blocks look-back, as in the reference; so does a negative token id
-// (the engine's history marks image spans with -1, docs/vision.md).
+// Row ids for positions [first, first + n) of a sequence whose raw token ids are tokens[0 .. first + n - base),
+// tokens[i] being the id at position base + i (a history kept from `base` on; 0: the whole sequence). Only the ids
+// at positions first - 3 and up are read; a position below `base` reads as id 0, as a zero-padded history does.
+// `live` may be null; a position with live == 0 (an image span; never for text) blocks look-back, as in the
+// reference, and is indexed by position; so does a negative token id (the engine's history marks image spans
+// with -1, docs/vision.md).
 // out: [n][kLayers][kCols], each id within its layer's table.
 void hash_positions(const HashMap& m, const int32_t* tokens, const uint8_t* live, int64_t first, int n,
-                    uint32_t* out);
+                    uint32_t* out, int64_t base = 0);
 
 // ---- who owns which rows --------------------------------------------------------------------
 

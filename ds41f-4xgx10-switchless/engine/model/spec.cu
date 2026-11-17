@@ -1134,8 +1134,7 @@ uint64_t Model::Impl::launch_spec(int R, int pos0, const int32_t* tokens, const 
     e_seq += 2;
     in.e_wait[0] = seq[0], in.e_wait[1] = seq[1];
     if (n) wait_done(n - 1);  // the previous step has read the Engram buffers
-    hist.resize(pos0);
-    for (int r = 0; r < R; ++r) hist.push_back(tokens[r]);
+    hist_put(hist, pos0, R, tokens);
     engram_prepare(pos0, R, seq);
   }
   const cudaGraphExec_t e = spec_graph(scan_ctx(pos_last));

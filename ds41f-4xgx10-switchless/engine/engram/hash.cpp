@@ -71,7 +71,8 @@ HashMap HashMap::load(const std::string& path) {
   return m;
 }
 
-void hash_positions(const HashMap& m, const int32_t* tokens, const uint8_t* live, int64_t first, int n, uint32_t* out) {
+void hash_positions(const HashMap& m, const int32_t* tokens, const uint8_t* live, int64_t first, int n, uint32_t* out,
+                    int64_t base) {
   for (int i = 0; i < n; i++) {
     const int64_t pos = first + i;
     // the n-gram ending at pos: t[s] is the token s places back, or pad once look-back is blocked
@@ -80,8 +81,9 @@ void hash_positions(const HashMap& m, const int32_t* tokens, const uint8_t* live
     bool blocked = false;
     for (int s = 0; s < kMaxNgram; s++) {
       const int64_t src = pos - s < 0 ? 0 : pos - s;
-      blocked = blocked || pos < s || (live && !live[src]) || tokens[src] < 0;  // < 0: an image span (vision)
-      t[s] = blocked ? m.pad : m.token_map[tokens[src]];
+      const int32_t tok = src < base ? 0 : tokens[src - base];
+      blocked = blocked || pos < s || (live && !live[src]) || tok < 0;  // < 0: an image span (vision)
+      t[s] = blocked ? m.pad : m.token_map[tok];
     }
     for (int l = 0; l < kLayers; l++) {
       uint32_t* o = out + (size_t(i) * kLayers + l) * kCols;

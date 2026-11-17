@@ -378,8 +378,11 @@ class Model {
 
   // launch + wait: sampled [R] (host) gets the chosen token of each row, the same everywhere.
   void step(const Ctl& c, int32_t* sampled, Sink* sink = nullptr);
-  // Forget the sequence (positions restart at 0).
+  // Forget the sequence (positions restart at 0); a history capacity above 1 Mi ids is given back.
   void reset();
+  // Cut every unit's token history to its last 4,096 ids, except a unit whose prompt has not been prefilled up to its
+  // end. Between commands only (no step in flight reads a history below that); hashing and a rewind never go below it.
+  void trim_history();
   // Bench only: the rows of a step of R rows ending at P = pos0 + R - 1 sit at P - (R - 1 - r) * stride
   // instead of P - (R - 1 - r) (1, the default), so stride >= 128 puts each row's window apart. With
   // group G > 1 they come in runs of G consecutive positions (a session's verify rows), the runs stride

@@ -77,6 +77,7 @@ void apply_state(model::Model& m, const StateOp& o) {
 
 void apply_ops(model::Model& m, const Cmd& c) {
   if (c.slot >= 0) m.use_slot(c.slot);
+  m.trim_history();
   std::vector<int> pin;
   for (int i = 0; i < c.n_ops; ++i) {
     pin.push_back(c.ops[i].h);

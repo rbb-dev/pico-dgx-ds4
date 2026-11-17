@@ -613,22 +613,21 @@ attn::CompressorCarry Model::Impl::step_carry(int k) const {
 // records of both Engram layers (completion seqs seq[0], seq[1]); the GPU waits for them only when it
 // reaches layer 1 / 14.
 void Model::Impl::engram_prepare(int pos0, int R, const uint64_t seq[2]) {
-  engram::hash_positions(*emap, hist.data(), nullptr, pos0, R, ids.data());
+  engram::hash_positions(*emap, hist.data(), nullptr, pos0, R, ids.data(), hist.base);
   engram_submit(R, seq);
 }
 
 void Model::Impl::engram_rows(int R, const int32_t* tok, const int32_t* pos, const int32_t* slot, const uint64_t seq[2],
                               int pad_to) {
   for (int r = 0; r < R; ++r) {
-    std::vector<int32_t>& h = hist_of(slot[r]);
-    if ((int)h.size() < pos[r]) die("model: slot %d's history ends at %zu, a row at %d", slot[r], h.size(), pos[r]);
-    h.resize(pos[r]);
-    h.push_back(tok[r]);
+    TokWin& h = hist_of(slot[r]);
+    if (h.end() < pos[r]) die("model: slot %d's history ends at %d, a row at %d", slot[r], h.end(), pos[r]);
+    hist_put(h, pos[r], 1, tok + r);
   }
   for (int r0 = 0, r1; r0 < R; r0 = r1) {  // a session's rows: consecutive positions of one slot
     for (r1 = r0 + 1; r1 < R && slot[r1] == slot[r0] && pos[r1] == pos[r1 - 1] + 1;) ++r1;
-    engram::hash_positions(*emap, hist_of(slot[r0]).data(), nullptr, pos[r0], r1 - r0,
-                           ids.data() + (size_t)r0 * 2 * kEngramCols);
+    const TokWin& h = hist_of(slot[r0]);
+    engram::hash_positions(*emap, h.data(), nullptr, pos[r0], r1 - r0, ids.data() + (size_t)r0 * 2 * kEngramCols, h.base);
   }
   // wide64: a wide bucket's pad rows look up row R - 1's n-grams again, so that the gathered segments and offsets
   // are the bucket's (the captured body's engram_seg) and the pad rows compute row R - 1's values
@@ -964,8 +963,7 @@ uint64_t Model::Impl::launch(int R, int pos0, const int32_t* tokens, const Sampl
     } else {
       if (late.on) die("model: a step waits for its tokens");
       if (n) wait_done(n - 1);  // the previous step has read the Engram buffers
-      hist.resize(pos0);
-      for (int r = 0; r < R; ++r) hist.push_back(tokens[r]);
+      hist_put(hist, pos0, R, tokens);
       engram_prepare(pos0, R, seq);
     }
   }
@@ -1051,8 +1049,7 @@ void Model::Impl::engram_late(int pos0, int R, const int32_t* tokens) {
     die("model: engram_late(%d, %d) for a step at %d, %d rows", pos0, R, late.on ? late.pos0 : -1, late.R);
   if (R < 1 || R > kMaxRows) die("model: engram_late(%d, %d)", pos0, R);
   if (n_steps >= 2) wait_done(n_steps - 2);  // the step before it has read the Engram buffers
-  hist.resize(pos0);
-  for (int r = 0; r < R; ++r) hist.push_back(tokens[r]);
+  hist_put(hist, pos0, R, tokens);
   engram_prepare(pos0, R, late.seq);
   late.on = false;
 }
@@ -1453,9 +1450,13 @@ void Model::step(const Ctl& c, int32_t* sampled, Sink* sink) {
   for (int r = 0; r < c.rows; ++r) sampled[r] = o.row[r].token;
 }
 void Model::reset() { d_->hist.clear(); }
-void Model::set_images(int n, const int32_t* lo, const int32_t* hi, const uint16_t* rows) {
+void Model::trim_history() {
+  for (TokWin& h : d_->hists) h.trim();
+  d_->hist.trim();
+}
+void Model::set_images(int n, const int32_t* lo, const int32_t* hi, int key) {
   Impl& I = *d_;
-  I.img_span.clear(), I.img_row0.clear();
+  I.img_span.clear(), I.img_row0.clear(), I.img_key = 0;
   size_t total = 0;
   for (int i = 0; i < n; ++i) {
     if (hi[i] <= lo[i] || lo[i] < 0 || (i && lo[i] < hi[i - 1])) die("model: image span %d [%d, %d)", i, lo[i], hi[i]);

@@ -81,6 +81,8 @@ struct Prefill {
   uint64_t *e_done, *e_wait;  // pinned [set][layer]: the store's completion flags, the seqs to wait for
   size_t e_seg[2][2] = {};
   int e_pos0[2] = {-1, -1}, e_n[2] = {0, 0};  // the positions of each set's pending lookups (-1: none)
+  int e_unit[2] = {-1, -1};                    // and the unit and token epoch they were hashed from: a chunk takes a
+  uint64_t e_ep[2] = {0, 0};                   // set only for its own unit's current tokens
   int e_last = 1;  // the set of the chunk enqueued last: the next chunk's lookups go to the other
   std::vector<uint32_t> ids[2];
   PLayer pl[kLayers];

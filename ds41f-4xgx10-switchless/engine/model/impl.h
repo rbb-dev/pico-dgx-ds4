@@ -20,6 +20,7 @@
 #include "common/check.h"
 #include "kernels/dsk.h"
 #include "model/ablit.h"
+#include "model/tokwin.h"
 #include "model/model.h"
 #include "model/ops.h"
 #include "model/vmm.h"
@@ -202,9 +203,17 @@ struct Model::Impl {
   // Engram
   const engram::HashMap* emap = nullptr;
   engram::Store* store = nullptr;
-  std::vector<int32_t> hist;  // token ids of the sequence so far (hashing reads 3 back): the current slot's
-  std::vector<int32_t> hists[kMaxUnits];  // the other slots' by unit (use_slot swaps them in and out)
-  std::vector<int32_t>& hist_of(int u) { return u == cur_unit ? hist : hists[u]; }
+  TokWin hist;  // token ids of the sequence so far, by position from hist.base (hashing reads 3 back): the current slot's
+  TokWin hists[kMaxUnits];  // the other slots' by unit (use_slot swaps them in and out)
+  TokWin& hist_of(int u) { return u == cur_unit ? hist : hists[u]; }
+  // The rows' ids put at [pos0, pos0 + R), the history cut to pos0 first (a rewind never reaches below the window, which
+  // keeps more than a draft's reach).
+  void hist_put(TokWin& h, int pos0, int R, const int32_t* tokens) {
+    if (!h.put(pos0, R, tokens)) die("model: a history cut to position %d, below its first held position %d", pos0, h.base);
+  }
+  // each unit's token epoch: set_tokens (a prompt's tokens) gives the unit a new one, so Engram lookups hashed before it
+  // (a cancelled prompt's look-ahead) are never taken by the unit's next prompt or by another unit
+  uint64_t tok_epoch = 0, hist_ep[kMaxUnits] = {};
   std::vector<uint32_t> ids;  // [R][2][24]
   // vision (docs/vision.md, set_images): the spans of the prefill in progress and their rows (pinned,
   // mapped: the inject kernel reads them in place); empty for every text request

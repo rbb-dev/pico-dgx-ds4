@@ -279,27 +279,29 @@ static void feat_write(const Prefill& p, const comm::DevChannel& ch, int a, int 
 
 void Model::Impl::prefill_engram(int a, int M, int set) {
   Prefill& p = *pf;
-  p.e_pos0[set] = a, p.e_n[set] = M;
+  p.rs->e_pos0[set] = a, p.rs->e_n[set] = M;
+  p.rs->e_unit[set] = cur_unit, p.rs->e_ep[set] = hist_ep[cur_unit];
   if (!store) return;
   // a lookup no chunk used (a cancelled request's) may still be writing the set's buffers
   for (int i = 2 * set; i < 2 * set + 2; ++i)
     while (__atomic_load_n(&p.e_done[i], __ATOMIC_ACQUIRE) < p.e_wait[i]) {
     }
-  if ((int)hist.size() < a + M) die("prefill: Engram lookups for [%d, %d) with %zu tokens", a, a + M, hist.size());
-  p.ids[set].resize((size_t)M * 2 * kEngramCols);
-  engram::hash_positions(*emap, hist.data(), nullptr, a, M, p.ids[set].data());
+  if (hist.end() < a + M) die("prefill: Engram lookups for [%d, %d) with %d tokens", a, a + M, hist.end());
+  if (hist.base > 0 && a < hist.base + 3) die("prefill: Engram lookups from %d, history held from %d", a, hist.base);
+  p.rs->ids[set].resize((size_t)M * 2 * kEngramCols);
+  engram::hash_positions(*emap, hist.data(), nullptr, a, M, p.rs->ids[set].data(), hist.base);
   for (int e = 0; e < 2; ++e) {
     engram::CellMap cm;
-    cm.build(store->split(), e, p.ids[set].data(), M);
-    cm.offsets(p.e_off[set][e]);
-    p.e_seg[set][e] = cm.seg_bytes();
+    cm.build(store->split(), e, p.rs->ids[set].data(), M);
+    cm.offsets(p.rs->e_off[set][e]);
+    p.rs->e_seg[set][e] = cm.seg_bytes();
     engram::Request rq;
     rq.layer = e;
-    rq.ids = p.ids[set].data();
+    rq.ids = p.rs->ids[set].data();
     rq.n_pos = M;
-    rq.out = p.e_send[set][e];
-    rq.done = reinterpret_cast<std::atomic<uint64_t>*>(&p.e_done[2 * set + e]);
-    rq.seq = p.e_wait[2 * set + e] = ++e_seq;
+    rq.out = p.rs->e_send[set][e];
+    rq.done = reinterpret_cast<std::atomic<uint64_t>*>(&p.rs->e_done[2 * set + e]);
+    rq.seq = p.rs->e_wait[2 * set + e] = ++e_seq;
     store->submit(rq);
   }
 }
@@ -685,19 +687,20 @@ uint64_t Model::Impl::prefill(int a, int M, const Sampling* sp, int handle, cons
   Prefill& p = *pf;
   if (M < 1 || M > p.cap || a < 0 || a + M > slot_ctx_[cur_slot]) die("model: bad prefill [%d, +%d) in slot %d", a, M, cur_slot);
   ensure_mapped(cur_slot, a + M - 1);  // the chunk's entries and the Reindex layers' over-read, before any work is queued
-  if ((int)hist.size() < a + M) die("model: prefill [%d, %d) with %zu tokens", a, a + M, hist.size());
+  if (hist.end() < a + M) die("model: prefill [%d, %d) with %d tokens", a, a + M, hist.end());
+  if (a < hist.base) die("model: prefill [%d, %d), history held from %d", a, a + M, hist.base);
   if (opt.first_layer != 0 || opt.n_layers != kLayers) die("model: prefill runs the whole model");
   if (ced && sp && a + M < kReplay) die("model: CED prefill ending at %d (the replay needs %d positions)", a + M, kReplay);
   drain();  // the decode buffers and the Engram sets are free; earlier steps' state is in place
   // this chunk's Engram lookups, unless prefill_lookup() started them
   int set = -1;
   for (int k = 0; k < 2; ++k)
-    if (p.e_pos0[k] == a && p.e_n[k] == M) set = k;
+    if (p.rs->e_pos0[k] == a && p.rs->e_n[k] == M && p.rs->e_unit[k] == cur_unit && p.rs->e_ep[k] == hist_ep[cur_unit]) set = k;
   if (set < 0) {  // after the drain either set is free on the device
-    set = 1 - p.e_last;
+    set = 1 - p.rs->e_last;
     prefill_engram(a, M, set);
   }
-  p.e_last = set;
+  p.rs->e_last = set;
   std::vector<std::pair<int, uint8_t*>> snaps;
   for (int s : snap_pos) {
     if (s <= a || s > a + M || s < kSnapRows) die("model: snapshot at %d outside (%d, %d]", s, a, a + M);
@@ -707,7 +710,12 @@ uint64_t Model::Impl::prefill(int a, int M, const Sampling* sp, int handle, cons
   const int slot = (int)(n_steps % ops::kOutSlots);
   CUDA_CHECK(cudaEventRecord(ev_beg[slot], st));
   CUDA_CHECK(cudaEventRecord(ev_pf[0], st));
-  std::memcpy(p.tok_h, hist.data() + a, (size_t)M * 4);
+  p.jn_n = 0, p.jn_on = p.stall;
+  if (p.stall) {  // the pair's own cost: two records with nothing between them
+    CUDA_CHECK(cudaEventRecord(p.ev_fl[0], st));
+    CUDA_CHECK(cudaEventRecord(p.ev_fl[1], st));
+  }
+  std::memcpy(p.rs->tok_h, hist.data() + (a - hist.base), (size_t)M * 4);
   p.a_cur = a;
   if (!img_span.empty())  // vision: the spans' ids are -1 in the history (Engram); embed a real id, then the rows
     for (int i = 0; i < M; ++i)
@@ -742,7 +750,7 @@ uint64_t Model::Impl::prefill(int a, int M, const Sampling* sp, int handle, cons
   }
   p.e_pos0[set] = -1;  // used
   CUDA_CHECK(cudaEventRecord(ev_pf[1], st));
-  if (!ced && !feat_dir().empty()) feat_write(p, ch, a, M, rank, hist.data() + a, st);  // drafter2: feature dump
+  if (!ced && !feat_dir().empty()) feat_write(p, ch, a, M, rank, hist.data() + (a - hist.base), st);  // drafter2: feature dump
   if (ced) {
     ced_project(M);
     ced_keep(a, M);
@@ -763,7 +771,7 @@ uint64_t Model::Impl::prefill(int a, int M, const Sampling* sp, int handle, cons
     const bf16* last = reinterpret_cast<const bf16*>(p.gath) + (size_t)((Mh - 1) / p.rq) * kDim;
     n = n_steps;
     if (n >= (uint64_t)ops::kInSlots) wait_done(n - ops::kInSlots);
-    const int32_t t = hist[a + M - 1] < 0 ? 129264 : hist[a + M - 1];  // vision: -1 marks an image position
+    const int32_t t = hist.at(a + M - 1) < 0 ? 129264 : hist.at(a + M - 1);  // vision: -1 marks an image position
     next_in(n, 1, a + M - 1, &t, *sp);
     ops::step_in(in_h, in_ctr, fb, in_d, st);
     if (head_coded) dsk::gemv_bf16x_norm(last, norm_w, kNormEps, 1, head, kVocabPart, kDim, logits, nullptr, chead, st);
@@ -775,6 +783,7 @@ uint64_t Model::Impl::prefill(int a, int M, const Sampling* sp, int handle, cons
   if (spec) spec_prefill_accept(a, M, handle, snap_pos, ced, sp);  // into the draft module's windows
   CUDA_CHECK(cudaEventRecord(ev_end[slot], st));
   CUDA_CHECK(cudaEventRecord(ev_pf[4], st));
+  hist.prefilled(a + M);  // the prompt's last chunk: the history may be trimmed (Model::trim_history)
   return n;
 }
 
@@ -783,8 +792,8 @@ uint64_t Model::Impl::prefill(int a, int M, const Sampling* sp, int handle, cons
 void Model::set_tokens(int pos0, int n, const int32_t* tokens) {
   auto& h = d_->hist;
   if (pos0 < 0 || n < 0) die("model: set_tokens(%d, %d)", pos0, n);
-  h.resize(pos0 + n);
-  std::copy(tokens, tokens + n, h.begin() + pos0);
+  d_->hist_ep[d_->cur_unit] = ++d_->tok_epoch;  // lookups hashed from the unit's earlier tokens are stale
+  h.assign(pos0, n, tokens);
 }
 
 size_t Model::prefill_init(comm::Ring& ring) {
