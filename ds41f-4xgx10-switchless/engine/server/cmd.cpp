@@ -167,6 +167,14 @@ int run_window(model::Model& m, const Cmd& c) {
   return st;
 }
 
+int run_lend(model::Model& m, const Cmd& c) {
+  const int st = m.engram_lend(c.rows, c.pos0);
+  if (store_check())
+    std::printf("store-check: rank %d lend command (phase %d, %d MiB) status %d digest %016llx\n", m.rank(), c.rows, c.pos0, st,
+                (unsigned long long)m.store_digest());
+  return st;
+}
+
 uint64_t run_prefill(model::Model& m, const Cmd& c) {
   const std::vector<int> snaps(c.snaps, c.snaps + c.n_snaps);
   const uint64_t n =
@@ -914,6 +922,11 @@ void follow(model::Model& m, comm::Ring& ring, Watchdog& wd, int rank) {
     } else if (c.op == kCmdWindow) {
       wd.started = now_s();  // capturing the graphs takes seconds of CPU
       run_window(m, c);
+      wd.started = 0;
+      (void)m.state_evicted();
+    } else if (c.op == kCmdLend) {
+      wd.started = now_s();
+      run_lend(m, c);
       wd.started = 0;
       (void)m.state_evicted();
     } else if (c.op == kCmdPrefill) {

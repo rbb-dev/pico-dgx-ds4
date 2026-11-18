@@ -62,6 +62,19 @@
 //                comes while others decode pauses them and is prefilled; while more requests decode
 //                than there are slots, they take turns of N tokens (default 64; 0: no turns, and a
 //                request that would need the slot of another in flight waits for one to free).
+//                --engram-vram off|on|require (default off): the Engram row cache's first slots (touched by the CPU only)
+//                go into the GB10's display reservation (~2 GiB a headless Spark never uses), which the pool's sizing
+//                does not count; off never opens the card (ordinary memory, as without the option); on falls back
+//                to ordinary memory with one start line when the card cannot give it; require stops;
+//                --engram-vram-card (default /dev/dri/card0), --engram-vram-mib N (the most it asks for, default 2032).
+//                --engram-cache-mib N (serve; default 4096) is the row cache's slots in MiB, the display reservation's included.
+//                The cache's block is host memory taken from the chunk pool by whole groups right after the pool is made, and
+//                the size can change while serving (the dashboard's setting, or CONFIG engram_mib): a size past what the pool can
+//                lend is cut to what fits and a failed hand-over leaves the cache smaller, never refuses a start.
+//                --engram-cache-max-mib N (default 16384): the address space the block is reserved over (the most a size can reach).
+//                --engram-cache-min-mib N (default: the set size, so the cache never gives way): the smallest the cache is
+//                made when the pool is short for a request and no window can be closed. --lend-null-mib N: the null control's
+//                spread of MemAvailable in MiB, the hand-over proof's tolerance when above its floor of 256.
 //                --ssd-flush-s S: a conversation idle for S seconds gets its pieces written to the disk tier (its tail
 //                chunk and bookmarks; full chunks are written at their turn's save; default 30, 0: never).
 //                --window-idle-s S: with --max-ctx past 1,048,576 the graphs and score buffers of factors 32 and 64 are made when a
@@ -166,6 +179,7 @@
 #include "common/heap.h"
 #include "common/keepfile.h"
 #include "dspark/dspark.h"
+#include "engram/display.h"
 #include "engram/engram.h"
 #include "model/model.h"
 #include "model/pool_rules.h"
@@ -325,7 +339,11 @@ struct Args {
   int tree_sib = 0;
   std::string seq_list, route_file, props;  // EXPERIMENT (spectf, generate --loop): prompt-lookup drafts
   int route_every = 0, chain_every = 0;
-  int step_timeout_s = 120, engram_cache_mib = 4096;
+  int step_timeout_s = 120, engram_cache_mib = 4096, engram_cache_max_mib = 16384, engram_cache_min_mib = -1, lend_null_mib = 0;
+  std::string engram_vram = "off";                   // the row cache's first slots in the display reservation: off | on | require
+  std::string engram_vram_card = "/dev/dri/card0";   // its DRM device
+  std::string engram_vram_sysfs = "/sys";            // where the card's outputs are read (tests point it at a fake tree)
+  int engram_vram_mib = 2032;                        // the most it asks for (the display reservation of a GB10 holds 2,032 MiB)
   int engram_read_batch = 1;  // the fleet file's RANK<r>_ENGRAM_READ_BATCH
   float temp = 0.f, top_p = 1.f;
   int top_k = 0;
@@ -406,6 +424,16 @@ Args parse(int argc, char** argv) {
     else if (s == "--first") a.first = std::atoi(val().c_str());
     else if (s == "--step-timeout") a.step_timeout_s = std::atoi(val().c_str());
     else if (s == "--engram-cache-mib") a.engram_cache_mib = std::atoi(val().c_str());
+    else if (s == "--engram-cache-max-mib") a.engram_cache_max_mib = std::atoi(val().c_str());
+    else if (s == "--engram-cache-min-mib") a.engram_cache_min_mib = std::atoi(val().c_str());
+    else if (s == "--lend-null-mib") a.lend_null_mib = std::atoi(val().c_str());
+    else if (s == "--engram-vram") {
+      a.engram_vram = val();
+      if (a.engram_vram != "off" && a.engram_vram != "on" && a.engram_vram != "require") die("--engram-vram: off, on or require");
+    }
+    else if (s == "--engram-vram-card") a.engram_vram_card = val();
+    else if (s == "--engram-vram-sysfs") a.engram_vram_sysfs = val();
+    else if (s == "--engram-vram-mib") a.engram_vram_mib = std::atoi(val().c_str());
     else if (s == "--temp") a.temp = std::atof(val().c_str());
     else if (s == "--seed") a.seed = (uint32_t)std::atoll(val().c_str());
     else if (s == "--ctx") a.ctx = std::atoi(val().c_str());
@@ -692,6 +720,7 @@ int main(int argc, char** argv) {
   mo.draft_fp8 = a.draft_fp8;
   mo.draft_head4 = a.draft_head4, mo.draft_markov8 = a.draft_markov8;
   mo.ablit = a.ablit;
+  mo.lend_null_mib = a.lend_null_mib;
   mo.tree_probe = !a.tree_probe.empty();
   mo.slots = a.slots;
   mo.big_slots = a.big_slots;
@@ -751,6 +780,7 @@ int main(int argc, char** argv) {
   }
   // 4. Engram
   std::unique_ptr<engram::HashMap> emap;
+  engram::Display display;  // before the store: released after it (munmap, GEM_CLOSE, close)
   std::unique_ptr<engram::Store> store;
   if (!a.no_engram) {
     emap = std::make_unique<engram::HashMap>(engram::HashMap::load(a.hashmap));
@@ -759,10 +789,43 @@ int main(int argc, char** argv) {
     sc.shard[0] = a.shard[0];
     sc.shard[1] = a.shard[1];
     sc.cpu = 9;
-    sc.cache_bytes = (size_t)a.engram_cache_mib << 20;
+    // serve: the cache starts empty over address space for --engram-cache-max-mib and is made by the hand-over from the chunk
+    // pool (Model::engram_lend, after the pool is made); the other modes keep a fixed cache made here
+    const bool lend = a.mode == "serve" && a.engram_cache_mib > 0 && a.engram_cache_max_mib > 0;
+    const size_t want_bytes = (size_t)a.engram_cache_mib << 20;
+    if (lend) sc.cache_max_bytes = (size_t)a.engram_cache_max_mib << 20;
+    else sc.cache_bytes = want_bytes;
+    // the row cache's slots are only ever touched by the CPU: its first slots go into the display reservation (a
+    // headless Spark never uses it; engram/display.h), the rest stay in ordinary memory, and the pool's sizing (step 6)
+    // counts only the ordinary part. Each rank makes the largest buffer it is given (at most the cache's size); every
+    // rank uses the smallest rank's size, or none when any rank has none.
+    if (a.engram_vram != "off" && want_bytes > 0) {
+      const bool ok = display.create(a.engram_vram_card, a.engram_vram_sysfs,
+                                     std::min(want_bytes, (size_t)a.engram_vram_mib << 20));
+      const uint64_t mine = ok ? display.size() : 0;
+      uint64_t sizes[4];
+      ring.allgather_host(&mine, sizes, sizeof mine);
+      const uint64_t least = std::min(std::min(sizes[0], sizes[1]), std::min(sizes[2], sizes[3]));
+      if (least == 0) {
+        const std::string why = ok ? "another rank has none" : display.why();
+        display.destroy();
+        std::printf("rank %d: engram row cache: display reservation not used (%s); all %.0f MiB in ordinary memory\n",
+                    a.rank, why.c_str(), want_bytes / 1048576.0);
+        if (a.engram_vram == "require") die("--engram-vram require: the display reservation is not available on every rank");
+      } else {
+        display.limit(least);
+        sc.display_region = display.data();
+        sc.display_bytes = display.capacity();
+      }
+    }
     sc.read_batch = a.engram_read_batch;  // the fleet file's, for this rank's SSD
     store = std::make_unique<engram::Store>(sc, *emap);
     m.set_engram(emap.get(), store.get());
+    if (display.active())
+      std::printf("rank %d: engram row cache: %.0f MiB of its %.0f MiB slots in the display reservation (of %.0f MiB; the "
+                  "smallest size over the ranks), %.0f MiB in ordinary memory\n", a.rank,
+                  store->cache_display_bytes() / 1048576.0, want_bytes / 1048576.0, display.capacity() / 1048576.0,
+                  (want_bytes - std::min(want_bytes, store->cache_display_bytes())) / 1048576.0);
   }
   // 5. the prefill path's buffers and gathered weights now, not on the first request (serve, and the
   // modes that prefill through it with --big); every rank's free device memory afterwards goes to
@@ -837,7 +900,10 @@ int main(int argc, char** argv) {
     size_t dfree = 0, dtotal = 0;
     CUDA_CHECK(cudaMemGetInfo(&dfree, &dtotal));
     const size_t avail = mem_available();
-    const size_t cache = a.no_engram ? 0 : (size_t)a.engram_cache_mib << 20;
+    // the Engram cache still to grow, in ordinary memory: its slots in the display reservation are not counted. A cache made
+    // by the hand-over (Model::engram_lend, below) is carved out of the pool after it is made: not counted here
+    const bool carved = store && store->cache_max_bytes() > 0;
+    const size_t cache = a.no_engram || carved ? 0 : ((size_t)a.engram_cache_mib << 20) - (store ? store->cache_display_bytes() : 0);
     const model::Model::PoolStats p0 = m.pool_stats();
     const uint64_t img = p0.number_bytes, have = p0.numbers;
     uint64_t by_free = UINT64_MAX, by_tokens = UINT64_MAX;
@@ -912,6 +978,9 @@ int main(int argc, char** argv) {
     so.grow_ahead = a.grow_ahead;
     so.ssd_flush_s = a.ssd_flush_s;
     so.window_idle_s = a.window_idle_s;
+    so.engram_mib = a.engram_cache_mib;
+    so.engram_min_mib = a.engram_cache_min_mib < 0 ? a.engram_cache_mib : a.engram_cache_min_mib;
+    so.engram_max_mib = a.engram_cache_max_mib;
     so.interleave = a.il;
     so.interleave.prefill_rows = a.prefill_rows;
     if (a.exact) so.interleave.on = false;  // --exact reads every prompt whole

@@ -7,6 +7,7 @@
 #include <cstdio>
 
 #include "model/impl.h"
+#include "model/lend_ops.h"
 #include "model/prefill.h"
 #include "model/spec.h"
 #include "model/state.h"
@@ -56,10 +57,6 @@ size_t Model::Impl::scan_bytes(int f, bool prefill) const {
   return (pk + (size_t)kIdxBatch * stride / 8) * sizeof(uint16_t);
 }
 
-// Numbers the pool holds with `g` groups out of it: its size before the first window, less whole groups below the
-// last group boundary of that size, so the arrays' ends are whole chunks.
-size_t Model::Impl::win_numbers_for(int g) const { return g == 0 ? win_n0 : win_n0 / kGroupNums * kGroupNums - (size_t)g * kGroupNums; }
-
 namespace {
 // whether session x holds a chunk number at or above `from` (in a list, a window bookmark or the end bookmark)
 bool holds_from(const Store::Sess& x, uint32_t from) {
@@ -104,13 +101,100 @@ int Model::Impl::pool_vacate(uint32_t from) {
 // The pool's top number with `g` more groups of factor f's window out of it; false when the pool could not hold one
 // conversation of the window even whole.
 bool Model::Impl::window_top(int f, int g, uint32_t* top) const {
-  const size_t n0 = win_groups ? win_n0 : calloc->numbers();
+  const size_t n0 = lent.groups ? lent.n0 : calloc->numbers();
   const size_t base = n0 / kGroupNums * kGroupNums;
-  const size_t cut = (size_t)(win_groups + g) * kGroupNums;
+  const size_t cut = (size_t)(lent.groups + g) * kGroupNums;
   const int whole = numbers_for(0, std::min(65536 * f, opt.max_ctx) - 1);
   if (cut + 2 > base || base - cut < (size_t)whole + 2) return false;
   *top = (uint32_t)(base - cut);
   return true;
+}
+
+// The chunk handles the pool holds for `nums` numbers, and the bytes of each array: the arrays' mapped ends rounded up to chunks.
+size_t Model::Impl::pool_chunks_for(size_t nums, size_t* bytes) const {
+  size_t chunks = 0;
+  for (int a = 0; a < 4; ++a) {
+    const size_t b = (nums * attn::kChunkEntries * kKvEntryBytes[a] + vmm::kChunk - 1) / vmm::kChunk * vmm::kChunk;
+    if (bytes) bytes[a] = b;
+    chunks += b / vmm::kChunk;
+  }
+  return chunks;
+}
+
+// The numbers at or above `top` leave the pool: the allocator, the arrays' mapped ends, their chunks (the physical memory goes
+// back to the system). The numbers must all be free (pool_vacate).
+void Model::Impl::pool_cut(size_t top) {
+  CUDA_CHECK(cudaDeviceSynchronize());
+  const size_t was = calloc->numbers();
+  if (!calloc->shrink((uint32_t)top)) die("model: the pool's numbers %zu.. are not all free after vacating them", top);
+  size_t bytes[4];
+  pool_chunks_for(top, bytes);
+  slot_pool->shrink(0, bytes);
+  // exactly the chunks the numbers' ends held: the handle count falls by what the arithmetic says (the hand-over's proof)
+  slot_pool->trim(std::min(slot_pool->free_chunks(), pool_chunks_for(was) - pool_chunks_for(top)));
+}
+
+// `more` numbers in the pool on this rank, or none: the chunks are made and mapped, and when the driver cannot, what was made
+// is given back at once (the pool is as it was).
+bool Model::Impl::pool_grow_try(size_t more) {
+  const size_t nums = calloc->numbers() + more;
+  if (nums > pool_max) return false;
+  size_t bytes[4];
+  const size_t want = pool_chunks_for(nums, bytes), have = slot_pool->total();
+  size_t added = 0;
+  if (want > have) {
+    added = slot_pool->add_chunks(want - have);
+    if (added != want - have) {
+      slot_pool->trim(added);
+      return false;
+    }
+  }
+  if (!slot_pool->ensure(0, bytes)) {
+    size_t was_bytes[4];
+    pool_chunks_for(calloc->numbers(), was_bytes);
+    slot_pool->shrink(0, was_bytes);  // ensure keeps what it mapped before the driver failed: unmapped, so trim can take the chunks
+    slot_pool->trim(added);
+    return false;
+  }
+  calloc->grow((uint32_t)nums);
+  return true;
+}
+
+// `more` numbers on every rank, or none of them anywhere: a rank that could grow goes back when another could not.
+bool Model::Impl::pool_grow_all(size_t more) {
+  const size_t was = calloc->numbers();
+#ifdef DSGB10_TEST_FAULTS
+  const bool fault = lend_fault("back");
+#else
+  const bool fault = false;
+#endif
+  const bool local = !fault && pool_grow_try(more);
+  const bool all = min_of(*host_ring, local) != 0;
+  if (local && !all) pool_cut(was);
+  return all;
+}
+
+// numbers one conversation of the longest window open needs (the base window's at least)
+size_t Model::Impl::lend_whole() const {
+  size_t whole = (size_t)numbers_for(0, std::min(65536 * 16, opt.max_ctx) - 1);
+  for (const int f : {32, 64})
+    if (lazy_win && scan_[level_of(f)].open) whole = std::max(whole, (size_t)numbers_for(0, std::min(65536 * f, opt.max_ctx) - 1));
+  return whole;
+}
+
+// The groups the Engram cache may hold at most, `others` (the windows' and any owed) held besides: the pool keeps one
+// conversation of the longest window the options allow, open or not, and the groups of each such window not open yet, so a
+// request past 1M never finds its window refused (kWindowNoRoom) because the cache took the room first.
+int Model::Impl::lend_cache_room(int others) const {
+  const size_t n0 = lent.groups ? lent.n0 : calloc->numbers();
+  const size_t gb = (size_t)kGroupNums * chunk_image();
+  size_t whole = (size_t)numbers_for(0, std::min(65536 * 16, opt.max_ctx) - 1);
+  int later = 0;
+  for (const int f : {32, 64}) {
+    if (opt.max_ctx <= 65536 * (f / 2)) continue;  // no request can need factor f
+    whole = std::max(whole, (size_t)numbers_for(0, std::min(65536 * f, opt.max_ctx) - 1));
+  }
+  return whole;
 }
 
 // `g` more groups out of the pool for factor f's window: the numbers above the new end are made free (pool_vacate), the
@@ -119,38 +203,35 @@ bool Model::Impl::window_top(int f, int g, uint32_t* top) const {
 // much of it now (win_busy_g records g then). The result is the same on every rank. On any other than kWindowOk the
 // conversations evicted on the way stay evicted; no number left the pool.
 int Model::Impl::window_make_room(int f, int g) {
-  const size_t n0 = win_groups ? win_n0 : calloc->numbers();
   uint32_t top = 0;
   if (!window_top(f, g, &top)) return kWindowNoRoom;
-  if (top < calloc->numbers()) {
-    if (pool_vacate(top)) return win_busy_g[level_of(f)] = g, kWindowBusy;
-    const size_t removed = calloc->numbers() - top;
-    const int64_t unheld = rules::unheld_sum(nslots, [&](int s) { return resv[s]; }, [&](int s) { return held(s); });
-    while (!rules::window_room((int64_t)calloc->free(), (int64_t)removed, unheld))
-      if (!store_evict_step(0)) return win_busy_g[level_of(f)] = g, kWindowBusy;
-    CUDA_CHECK(cudaDeviceSynchronize());
-    if (!calloc->shrink(top)) die("model: window: the pool's numbers %u.. are not all free after vacating them", top);
-    size_t bytes[4];
-    for (int a = 0; a < 4; ++a)
-      bytes[a] = ((size_t)top * attn::kChunkEntries * kKvEntryBytes[a] + vmm::kChunk - 1) / vmm::kChunk * vmm::kChunk;
-    slot_pool->shrink(0, bytes);
-    slot_pool->trim(slot_pool->free_chunks());  // the physical memory goes back to the system
-  }
-  if (!win_groups) win_n0 = n0;
-  win_groups += g;
+  LendOps ops{*this};
+  lend::Lender<LendOps> L(ops, lent);
+  const int st = L.take(g, (size_t)numbers_for(0, std::min(65536 * f, opt.max_ctx) - 1));
+  if (st == lend::kNoRoom) return kWindowNoRoom;
+  if (st == lend::kBusy) return win_busy_g[level_of(f)] = g, kWindowBusy;
+  if (st != lend::kOk) return kWindowFailed;
   win_busy_g[level_of(f)] = 0;
   return kWindowOk;
 }
 
-// `groups` groups back into the pool: the numbers are made and mapped again (the driver must have the memory).
-void Model::Impl::window_regrow(int groups) {
-  if (groups < 1) return;
-  const int left = win_groups - groups;
-  if (left < 0) die("model: window: %d groups back of %d", groups, win_groups);
-  const size_t to = win_numbers_for(left);
-  if (to > calloc->numbers()) pool_grow(to - calloc->numbers());
-  win_groups = left;
-  if (!left) win_n0 = 0;
+// `groups` groups back into the pool: the numbers are made and mapped again (the driver must have the memory on every rank).
+// false: some rank could not; nothing changed on any, the groups stay out and are the caller's to owe.
+bool Model::Impl::window_regrow(int groups) {
+  if (groups < 1) return true;
+  LendOps ops{*this};
+  lend::Lender<LendOps> L(ops, lent);
+  return L.give(groups);
+}
+
+// What is owed, asked for again: every rank has the memory for it (device memory free), then the numbers are made.
+int Model::Impl::lend_settle() {
+  if (lent.owed < 1) return lend::kOk;
+  const size_t back = (size_t)lent.owed * lend::kGroupNums * chunk_image();
+  const bool ok = free_device() >= back + 4 * kMargin;
+  LendOps ops{*this};
+  lend::Lender<LendOps> L(ops, lent);
+  return L.settle(min_of(*host_ring, ok) != 0);
 }
 
 bool Model::Impl::win_alloc(int f) {
@@ -235,9 +316,11 @@ int Model::Impl::window_open(int f) {
   const bool ok = made && !fault && free_device() >= gr + kMargin;
   if (!min_of(*host_ring, ok)) {
     if (made) win_free(f);  // the buffers are this rank's to free whichever check failed, or they stay held
-    window_regrow(g);
-    if (rank == 0) std::printf("window: factor %d: too little memory on a rank for its %.2f GiB; the %d groups are back in the pool\n", f,
-                               (bufs + gr) / 1073741824.0, g);
+    const bool back_in = window_regrow(g);
+    if (!back_in) lent.owed += g;  // a rank could not make the numbers again: owed, asked for again by the next settle
+    if (rank == 0)
+      std::printf("window: factor %d: too little memory on a rank for its %.2f GiB; the %d groups are %s\n", f, (bufs + gr) / 1073741824.0, g,
+                  back_in ? "back in the pool" : "owed to the pool");
     return kWindowFailed;
   }
   // the graphs
@@ -257,7 +340,7 @@ int Model::Impl::window_open(int f) {
   const size_t have = (size_t)g * gb;
   const int spare = used + kMargin < have ? (int)std::min<size_t>((have - used - kMargin) / gb, (size_t)g - 1) : 0;
   const int back = (int)min_of(*host_ring, (uint64_t)spare);
-  window_regrow(back);
+  if (!window_regrow(back)) lent.owed += back;  // owed: the window no longer holds them
   sc.groups = g - back;
   sc.bytes = bufs;
   book_windows();
@@ -276,7 +359,7 @@ int Model::Impl::window_open(int f) {
 // Closes factor f's window (f 0: only settles what a closed window still owes the pool): its graphs and buffers are
 // freed and, when every rank has the memory, its groups are numbers of the pool again.
 int Model::Impl::window_close(int f) {
-  if (!lazy_win || !host_ring) return kWindowOk;
+  if (!host_ring || (!lazy_win && f != 0)) return kWindowOk;  // f 0 settles what any borrower owes, windows or not
   const double t0 = wall();
   if (f > 16 && scan_[level_of(f)].open) {
     Scan& sc = scan_[level_of(f)];
@@ -287,18 +370,19 @@ int Model::Impl::window_close(int f) {
     win_graphs_drop(f);
     win_free(f);
     sc.open = false;
-    win_owed += sc.groups;
+    lent.owed += sc.groups;
     sc.groups = 0;
+    book_windows();
   }
-  if (win_owed < 1) return kWindowOk;
-  const size_t back = (size_t)win_owed * kGroupNums * chunk_image();
-  const bool ok = free_device() >= back + 4 * kMargin;
-  if (!min_of(*host_ring, ok)) return kWindowBusy;  // some rank's memory is still taken: owed until the next settle
-  window_regrow(win_owed);
+  split_zone_update();
+  if (lent.owed < 1) return kWindowOk;
+  const int owed = lent.owed;
+  const int st = lend_settle();
+  if (st == lend::kBusy) return kWindowBusy;  // some rank's memory is still taken: owed until the next settle
+  if (st != lend::kOk) return kWindowFailed;
   if (rank == 0)
-    std::printf("window: factor %d closed in %.2f s: %d groups back, the pool has %u numbers (%.2f GiB)\n", f, wall() - t0, win_owed,
+    std::printf("window: factor %d closed in %.2f s: %d groups back, the pool has %u numbers (%.2f GiB)\n", f, wall() - t0, owed,
                 calloc->numbers(), calloc->total() * (double)chunk_image() / 1073741824.0);
-  win_owed = 0;
   return kWindowOk;
 }
 
@@ -309,8 +393,8 @@ bool Model::window_is_open(int factor) const {
 }
 int Model::window_open(int factor) { return d_->window_open(factor); }
 int Model::window_close(int factor) { return d_->window_close(factor); }
-int Model::window_owed() const { return d_->win_owed; }
-int Model::window_groups() const { return d_->win_groups; }
+int Model::window_owed() const { return d_->lent.owed; }
+int Model::window_groups() const { return d_->lent.groups; }
 
 int Model::window_groups_estimate(int f) const {
   if (f != 32 && f != 64) return 0;

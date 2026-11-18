@@ -153,7 +153,7 @@ struct StatsReq {
 // i64 fields that follow, then the fields in this order; a field < 0, or one not sent, keeps its value. The engine checks
 // each against its flag's range and ignores one out of range; the next Stats frame shows what it runs.
 constexpr uint32_t kConfigVersion = 3;
-constexpr uint32_t kConfigFields = 9;
+constexpr uint32_t kConfigFields = 15;
 struct Config {
   uint32_t version;  // kConfigVersion
   uint32_t n_fields;
@@ -166,13 +166,14 @@ struct Config {
   int64_t ssd_gib;       // the disk tier's size in GiB (at most its file's size at the start; smaller evicts to fit)
   int64_t keep_days;     // a conversation unused this many days is dropped (1-3650)
   int64_t extend;        // the context past 1,048,576 tokens: 0 off (the 1,048,576-token window only), 1 on (a factor per request)
+  int64_t engram_mib;    // the Engram row cache's slots in MiB, the display reservation's included (0 off; applied at a run boundary)
 };
 
 // The engine's own counters for the dashboard: version, the number of u64 fields that follow, then the fields in this
 // order. A front-end reads min(n_fields, kStatsFields) of them; a field it does not get is 0. The pool's counts are
 // rank 0's (every rank's are equal); counters count from the engine's start.
 constexpr uint32_t kStatsVersion = 2;
-constexpr uint32_t kStatsFields = 34;
+constexpr uint32_t kStatsFields = 100;
 struct StatsFrame {
   uint32_t version;   // kStatsVersion
   uint32_t n_fields;  // kStatsFields
@@ -214,6 +215,18 @@ struct StatsFrame {
   uint64_t extend;                  // the context past 1,048,576 tokens (CONFIG extend): 0 off, 1 on
   uint64_t ctx_limit;               // the longest context a request may use: the start window, 1,048,576 with extend 0
   uint64_t ranks;                   // the Sparks the engine runs on: each holds the same pool and the same disk tier
+  uint64_t image_numbers;           // numbers the running requests' image rows hold now (each 204 rows; they are not in pool_held's conversations)
+  // the Engram row cache, a borrower of the pool's memory (rank 0's; the cache's contents differ by rank, its size does not)
+  uint64_t engram_cache_bytes;      // the cache's slots now, bytes (the display reservation's included)
+  uint64_t engram_groups;           // groups of the pool its block holds
+  uint64_t engram_pending_mib;      // the size a change not yet landed is going to (running, or waiting for memory or a back-off); 0: none
+  uint64_t engram_lookups;          // rows looked up in the cache since the start
+  uint64_t engram_hits;             //   and found
+  uint64_t engram_lend_ok_total;    // changes of its size that landed
+  uint64_t engram_lend_failed_total;  // that failed (the cache stayed at its old size)
+  uint64_t lent_owed_groups;        // groups a borrower gave back that the pool could not make into numbers yet
+  uint64_t engram_huge_pct;         // % of its block's resident bytes in huge pages at the last change's end
+  uint64_t engram_evictions;        // rows the cache dropped to make room, since the start
 };
 
 static_assert(sizeof(FrameHeader) == 8);
@@ -233,10 +246,14 @@ static_assert(sizeof(StatsReq) == 8);
 static_assert(sizeof(StatsFrame) == 8 + 8 * kStatsFields);
 static_assert(offsetof(StatsFrame, pool_numbers) == 8);
 static_assert(offsetof(StatsFrame, lines) == 8 + 8 * 11);
-static_assert(offsetof(StatsFrame, keep_days) == 8 + 8 * (kStatsFields - 4));
-static_assert(offsetof(StatsFrame, extend) == 8 + 8 * (kStatsFields - 3));
-static_assert(offsetof(StatsFrame, ctx_limit) == 8 + 8 * (kStatsFields - 2));
-static_assert(offsetof(StatsFrame, ranks) == 8 + 8 * (kStatsFields - 1));
+static_assert(offsetof(StatsFrame, keep_days) == 8 + 8 * 30);
+static_assert(offsetof(StatsFrame, extend) == 8 + 8 * 31);
+static_assert(offsetof(StatsFrame, ctx_limit) == 8 + 8 * 32);
+static_assert(offsetof(StatsFrame, ranks) == 8 + 8 * 33);
+static_assert(offsetof(StatsFrame, image_numbers) == 8 + 8 * 34);
+static_assert(offsetof(StatsFrame, engram_cache_bytes) == 8 + 8 * 35);
+static_assert(offsetof(StatsFrame, engram_huge_pct) == 8 + 8 * 43);
+static_assert(offsetof(StatsFrame, engram_evictions) == 8 + 8 * (kStatsFields - 1));
 static_assert(sizeof(Config) == 8 + 8 * kConfigFields);
 
 }  // namespace fe

@@ -16,6 +16,9 @@ struct ServeOptions {
   std::string socket;              // the front-end's socket (mode 0600)
   int max_ctx = 65536;             // prompt + output positions per request
   int prefill_rows = 4096;         // rows per prefill chunk
+  int engram_mib = 0;              // the Engram row cache's size (MiB of slots) the server keeps asking the model for (0: no cache hand-over)
+  int engram_min_mib = 0;          // the smallest it is made to give way to a request (the set size: it never gives way)
+  int engram_max_mib = 16384;      // the largest a CONFIG may set (--engram-cache-max-mib: the block's address space)
   int small_rows = 8;              // a remainder of at most this many rows runs as one step (graphs)
   int snap_every = 1024;           // a window snapshot every this many positions (exact reuse)
   bool snap_thin = true;           // keep them dense near a session's end only (serve.cpp keep_snap); false

@@ -95,6 +95,11 @@ struct StoreConfig {
   std::string shard[kLayers];         // KitShard: engram-l1-r{rank}of4.bin, engram-l14-r{rank}of4.bin
   std::string checkpoint;             // Checkpoint: the checkpoint directory
   size_t cache_bytes = size_t(4) << 30;  // hot-row cache; 0 disables it
+  // > 0: the cache changes size while serving (Store::resize_begin), up to this many bytes of slots (the display
+  // reservation's included). It starts empty: cache_bytes is not used, and no memory is taken until the first resize.
+  size_t cache_max_bytes = 0;
+  uint8_t* display_region = nullptr;     // the cache's first slots live here (display.h's mapping), the rest in
+  size_t display_bytes = 0;              //   ordinary memory; the caller keeps it mapped until the store is gone
   int queue_depth = 128;              // reads in flight
   int spin_us = 1000000;              // the worker busy-polls this long after its last work before it
                                       // sleeps (-1: never sleeps); waking a sleeping worker costs the
@@ -144,6 +149,28 @@ class Store {
   StoreStats stats() const;  // approximate while requests are in flight
   void clear_cache();        // drop every cached row (between benchmarks); call when idle
   const Split& split() const;
+  size_t cache_display_bytes() const;  // bytes of the cache slots held in the display region (whole slots)
+
+  // ---- a cache that changes size while serving (StoreConfig::cache_max_bytes > 0) ----
+  // The worker thread does the work, a slice between its other work; lookups go on against the old size. A grow commits
+  // and populates the new pages and rebuilds the index beside the old one; a shrink drops the rows of the slots above and
+  // decommits them. Either way the cache is at its old size when it fails.
+  size_t cache_max_bytes() const;  // the most the cache can grow to (0: a fixed-size cache)
+  enum class Resize { Idle, Running, Done, Failed };
+  // Starts a change to `cache_bytes` of slots (whole slots; the display reservation's included). False when one is
+  // running or has not been acknowledged, the size is the same, or it is past cache_max_bytes. Control thread only.
+  bool resize_begin(size_t cache_bytes);
+  Resize resize_state() const;
+  void resize_ack();  // Done or Failed back to Idle
+  struct CacheInfo {
+    uint64_t slots = 0;           // the cache's slots now
+    uint64_t block_bytes = 0;     // pages committed behind the slots and the index
+    uint64_t rss_before = 0;      // the block's resident bytes (from /proc/self/smaps) when the last resize began
+    uint64_t rss_after = 0;       //   and when it ended
+    uint64_t huge_after = 0;      // of them in huge pages, at its end
+    uint64_t resize_ms = 0;       // how long the last resize took
+  };
+  CacheInfo cache_info() const;
 
   struct Impl;
 

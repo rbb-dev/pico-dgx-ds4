@@ -82,6 +82,9 @@ enum : int32_t {
   // a factor's window (Model::window_open / window_close): rows = the YaRN factor (0: only settle what a closed window
   // owes the pool), pos0 = 0 to open it, 1 to close it. Every rank runs run_window and gets the same status
   kCmdWindow = 22,
+  // the Engram row cache's hand-over (Model::engram_lend): rows = Model::kLendBegin (pos0 = the size to go to, MiB) or
+  // Model::kLendPoll (finishes a change once every rank's worker has). Every rank runs run_lend and gets the same status
+  kCmdLend = 23,
 };
 enum : uint32_t { kPfSample = 1, kPfCed = 2 };  // kPfCed: a CED chunk (Model::prefill's ced, docs/ced.md)
 struct Cmd {
@@ -136,6 +139,8 @@ model::Ctl to_ctl(const Cmd& c);
 // kCmdWindow on this rank: Model::window_open / window_close's status (the same on every rank), once the command's state
 // operations were applied. The sessions it evicts are the store's evicted list, as for any command.
 int run_window(model::Model& m, const Cmd& c);
+// kCmdLend on this rank: Model::engram_lend's status (the same on every rank), once the command's state operations were applied.
+int run_lend(model::Model& m, const Cmd& c);
 
 // A prefill chunk on this rank (every rank alike): positions [pos0, pos0 + rows) of the tokens set
 // before; with kPfSample the last row is sampled (the step's number), else ~0.

@@ -153,6 +153,8 @@ struct Options {
   bool tree_probe = false;
   // the runtime abliteration (model/ablit.h, tools/ablit/make_ablit.py): its file; empty: none (Sampling::ablit is ignored)
   std::string ablit;
+  // the hand-over proof's MemAvailable tolerance is at least 256 MiB; this is the null control's spread (MiB) when that is larger
+  int lend_null_mib = 0;
 };
 
 class Model {
@@ -222,6 +224,35 @@ class Model {
   // (0: none), the same on every rank: a plan made with the first is made again with the second.
   int window_groups_estimate(int f) const;
   int window_busy_groups(int f) const;
+  // ---- the Engram row cache as a borrower of the pool's memory (lend.cu; docs/engine.md, "The Engram cache's memory") ----
+  // The cache's block (slots, keys, reference bits, tables) is host memory taken from the pool by whole groups: the store
+  // gives the groups' chunks back to the driver, the cache's worker commits and populates the same bytes as one block and
+  // gives them back the other way. engram_lend(kLendBegin, mib) starts a change to `mib` MiB of slots (the display
+  // reservation's included) and engram_lend(kLendPoll, 0) finishes it once every rank's worker has: both are commands
+  // (every rank, the same answer, one at a time; the server calls them at run boundaries). A setting past what the pool can
+  // lend, or the block's address space, is cut to what fits (kLendDone, engram_lend_info().mib says what it is). A failed
+  // hand-over leaves the cache at its old size and the groups back in the pool, or owed (window_owed) when a rank's driver
+  // cannot make the chunks yet; nothing dies. Test builds (DSGB10_TEST_FAULTS): DSGB10_LEND_FAIL=rank:R,step:B|C|back[,skip:N].
+  enum LendStatus { kLendIdle = 0, kLendDone, kLendPending, kLendBusy, kLendNoRoom, kLendFailed, kLendSame };
+  enum { kLendBegin = 1, kLendPoll = 2 };
+  bool engram_lend_enabled() const;  // the store's cache can change size
+  int engram_lend(int phase, int64_t mib);
+  struct EngramLendInfo {
+    uint64_t mib = 0;            // the cache's slots now, MiB (the display reservation's included)
+    uint64_t slots = 0;
+    uint64_t block_bytes = 0;    // committed behind the slots and the index, this rank
+    uint64_t groups = 0;         // groups of the pool the cache holds
+    uint64_t pending_mib = 0;    // the size a running change is going to (0: none)
+    uint64_t ok_total = 0, failed_total = 0;
+    uint64_t huge_pct = 0;       // of the block's resident bytes in huge pages, at the last change's end
+    uint64_t lookups = 0, hits = 0, evictions = 0;  // the cache's, since the start
+    int running = 0;             // 1 growing, 2 shrinking, 3 going back
+    int last_status = 0;
+    const char* reason = "";     // why the last change failed
+  };
+  EngramLendInfo engram_lend_info() const;
+  // The largest size (MiB) whose block takes at most `groups` groups, within what the cache can grow to.
+  uint64_t engram_mib_for_groups(int groups) const;
   int slots() const;
   int slot_ctx(int s) const;  // positions slot s holds (Options::big_slots)
   // Slot memory (Options::vmm; every call is a no-op or zero without it). slot_reserve: commit the chunks a request of

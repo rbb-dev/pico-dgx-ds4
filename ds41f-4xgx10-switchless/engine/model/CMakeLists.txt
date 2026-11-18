@@ -1,4 +1,4 @@
-add_library(dsmodel STATIC model.cu ablit.cu ops.cu fused.cu sample.cu prefill.cu state.cu spec.cu window.cu wave_probe.cu spill.cpp vmm.cpp vmm.cu chunks.cpp)
+add_library(dsmodel STATIC model.cu ablit.cu ops.cu fused.cu sample.cu prefill.cu state.cu spec.cu window.cu lend.cu wave_probe.cu spill.cpp vmm.cpp vmm.cu chunks.cpp)
 target_include_directories(dsmodel PUBLIC ${CMAKE_SOURCE_DIR})
 find_package(CUDAToolkit REQUIRED)
 target_link_libraries(dsmodel PUBLIC dsattn dsk_kernels dsgb10_comm engram dsw_loader dspark CUDA::cuda_driver)
@@ -21,6 +21,12 @@ target_include_directories(vmm_test PRIVATE ${CMAKE_SOURCE_DIR})
 add_executable(chunks_test tests/chunks_test.cpp chunks.cpp)
 target_include_directories(chunks_test PRIVATE ${CMAKE_SOURCE_DIR})
 
+
+# The lent groups' ledger, the hand-over proof, the cache's sizes and resize plan (lend.h) over the real allocator and the VMM
+# pool on a fake driver; host only, no GPU. Built with -DPICO_OLD_RULES its red cases fail
+add_executable(lend_test tests/lend_test.cpp chunks.cpp vmm.cpp)
+target_include_directories(lend_test PRIVATE ${CMAKE_SOURCE_DIR})
+
 # The pool on a GB10 (stop the engine first): a graph captured over a reserved range replays after more is mapped;
 # maps and unmaps beside a replaying graph (tests/vmm_probe.cu)
 add_executable(vmm_probe tests/vmm_probe.cu)
@@ -34,6 +40,12 @@ target_link_libraries(vmm_giveback dsmodel)
 
 # Profiling builds (-DDSGB10_NVTX=ON): NVTX ranges per turn, chunk, layer and part for nsys (model/nvtx.h),
 # and DSGB10_ROUTE_DUMP (model/prefill.cu). The ranges cost nothing without a profiler attached.
+# Fault injection for the Engram hand-over tests (model/lend.cu): DSGB10_LEND_FAIL=rank:R,step:B|C|back
+option(DSGB10_TEST_FAULTS "DSGB10_LEND_FAIL fault injection in the Engram hand-over" OFF)
+if(DSGB10_TEST_FAULTS)
+  target_compile_definitions(dsmodel PUBLIC DSGB10_TEST_FAULTS)
+endif()
+
 option(DSGB10_NVTX "NVTX ranges in the model and the server, for nsys" OFF)
 if(DSGB10_NVTX)
   target_compile_definitions(dsmodel PUBLIC DSGB10_NVTX)

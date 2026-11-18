@@ -287,7 +287,7 @@ def main():
     # ---- the live settings (interleaved prefill): read from STATS, changed with a CONFIG frame, refused out of range
     il = s.get("interleave")
     check(il == {"on": True, "whole_rows": 32768, "push_rows": 131072, "gap_ms": 600, "share": 40, "burst_max_ms": 1000,
-                 "reading": 0, "queued": 0, "ssd_gib": 256, "keep_days": 30, "extend": True}, f"status.interleave: the engine's settings {il}")
+                 "reading": 0, "queued": 0, "ssd_gib": 256, "keep_days": 30, "extend": True, "engram_mib": 2032}, f"status.interleave: the engine's settings {il}")
     st, sv = get_json("/dashboard/api/v1/settings")
     check(st == 200 and sv == il, "GET settings is the same object")
     st, raw, _ = http_("POST", "/dashboard/api/v1/settings", {"share": 60, "gap_ms": 450})
@@ -298,12 +298,19 @@ def main():
     got = wait_for(lambda: (lambda x: x if x and x["ssd_gib"] == 128 else None)(get_json("/dashboard/api/v1/settings")[1]), 3)
     check(st == 200 and bool(got) and got["keep_days"] == 14 and got["share"] == 60, f"the SSD tier's size and expiry change live: {got}")
     check(http_("POST", "/dashboard/api/v1/settings", {"ssd_gib": 256, "keep_days": 30})[0] == 200, "and back")
+    en = (get_json("/dashboard/api/v1/status")[1] or {}).get("engram")
+    check(bool(en) and en["size_mib"] == 2032 and en["pending_mib"] == 0 and "hit_rate_1m" in en, f"status.engram carries the cache: {en}")
+    st, raw, _ = http_("POST", "/dashboard/api/v1/settings", {"engram_mib": 4096})
+    got = wait_for(lambda: (lambda x: x if x and x["engram_mib"] == 4096 else None)(get_json("/dashboard/api/v1/settings")[1]), 3)
+    check(st == 200 and bool(got) and got["share"] == 60, f"the Engram cache's size changes live and keeps the rest: {got}")
+    check(http_("POST", "/dashboard/api/v1/settings", {"engram_mib": 2032})[0] == 200, "and back")
+    check(http_("POST", "/dashboard/api/v1/settings", {"engram_mib": -1})[0] == 400, "a negative size is refused (400)")
     st, raw, _ = http_("GET", "/dashboard", headers={"Authorization": None})
     page = raw.decode()
     check(st == 200 and "EXTEND CONTEXT" in page and "'check'" in page and "checkbox" in page,
           "the LONG PROMPTS AND SSD card has the Extend context checkbox")
     for label in ("'LONG PROMPTS AND SSD'", "'SPLIT LONG PROMPTS'", "'TIME FOR OTHERS'", "'MAX PAUSE FOR OTHERS'",
-                  "'READ 2 AT ONCE UP TO'", "'NO SPLIT UP TO'", "'SSD CACHE SIZE'", "'FORGET UNUSED AFTER'"):
+                  "'READ 2 AT ONCE UP TO'", "'NO SPLIT UP TO'", "'SSD CACHE SIZE'", "'FORGET UNUSED AFTER'", "'ENGRAM CACHE'", "'ENGRAM CACHE SIZE'"):
         check(label in page, f"the settings have the label {label}")
     st, raw, _ = http_("POST", "/dashboard/api/v1/settings", {"extend": False})
     got = wait_for(lambda: (lambda x: x if x and x["extend"] is False else None)(get_json("/dashboard/api/v1/settings")[1]), 3)

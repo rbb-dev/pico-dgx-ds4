@@ -134,11 +134,11 @@ nav.sections button[aria-current="page"] { background: transparent; color: var(-
 .stg i { display: block; width: 0; }
 .stg .pre { background: #7d6bb0; } .stg .dec { background: #e8eaec; }
 
-/* ENGINE: one strip of tiles, a value and a short qualifier each (hover a tile for its detail); seven in a row, four in a
+/* ENGINE: one strip of tiles, a value and a short qualifier each (hover a tile for its detail); eight in a row, four in a
    narrower box, two on a phone */
 [data-box="engine"] { container-type: inline-size; padding: 0; gap: 0; overflow: hidden; }
-.strip { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); margin: 0 -1px -1px 0; }
-@container (max-width: 1300px) { .strip { grid-template-columns: repeat(4, minmax(0, 1fr)); } .etile:last-child { grid-column: span 2; } }
+.strip { display: grid; grid-template-columns: repeat(8, minmax(0, 1fr)); margin: 0 -1px -1px 0; }
+@container (max-width: 1300px) { .strip { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
 @container (max-width: 640px) { .strip { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 .etile { padding: 7px 12px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); display: flex; flex-direction: column; gap: 2px; min-width: 0; cursor: help; }
 .etile .k { font-family: var(--mono); font-size: 9px; letter-spacing: .14em; color: var(--t4); white-space: nowrap; }
@@ -697,13 +697,36 @@ function sessionsTiles() {
       const n = Number(p.numbers), nb = Number(p.number_bytes), held = Number(p.held), pct = 100 * held / Math.max(1, n);
       const kept = Number(cv.on_lines) + Number(cv.in_memory), sharing = Number(cv.sharing);
       used.set(gib(SPARKS * held * nb), 'GiB', `${one.format(pct)} % of ${gib(SPARKS * n * nb)} GiB`,
-        `The kept conversations hold ${whole.format(held)} of ${whole.format(n)} chunks a Spark (${one.format(nb / 2 ** 20)} MiB each): ${gib(SPARKS * held * nb)} of ${gib(SPARKS * n * nb)} GiB on the ${SPARKS} Sparks together.`);
+        `The kept conversations hold ${whole.format(held)} of ${whole.format(n)} chunks a Spark (${one.format(nb / 2 ** 20)} MiB each): ${gib(SPARKS * held * nb)} of ${gib(SPARKS * n * nb)} GiB on the ${SPARKS} Sparks together. Not counted here: the images of the requests running now hold ${whole.format(Number(p.image_numbers) || 0)} chunks a Spark (${gib(SPARKS * (Number(p.image_numbers) || 0) * nb)} GiB on the ${SPARKS} Sparks), freed when each request ends.`);
       cap.set(posFmt(Number(p.positions)).replace(' ', ''), 'tokens', `max context ${tokFmt(ss.usable_window)}`,
         `${whole.format(n)} chunks of ${one.format(nb / 2 ** 20)} MiB on each of the ${SPARKS} Sparks (${gib(n * nb)} GiB a Spark, ${gib(SPARKS * n * nb)} GiB in all) hold ${whole.format(Number(p.positions))} tokens of conversation. The longest context one request may use now (it follows Extend context): ${whole.format(ss.usable_window)} tokens.`);
       ctx.set(whole.format(kept), 'in memory', `${whole.format(Number(cv.on_disk))} on SSD only`,
         `${whole.format(kept)} conversations have their cache in the pool: running, or waiting for their next turn (a finished one stays on its line until the line is needed; ${whole.format(Number(cv.on_lines))} are on a line now). ${whole.format(Number(cv.on_disk))} are kept only on the SSD cache: their next turn reads them back first.`);
       shared.set(gib(SPARKS * Number(p.shared) * nb), 'GiB', `${whole.format(sharing)} sharing a prefix`,
         `The beginnings that ${whole.format(sharing)} ${sharing === 1 ? 'conversation shares' : 'conversations share'} with another, kept once: ${whole.format(Number(p.shared))} chunks a Spark, ${gib(SPARKS * Number(p.shared) * nb)} GiB in all.`);
+    },
+  };
+}
+// The Engram cache (rows of the Engram tables kept in memory the pool lends): its size now, the share of lookups the last minute found
+// in it, and the groups of the pool it holds; a size change under way is named. The tip has the rest.
+function engramTile() {
+  const t = etile('engram', 'ENGRAM CACHE', 'The Engram row cache: the memory the pool lends to keep rows of the Engram tables, its size, how many of the rows looked up in the last minute it had, and the groups of the pool it holds.');
+  return {
+    els: [t.el],
+    update(st) {
+      const e = st.engram;
+      t.qual.classList.remove('warn');
+      if (!e) { t.set('-', '', 'not reported'); return; }
+      const rate = e.hit_rate_1m == null ? 'no lookups in the last minute' : `${one.format(100 * Number(e.hit_rate_1m))} % found in the last minute`;
+      const going = Number(e.pending_mib) > 0 ? ` · changing to ${whole.format(Number(e.pending_mib))} MiB` : '';
+      const failed = Number(e.lend_failed);
+      t.qual.classList.toggle('warn', failed > 0);
+      t.set(whole.format(Number(e.size_mib)), 'MiB', `${e.hit_rate_1m == null ? 'no recent lookups' : one.format(100 * Number(e.hit_rate_1m)) + ' % hit'} · ${whole.format(Number(e.groups))} groups${going}`,
+        `The cache holds ${whole.format(Number(e.size_mib))} MiB on each Spark (${whole.format(Number(e.groups))} groups of the pool), ${rate}. ` +
+        `Since the engine started: ${whole.format(Number(e.lookups))} rows looked up, ${whole.format(Number(e.hits))} found, ${whole.format(Number(e.evictions))} dropped to make room. ` +
+        `Size changes: ${whole.format(Number(e.lend_ok))} done, ${whole.format(failed)} failed (a failed change leaves the old size)` +
+        (Number(e.pending_mib) > 0 ? `; one to ${whole.format(Number(e.pending_mib))} MiB is under way` : '') + '. ' +
+        `${whole.format(Number(e.owed_groups))} groups are owed back to the pool; ${whole.format(Number(e.huge_pct))} % of the cache is in huge pages.`);
     },
   };
 }
@@ -746,6 +769,7 @@ function settingsBox() {
     ['whole_rows', 'NO SPLIT UP TO', 'A prompt with at most this many tokens to compute (after what is cached) is read whole: the decoding users wait for it.', [8192, 16384, 32768, 65536, 131072].map((v) => [v, (v / 1024) + 'K tokens'])],
     ['ssd_gib', 'SSD CACHE SIZE', 'How much of each Spark\'s SSD the conversations kept on disk may use: at most the file made when the engine started (a larger one takes a restart). Smaller drops the least recently used conversations\' copies to fit.', [16, 32, 64, 128, 256].map((v) => [v, v + ' GiB'])],
     ['keep_days', 'FORGET UNUSED AFTER', 'A conversation unused this long is dropped (from memory and the SSD).', [1, 3, 7, 14, 30, 60, 90].map((v) => [v, v + (v === 1 ? ' day' : ' days')])],
+    ['engram_mib', 'ENGRAM CACHE SIZE', 'The memory each Spark lends the Engram row cache, in MiB (the display reservation included). The pool hands groups to it or takes them back when no step is running; a size the pool cannot lend is cut, and the engine\'s own largest size is the limit. The tile shows the size now and a change under way.', [2032, 4096, 6912].map((v) => [v, whole.format(v) + ' MiB'])],
     ['extend', 'EXTEND CONTEXT', 'Lets a conversation grow past 1,048,576 tokens, up to the window the engine was started with. At 1M and again at 2M the whole conversation is read again, once each. Off: a 1M window; a longer prompt is refused and an output that reaches it ends.', 'check'],
   ];
   const note = h('span', { class: 'note' });
@@ -764,7 +788,7 @@ function settingsBox() {
     sels[key] = sel;
     return h('label', { class: check ? 'field check' : 'field', title: tip }, h('span', { class: 'k', text: label }), sel);
   }), note, copyLine);
-  const b = box('reading', 'LONG PROMPTS AND SSD', 'How the engine reads long prompts while others decode (interleaved prefill), how much SSD its kept conversations may use and for how long, and whether a conversation may extend past 1M tokens. Changes apply at once and last until the engine restarts; its start flags set them again.', grid);
+  const b = box('reading', 'LONG PROMPTS AND SSD', 'How the engine reads long prompts while others decode (interleaved prefill), how much SSD its kept conversations may use and for how long, the size of the Engram cache, and whether a conversation may extend past 1M tokens. Changes apply at once and last until the engine restarts; its start flags set them again.', grid);
   function update(st) {
     const il = st && st.interleave;
     for (const [key, sel] of Object.entries(sels)) {
@@ -772,7 +796,7 @@ function settingsBox() {
       if (!il || document.activeElement === sel) continue;
       if (sel.type === 'checkbox') { sel.checked = il[key] === true; continue; }
       const v = String(il[key]);
-      if (![...sel.options].some((o) => o.value === v)) sel.append(h('option', { value: v, text: v }));
+      if (![...sel.options].some((o) => o.value === v)) sel.append(h('option', { value: v, text: key === 'engram_mib' ? whole.format(Number(v)) + ' MiB' : v }));
       if (sel.value !== v) sel.value = v;
     }
     const cp = st && st.copy;
@@ -790,13 +814,13 @@ function settingsBox() {
 }
 
 function overview() {
-  const lines = linesBox(), health = healthBox(), rate = rateTiles(), kv = sessionsTiles(), tier = tierTiles(), reading = settingsBox();
+  const lines = linesBox(), health = healthBox(), rate = rateTiles(), kv = sessionsTiles(), tier = tierTiles(), eg = engramTile(), reading = settingsBox();
   const cd = chart('DECODE', 'Tokens a second the engine generates, all streams, the last 15 minutes. Fixed 10-second buckets: a bucket keeps its value as the window moves; hover for the bucket\'s mean and peak.', '#e8eaec', 'tok/s', 'decode_tps');
   const cp = chart('PREFILL', 'Prompt tokens a second of the prompt passes as they ran (the speed now, sampled every second), the last 15 minutes. Fixed 10-second buckets; hover for the mean and peak.', '#9d8bd0', 'tok/s', 'prefill_tps');
   const wrap = (name, c) => h('section', { class: 'box plotbox', 'data-box': name }, c.el);
   // the board: the ENGINE strip across the top, LINES beside DECODE over PREFILL, NODE HEALTH across, the settings box across
   refs.main.append(h('div', { class: 'board' },
-    h('section', { class: 'box', 'data-box': 'engine', 'aria-label': 'ENGINE' }, h('div', { class: 'strip' }, rate.els, kv.els, tier.els)),
+    h('section', { class: 'box', 'data-box': 'engine', 'aria-label': 'ENGINE' }, h('div', { class: 'strip' }, rate.els, kv.els, tier.els, eg.els)),
     lines.el,
     h('div', { class: 'plots' }, wrap('decode', cd), wrap('prefill', cp)),
     health.el,
@@ -861,6 +885,7 @@ function overview() {
     health.update(st, ledger);
     kv.update(st, inflight);
     tier.update(st);
+    eg.update(st);
     rate.update(st, recent);
     reading.update(st);
   };

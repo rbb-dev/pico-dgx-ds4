@@ -51,6 +51,8 @@ impl DoneReason {
             1 => DoneReason::Length,
             2 => DoneReason::Cancelled,
             3 => DoneReason::Context,
+            5 => DoneReason::TooLarge,
+            6 => DoneReason::PrefixGone,
             _ => DoneReason::Error,
         }
     }
@@ -135,7 +137,7 @@ pub struct Done {
 
 /// The fields of a STATS frame, in wire order (docs/protocol.md, "The dashboard's frames"); a frame of another version is refused.
 pub const STATS_VERSION: u32 = 2;
-pub const STATS_FIELDS: usize = 34;
+pub const STATS_FIELDS: usize = 100;
 
 /// The engine's own counters for the dashboard: the chunk pool and its conversations (rank 0's; every rank's are the same),
 /// the disk tier, interleaved prefill. Counters count from the engine's start.
@@ -192,6 +194,26 @@ pub struct EngineStats {
     pub ctx_limit: u64,
     /// the Sparks (ranks) the engine runs on: each holds the same pool and the same disk tier
     pub ranks: u64,
+    /// numbers the running requests' image rows hold (204 rows each; not in `pool_held`)
+    pub image_numbers: u64,
+    /// the Engram row cache, a borrower of the pool's memory: its slots in bytes (the display reservation's included)
+    pub engram_cache_bytes: u64,
+    /// groups of the pool its block holds
+    pub engram_groups: u64,
+    /// the size in MiB a change not yet landed goes to; 0: none
+    pub engram_pending_mib: u64,
+    /// rows looked up in the cache since the engine's start, and found
+    pub engram_lookups: u64,
+    pub engram_hits: u64,
+    /// changes of its size that landed, and that failed (the cache stayed at its old size)
+    pub engram_lend_ok_total: u64,
+    pub engram_lend_failed_total: u64,
+    /// groups a borrower gave back that the pool could not yet make into numbers
+    pub lent_owed_groups: u64,
+    /// % of its block's resident bytes in huge pages at the last change's end
+    pub engram_huge_pct: u64,
+    /// rows the cache dropped to make room, since the engine's start
+    pub engram_evictions: u64,
 }
 
 impl EngineStats {
@@ -231,6 +253,17 @@ impl EngineStats {
             self.extend,
             self.ctx_limit,
             self.ranks,
+            self.image_numbers,
+            self.engram_cache_bytes,
+            self.engram_groups,
+            self.engram_pending_mib,
+            self.engram_lookups,
+            self.engram_hits,
+            self.engram_lend_ok_total,
+            self.engram_lend_failed_total,
+            self.lent_owed_groups,
+            self.engram_huge_pct,
+            self.engram_evictions,
             self.copy_adapt,
             self.copy_proposals_total,
             self.copy_scored_total,
@@ -283,6 +316,17 @@ impl EngineStats {
             extend: f(31),
             ctx_limit: f(32),
             ranks: f(33),
+            image_numbers: f(34),
+            engram_cache_bytes: f(35),
+            engram_groups: f(36),
+            engram_pending_mib: f(37),
+            engram_lookups: f(38),
+            engram_hits: f(39),
+            engram_lend_ok_total: f(40),
+            engram_lend_failed_total: f(41),
+            lent_owed_groups: f(42),
+            engram_huge_pct: f(43),
+            engram_evictions: f(44),
         }
     }
 }
@@ -290,7 +334,7 @@ impl EngineStats {
 /// Interleaved prefill's settings for rank 0 (docs/protocol.md, CONFIG): a field < 0 keeps the engine's value; the engine
 /// takes each one in its flag's range and ignores the others; its next STATS shows what it runs.
 pub const CONFIG_VERSION: u32 = 3;
-pub const CONFIG_FIELDS: u32 = 9;
+pub const CONFIG_FIELDS: u32 = 10;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConfigFrame {
     pub on: i64,
@@ -305,17 +349,21 @@ pub struct ConfigFrame {
     pub keep_days: i64,
     /// whether a conversation may grow past 1,048,576 tokens: 0 off, 1 on
     pub extend: i64,
+    /// the Engram row cache's size in MiB, the display reservation's included (0 off); the engine clamps it to its
+    /// --engram-cache-max-mib, applies it at a run boundary and cuts a size the pool cannot lend; an engine that does not
+    /// know the field reads only the fields it has and ignores this one
+    pub engram_mib: i64,
 }
 
 impl Default for ConfigFrame {
     fn default() -> Self {
-        ConfigFrame { on: -1, whole_rows: -1, push_rows: -1, gap_ms: -1, share: -1, burst_max_ms: -1, ssd_gib: -1, keep_days: -1, extend: -1 }
+        ConfigFrame { on: -1, whole_rows: -1, push_rows: -1, gap_ms: -1, share: -1, burst_max_ms: -1, ssd_gib: -1, keep_days: -1, extend: -1, engram_mib: -1 }
     }
 }
 
 impl ConfigFrame {
     fn fields(&self) -> [i64; CONFIG_FIELDS as usize] {
-        [self.on, self.whole_rows, self.push_rows, self.gap_ms, self.share, self.burst_max_ms, self.ssd_gib, self.keep_days, self.extend]
+        [self.on, self.whole_rows, self.push_rows, self.gap_ms, self.share, self.burst_max_ms, self.ssd_gib, self.keep_days, self.extend, self.engram_mib]
     }
 }
 
@@ -589,7 +637,7 @@ impl Frame {
                 }
                 let v = (0..n).map(|_| r.u64().map(|x| x as i64)).collect::<Result<Vec<_>, _>>()?;
                 let f = |i: usize| v.get(i).copied().unwrap_or(-1);
-                Frame::Config(ConfigFrame { on: f(0), whole_rows: f(1), push_rows: f(2), gap_ms: f(3), share: f(4), burst_max_ms: f(5), ssd_gib: f(6), keep_days: f(7), extend: f(8) })
+                Frame::Config(ConfigFrame { on: f(0), whole_rows: f(1), push_rows: f(2), gap_ms: f(3), share: f(4), burst_max_ms: f(5), ssd_gib: f(6), keep_days: f(7), extend: f(8), engram_mib: f(9) })
             }
             T_STATS => {
                 let version = r.u32()?;
@@ -786,18 +834,15 @@ mod tests {
         assert_eq!(Frame::decode(T_STATS_REQ, &b[8..], |_| 0).unwrap(), Frame::StatsReq);
         let st = EngineStats { pool_numbers: 8913, conv_on_disk: 3, restore_wait_max_ns: 7, conv_sharing: 2, lines: 32, ..Default::default() };
         let b = Frame::Stats(st).encode();
-        assert_eq!(b.len(), 8 + 8 + 8 * 34);
+        assert_eq!(b.len(), 8 + 8 + 8 * STATS_FIELDS);
         assert_eq!(u32::from_le_bytes(b[8..12].try_into().unwrap()), 2, "version 2");
-        assert_eq!(u32::from_le_bytes(b[12..16].try_into().unwrap()), 34, "n_fields after the version");
+        assert_eq!(u32::from_le_bytes(b[12..16].try_into().unwrap()), STATS_FIELDS as u32, "n_fields after the version");
         assert_eq!(u64::from_le_bytes(b[16..24].try_into().unwrap()), 8913, "pool_numbers is the first field");
         assert_eq!(u64::from_le_bytes(b[16 + 8 * 11..16 + 8 * 12].try_into().unwrap()), 32, "lines is the 12th");
         let il = EngineStats { il_share: 40, il_queued: 2, keep_days: 30, extend: 1, ctx_limit: 1_048_576, ranks: 4, ..Default::default() };
         let bi = Frame::Stats(il).encode();
-        assert_eq!(u64::from_le_bytes(bi[bi.len() - 8..].try_into().unwrap()), 4, "ranks is the last");
-        assert_eq!(u64::from_le_bytes(bi[bi.len() - 16..bi.len() - 8].try_into().unwrap()), 1_048_576, "ctx_limit before it");
-        assert_eq!(u64::from_le_bytes(bi[bi.len() - 24..bi.len() - 16].try_into().unwrap()), 1, "extend before that");
-        assert_eq!(u64::from_le_bytes(bi[bi.len() - 32..bi.len() - 24].try_into().unwrap()), 30, "keep_days before extend");
-        assert_eq!(u64::from_le_bytes(bi[bi.len() - 40..bi.len() - 32].try_into().unwrap()), 2, "il_queued before keep_days");
+        let f = |i: usize| u64::from_le_bytes(bi[16 + 8 * i..16 + 8 * (i + 1)].try_into().unwrap());
+        assert_eq!((f(29), f(30), f(31), f(32), f(33)), (2, 30, 1, 1_048_576, 4), "il_queued, keep_days, extend, ctx_limit, ranks are the 30th to 34th");
         assert_eq!(u64::from_le_bytes(bi[16 + 8 * 26..16 + 8 * 27].try_into().unwrap()), 40, "il_share is the 27th");
         assert_eq!(Frame::decode(T_STATS, &bi[8..], |_| 0).unwrap(), Frame::Stats(il));
         assert_eq!(Frame::decode(T_STATS, &b[8..], |_| 0).unwrap(), Frame::Stats(st));
@@ -809,10 +854,44 @@ mod tests {
         assert_eq!((got.pool_numbers, got.conv_on_disk, got.lines), (8913, 0, 0));
         let mut long = Frame::Stats(st).encode();
         long.extend(5u64.to_le_bytes());
-        long[12..16].copy_from_slice(&35u32.to_le_bytes());
+        long[12..16].copy_from_slice(&(STATS_FIELDS as u32 + 1).to_le_bytes());
         assert_eq!(Frame::decode(T_STATS, &long[8..], |_| 0).unwrap(), Frame::Stats(st));
         long[8..12].copy_from_slice(&1u32.to_le_bytes());
         assert!(Frame::decode(T_STATS, &long[8..], |_| 0).is_err(), "another version");
+        // the Engram row cache's fields: the 45-field frame, the new ones last, in the engine's order (frontend_protocol.h)
+        let en = EngineStats { ranks: 4, image_numbers: 12, engram_cache_bytes: 2032 << 20, engram_groups: 14, engram_pending_mib: 4096,
+                               engram_lookups: 1000, engram_hits: 900, engram_lend_ok_total: 3, engram_lend_failed_total: 1,
+                               lent_owed_groups: 2, engram_huge_pct: 97, engram_evictions: 55, ..Default::default() };
+        let be = Frame::Stats(en).encode();
+        assert_eq!(STATS_FIELDS, 100);
+        assert_eq!(be.len(), 8 + 8 + 8 * 100);
+        assert_eq!(u32::from_le_bytes(be[12..16].try_into().unwrap()), 100, "n_fields 100");
+        let at = |i: usize| u64::from_le_bytes(be[16 + 8 * i..16 + 8 * (i + 1)].try_into().unwrap());
+        assert_eq!((at(33), at(34), at(35), at(36), at(37)), (4, 12, 2032 << 20, 14, 4096), "ranks, image_numbers, cache bytes, groups, pending");
+        assert_eq!((at(38), at(39), at(40), at(41), at(42), at(43), at(44)), (1000, 900, 3, 1, 2, 97, 55), "lookups .. evictions");
+        assert_eq!(Frame::decode(T_STATS, &be[8..], |_| 0).unwrap(), Frame::Stats(en));
+        // an older engine's 34-field frame still decodes: the new fields are 0
+        let mut old = Frame::Stats(en).encode();
+        old.truncate(8 + 8 + 8 * 34);
+        old[12..16].copy_from_slice(&34u32.to_le_bytes());
+        let Frame::Stats(got) = Frame::decode(T_STATS, &old[8..], |_| 0).unwrap() else { panic!() };
+        assert_eq!(got, EngineStats { image_numbers: 0, engram_cache_bytes: 0, engram_groups: 0, engram_pending_mib: 0, engram_lookups: 0,
+                                      engram_hits: 0, engram_lend_ok_total: 0, engram_lend_failed_total: 0, lent_owed_groups: 0,
+                                      engram_huge_pct: 0, engram_evictions: 0, ..en });
+        assert_eq!(got.ranks, 4);
+        // CONFIG's 10th field is engram_mib; a frame of 9 fields keeps it (-1)
+        let ce = ConfigFrame { engram_mib: 4096, extend: 1, ..Default::default() };
+        let bc = Frame::Config(ce).encode();
+        assert_eq!((CONFIG_FIELDS, bc.len()), (10, 8 + 8 + 8 * 10));
+        assert_eq!(u32::from_le_bytes(bc[12..16].try_into().unwrap()), 10, "n_fields 10");
+        assert_eq!(i64::from_le_bytes(bc[16 + 8 * 8..16 + 8 * 9].try_into().unwrap()), 1, "extend stays the 9th");
+        assert_eq!(i64::from_le_bytes(bc[16 + 8 * 9..16 + 8 * 10].try_into().unwrap()), 4096, "engram_mib is the 10th");
+        assert_eq!(Frame::decode(T_CONFIG, &bc[8..], |_| 0).unwrap(), Frame::Config(ce));
+        assert_eq!(ConfigFrame::default().engram_mib, -1, "kept unless set");
+        let mut nine = Frame::Config(ce).encode();
+        nine.truncate(8 + 8 + 8 * 9);
+        nine[12..16].copy_from_slice(&9u32.to_le_bytes());
+        assert_eq!(Frame::decode(T_CONFIG, &nine[8..], |_| 0).unwrap(), Frame::Config(ConfigFrame { engram_mib: -1, ..ce }));
         // HELLO from the engine (version 4): the C struct's 32 bytes, keep_positions after name_len, then the name
         let he = HelloEngine { version: VERSION, max_context: 1 << 20, vocab_size: 129280, eos_id: 1, max_sessions: 16,
                                keep_positions: 21_004_288, name: "pico".into() };
@@ -825,7 +904,7 @@ mod tests {
         // CONFIG: version, n, then i64 fields; a field not sent is -1 (kept)
         let c = ConfigFrame { share: 40, gap_ms: 600, ssd_gib: 128, keep_days: 14, extend: 1, ..Default::default() };
         let b = Frame::Config(c).encode();
-        assert_eq!((b.len(), u16::from_le_bytes(b[4..6].try_into().unwrap())), (8 + 8 + 8 * 9, 0x06));
+        assert_eq!((b.len(), u16::from_le_bytes(b[4..6].try_into().unwrap())), (8 + 8 + 8 * 10, 0x06));
         assert_eq!(u32::from_le_bytes(b[8..12].try_into().unwrap()), 3, "CONFIG version 3");
         assert_eq!(i64::from_le_bytes(b[16..24].try_into().unwrap()), -1, "on: kept");
         assert_eq!(i64::from_le_bytes(b[16 + 8 * 4..16 + 8 * 5].try_into().unwrap()), 40, "share is the 5th");

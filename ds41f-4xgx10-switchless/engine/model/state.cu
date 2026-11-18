@@ -1675,7 +1675,17 @@ uint64_t Model::store_digest() const {
     for (const int k : s.last) mix((uint64_t)(uint32_t)k);
   }
   for (const uint32_t r : m.refs) mix(r);
-  for (int t = 0; t < m.nslots; ++t) mix((uint64_t)(uint32_t)m.resv[t]);
+  // the pool's lending: the groups out of it (the windows' and the Engram cache's), those owed, the pool's size before any
+  // left, the cache's own groups and the phase of its change
+  mix((uint64_t)(uint32_t)m.lent.groups), mix((uint64_t)(uint32_t)m.lent.owed), mix((uint64_t)m.lent.n0);
+  mix((uint64_t)(uint32_t)m.el.cur_groups), mix((uint64_t)(uint32_t)m.el.phase);
+  if (m.calloc) mix((uint64_t)m.calloc->numbers());
+  for (int t = 0; t < m.nslots; ++t) mix((uint64_t)(uint32_t)m.resv[t]), mix((uint64_t)(uint32_t)m.resv_img[t]);
+  if (m.store_s)
+    m.store_s->img.each([&](int key, const imgrows::Ledger::Rows& r) {
+      mix((uint64_t)(uint32_t)key), mix(r.rows);
+      for (const uint32_t c : r.nums) mix(c);
+    });
   return h;
 }
 std::vector<int> Model::state_evicted() {

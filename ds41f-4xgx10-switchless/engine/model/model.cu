@@ -1444,6 +1444,7 @@ void Model::slot_release(int s) { d_->slot_release(s); }
 void Model::set_engram(const engram::HashMap* map, engram::Store* store) {
   d_->emap = map;
   d_->store = store;
+  d_->el.enabled = store && store->cache_max_bytes() > 0;
 }
 uint64_t Model::launch(int R, int pos0, const int32_t* tokens, const Sampling& sp, uint32_t flags, Sink* sink) {
   return d_->launch(R, pos0, tokens, sp, flags, sink);

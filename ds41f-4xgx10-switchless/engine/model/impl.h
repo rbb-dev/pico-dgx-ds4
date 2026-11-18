@@ -25,6 +25,7 @@
 #include "model/ablit.h"
 #include "model/chunks.h"
 #include "model/tokwin.h"
+#include "model/lend.h"
 #include "model/model.h"
 #include "model/ops.h"
 #include "model/pool_rules.h"
@@ -223,9 +224,10 @@ struct Model::Impl {
   static int level_of(int f) { return f == 16 ? 0 : f == 32 ? 1 : 2; }
   const Scan& scan() const { return lazy_win ? scan_[level_of(sf)] : scan_[0]; }
   // window.cu: the pool's memory a window takes while it is open (docs/engine.md, "Context past 1M")
-  size_t win_n0 = 0;                // the pool's numbers before the first window took any (0: none taken)
-  int win_groups = 0;               // groups of window.cu's kGroupNums (64) numbers out of the pool
-  int win_owed = 0;                 // of them, owed back by a window that closed (its memory not yet checked free)
+  // The groups out of the pool, every borrower's (a window's buffers, the Engram row cache's block): lend.h's ledger. n0: the
+  // pool's numbers before the first group left; groups: of window.cu's kGroupNums (64) numbers; owed: of them, groups a borrower
+  // finished with whose numbers could not be made again yet (the memory not yet checked free, or a rank's driver refused).
+  lend::Ledger lent;
   size_t win_gcost = 0;             // device bytes factor 16's step and batch step graphs took at the start
   size_t win_free_end = 0;          // free device memory when the last window opened
   size_t scan_bytes(int f, bool prefill) const;
@@ -233,14 +235,49 @@ struct Model::Impl {
   bool win_alloc(int f);
   void win_free(int f);
   void win_graphs_drop(int f);
-  size_t win_numbers_for(int g) const;
+  struct LendOps;  // the pool's side of lend::Lender (window.cu)
   int window_make_room(int f, int groups);
   // The top number of the pool with `g` more groups of factor f's window out of it, and false when the pool could not
   // hold one conversation of the window even whole (kWindowNoRoom). Reads the allocator only.
   bool window_top(int f, int g, uint32_t* top) const;
   size_t win_need(int f) const;  // the bytes factor f's window takes by this rank's own estimate
   int win_busy_g[3] = {0, 0, 0};  // by window level: the exact groups of the last open that found it busy (0: none)
-  void window_regrow(int groups);
+  bool window_regrow(int groups);  // groups back into the pool; false: they are owed (some rank could not make the numbers)
+  // `more` numbers in the pool on every rank, or none anywhere (collective); false when some rank could not
+  bool pool_grow_all(size_t more);
+  // `more` numbers in the pool on this rank; false, with nothing changed, when the driver cannot make or map the chunks
+  bool pool_grow_try(size_t more);
+  // the pool's numbers at or above `top` leave: the allocator, the arrays' mapped ends and their chunks (the memory goes back
+  // to the system). Every one of them must be free.
+  void pool_cut(size_t top);
+  // the chunk handles the pool holds for `nums` numbers (and the arrays' bytes for them)
+  size_t pool_chunks_for(size_t nums, size_t* bytes = nullptr) const;
+  // numbers one conversation of the longest open window needs: what the pool keeps whatever it lends
+  size_t lend_whole() const;
+  int lend_cache_room(int others) const;  // the groups the Engram cache may hold: the longest allowed window keeps its room
+  int lend_settle();  // what is owed, asked for again (every rank)
+  // lend.cu: the Engram cache's hand-over. Replicated: every rank holds the same phase, sizes and groups.
+  struct EngramLend {
+    bool enabled = false;
+    uint64_t cur_mib = 0;
+    int cur_groups = 0;
+    int phase = 0;  // 0 idle, 1 growing, 2 shrinking, 3 going back after a failed grow
+    uint64_t target_mib = 0, from_mib = 0;
+    int target_groups = 0, from_groups = 0;
+    lend::Reading a, b;  // the readings before the groups left and after
+    uint64_t block_before = 0, tol = 0;
+    bool local_fail = false;
+    uint64_t ok_total = 0, failed_total = 0, proof_failed_total = 0;
+    int last_status = 0;
+    const char* reason = "";
+  } el;
+  int engram_lend(int phase, int64_t mib);
+  int lend_begin(uint64_t want_mib);
+  int lend_poll();
+  void lend_fail(const char* why);
+#ifdef DSGB10_TEST_FAULTS
+  bool lend_fault(const char* step) const;  // DSGB10_LEND_FAIL names this rank and step: it answers true once
+#endif
   int window_open(int f);
   int window_close(int f);
 

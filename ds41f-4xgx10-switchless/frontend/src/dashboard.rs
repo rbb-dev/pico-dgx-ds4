@@ -217,6 +217,39 @@ struct NodeSample {
     json: Value,
 }
 
+/// The Engram cache's lookups and hits as the engine's STATS counted them, sampled once a STATS: the hit rate is the change
+/// over the last 60 seconds, not the whole run's.
+#[derive(Default)]
+pub struct HitWindow {
+    samples: VecDeque<(Instant, u64, u64)>,
+}
+
+const HIT_WINDOW: Duration = Duration::from_secs(60);
+
+impl HitWindow {
+    pub fn push(&mut self, now: Instant, lookups: u64, hits: u64) {
+        // counters that went back mean the engine restarted: start over
+        if self.samples.back().is_some_and(|&(_, l, h)| lookups < l || hits < h) {
+            self.samples.clear();
+        }
+        self.samples.push_back((now, lookups, hits));
+        while self.samples.front().is_some_and(|&(t, _, _)| now.duration_since(t) > HIT_WINDOW) {
+            self.samples.pop_front();
+        }
+    }
+
+    /// hits / lookups between the oldest sample in the window and the newest; None when no row was looked up in between.
+    pub fn rate(&self, now: Instant) -> Option<f64> {
+        let &(_, l1, h1) = self.samples.back()?;
+        let &(_, l0, h0) = self.samples.iter().find(|&&(t, _, _)| now.duration_since(t) <= HIT_WINDOW)?;
+        let dl = l1 - l0;
+        if dl == 0 {
+            return None;
+        }
+        Some((h1 - h0) as f64 / dl as f64)
+    }
+}
+
 pub struct Telemetry {
     started: Instant,
     connected_ms: AtomicU64,
@@ -230,6 +263,7 @@ pub struct Telemetry {
     decode_series: Mutex<Buckets>,
     prefill_series: Mutex<Buckets>,
     stats: Mutex<Option<(Instant, EngineStats)>>,
+    engram_hits: Mutex<HitWindow>,
     node_addrs: Mutex<Vec<String>>,
     nodes: Mutex<Vec<Option<NodeSample>>>,
 }
@@ -255,6 +289,7 @@ impl Telemetry {
             decode_series: Mutex::new(Buckets::default()),
             prefill_series: Mutex::new(Buckets::default()),
             stats: Mutex::new(None),
+            engram_hits: Mutex::new(HitWindow::default()),
             node_addrs: Mutex::new(Vec::new()),
             nodes: Mutex::new(Vec::new()),
         }
@@ -301,7 +336,14 @@ impl Telemetry {
     }
 
     pub fn set_stats(&self, s: EngineStats) {
-        *self.stats.lock().unwrap() = Some((Instant::now(), s));
+        let now = Instant::now();
+        self.engram_hits.lock().unwrap().push(now, s.engram_lookups, s.engram_hits);
+        *self.stats.lock().unwrap() = Some((now, s));
+    }
+
+    /// The Engram cache's hit rate over the last minute of STATS (None: no row looked up in it).
+    pub fn engram_hit_rate(&self) -> Option<f64> {
+        self.engram_hits.lock().unwrap().rate(Instant::now())
     }
 
     pub fn stats(&self) -> Option<EngineStats> {
@@ -396,9 +438,24 @@ pub fn sessions_json(s: &EngineStats, usable_window: u32) -> Value {
     let window = if s.ctx_limit > 0 { s.ctx_limit } else { usable_window as u64 };
     json!({"lines": s.lines, "usable_window": window, "ranks": s.ranks,
            "pool": {"numbers": s.pool_numbers, "free": s.pool_free, "held": s.pool_held, "shared": s.pool_shared,
-                    "reserved": s.pool_reserved, "number_bytes": s.number_bytes, "positions": s.pool_positions},
+                    "reserved": s.pool_reserved, "number_bytes": s.number_bytes, "positions": s.pool_positions,
+                    "image_numbers": s.image_numbers},
            "conversations": {"on_lines": s.conv_on_lines, "in_memory": s.conv_in_memory, "on_disk": s.conv_on_disk,
                              "sharing": s.conv_sharing}})
+}
+
+/// The Engram row cache as the page's tile reads it: its size, the groups of the pool it holds, the size a change under way goes to,
+/// lookups and hits since the engine's start with the hit rate of the last minute (`rate`, null without lookups), evictions, size changes
+/// landed and failed, the groups owed back to the pool and the huge-page share. Null for an engine that sends none of it.
+pub fn engram_json(s: &EngineStats, rate: Option<f64>) -> Value {
+    if s.engram_cache_bytes == 0 && s.engram_groups == 0 && s.engram_pending_mib == 0 && s.engram_lookups == 0
+        && s.engram_lend_ok_total == 0 && s.engram_lend_failed_total == 0 {
+        return Value::Null;
+    }
+    json!({"cache_bytes": s.engram_cache_bytes, "size_mib": engram_mib(s), "groups": s.engram_groups,
+           "pending_mib": s.engram_pending_mib, "lookups": s.engram_lookups, "hits": s.engram_hits, "hit_rate_1m": rate,
+           "evictions": s.engram_evictions, "lend_ok": s.engram_lend_ok_total, "lend_failed": s.engram_lend_failed_total,
+           "owed_groups": s.lent_owed_groups, "huge_pct": s.engram_huge_pct})
 }
 
 /// The SSD tier as the page's card reads it: `spill` (its state) and `prompt_cache` (its counters).
@@ -495,6 +552,7 @@ pub fn status_json(app: &App) -> Value {
            "ablit": {"alias": app.ablit_name()},
            "engine": {"connected": info.is_some(), "name": info.as_ref().map(|i| i.name.clone()), "uptime_s": t.started.elapsed().as_secs()},
            "health": health, "sessions": kv, "node_health": node_health_json(t),
+           "engram": stats.as_ref().map_or(Value::Null, |s| engram_json(s, t.engram_hit_rate())),
            "interleave": settings_json(stats.as_ref())})
 }
 
@@ -504,8 +562,8 @@ pub fn settings_json(s: Option<&EngineStats>) -> Value {
         Some(s) if s.il_share > 0 => json!({"on": s.il_on == 1, "whole_rows": s.il_whole_rows, "push_rows": s.il_push_rows,
                                             "gap_ms": s.il_gap_ms, "share": s.il_share, "burst_max_ms": s.il_burst_max_ms,
                                             "reading": s.il_reading, "queued": s.il_queued,
-                                            "ssd_gib": s.disk_cap_bytes >> 30, "keep_days": s.keep_days,
-                                            "extend": s.extend == 1}),
+                                            "ssd_gib": s.disk_cap_bytes >> 30, "ssd_choices": SSD_SIZES_GIB, "keep_days": s.keep_days,
+                                            "extend": s.extend == 1, "engram_mib": engram_mib(s)}),
         _ => Value::Null,
     }
 }
@@ -530,7 +588,8 @@ pub fn parse_settings(v: &Value, max_ctx: i64) -> Result<ConfigFrame, String> {
             "ssd_gib" => c.ssd_gib = int(1, 131071)?,
             "keep_days" => c.keep_days = int(1, 3650)?,
             "extend" => c.extend = x.as_bool().ok_or("extend: true or false")? as i64,
-            _ => return Err(format!("{k}: not a setting (on, share, gap_ms, burst_max_ms, whole_rows, push_rows, ssd_gib, keep_days, extend)")),
+            "engram_mib" => c.engram_mib = int(0, 131072)?,
+            _ => return Err(format!("{k}: not a setting (on, share, gap_ms, burst_max_ms, whole_rows, push_rows, ssd_gib, keep_days, extend, engram_mib)")),
         }
     }
     if c == ConfigFrame::default() {
@@ -902,6 +961,67 @@ mod tests {
             w.push(at(s as f64), 400, 4096);
         }
         assert_eq!(w.push(at(9.0), 400, 4096), (0.0, 0.0));
+    }
+
+    #[test]
+    fn the_engram_cache_reaches_the_json() {
+        let s = EngineStats { pool_numbers: 8913, number_bytes: 2_916_352, image_numbers: 6, lines: 32, ranks: 4, engram_cache_bytes: 2032 << 20,
+                              engram_groups: 14, engram_pending_mib: 4096, engram_lookups: 1000, engram_hits: 900, engram_lend_ok_total: 3,
+                              engram_lend_failed_total: 1, lent_owed_groups: 2, engram_huge_pct: 97, engram_evictions: 55, ..Default::default() };
+        assert_eq!(sessions_json(&s, 5)["pool"]["image_numbers"].as_u64(), Some(6), "the images' numbers beside the pool's");
+        let e = engram_json(&s, Some(0.9));
+        assert_eq!((e["cache_bytes"].as_u64(), e["size_mib"].as_u64(), e["groups"].as_u64(), e["pending_mib"].as_u64()),
+                   (Some(2032 << 20), Some(2032), Some(14), Some(4096)));
+        assert_eq!((e["lookups"].as_u64(), e["hits"].as_u64(), e["evictions"].as_u64()), (Some(1000), Some(900), Some(55)));
+        assert_eq!((e["lend_ok"].as_u64(), e["lend_failed"].as_u64(), e["owed_groups"].as_u64(), e["huge_pct"].as_u64()),
+                   (Some(3), Some(1), Some(2), Some(97)));
+        assert_eq!(e["hit_rate_1m"].as_f64(), Some(0.9));
+        assert_eq!(engram_json(&s, None)["hit_rate_1m"], Value::Null, "no lookups in the last minute: no rate");
+        // an engine that sends none of it (34 fields): the block is null, so the page hides the tile
+        assert_eq!(engram_json(&EngineStats { engram_lookups: 0, ..EngineStats::default() }, None), Value::Null);
+        // the setting: the cache's size now, in MiB; and a change is checked and sent
+        let v = settings_json(Some(&EngineStats { il_share: 40, engram_cache_bytes: 4096 << 20, ..Default::default() }));
+        assert_eq!(v["engram_mib"].as_u64(), Some(4096));
+        for ok in [0i64, 2032, 4096, 6912] {
+            assert_eq!(parse_settings(&json!({"engram_mib": ok}), 1 << 20).unwrap().engram_mib, ok);
+        }
+        let c = parse_settings(&json!({"engram_mib": 6912}), 1 << 20).unwrap();
+        assert_eq!((c.engram_mib, c.share, c.extend), (6912, -1, -1), "only the given field changes");
+        for bad in [json!({"engram_mib": -1}), json!({"engram_mib": "4096"}), json!({"engram_mib": 1e9 as i64}), json!({"engram_mib": true})] {
+            assert!(parse_settings(&bad, 1 << 20).is_err(), "{bad} must be refused");
+        }
+    }
+
+    #[test]
+    fn the_hit_rate_is_over_the_last_minute() {
+        let mut w = HitWindow::default();
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        assert_eq!(w.rate(at(0)), None, "no sample");
+        w.push(at(0), 1000, 500);
+        assert_eq!(w.rate(at(0)), None, "one sample has no change");
+        w.push(at(10), 1000, 500);
+        assert_eq!(w.rate(at(10)), None, "no lookups since: no rate, not 0");
+        w.push(at(20), 1100, 590);
+        assert_eq!(w.rate(at(20)), Some(0.9), "90 of 100 rows since the first sample");
+        // the old rows leave the window: at 100 s only the samples from 40 s on count
+        w.push(at(40), 1200, 590);
+        w.push(at(100), 1400, 790);
+        assert_eq!(w.rate(at(100)), Some(1.0), "200 of 200 rows since the sample 60 s back");
+        // the engine restarted: the counters began again
+        w.push(at(101), 50, 5);
+        assert_eq!(w.rate(at(101)), None, "counters went back: start over");
+        w.push(at(102), 150, 105);
+        assert_eq!(w.rate(at(102)), Some(1.0));
+    }
+
+    #[test]
+    fn the_hit_rate_is_kept_by_the_telemetry() {
+        let t = Telemetry::new();
+        assert_eq!(t.engram_hit_rate(), None);
+        t.set_stats(EngineStats { engram_lookups: 100, engram_hits: 50, ..Default::default() });
+        t.set_stats(EngineStats { engram_lookups: 200, engram_hits: 100, ..Default::default() });
+        assert_eq!(t.engram_hit_rate(), Some(0.5));
     }
 
     fn stats() -> EngineStats {

@@ -12,12 +12,15 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <thread>
 #include <vector>
 
 #include "common/check.h"
 #include "engram/cache.h"
+#include "engram/rowcache.h"
 #include "engram/engram.h"
 #include "engram/uring.h"
 #include "weights/safetensors.h"
@@ -38,34 +41,6 @@ inline uint64_t now_ns() {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
       .count();
 }
-
-// The hot-row cache: a CLOCK index over slots of kRowBytes.
-struct RowCache {
-  ClockIndex idx;
-  uint8_t* data = nullptr;
-
-  void init(size_t bytes) {
-    const size_t slots = bytes / kRowBytes;
-    if (!slots) return;
-    data = static_cast<uint8_t*>(big_alloc(slots * kRowBytes));
-    idx.init(slots);
-  }
-  ~RowCache() {
-    if (data) munmap(data, idx.slots() * kRowBytes);
-  }
-  void clear() { idx.clear(); }
-  const uint8_t* find(uint64_t key) {
-    const uint32_t s = idx.find(key);
-    return s == kNoSlot ? nullptr : data + size_t(s) * kRowBytes;
-  }
-  // Returns true if a row was evicted.
-  bool insert(uint64_t key, const uint8_t* rec) {
-    bool evicted;
-    const uint32_t s = idx.insert(key, &evicted);
-    if (s != kNoSlot) std::memcpy(data + size_t(s) * kRowBytes, rec, kRowBytes);
-    return evicted;
-  }
-};
 
 }  // namespace
 
@@ -137,6 +112,34 @@ struct Store::Impl {
   std::atomic<uint32_t> futex_word{0};
   std::atomic<bool> sleeping{false}, stop{false};
   std::atomic<int> clear_state{0};
+  // a live resize: the control thread posts a target and a request, the worker works through it a slice a pass
+  enum : int { kRzIdle, kRzReq, kRzRun, kRzDone, kRzFailed };
+  std::atomic<int> rz_state{kRzIdle};
+  std::atomic<uint64_t> rz_target{0}, rz_slots{0}, rz_block{0}, rz_rss0{0}, rz_rss1{0}, rz_huge1{0}, rz_ms{0};
+  uint64_t rz_t0 = 0;
+#ifdef DSGB10_TEST_FAULTS
+  // DSGB10_ENGRAM_BREAK=<layer>:<row>: that row has its first byte flipped in what the request receives, whether the row came
+  // from the cache or from the disk (a test build's control: every rank serves the same value, whatever its cache holds, so the
+  // ranks' states stay equal and the output differs); <layer>:all: every row of that layer (a control that needs no knowledge
+  // of which rows a prompt reads)
+  uint64_t break_key = kNoKey;
+  int break_layer = -1;
+  bool break_logged = false;
+  void read_break() {
+    const char* e = std::getenv("DSGB10_ENGRAM_BREAK");
+    int l = 0;
+    unsigned long r = 0;
+    char all[4] = {};
+    if (e && std::sscanf(e, "%d:%3s", &l, all) == 2 && std::strcmp(all, "all") == 0) break_layer = l;
+    else if (e && std::sscanf(e, "%d:%lu", &l, &r) == 2) break_key = key_of(l, uint32_t(r));
+  }
+  bool broken(uint64_t key) const { return key == break_key || (break_layer >= 0 && int(key >> 32) == break_layer); }
+  void serve_break(uint64_t key, uint8_t* dest) {
+    if (!broken(key)) return;
+    dest[0] ^= 1;
+    if (!break_logged) std::fprintf(stderr, "engram: test break: row %llx served with a flipped byte\n", (unsigned long long)key), break_logged = true;
+  }
+#endif
   std::thread worker;
 
   std::atomic<uint64_t> st_requests{0}, st_lookups{0}, st_hits{0}, st_joined{0}, st_reads{0}, st_bytes{0},
@@ -162,7 +165,15 @@ struct Store::Impl {
     inflight.init(max_miss * 2);
     waiters.resize(max_wait);
     for (size_t i = max_wait; i-- > 0;) free_waiters.push_back(uint32_t(i));
-    cache.init(cfg.cache_bytes);
+    if (cfg.cache_max_bytes) {
+      if (!cache.init_growable(cfg.cache_max_bytes, cfg.display_region, cfg.display_bytes))
+        die("engram: cannot reserve address space for a cache of %zu MiB", cfg.cache_max_bytes >> 20);
+    } else {
+      cache.init(cfg.cache_bytes, cfg.display_region, cfg.display_bytes);
+    }
+#ifdef DSGB10_TEST_FAULTS
+    read_break();
+#endif
     worker = std::thread([this] { run(); });
   }
 
@@ -270,6 +281,9 @@ struct Store::Impl {
           const uint64_t key = key_of(r.layer, row);
           if (const uint8_t* hit = cache.find(key)) {
             std::memcpy(dest, hit, kRowBytes);
+#ifdef DSGB10_TEST_FAULTS
+            serve_break(key, dest);
+#endif
             hits++;
           } else {
             if (free_waiters.empty()) {
@@ -432,6 +446,9 @@ struct Store::Impl {
     for (uint32_t wi = m.waiters; wi != kNone;) {
       const Waiter w = waiters[wi];
       std::memcpy(w.dest, rec, kRowBytes);
+#ifdef DSGB10_TEST_FAULTS
+      serve_break(m.key, w.dest);
+#endif
       Active& a = q[w.req % kQ];
       if (--a.pending == 0 && a.scanned) complete(a);
       free_waiters.push_back(wi);
@@ -444,6 +461,35 @@ struct Store::Impl {
     free_slots.push_back(si);
     n_inflight_reads--;
     retire();
+  }
+
+  // The worker's share of a live resize: starts a posted one, then one slice of the running one. True while it has work.
+  bool resize_pass() {
+    int rs = rz_state.load(std::memory_order_acquire);
+    if (rs == kRzReq) {
+      uint64_t rss, huge;
+      cache.block().resident(&rss, &huge);
+      rz_rss0.store(rss, std::memory_order_relaxed);
+      rz_t0 = now_ns();
+      if (!cache.resize_begin(size_t(rz_target.load(std::memory_order_relaxed)))) {
+        rz_state.store(kRzFailed, std::memory_order_release);
+        return false;
+      }
+      rz_state.store(kRzRun, std::memory_order_release);
+      rs = kRzRun;
+    }
+    if (rs != kRzRun) return false;
+    const Step st = cache.resize_step();
+    if (st == Step::More) return true;
+    uint64_t rss = 0, huge = 0;
+    cache.block().resident(&rss, &huge);
+    rz_rss1.store(rss, std::memory_order_relaxed);
+    rz_huge1.store(huge, std::memory_order_relaxed);
+    rz_slots.store(cache.slots(), std::memory_order_relaxed);
+    rz_block.store(cache.block().committed_total(), std::memory_order_relaxed);
+    rz_ms.store((now_ns() - rz_t0) / 1000000, std::memory_order_relaxed);
+    rz_state.store(st == Step::Done ? kRzDone : kRzFailed, std::memory_order_release);
+    return false;
   }
 
   void run() {
@@ -459,6 +505,7 @@ struct Store::Impl {
     last_io = last;
     for (;;) {
       bool did = scan();
+      did |= resize_pass();
       if (issue()) {
         ring->submit();
         did = true;
@@ -497,7 +544,8 @@ struct Store::Impl {
       const uint32_t v = futex_word.load(std::memory_order_seq_cst);
       sleeping.store(true, std::memory_order_seq_cst);
       if (q_tail.load(std::memory_order_seq_cst) == q_scan && !stop.load(std::memory_order_seq_cst) &&
-          clear_state.load(std::memory_order_seq_cst) != 1)
+          clear_state.load(std::memory_order_seq_cst) != 1 &&
+          (rz_state.load(std::memory_order_seq_cst) == kRzIdle || rz_state.load(std::memory_order_seq_cst) >= kRzDone))
         syscall(SYS_futex, &futex_word, FUTEX_WAIT_PRIVATE, v, top, nullptr, 0);
       sleeping.store(false, std::memory_order_seq_cst);
       // `last` stays: a request that woke us counts as work on the next pass, a timeout does not
@@ -509,6 +557,7 @@ Store::Store(const StoreConfig& cfg, const HashMap& map) : impl_(std::make_uniqu
 Store::~Store() = default;
 void Store::submit(const Request& r) { impl_->submit(r); }
 const Split& Store::split() const { return impl_->sp; }
+size_t Store::cache_display_bytes() const { return impl_->cache.split * kRowBytes; }
 
 StoreStats Store::stats() const {
   StoreStats s;
@@ -521,6 +570,45 @@ StoreStats Store::stats() const {
   s.evictions = impl_->st_evictions.load(std::memory_order_relaxed);
   s.pad_reads = impl_->st_pads.load(std::memory_order_relaxed);
   return s;
+}
+
+size_t Store::cache_max_bytes() const { return impl_->cfg.cache_max_bytes; }
+
+bool Store::resize_begin(size_t cache_bytes) {
+  if (!impl_->cfg.cache_max_bytes || cache_bytes > impl_->cfg.cache_max_bytes) return false;
+  const size_t slots = cache_bytes / kRowBytes;
+  int idle = Impl::kRzIdle;
+  if (slots == impl_->rz_slots.load(std::memory_order_relaxed) || impl_->rz_state.load(std::memory_order_acquire) != idle) return false;
+  impl_->rz_target.store(slots, std::memory_order_relaxed);
+  impl_->rz_state.store(Impl::kRzReq, std::memory_order_seq_cst);
+  impl_->wake();
+  return true;
+}
+
+Store::Resize Store::resize_state() const {
+  switch (impl_->rz_state.load(std::memory_order_acquire)) {
+    case Impl::kRzReq:
+    case Impl::kRzRun: return Resize::Running;
+    case Impl::kRzDone: return Resize::Done;
+    case Impl::kRzFailed: return Resize::Failed;
+    default: return Resize::Idle;
+  }
+}
+
+void Store::resize_ack() {
+  const int s = impl_->rz_state.load(std::memory_order_acquire);
+  if (s == Impl::kRzDone || s == Impl::kRzFailed) impl_->rz_state.store(Impl::kRzIdle, std::memory_order_release);
+}
+
+Store::CacheInfo Store::cache_info() const {
+  CacheInfo c;
+  c.slots = impl_->rz_slots.load(std::memory_order_relaxed);
+  c.block_bytes = impl_->rz_block.load(std::memory_order_relaxed);
+  c.rss_before = impl_->rz_rss0.load(std::memory_order_relaxed);
+  c.rss_after = impl_->rz_rss1.load(std::memory_order_relaxed);
+  c.huge_after = impl_->rz_huge1.load(std::memory_order_relaxed);
+  c.resize_ms = impl_->rz_ms.load(std::memory_order_relaxed);
+  return c;
 }
 
 void Store::clear_cache() {

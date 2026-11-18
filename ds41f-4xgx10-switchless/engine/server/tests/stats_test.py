@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The dashboard's frames from the engine (docs/protocol.md, version 4): HELLO's keep_positions and STATS version 2 (34
+"""The dashboard's frames from the engine (docs/protocol.md, version 4): HELLO's keep_positions and STATS version 2 (35
 fields), read off rank 0's socket while the engine does things the counts must show: (a) at the start the pool is all free
 and keep_positions = (numbers + disk bytes / number_bytes) x 16,384 / 5; (b) after a request free + held = numbers; (c) after
 a fork numbers are shared; (d) after release nothing is held.
@@ -21,7 +21,9 @@ NAMES = ['pool_numbers', 'pool_free', 'pool_held', 'pool_shared', 'pool_reserved
          'disk_cap_bytes', 'disk_used_bytes', 'spills_total', 'spill_bytes_total', 'spills_pending', 'restores_total',
          'restore_bytes_total', 'restored_tokens_total', 'restore_wait_ns_total', 'restore_wait_max_ns',
          'il_on', 'il_whole_rows', 'il_push_rows', 'il_gap_ms', 'il_share', 'il_burst_max_ms', 'il_reading', 'il_queued',
-         'keep_days', 'extend', 'ctx_limit', 'ranks']
+         'keep_days', 'extend', 'ctx_limit', 'ranks', 'image_numbers',
+         'engram_cache_bytes', 'engram_groups', 'engram_pending_mib', 'engram_lookups', 'engram_hits', 'engram_lend_ok_total',
+         'engram_lend_failed_total', 'lent_owed_groups', 'engram_huge_pct', 'engram_evictions']
 S0 = 0x7374617400000000  # 'stat'
 fails = 0
 
@@ -60,6 +62,7 @@ def main():
     check(e.version == 4 and ver == 2 and n == len(NAMES), 'protocol %d, STATS version %d with %d fields' % (e.version, ver, n))
     check(s['ctx_limit'] == e.max_ctx and s['ranks'] == 4,
           'a request may use %d tokens (HELLO max_context %d), on %d ranks' % (s['ctx_limit'], e.max_ctx, s['ranks']))
+    check(s['image_numbers'] == 0, 'no image rows held at the start')
     check(s['extend'] == 1, 'extend (Extend context) is %d: on at the default start' % s['extend'])
     check(s['pool_numbers'] == a.numbers and s['pool_free'] == a.numbers and s['pool_held'] == 0,
           'the pool: %d numbers, %d free, %d held' % (s['pool_numbers'], s['pool_free'], s['pool_held']))

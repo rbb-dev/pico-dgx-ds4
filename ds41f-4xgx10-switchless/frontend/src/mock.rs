@@ -115,7 +115,7 @@ async fn connection(stream: UnixStream, cfg: MockConfig, sessions: Sessions) {
                 let (tx, cfg, sessions, cancels) = (tx.clone(), cfg.clone(), sessions.clone(), cancels.clone());
                 tokio::spawn(async move {
                     let req_id = s.req_id;
-                    generate(s, flag, &tx, &cfg, &sessions).await;
+                    generate(s, flag, &tx, &cfg, &sessions, ver).await;
                     cancels.lock().unwrap().remove(&req_id);
                 });
             }
@@ -155,11 +155,12 @@ struct MockIl {
     ssd_gib: u64,
     keep_days: u64,
     extend: u64,
+    engram_mib: u64,
 }
 
 impl Default for MockIl {
     fn default() -> Self {
-        MockIl { on: 1, whole_rows: 32768, push_rows: 131072, gap_ms: 600, share: 40, burst_max_ms: 1000, ssd_gib: 256, keep_days: 30, extend: 1 }
+        MockIl { on: 1, whole_rows: 32768, push_rows: 131072, gap_ms: 600, share: 40, burst_max_ms: 1000, ssd_gib: 256, keep_days: 30, extend: 1, engram_mib: 2032 }
     }
 }
 
@@ -185,6 +186,9 @@ impl MockIl {
         }
         if c.extend == 0 || c.extend == 1 {
             self.extend = c.extend as u64;
+        }
+        if c.engram_mib >= 0 {  // the engine clamps to its --engram-cache-max-mib (16,384 by default)
+            self.engram_mib = (c.engram_mib as u64).min(16384);
         }
         if (10..=90).contains(&c.share) {
             self.share = c.share as u64;
@@ -242,6 +246,17 @@ fn stats(cfg: &MockConfig, sessions: &Sessions, il: &MockIl) -> EngineStats {
         // as the engine: the start window with extend on, at most 1,048,576 with it off; four ranks
         ctx_limit: if il.extend == 1 { cfg.max_context as u64 } else { (cfg.max_context as u64).min(1_048_576) },
         ranks: 4,
+        image_numbers: 0,
+        engram_cache_bytes: il.engram_mib << 20,
+        engram_groups: il.engram_mib / 145,
+        engram_pending_mib: 0,
+        engram_lookups: finished * 1000,
+        engram_hits: finished * 900,
+        engram_lend_ok_total: 0,
+        engram_lend_failed_total: 0,
+        lent_owed_groups: 0,
+        engram_huge_pct: 100,
+        engram_evictions: finished * 10,
     }
 }
 
@@ -249,7 +264,7 @@ fn lcp(a: &[u32], b: &[u32]) -> usize {
     a.iter().zip(b).take_while(|(x, y)| x == y).count()
 }
 
-async fn generate(s: Submit, cancel: Arc<AtomicBool>, tx: &mpsc::UnboundedSender<Vec<u8>>, cfg: &MockConfig, sessions: &Sessions) {
+async fn generate(mut s: Submit, cancel: Arc<AtomicBool>, tx: &mpsc::UnboundedSender<Vec<u8>>, cfg: &MockConfig, sessions: &Sessions, ver: u32) {
     let t0 = Instant::now();
     let mut done = Done {
         req_id: s.req_id,

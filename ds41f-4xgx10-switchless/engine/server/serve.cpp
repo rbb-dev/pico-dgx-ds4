@@ -79,6 +79,7 @@
 
 #include "common/check.h"
 #include "common/heap.h"
+#include "model/lend.h"
 #include "model/nvtx.h"
 #include "common/frontend_protocol.h"
 #include "common/keepfile.h"
@@ -534,7 +535,16 @@ void add(DecodeEnd& a, const DecodeEnd& b) {
 class Server {
  public:
   Server(model::Model& m, comm::Ring& ring, Watchdog& wd, const ServeOptions& o, Io& io, size_t budget)
-      : m_(m), ring_(ring), wd_(wd), o_(o), io_(io), budget_(budget), slot_(m.slots(), 0), il_(o.interleave), keep_age_s_(o.keep_age_s), extend_(o.extend) {}
+      : m_(m), ring_(ring), wd_(wd), o_(o), keep_age_s_(o.keep_age_s), extend_(o.extend), io_(io), budget_(budget), slot_(m.slots(), 0), il_(o.interleave) {
+    engram_set_mib_ = engram_goal_mib_ = o.engram_mib;
+    loan_mib_ = m.prefill_loan_mib(), loan_groups_ = m.prefill_loan_groups();
+    loan_goal_ = loan_mib_ > 0 && m.tenant_group_count(model::lend::kTenantPrefill) > 0 ? 1 : -1;
+    if (rowsloan::start_backoff(loan_mib_ > 0, m.tenant_group_count(model::lend::kTenantPrefill)))
+      loan_backoff_.fail((uint64_t)loan_mib_, now_s(), loan_gen_);  // a start that made no set does not ask again at once
+    // a start that made less than was asked for (cut, or the hand-over failed) is not tried again at once
+    if (m.engram_lend_enabled() && (int64_t)m.engram_lend_info().mib != engram_goal_mib_)
+      engram_backoff_.fail((uint64_t)engram_goal_mib_, now_s(), engram_gen_);
+  }
 
   // Requests let go after their session's last one ended first, then those that waited for a slot (when
   // one is there), then the front-end's frames, then a run of the requests decoding (run).
@@ -542,6 +552,7 @@ class Server {
     while (!g_stop) {
       fe::Config cf;
       if (io_.take_config(cf)) apply_config(cf);
+      lend_tick();
       publish();
       sweep();
       if (!pfq_.empty()) {  // interleaved prefill: long prompts and decoders take turns
@@ -1342,6 +1353,13 @@ class Server {
       std::printf("serve: extend context %s: %s\n", extend_ ? "on" : "off",
                   extend_ ? "the factor per request, up to the context" : "the 1,048,576-token window only");
     }
+    const int64_t emib = std::min<int64_t>(c.engram_mib, o_.engram_max_mib);  // at most the block's address space (int32 on the ring)
+    if (emib >= 0 && m_.engram_lend_enabled() && emib != engram_set_mib_) {  // the Engram cache's size, MiB
+      engram_set_mib_ = engram_goal_mib_ = emib;
+      ++engram_gen_;  // a size that failed is tried again for a new setting
+      engram_next_ = 0;
+      std::printf("serve: the Engram cache goes to %lld MiB at the next run boundary\n", (long long)emib);
+    }
     published_ = 0;  // the next STATS shows it
     std::printf("serve: interleave settings: %s, whole %d rows, push %d rows, gap %d ms, share %d %%, window at most %d ms\n",
                 il_.on ? "on" : "off", il_.whole_rows, il_.push_rows, il_.gap_ms, il_.share, il_.burst_max_ms);
@@ -1877,7 +1895,9 @@ class Server {
           persist_slot(t, true, holds(sid, base));
         });
     if (!short_by(n)) return true;
-    return may_close && close_unused_window() && !short_by(n);
+    if (may_close && close_unused_window() && !short_by(n)) return true;
+    if (may_close) engram_give_way();  // the last tier: the answer is still no; the group arrives and the consumer asks again
+    return false;
   }
   // A slot for a session that holds none, among those that hold `need` positions (with big slots, the small
   // ones first): a free one; else the least recently used one whose session no request uses (its state goes
@@ -2279,6 +2299,15 @@ class Server {
     sf.keep_days = (uint64_t)(keep_age_s_ / 86400);
     sf.extend = extend_ ? 1 : 0;
     sf.ctx_limit = (uint64_t)ctx_limit(), sf.ranks = (uint64_t)model::kRanks;
+    if (m_.engram_lend_enabled()) {
+      const model::Model::EngramLendInfo li = m_.engram_lend_info();
+      sf.engram_cache_bytes = li.slots * engram::kRowBytes, sf.engram_groups = li.groups;
+      sf.engram_pending_mib = li.running ? li.pending_mib : (int64_t)li.mib != engram_goal_mib_ ? (uint64_t)engram_goal_mib_ : 0;
+      sf.engram_lookups = li.lookups, sf.engram_hits = li.hits;
+      sf.engram_lend_ok_total = li.ok_total, sf.engram_lend_failed_total = li.failed_total;
+      sf.engram_huge_pct = li.huge_pct, sf.engram_evictions = li.evictions;
+    }
+    sf.lent_owed_groups = (uint64_t)std::max(0, m_.window_owed());
     if (model::copy::mode() & model::copy::kAdapt) {
       sf.copy_adapt = 1, sf.copy_proposals_total = copy_proposals_total_, sf.copy_scored_total = copy_scored_total_;
       sf.copy_first_right_total = copy_first_right_total_, sf.copy_rows_verified_total = copy_rows_verified_total_;
@@ -2505,6 +2534,60 @@ class Server {
       for (const Request& r : *d)
         if (factor_for((int64_t)r.prompt.size()) == factor) return true;
     return false;
+  }
+  // The Engram cache's size: the goal (the setting, or lower while the cache gave way) is asked of the model at a run boundary
+  // (kCmdLend begin) and the change finished when every rank's worker has (kCmdLend poll, every 100 ms until then). A refused
+  // or failed size is not asked for again for five minutes unless the setting changes; a request that finds the pool's
+  // runners in the way is asked again in a second. What a closed window or a finished change owes the pool is settled here too.
+  void lend_tick() {
+    if (!m_.engram_lend_enabled()) return;
+    const double t = now_s();
+    if (m_.window_owed() > 0 && t - win_settled_ >= 5) settle_windows();
+    const model::Model::EngramLendInfo li = m_.engram_lend_info();
+    Cmd c{};
+    c.op = kCmdLend;
+    if (li.running) {
+      if (t < engram_poll_at_) return;
+      engram_poll_at_ = t + 0.1;
+      c.rows = model::Model::kLendPoll;
+    } else {
+      if ((int64_t)li.mib == engram_goal_mib_ || t < engram_next_ || engram_backoff_.blocked((uint64_t)engram_goal_mib_, t, engram_gen_)) return;
+      c.rows = model::Model::kLendBegin, c.pos0 = (int32_t)engram_goal_mib_;
+    }
+    wd_.started = now_s();
+    issue(c);
+    const int st = run_lend(m_, c);
+    wd_.started = 0;
+    digest("engram lend");
+    forget_evicted();
+    using M = model::Model;
+    if (st == M::kLendPending) {
+      engram_poll_at_ = now_s() + 0.05;
+    } else if (st == M::kLendDone) {
+      win_retry_at_ = 0;  // groups came back to the pool: a consumer that waited for them asks again at once
+    } else if (st == M::kLendBusy) {
+      engram_next_ = now_s() + 1.0;  // running requests hold what the cut takes
+    } else if (st == M::kLendSame || st == M::kLendNoRoom || st == M::kLendFailed) {
+      engram_backoff_.fail((uint64_t)engram_goal_mib_, now_s(), engram_gen_);
+      if (st == M::kLendFailed) win_retry_at_ = 0;  // its groups are back in the pool, or owed
+      if (st == M::kLendSame)
+        std::printf("serve: the Engram cache stays at %llu MiB (the pool cannot lend more; %lld MiB asked for)\n", (unsigned long long)m_.engram_lend_info().mib,
+                    (long long)engram_goal_mib_);
+    }
+  }
+  // A consumer is short, no line has anything left and no window can be closed: the Engram cache gives up one group, when its
+  // floor (--engram-cache-min-mib) is below its size. The cache is smaller until the setting changes; what it gives arrives at
+  // the change's poll, which wakes the consumer. With the floor at the set size (the default) the cache never gives way.
+  void engram_give_way() {
+    if (!m_.engram_lend_enabled() || o_.engram_min_mib < 0) return;
+    const model::Model::EngramLendInfo li = m_.engram_lend_info();
+    if (li.running || li.groups < 1 || (int64_t)li.mib <= o_.engram_min_mib) return;
+    const int64_t to = std::max<int64_t>(o_.engram_min_mib, (int64_t)m_.engram_mib_for_groups((int)li.groups - 1));
+    if (to >= (int64_t)li.mib) return;
+    std::printf("serve: a request needs the pool's memory: the Engram cache gives up a group, %llu -> %lld MiB\n", (unsigned long long)li.mib, (long long)to);
+    engram_goal_mib_ = to;
+    engram_next_ = 0;
+    engram_backoff_ = model::lend::Backoff();
   }
   // The window to give back when a consumer is short and no line has anything left: the least recently used open one that
   // no request needs (a paused flight is in rot_, so its window is never closed under it). Closes it, settles what the
@@ -2761,6 +2844,10 @@ class Server {
                                              // those waiting for a slot
   std::set<uint64_t> flying_, later_;  // the sessions in flight; RELEASEs of them, applied at their end
   double win_used_[3] = {};   // when each factor's window was last used (index: win_level)
+  int64_t engram_set_mib_ = 0, engram_goal_mib_ = 0;  // the Engram cache's size: the setting, and what the server steers to (lower after it gave way)
+  uint64_t engram_gen_ = 1;                          // changes with the setting: a failed size is tried again
+  double engram_poll_at_ = 0, engram_next_ = 0;
+  model::lend::Backoff engram_backoff_;
   double win_retry_at_ = 0;   // a window refused for lack of memory is not asked for again before this
   double win_note_ = 0, win_settled_ = 0;
   int win_fails_ = 0;
