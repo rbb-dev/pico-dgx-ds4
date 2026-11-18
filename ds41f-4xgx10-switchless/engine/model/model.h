@@ -217,6 +217,8 @@ class Model {
     uint32_t top = 0;
     int64_t removed = 0;
     std::vector<WindowHolder> holders;
+    int64_t image_numbers = 0;  // numbers >= top that image flights hold (they cannot move: the window waits for those flights)
+    int image_flights = 0;      // how many flights hold them
   };
   WindowPlan window_plan(int f, int g) const;
   // The groups factor f's window needs by this rank's own estimate (window_open takes the largest of every rank's, so the
@@ -264,7 +266,8 @@ class Model {
   int slot_uncommitted() const;                // chunks no slot holds or has reserved
   int slot_chunks_total() const;               // chunks the pool made
   int slot_chunks_peak() const;                // most chunks mapped at once
-  void slot_reserve(int s, int need);
+  // `img`: numbers also reserved for the request's image rows, which image_take takes next (counted like the reservation)
+  void slot_reserve(int s, int need, int img = 0);
   void slot_unreserve(int s);  // slot s's reservation to 0: its request has finished (the line keeps what it holds)
   void slot_release(int s);
   void slot_attach(int s, int h);  // slot s's unit holds stored session h from now on (no copy: its rows are h's)
@@ -332,11 +335,22 @@ class Model {
   // CED chunks of one run (each chunk starting where the one before ended), P >= 128. Of the snapshots
   // only one at P covers the decoder layers; the others hold the encoder layers' rings only.
   void set_tokens(int pos0, int n, const int32_t* tokens);
-  // Vision (docs/vision.md): image spans [lo[i], hi[i]) of the current slot's sequence and their rows
-  // (bf16 [sum (hi - lo)][kDim], copied), the current slot's: used by its prefill chunks until set_images(0, ...):
-  // the rows replace the embeddings there, the span routes with ffn.gate.bias_vl and Engram leaves it
-  // alone. The history (set_tokens) must hold -1 at those positions. Text requests never call it.
-  void set_images(int n, const int32_t* lo, const int32_t* hi, const uint16_t* rows);
+  // Vision (docs/vision.md): image spans [lo[i], hi[i]) of the current slot's sequence, whose rows are flight `key`'s in the
+  // store (image_take, image_fill): used by its prefill chunks until set_images(0, ...) (which leaves the rows where they
+  // are): the rows replace the embeddings there, the span routes with ffn.gate.bias_vl and Engram leaves it alone. The
+  // history (set_tokens) must hold -1 at those positions. A request's every go sets the spans again and sends no rows.
+  // Text requests never call it.
+  void set_images(int n, const int32_t* lo, const int32_t* hi, int key);
+  // A flight's rows in the store (model/img_rows.h; the same on every rank): image_take takes the numbers for `rows` rows
+  // (false: a key that holds rows already, or no room), clearing slot `slot`'s reservation (slot_reserve's `img`); image_fill
+  // writes rows [row0, row0 + n) from host memory, n at most kImgStageRows; image_free gives a flight's numbers back (key 0:
+  // every flight's); image_numbers counts the numbers the flights hold. state_free does not touch them: a flight's rows
+  // outlive the session handle its conversation has at any one time.
+  static constexpr size_t kImgStageRows = 408;  // two numbers' rows, 4,177,920 B: the staging buffer's piece
+  bool image_take(int key, size_t rows, int slot);
+  void image_fill(int key, size_t row0, size_t n, const uint16_t* src);
+  void image_free(int key);
+  size_t image_numbers() const;
   void prefill_lookup(int a, int M);
   // The prefill path's buffers and the weights it gathers, made now instead of by the first prefill:
   // every rank at the same point, after set_engram(). This rank's allocations come before ring's host
@@ -468,7 +482,7 @@ class Model {
   // shared by more than one, reserved for the running requests' horizons and not yet held; one number's bytes; the
   // conversations on lines, idle in memory, in the disk tier, and those naming a shared number.
   struct PoolStats {
-    uint64_t numbers = 0, free = 0, held = 0, shared = 0, reserved = 0, number_bytes = 0;
+    uint64_t numbers = 0, free = 0, held = 0, shared = 0, reserved = 0, number_bytes = 0, image_numbers = 0;
     uint64_t on_lines = 0, in_memory = 0, on_disk = 0, sharing = 0;
   };
   PoolStats pool_stats() const;

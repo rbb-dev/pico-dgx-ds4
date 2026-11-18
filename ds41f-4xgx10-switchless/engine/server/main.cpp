@@ -188,6 +188,7 @@
 #include "server/cmd.h"
 #include "server/golden.h"
 #include "server/serve.h"
+#include "vision/vit_device.h"
 #include "weights/loader.h"
 
 namespace {
@@ -377,6 +378,7 @@ struct Args {
   bool spec = false, no_spec = false, draft_fp8 = false, draft_bf16 = false, draft_head4 = false, draft_markov8 = false;
   bool head_raw = false, no_l2pf = false;
   std::string draft_weights;  // --draft-weights FILE: the drafter (mtp.*) from this rank file instead of --weights
+  std::string vision_weights;  // --vision-weights FILE: this rank's quarter of the image encoder (dsw_convert --vision), loaded before the store is sized
   std::string ablit;          // --ablit FILE: the runtime abliteration (model/ablit.h); requests opt in per request
   int node_stats_port = 9760;  // serve: the dashboard's node sampler on this rank's first link address (0: none)
   std::string node_stats_addr, node_stats_rails[2];  // from the fleet file: that address, the rails' devices
@@ -401,6 +403,7 @@ Args parse(int argc, char** argv) {
     else if (s == "--golden") a.golden = val();
     else if (s == "--weights") a.weights = val();
     else if (s == "--draft-weights") a.draft_weights = val();
+    else if (s == "--vision-weights") a.vision_weights = val();
     else if (s == "--hashmap") a.hashmap = val();
     else if (s == "--shard1") a.shard[0] = val();
     else if (s == "--shard14") a.shard[1] = val();
@@ -579,6 +582,7 @@ Args parse(int argc, char** argv) {
   };
   path(a.weights, me.weights, "WEIGHTS", "--weights");
   if (!a.draft_weights.empty()) a.draft_weights = comm::fleet_path(a.draft_weights, a.rank);
+  if (!a.vision_weights.empty()) a.vision_weights = comm::fleet_path(a.vision_weights, a.rank);
   if (!a.no_engram) {
     path(a.hashmap, me.hashmap, "HASHMAP", "--hashmap");
     std::string dir = me.engram;
@@ -778,6 +782,40 @@ int main(int argc, char** argv) {
     std::printf("rank %d: the head coded in %.2f s: %.1f MB in place of %.1f (%d tiles raw)\n", a.rank, now_s() - t1,
                 hb / 1e6, (double)model::kVocabPart * model::kDim * 2 / 1e6, raw);
   }
+  // 3a. copy drafting's settings (DSGB10_COPY*, the table file's bytes) must be one set on the four ranks: a rank that differs verifies
+  // other rows than the others and the ranks stop at the next collective. Every rank makes this call, whatever its own settings.
+  {
+    const model::copy::Settings mine = model::copy::settings();
+    model::copy::Settings all[comm::kRanks];
+    ring.allgather_host(&mine, all, sizeof mine, comm::kCallCopyAgree);
+    for (int r = 0; r < comm::kRanks; ++r)
+      if (std::memcmp(&all[r], &mine, sizeof mine) != 0)
+        die("rank %d: copy drafting settings differ between the ranks (mode bits %u %u %u %u, shortest match %u %u %u %u, table file hash "
+            "%016llx %016llx %016llx %016llx): set DSGB10_COPY, DSGB10_COPY_DUMP, DSGB10_COPY_ADAPT, DSGB10_COPY_MIN and DSGB10_COPY_TABLE alike "
+            "on every Spark", a.rank, all[0].mode, all[1].mode, all[2].mode, all[3].mode, all[0].min_match, all[1].min_match, all[2].min_match,
+            all[3].min_match, (unsigned long long)all[0].table_hash, (unsigned long long)all[1].table_hash, (unsigned long long)all[2].table_hash,
+            (unsigned long long)all[3].table_hash);
+  }
+  // 3b. --vision-weights: this rank's quarter of the image encoder (dsw_convert --vision), into device memory before the
+  // store is sized, so the pool's offer is taken from what is left. The file is checked against the 266 tensors this rank
+  // must hold, and the four ranks compare a digest of their files before any byte is read: a file of another rank, another
+  // cut or another checkpoint ends the start on every rank (the same flag, and so the same collective, on every rank).
+  std::unique_ptr<vit::VisionWeights> vision;
+  if (!a.vision_weights.empty()) {
+    vision = std::make_unique<vit::VisionWeights>(a.vision_weights, a.rank);  // refuses another rank's file, or one that is not the rank's vision weights
+    const uint64_t mine = vision->digest();
+    uint64_t all[comm::kRanks];
+    ring.allgather_host(&mine, all, sizeof mine);
+    for (int r = 0; r < comm::kRanks; ++r)
+      if (all[r] != mine)
+        die("rank %d: the vision weight files are not one set: digests of ranks 0-3 %016llx %016llx %016llx %016llx "
+            "(cut them together, from one checkpoint, with dsw_convert --vision)", a.rank, (unsigned long long)all[0],
+            (unsigned long long)all[1], (unsigned long long)all[2], (unsigned long long)all[3]);
+    const dsw::LoadStats vs = vision->load(a.threads);
+    std::printf("rank %d: vision weights %s: %d tensors, %.2f MiB in %.2f s (%.2f GB/s), %.2f MiB on the device with the "
+                "padded patch embedding; set digest %016llx\n", a.rank, vision->path().c_str(), vision->tensors(),
+                vs.bytes / 1048576.0, vs.seconds, vs.gbps, vision->device_bytes() / 1048576.0, (unsigned long long)mine);
+  }
   // 4. Engram
   std::unique_ptr<engram::HashMap> emap;
   engram::Display display;  // before the store: released after it (munmap, GEM_CLOSE, close)
@@ -939,8 +977,54 @@ int main(int argc, char** argv) {
       if (a.pool_tokens >= 0) std::printf("--pool-tokens %lld: %llu", (long long)a.pool_tokens, (unsigned long long)by_tokens);
       if (a.pool_free_gib >= 0 && a.pool_tokens >= 0) std::printf(", the %s", a.pool_pick.c_str());
       std::printf("; free device / available host memory before it, ranks 0-3:");
-      for (const auto& r : all) std::printf(" %.2f / %.2f", r[0] / gib, r[1] / gib);
+      for (const auto& r : all) std::printf(" %.2f / %.2f", r.dfree / gib, r.avail / gib);
       std::printf(" GiB, the Engram cache's %.1f to grow)\n", cache / gib);
+      if (vision && a.pool_free_gib >= 0) {  // loaded before the reads above, so they are already lower by its bytes
+        const uint64_t vb = vision->device_bytes(), keep = (uint64_t)(a.pool_free_gib * gib);
+        std::printf("vision weights: %llu bytes on every rank (%.2f numbers of %.2f MiB); each rank's own offer is lower than without them, "
+                    "at the same readings, by:", (unsigned long long)vb, vb / (double)img, img / 1048576.0);
+        for (const auto& r : all)
+          std::printf(" %llu", (unsigned long long)(model::rules::pool_offer(have, r.dfree + vb, r.avail, keep, cache, img) -
+                                                   model::rules::pool_offer(have, r.dfree, r.avail, keep, cache, img)));
+        std::printf(" numbers\n");
+      }
+    }
+    // the ledger and the start check: with --pool-free-gib the fixed lines and the slack must fit in what the pool leaves free
+    rules::Ledger ledgers[rules::kRanks];
+    uint64_t projected[rules::kRanks];
+    for (int r = 0; r < rules::kRanks; ++r) {
+      ledgers[r] = all[r].ledger;
+      projected[r] = rules::projected_available(all[r].avail, (pool - have) * img, ledgers[r]);
+    }
+    const size_t keep_bytes = a.pool_free_gib >= 0 ? (size_t)(a.pool_free_gib * gib) : 0;
+    const rules::StartCheck chk = rules::start_check(ledgers, (uint64_t)(a.pool_slack_gib * gib), keep_bytes);
+    const std::string table = rules::ledger_table(ledgers, projected, (uint64_t)(a.pool_slack_gib * gib), keep_bytes, chk);
+    if (a.rank == 0) {
+      std::printf("%s", table.c_str());
+      if (!rules::unequal_lines(ledgers).empty()) std::printf("memory ledger: a line differs between ranks (marked above)\n");
+      for (int r = 0; r < rules::kRanks; ++r)
+        if (projected[r] < rules::kProjectedFloor)
+          std::printf("WARNING: rank %d is projected to have %.2f GiB of memory available once the pool, the Engram cache and "
+                      "the fixed lines are taken (below %.0f GiB)\n", r, projected[r] / gib, rules::kProjectedFloor / gib);
+    }
+    if (a.pool_free_gib >= 0 && chk.refuse)
+      die("the start is refused: rank %d's fixed lines and the slack need %.2f GiB, more than the %.1f GiB --pool-free-gib keeps free "
+          "(table above; lower --front-mib, --encoder-mib or --pool-slack-gib, or raise --pool-free-gib)", chk.worst, chk.need / gib,
+          a.pool_free_gib);
+    // the Engram cache from the pool's groups (model/lend.cu): the pool is made whole, so the groups that leave are real memory.
+    // A size the pool cannot lend is cut to what fits, a failed hand-over leaves the cache empty and the engine serving; the
+    // server asks again (a start is never refused by the cache)
+    if (carved && m.engram_lend_enabled()) {
+      int st = m.engram_lend(model::Model::kLendBegin, a.engram_cache_mib);
+      while (st == model::Model::kLendPending) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        st = m.engram_lend(model::Model::kLendPoll, 0);
+      }
+      const model::Model::EngramLendInfo li = m.engram_lend_info();
+      std::printf("rank %d: engram row cache: %llu MiB asked for, %llu MiB made (%llu groups of the pool, %.0f MiB resident in the block, "
+                  "%llu %% in huge pages)%s\n", a.rank, (unsigned long long)a.engram_cache_mib, (unsigned long long)li.mib,
+                  (unsigned long long)li.groups, li.block_bytes / 1048576.0, (unsigned long long)li.huge_pct,
+                  st == model::Model::kLendDone ? "" : li.reason[0] ? (std::string("; the hand-over failed: ") + li.reason).c_str() : "; not made now");
     }
   }
   ring.barrier();
@@ -952,6 +1036,7 @@ int main(int argc, char** argv) {
     nm.device_bytes = dtotal;
     nm.weights_bytes = std::filesystem::file_size(a.weights, ec);
     if (ec) nm.weights_bytes = 0;
+    if (vision) nm.weights_bytes += vision->device_bytes();
     nm.kv_bytes = m.state_capacity();
     const uint64_t used = dtotal - dfree;
     nm.work_bytes = used > nm.weights_bytes + nm.kv_bytes ? used - nm.weights_bytes - nm.kv_bytes : 0;

@@ -2,6 +2,8 @@
 //
 //   dsw_convert --ckpt DIR --rank R --out FILE [--world 4] [--threads 8] [--mem-gib 6]
 //   dsw_convert --ckpt DIR --rank R --plan         print the partition and sizes only
+//   dsw_convert --vision ...                        the vision weight file instead: the image encoder's tensors only
+//                                                   (a quarter of every large matrix, docs/vision.md), no GPU needed
 //
 // Reads with O_DIRECT (no page-cache build-up), one output tensor per task, bounded memory, and
 // writes FILE.tmp with O_DIRECT, renaming it to FILE once the TOC and header are in place. Tensors
@@ -147,7 +149,7 @@ void copy_piece(const Piece& p, int fd, uint64_t fsize, uint8_t* out, AlignedBuf
   }
 }
 
-void print_plan(const Plan& plan) {
+void print_plan(const Plan& plan, bool vision) {
   std::map<std::string, std::pair<uint64_t, int>> comp, lay;
   for (auto& o : plan.tensors) {
     comp[o.component].first += o.bytes;
@@ -155,8 +157,9 @@ void print_plan(const Plan& plan) {
     lay[layout_name(o.layout)].first += o.bytes;
     lay[layout_name(o.layout)].second++;
   }
-  std::printf("rank %d/%d: %zu tensors, file %.2f GiB, %zu checkpoint tensors left out (vision, Engram tables)\n",
-              plan.rank, plan.world, plan.tensors.size(), plan.file_bytes / 1073741824.0, plan.skipped.size());
+  std::printf("rank %d/%d: %zu tensors, file %.2f GiB, %zu checkpoint tensors left out (%s)\n",
+              plan.rank, plan.world, plan.tensors.size(), plan.file_bytes / 1073741824.0, plan.skipped.size(),
+              vision ? "the text model" : "vision, Engram tables");
   for (auto& [c, v] : comp) std::printf("  %-26s %9.3f GiB  %5d tensors\n", c.c_str(), v.first / 1073741824.0, v.second);
   std::printf("layouts:");
   for (auto& [c, v] : lay) std::printf("  %s %.3f GiB (%d)", c.c_str(), v.first / 1073741824.0, v.second);
@@ -169,7 +172,7 @@ int main(int argc, char** argv) {
   std::string ckpt, out, only;
   int rank = -1, world = 4, threads = 8;
   double mem_gib = 6;
-  bool plan_only = false, coverage = true;
+  bool plan_only = false, coverage = true, vision = false;
   for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
     auto next = [&]() -> std::string {
@@ -185,19 +188,21 @@ int main(int argc, char** argv) {
     else if (a == "--plan") plan_only = true;
     else if (a == "--no-coverage") coverage = false;
     else if (a == "--only") only = next();
+    else if (a == "--vision") vision = true;
     else die("unknown argument %s", a.c_str());
   }
   if (ckpt.empty() || rank < 0 || (!plan_only && out.empty()))
-    die("usage: dsw_convert --ckpt DIR --rank R (--out FILE | --plan) [--world 4] [--threads 8] [--mem-gib 6]");
+    die("usage: dsw_convert --ckpt DIR --rank R (--out FILE | --plan) [--vision] [--world 4] [--threads 8] [--mem-gib 6]");
 
   double t0 = now_s();
   Checkpoint ck = Checkpoint::open(ckpt);
   std::printf("checkpoint: %zu shards, %zu tensors (%.1f s)\n", ck.shards.size(), ck.tensors.size(), now_s() - t0);
   if (coverage) {
-    check_coverage(ck, world);
+    check_coverage(ck, world, vision);
     std::printf("coverage: every tensor is whole on every rank or cut into %d disjoint, complete pieces\n", world);
   }
-  Plan plan = make_plan(ck, rank, world);
+  Plan plan = vision ? make_vision_plan(ck, rank, world) : make_plan(ck, rank, world);
+  if (vision && plan.tensors.empty()) die("--vision: the checkpoint has no vision tensors to cut");
   if (!only.empty()) {  // a test file holding just the tensors whose names contain `only`
     std::erase_if(plan.tensors, [&](const OutTensor& o) { return o.name.find(only) == std::string::npos; });
     plan.data_offset = align_up(plan.toc_offset + plan.tensors.size() * sizeof(TocEntry));
@@ -205,7 +210,7 @@ int main(int argc, char** argv) {
     for (auto& o : plan.tensors) o.offset = off, off += align_up(o.bytes);
     plan.file_bytes = off;
   }
-  print_plan(plan);
+  print_plan(plan, vision);
   if (plan_only) return 0;
 
   // CUDA first: it can fail to start once the page cache has filled memory (docs/findings.md)

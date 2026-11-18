@@ -5,6 +5,10 @@ layouts after the kernels' tile functions (which wrote them) and layout.h (which
 It also confirms the cuts agree with the reference's tensor-parallel split (ref/inference/convert.py
 `mapping`) wherever ours follows it, and lists where it deliberately does not.
 
+A vision weight file (dsw_convert --vision: the image encoder's tensors, docs/vision-split) is recognised by its names
+(every tensor vision.*, aligner.* or image_*) and is checked the same way; it must also reference every such tensor of the
+checkpoint exactly once and hold no other.
+
 Run in the canary-roce image (it has torch and safetensors):
   docker run --rm -v CKPT:/models:ro -v DSWDIR:/dsw:ro -v REPO:/work dsv41-4x-spark:canary-roce \
       /opt/sglang/bin/python3 /work/engine/weights/check_dsw.py /models /dsw/rank0.dsw [--sample N]
@@ -64,7 +68,7 @@ def main():
     with open(path, "rb") as fh:
         h = HDR.unpack(fh.read(HDR.size))
         magic, version, _, rank, world, n, entry_bytes, toc_off, data_off = h[:9]
-        assert magic == b"DSGB10W1" and version in (1, 2) and entry_bytes == 512, h[:7]
+        assert magic == b"DSGB10W1" and version in (1, 2, 3) and entry_bytes == 512, h[:7]
         fh.seek(toc_off)
         toc = [ENT.unpack(fh.read(512)[: ENT.size]) for _ in range(n)]
         picks = range(n) if not sample else sorted(random.Random(0).sample(range(n), min(sample, n)))
@@ -104,12 +108,24 @@ def main():
                 bad += 1
                 print("MISMATCH", name)
             # agreement with the reference's own TP split where ours follows it
-            key = name.split(".")[-1] if name.endswith("attn_sink") else name.split(".")[-2]
+            parts = name.split(".")
+            key = parts[-1] if name.endswith("attn_sink") or len(parts) < 2 else parts[-2]  # image_start has no dot
             if key in REF_DIM:
                 ours = {2: 0, 3: 1}.get(kind)
                 if ours != REF_DIM[key]:
                     where = "indexer." if "indexer" in name else "markov_head." if "markov" in name else ""
                     deliberate.add(f"{where}{key}: reference splits dim {REF_DIM[key]}, here {KIND[kind]}")
+        names = [cstr(e[0]) for e in toc]
+        vision_name = lambda n: n.startswith(("vision.", "aligner.", "image_"))
+        if sample == 0 and names and all(vision_name(n) for n in names):
+            want_src = sorted(k for k in weight_map if vision_name(k))
+            got_src = sorted(cstr(e[1]) for e in toc)
+            if want_src != got_src:
+                bad += 1
+                print("MISMATCH vision sources: file has", len(got_src), "checkpoint has", len(want_src),
+                      "; missing", sorted(set(want_src) - set(got_src))[:5], "extra", sorted(set(got_src) - set(want_src))[:5])
+            else:
+                print(f"vision file: all {len(got_src)} vision tensors of the checkpoint, each once, and no other")
         print(f"{path}: version {version}, rank {rank}/{world}, checked {len(picks)} of {n} tensors with torch "
               f"slicing ({tiled} un-tiled with torch), {bad} bad")
         for d in sorted(deliberate):

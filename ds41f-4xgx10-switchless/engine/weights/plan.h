@@ -50,9 +50,14 @@ std::string normalize(const std::string& name);
 // fit its tiled layout.
 Plan make_plan(const Checkpoint& ck, int rank, int world);
 
+// The vision weight file's plan: the image encoder's tensors only (vision.*, aligner.*, image_*), each cut for `rank`
+// of `world` (four) as docs/vision.md lays out: wqkv, its bias and w1 in segments, wo, w2 and the aligner by output
+// rows, the rest whole. Names are the checkpoint's. Dies on a vision tensor the table does not know.
+Plan make_vision_plan(const Checkpoint& ck, int rank, int world);
+
 // Cross-rank check: for every source tensor, replicated ones are whole on every rank, split ones
-// are cut into disjoint pieces that together cover it exactly.
-void check_coverage(const Checkpoint& ck, int world);
+// are cut into disjoint pieces that together cover it exactly. `vision` checks the vision plan instead.
+void check_coverage(const Checkpoint& ck, int world, bool vision = false);
 
 // The TOC record for a planned tensor (crc32c left 0 for the caller).
 void fill_entry(const OutTensor& o, TocEntry& e);

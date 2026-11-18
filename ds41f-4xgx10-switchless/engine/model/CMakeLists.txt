@@ -21,6 +21,9 @@ target_include_directories(vmm_test PRIVATE ${CMAKE_SOURCE_DIR})
 add_executable(chunks_test tests/chunks_test.cpp chunks.cpp)
 target_include_directories(chunks_test PRIVATE ${CMAKE_SOURCE_DIR})
 
+# A request's image rows as store numbers: geometry, runs, the flights' ledger against the allocator, the reservation (host only)
+add_executable(img_rows_test tests/img_rows_test.cpp chunks.cpp)
+target_include_directories(img_rows_test PRIVATE ${CMAKE_SOURCE_DIR})
 
 # The lent groups' ledger, the hand-over proof, the cache's sizes and resize plan (lend.h) over the real allocator and the VMM
 # pool on a fake driver; host only, no GPU. Built with -DPICO_OLD_RULES its red cases fail

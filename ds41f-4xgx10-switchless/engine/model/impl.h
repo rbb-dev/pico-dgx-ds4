@@ -24,6 +24,7 @@
 #include "kernels/dsk.h"
 #include "model/ablit.h"
 #include "model/chunks.h"
+#include "model/img_rows.h"
 #include "model/tokwin.h"
 #include "model/lend.h"
 #include "model/model.h"
@@ -181,10 +182,7 @@ struct Model::Impl {
   uint32_t *lists_d = nullptr, *lists_h = nullptr;
   int list_len = 0;
   static constexpr int kNoLine = -2147483647 - 1;  // no session (a unit's own are -1 - u)
-  int line_h[kMaxUnits];
   size_t store_numbers = 0, pool_max = 0;  // the store's share; the numbers the arrays' address space holds
-  int resv[kMaxSlots] = {};
-  size_t held_peak = 0;
   bool pool_poison = false;
   int held(int s) const;                 // chunk numbers slot s's session's lists hold
   int numbers_for(int s, int upto) const;  // chunk numbers slot s needs to hold positions [0, upto]
@@ -337,19 +335,17 @@ struct Model::Impl {
   // (a cancelled prompt's look-ahead) are never taken by the unit's next prompt or by another unit
   uint64_t tok_epoch = 0, hist_ep[kMaxUnits] = {};
   std::vector<uint32_t> ids;  // [R][2][24]
-  // vision (docs/vision.md, set_images): the spans of the prefill in progress and their rows (pinned,
-  // mapped: the inject kernel reads them in place); empty for every text request
+  // vision (docs/vision.md, set_images): the spans of the prefill in progress and the key of the flight whose rows they
+  // read (Store::img: store numbers, 204 rows each); empty for every text request
   std::vector<std::pair<int, int>> img_span;
-  std::vector<size_t> img_row0;  // span i's first row in img_rows
-  uint16_t* img_rows = nullptr;
-  size_t img_cap = 0;  // rows img_rows holds
-  // the other units' image sets: a prompt's images stay with its unit (use_slot swaps them in and out, as hists), so that
+  std::vector<size_t> img_row0;  // span i's first row among the flight's rows
+  int img_key = 0;               // the flight holding the rows (0: none)
+  // the other units' image views: a prompt's images stay with its unit (use_slot swaps them in and out, as hists), so that
   // another prompt's chunks read between its pieces see their own (interleaved prefill)
   struct ImgSet {
     std::vector<std::pair<int, int>> span;
     std::vector<size_t> row0;
-    uint16_t* rows = nullptr;
-    size_t cap = 0;
+    int key = 0;
   };
   ImgSet imgs[kMaxUnits];
   // this rank's rows [i0, i1) of the current chunk (absolute first position a) inside span k, clipped to [0, n)
@@ -360,6 +356,16 @@ struct Model::Impl {
       if (i0 < i1) f(k, i0, i1);
     }
   }
+  // Row `row` of the flight `key`'s rows in device memory (dies when the store holds none for the key).
+  const uint8_t* img_row(int key, size_t row) const;
+  // The flight's rows in the store (state.cu): img_take takes numbers for `rows` rows (kStImgTake; clears slot's reservation),
+  // img_fill writes rows [row0, row0 + n) from host memory (n <= kImgStageRows; through the pinned staging buffer), img_free gives the flight's numbers back (kStImgFree; key 0: every flight's, the tripwire's).
+  bool img_take(int key, size_t rows, int slot);
+  void img_fill(int key, size_t row0, size_t n, const uint16_t* src);
+  void img_free(int key);
+  size_t img_numbers() const;  // numbers the flights' rows hold now
+  uint8_t* img_stage = nullptr;  // pinned, kImgStage bytes: img_fill copies each piece through it (made at the first fill)
+  cudaEvent_t img_stage_ev = nullptr;  // the last copy out of it: the next piece waits for it
   uint8_t* e_send[2];         // pinned: this rank's packed records per Engram layer
   uint32_t* e_off[2];         // pinned: [R][24] offsets into the gathered segments
   uint64_t* e_done;           // pinned: the store's completion flags [2]
@@ -392,7 +398,6 @@ struct Model::Impl {
   float pf_ablit = 0.f;  // the prefill chunk in progress: its session's strength (0: none)
 
   std::unique_ptr<detail::Prefill> pf;
-  std::unique_ptr<detail::Store> store_s;
   std::unique_ptr<detail::Spec> spec;
   bool mh_on = false;  // capturing a spec step: main_hidden at the inputs of layers 37-39
   // The certified head (DSGB10_CERT=1; one-session spec steps whose rows are all greedy without top logprobs,
@@ -429,7 +434,7 @@ struct Model::Impl {
   // request cannot reach. slot_release: unmap all of slot s (its session's state is saved and no work for it is queued).
   void ensure_mapped(int s, int upto);
   void slot_release(int s);
-  void slot_reserve(int s, int need);
+  void slot_reserve(int s, int need, int img = 0);
   void slot_unreserve(int s);
   int slot_chunks_for(int s, int need) const;
   // A step's view of the state: with one slot, its pointers (the kernels' one-session code, no table); with

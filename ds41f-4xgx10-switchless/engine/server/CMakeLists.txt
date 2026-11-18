@@ -1,5 +1,5 @@
 add_executable(dsgb10_rank main.cpp cmd.cpp serve.cpp node_stats.cpp)
-target_link_libraries(dsgb10_rank PRIVATE dsmodel)
+target_link_libraries(dsgb10_rank PRIVATE dsmodel vit_device)
 
 # interleave.h decisions against a table of cases (host only)
 add_executable(interleave_test tests/interleave_test.cpp)
@@ -24,3 +24,7 @@ add_executable(bounds_test tests/bounds_test.cpp)
 
 # common/heap.h: giving the free pages of the heap back (host only)
 add_executable(heap_test tests/heap_test.cpp)
+
+# img_hold.h: a flight's image rows in the store, taken once, held across resumes, freed at every end (host only)
+add_executable(img_hold_test tests/img_hold_test.cpp ../model/chunks.cpp)
+target_include_directories(img_hold_test PRIVATE ${CMAKE_SOURCE_DIR})

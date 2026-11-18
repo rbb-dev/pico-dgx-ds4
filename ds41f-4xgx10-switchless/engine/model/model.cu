@@ -294,6 +294,7 @@ void Model::Impl::inject(Sink* sink, int L, const char* name, int pos0, int R, v
 void Model::Impl::bind(dsw::WeightFile& wf, comm::Ring& ring) {
   ch = ring.dev();
   host_ring = &ring;
+  store_notes();
   auto need = [&](const std::string& n, dsw::DType t, std::initializer_list<int64_t> shape) -> uint8_t* {
     const dsw::DeviceTensor& d = wf[n];
     if (d.dtype != t || d.ndim != (int)shape.size())
@@ -345,7 +346,6 @@ void Model::Impl::bind(dsw::WeightFile& wf, comm::Ring& ring) {
     tile8("head.weight", h, kVocabPart, kDim * 2, Layout::L2);
     head = h;
   }
-  float* hc_local = nullptr;
   double code_share = 0;  // the experts' scale codes: the share of 32-scale groups coded, summed over layers
   size_t code_bytes = 0;
   for (int L = opt.first_layer; L < opt.n_layers; ++L) {
@@ -464,7 +464,6 @@ void Model::Impl::bind(dsw::WeightFile& wf, comm::Ring& ring) {
   if (scratch) CUDA_CHECK(cudaFree(scratch));
   scratch = nullptr;
   scratch_bytes = 0;
-  if (hc_local) CUDA_CHECK(cudaFree(hc_local));
   if (opt.n_layers > opt.first_layer)
     std::printf("moe: the experts' scale codes, %.1f MiB: %.2f %% of their 32-scale groups coded\n", code_bytes / 1048576.0,
                 100 * code_share / (opt.n_layers - opt.first_layer));
@@ -507,7 +506,7 @@ void Model::Impl::use_slot(int s) {
   if (u != cur_unit) hist.swap(hists[cur_unit]), hist.swap(hists[u]);  // Engram's history: slot s's
   if (u != cur_unit) {  // and its prompt's images
     const auto park = [&](ImgSet& d) {
-      std::swap(img_span, d.span), std::swap(img_row0, d.row0), std::swap(img_rows, d.rows), std::swap(img_cap, d.cap);
+      std::swap(img_span, d.span), std::swap(img_row0, d.row0), std::swap(img_key, d.key);
     };
     park(imgs[cur_unit]), park(imgs[u]);
   }
@@ -693,7 +692,8 @@ void Model::Impl::indexer(int L, int R, int ctx) {
 // has no collective before its all-reduce).
 void Model::Impl::project(const bf16* stream, int L, int h, int R) {
   fork(sa);
-  attn::hc_project(U(stream), R, lw[L].hc_fn[h], kDim * rank, kDim * (rank + 1), hc_chunks, false, sa);
+  attn::hc_project(U(stream), R, lw[L].hc_fn[h], kDim * rank, kDim * (rank + 1), hc_chunks, false, sa,
+                  lw[L].hc_ld);
 }
 
 // On entry yraw holds hc_pre(x, pre_mix) before attn_norm (the previous FFN's allreduce_hc made it).
@@ -1433,13 +1433,13 @@ int Model::slot_mapped(int s) const { return d_->calloc ? d_->held(s) : 0; }
 int Model::slot_uncommitted() const {
   if (!d_->calloc) return 0;
   int64_t reserved = 0;
-  for (int s = 0; s < d_->nslots; ++s) reserved += std::max(0, d_->resv[s] - d_->held(s));
+  for (int s = 0; s < d_->nslots; ++s) reserved += std::max(0, d_->resv[s] - d_->held(s)) + d_->resv_img[s];
   return (int)std::max<int64_t>(0, (int64_t)d_->calloc->free() - reserved);
 }
 void Model::slot_attach(int s, int h) { d_->slot_attach(s, h); }
 int Model::slot_chunks_total() const { return d_->calloc ? (int)d_->calloc->total() : 0; }
 int Model::slot_chunks_peak() const { return (int)d_->held_peak; }
-void Model::slot_reserve(int s, int need) { d_->slot_reserve(s, need); }
+void Model::slot_reserve(int s, int need, int img) { d_->slot_reserve(s, need, img); }
 void Model::slot_release(int s) { d_->slot_release(s); }
 void Model::set_engram(const engram::HashMap* map, engram::Store* store) {
   d_->emap = map;
@@ -1478,15 +1478,15 @@ void Model::set_images(int n, const int32_t* lo, const int32_t* hi, int key) {
     I.img_span.emplace_back(lo[i], hi[i]), I.img_row0.push_back(total), total += hi[i] - lo[i];
   }
   if (!n) return;
-  if (total > I.img_cap) {
-    I.drain();  // a chunk in flight may still read the old buffer
-    if (I.img_rows) CUDA_CHECK(cudaFreeHost(I.img_rows));
-    I.img_cap = std::max(total, (size_t)2048);
-    I.img_rows = detail::halloc<uint16_t>(I.img_cap * kDim);
-  }
-  I.drain();
-  std::memcpy(I.img_rows, rows, total * kDim * 2);
+  const imgrows::Ledger::Rows* r = I.store_s ? I.store_s->img.find(key) : nullptr;
+  if (!r) die("model: the images of flight %d are not in the store", key);
+  if (r->rows != total) die("model: flight %d holds %zu image rows, its spans name %zu", key, r->rows, total);
+  I.img_key = key;
 }
+bool Model::image_take(int key, size_t rows, int slot) { return d_->img_take(key, rows, slot); }
+void Model::image_fill(int key, size_t row0, size_t n, const uint16_t* src) { d_->img_fill(key, row0, n, src); }
+void Model::image_free(int key) { d_->img_free(key); }
+size_t Model::image_numbers() const { return d_->img_numbers(); }
 void Model::set_pos_stride(int stride, int group) {
   d_->pos_stride = std::max(1, stride);
   d_->pos_group = std::max(1, group);

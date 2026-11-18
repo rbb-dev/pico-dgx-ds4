@@ -527,6 +527,60 @@ void Model::Impl::give_nums(Nums& v) {
   v.clear();
 }
 
+// ---- image rows (img_rows.h): a running request's rows are numbers no session names ---------------------------------------------
+
+static_assert(imgrows::kNumberBytes == (size_t)attn::kChunkEntries * 256, "an image row's number is a bookmark's: the first array's slice");
+
+size_t Model::Impl::img_numbers() const { return store_s ? store_s->img.numbers() : 0; }
+
+const uint8_t* Model::Impl::img_row(int key, size_t row) const {
+  const imgrows::Ledger::Rows* r = store_s ? store_s->img.find(key) : nullptr;
+  if (!r || row >= r->rows) die("model: image row %zu of flight %d is not in the store", row, key);
+  const imgrows::Where w = imgrows::where(row);
+  return pool_arr[0] + ((size_t)r->nums[w.number] << attn::kChunkShift) * kKvEntryBytes[0] + w.offset;
+}
+
+// The numbers for flight `key`'s rows: lowest free first, evicting idle conversations while too few are free (the
+// command's pinned sessions stay). The slot's reservation for them is spent either way.
+bool Model::Impl::img_take(int key, size_t rows, int slot) {
+  Store& s = store_of();
+  const imgrows::Take t = s.img.take(key, rows, [&](size_t n, Nums* out) { return take_nums(0, n, out); });
+  if (slot >= 0 && slot < nslots) resv_img[slot] = 0;
+  return t == imgrows::Take::kTaken;
+}
+
+// Rows [row0, row0 + n) from host memory into the flight's numbers, one staging piece at a time: the piece waits for the
+// copy that last read the buffer, and its own copy is queued on the model's stream behind everything that read the numbers.
+void Model::Impl::img_fill(int key, size_t row0, size_t n, const uint16_t* src) {
+  const imgrows::Ledger::Rows* r = store_s ? store_s->img.find(key) : nullptr;
+  if (!r || row0 + n > r->rows || n > Model::kImgStageRows) die("model: image rows [%zu, %zu) of flight %d do not fit its %zu", row0, row0 + n, key, r ? r->rows : 0);
+  if (!img_stage) {
+    img_stage = halloc<uint8_t>(Model::kImgStageRows * imgrows::kRowBytes);
+    CUDA_CHECK(cudaEventCreateWithFlags(&img_stage_ev, cudaEventDisableTiming));
+  }
+  CUDA_CHECK(cudaEventSynchronize(img_stage_ev));
+  std::memcpy(img_stage, src, n * imgrows::kRowBytes);
+  size_t at = 0;
+  imgrows::runs(row0, row0 + n, [&](size_t r0, size_t cnt) {
+    CUDA_CHECK(cudaMemcpyAsync(const_cast<uint8_t*>(img_row(key, r0)), img_stage + at, cnt * imgrows::kRowBytes, cudaMemcpyHostToDevice, st));
+    at += cnt * imgrows::kRowBytes;
+  });
+  CUDA_CHECK(cudaEventRecord(img_stage_ev, st));
+}
+
+// key's numbers back to the pool (key 0: every flight's). Reads of them are queued on the model's stream ahead of any
+// later write, so the numbers can be taken again at once.
+void Model::Impl::img_free(int key) {
+  if (!store_s) return;
+  Store& s = *store_s;
+  const auto give = [&](Nums& v) { give_nums(v); };
+  if (key == 0) s.img.release_all(give);
+  else s.img.release(key, give);
+  for (ImgSet& d : imgs)  // a view parked on a unit that read the rows
+    if (d.key == key || key == 0) d.span.clear(), d.row0.clear(), d.key = 0;
+  if (img_key == key || key == 0) img_span.clear(), img_row0.clear(), img_key = 0;
+}
+
 void Model::Impl::share_nums(const Nums& from, size_t n, Nums* out) {
   if (n > from.size()) die("state: %zu numbers shared from a list of %zu", n, from.size());
   for (size_t i = 0; i < n; ++i) {
@@ -683,9 +737,10 @@ void Model::Impl::ensure_mapped(int s, int upto) {
   mapped_upto[s] = got;
 }
 
-void Model::Impl::slot_reserve(int s, int need) {
+void Model::Impl::slot_reserve(int s, int need, int img) {
   if (s < 0 || s >= nslots) die("model: slot_reserve in slot %d of %d", s, nslots);
   resv[s] = slot_chunks_for(s, need);  // the server counted the pool first (serve.cpp mem_ok)
+  resv_img[s] = std::max(0, img);      // and the rows' numbers the request takes next
 }
 
 // Slot s's reservation to nothing: its request has finished, and a finished request reserves no numbers for anyone (the
@@ -693,6 +748,7 @@ void Model::Impl::slot_reserve(int s, int need) {
 void Model::Impl::slot_unreserve(int s) {
   if (s < 0 || s >= nslots) die("model: slot_unreserve in slot %d of %d", s, nslots);
   resv[s] = rules::resv_after_finish(resv[s]);
+  resv_img[s] = 0;
 }
 
 // The slot's unit holds session h from now on (its rows are h's lists): the session it held leaves it (keeping its
@@ -701,9 +757,9 @@ void Model::Impl::slot_attach(int s, int h) {
   if (s < 0 || s >= nslots || h <= 0) die("model: session %d attaches to slot %d", h, s);
   const int u = unit_of[s];
   if (line_h[u] == h) return;
-  const int r = resv[s];  // the request's reservation (kStReserve comes first) stays with the slot
+  const int r = resv[s], ri = resv_img[s];  // the request's reservation (kStReserve comes first) stays with the slot
   slot_release(s);
-  resv[s] = r;
+  resv[s] = r, resv_img[s] = ri;
   Store::Sess& x = use_blocks(*this, h);
   if (x.line >= 0) die("model: session %d attaches to slot %d while unit %d holds it", h, s, x.line);
   x.line = u;
@@ -730,7 +786,7 @@ void Model::Impl::slot_release(int s) {
     line_h[u] = kNoLine;
   }
   mapped_upto[s] = -1;
-  resv[s] = 0;
+  resv[s] = 0, resv_img[s] = 0;
 }
 
 namespace {
@@ -790,7 +846,7 @@ bool Model::Impl::own_tail(int h, int pos) {
 // With none to spare the bookmark is not taken: a later restart starts at an earlier one.
 bool Model::Impl::take_extra(int h, size_t n, Nums* out) {
   Store& s = store_of();
-  const int64_t reserved = rules::unheld_sum(nslots, [&](int t) { return resv[t]; }, [&](int t) { return held(t); });
+  const int64_t reserved = rules::unheld_sum(nslots, [&](int t) { return resv[t]; }, [&](int t) { return held(t); }, [&](int t) { return resv_img[t]; });
   const auto giveable = [&]() {  // what store_evict_step can still give back counts too
     std::vector<int> keep = s.pinned;
     keep.insert(keep.end(), s.live.begin(), s.live.end());
@@ -808,7 +864,7 @@ bool Model::Impl::take_extra(int h, size_t n, Nums* out) {
 // a restore cuts at the first piece with no room instead of eating a reservation (the restore's cut_at).
 bool Model::Impl::take_restore(int h, size_t n, Nums* out) {
   Store& s = store_of();
-  const int64_t reserved = rules::unheld_sum(nslots, [&](int t) { return resv[t]; }, [&](int t) { return held(t); });
+  const int64_t reserved = rules::unheld_sum(nslots, [&](int t) { return resv[t]; }, [&](int t) { return held(t); }, [&](int t) { return resv_img[t]; });
   const auto giveable = [&]() {
     std::vector<int> keep = s.pinned;
     keep.insert(keep.end(), s.live.begin(), s.live.end());
@@ -1547,7 +1603,7 @@ void Model::Impl::state_free(int h) {
     write_rows(*this, u, nullptr);
     line_h[u] = kNoLine;
     for (int t = 0; t < nslots; ++t)
-      if (unit_of[t] == u) mapped_upto[t] = -1, resv[t] = 0;
+      if (unit_of[t] == u) mapped_upto[t] = -1, resv[t] = 0, resv_img[t] = 0;
   }
   free_lists(h);
   for (auto& sn : ss.snaps) give_nums(sn.second);
@@ -1649,7 +1705,7 @@ int Model::state_cow_numbers(int h_src, int h_own, int pos) const {
 }
 
 // A hash of the state every rank must hold alike (sessions with their lists, bookmarks and images, the numbers' counts and
-// images, the reservations, the evict-last list): compared across the ranks' logs under DSGB10_STORE_CHECK=1.
+// images, the reservations, the evict-last list, the pool's lending): compared across the ranks' logs under DSGB10_STORE_CHECK=1.
 uint64_t Model::store_digest() const {
   const Impl& m = *d_;
   uint64_t h = 1469598103934665603ull;
@@ -1781,7 +1837,8 @@ Model::PoolStats Model::pool_stats() const {
   if (!m.calloc) return p;
   p.numbers = m.calloc->total(), p.free = m.calloc->free(), p.held = m.calloc->held(), p.number_bytes = m.chunk_image();
   for (const uint32_t r : m.refs) p.shared += r > 1;
-  for (int s = 0; s < m.nslots; ++s) p.reserved += (uint64_t)std::max(0, m.resv[s] - m.held(s));
+  for (int s = 0; s < m.nslots; ++s) p.reserved += (uint64_t)std::max(0, m.resv[s] - m.held(s)) + (uint64_t)m.resv_img[s];
+  p.image_numbers = m.img_numbers();
   if (const detail::Store* st = m.store_s.get())
     for (const auto& [k, ss] : st->sess) {
       if (k <= 0) continue;  // a line's own session (tools, tests)

@@ -41,7 +41,8 @@ enum : int32_t {
   kStSpill,        // state_spill(h)
   kStUnspill,      // state_unspill(h)
   kStKeep,         // state_keep(gen): a planned stop's kept sessions (gen = a | b << 32)
-  kStReserve,      // slot_reserve(a, b): slot a's memory committed for b positions (the request's prompt and every token)
+  kStReserve,      // slot_reserve(a, b, h): slot a's memory committed for b positions (the request's prompt and every token), and h
+                   // numbers reserved to its image rows (0: none); h names no session here
   kStRelease,      // slot_release(a): slot a's session has left (its state saved first): its memory back to the pool
   kStPin,          // nothing: names session h, which the command's operations (and the store, when it gives chunks back) leave alone
   kStAttach,       // slot_attach(a, h): slot a's unit holds session h from now on (its rows are h's chunk lists, no copy)
@@ -50,7 +51,10 @@ enum : int32_t {
   kStCheckpoint,   // state_checkpoint(gen): the index a crash comes back to (gen = a | b << 32)
   kStFactor,       // set_slot_factor(a, b): slot a rotates with YaRN factor b (16, 32, 64) from its next step; the store's
                    // session h (when > 0) is tagged with b (state_set_factor)
-  kStUnreserve,    // slot_unreserve(a): slot a's reservation to 0 (its request has finished: no reservation to anyone)
+  kStUnreserve,    // slot_unreserve(a): slot a's reservation to 0 (its request has finished: no reservation held for anyone)
+  kStImgTake,      // image_take(h, a, b): flight h's image rows (a rows) get their numbers; slot b's reservation for them is spent (h is
+                   // the flight's key, not a session: nothing is pinned for it)
+  kStImgFree,      // image_free(h): flight h's image numbers back to the pool (h = 0: every flight's)
   kStLast,         // nothing: names session h, which the command's operations evict after every other session (not pinned)
 };
 struct StateOp {
@@ -76,8 +80,10 @@ enum : int32_t {
   // BatchEntry's and then their tokens follow as payloads. (20: clear of the batch commands added beside it.)
   kCmdBatchTf = 20,
   kCmdSpecBatch = 8,  // spec_batch_loop (B3): the same with drafts; the Cmd's spec_* fields as kCmdDecode's
-  // vision (docs/vision.md): n image spans for the prefill chunks that follow (Model::set_images; n = 0 clears
-  // them); their bounds (int32 lo[n], hi[n]) and rows (bf16 [rows][5120]) follow as payloads
+  // vision (docs/vision.md): n image spans for the prefill chunks that follow, whose rows are flight pos0's in the store
+  // (Model::set_images; n = 0 clears the view and leaves the rows); their bounds (int32 lo[n], hi[n]) follow as a payload,
+  // and, when rows = 1 (the flight's first go, after its kStImgTake), the rows (bf16 [sum][5120]) in pieces of at most
+  // Model::kImgStageRows rows, each a payload that every rank writes into the store (Model::image_fill)
   kCmdImages = 21,
   // a factor's window (Model::window_open / window_close): rows = the YaRN factor (0: only settle what a closed window
   // owes the pool), pos0 = 0 to open it, 1 to close it. Every rank runs run_window and gets the same status

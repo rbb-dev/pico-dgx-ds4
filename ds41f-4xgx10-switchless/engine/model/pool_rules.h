@@ -72,6 +72,19 @@ int64_t unheld_sum(int n, Resv resv, Held held) {
   return sum;
 }
 
+// The same with the reservations for image rows not yet taken (`img(t)`: numbers slot t's request will take for its rows):
+// they are numbers no other consumer may use either.
+template <class Resv, class Held, class Img>
+int64_t unheld_sum(int n, Resv resv, Held held, Img img) {
+  int64_t sum = unheld_sum(n, resv, held);
+#ifdef PICO_OLD_RULES
+  (void)img;  // without the rule: the rows' numbers are not reserved, so a bookmark or a restore may take them first
+#else
+  for (int t = 0; t < n; ++t) sum += std::max(0, (int)img(t));
+#endif
+  return sum;
+}
+
 // Whether the pool can spare `n` numbers beside the reservations: free ones, or free plus what evicting stored sessions gives
 // (`giveable()`, asked only when free ones do not cover it). state.cu take_extra.
 template <class Giveable>

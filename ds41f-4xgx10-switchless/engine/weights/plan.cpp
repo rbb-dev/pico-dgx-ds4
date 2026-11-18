@@ -12,7 +12,7 @@ namespace dsw {
 
 namespace {
 
-enum class Rule { Skip, Rep, Rows, Cols, RowsSeg5 };
+enum class Rule { Skip, Rep, Rows, Cols, RowsSeg5, RowsSeg3, RowsSeg2 };
 
 struct Entry {
   const char* name;
@@ -98,6 +98,31 @@ const Entry kLayerOnly[] = {
     {"engram.embed.scale", Rule::Skip},
 };
 
+// The image encoder's tensors (vision.*, aligner.*, image_*), cut for the vision weight files (dsw_convert --vision),
+// never for the rank files: output rows, so every output number is computed whole on one rank (docs/vision.md).
+// wqkv is q | k | v chunks of 1024 rows and w1 is gate | up chunks of 2816 rows, so each rank takes its quarter of
+// every chunk (RowsSeg); the patch embedding, the norms and the delimiters stay whole on every rank.
+const Entry kVision[] = {
+    {"vision.blocks.N.attn.wqkv.weight", Rule::RowsSeg3},  // heads 4r..4r+3 of q, of k and of v
+    {"vision.blocks.N.attn.wqkv.bias", Rule::RowsSeg3},
+    {"vision.blocks.N.attn.wo.weight", Rule::Rows},  // outputs 256r..
+    {"vision.blocks.N.attn.wo.bias", Rule::Rows},
+    {"vision.blocks.N.mlp.w1.weight", Rule::RowsSeg2},  // 704r.. of the gate and of the up half
+    {"vision.blocks.N.mlp.w2.weight", Rule::Rows},
+    {"vision.blocks.N.norm1.weight", Rule::Rep},
+    {"vision.blocks.N.norm2.weight", Rule::Rep},
+    {"vision.patch_embed.proj.weight", Rule::Rep},  // K = 588 is not a multiple of 64: stored as the checkpoint has it
+    {"vision.patch_embed.proj.bias", Rule::Rep},
+    {"vision.norm.weight", Rule::Rep},
+    {"aligner.w1.weight", Rule::Rows},  // outputs 1280r..
+    {"aligner.w1.bias", Rule::Rows},
+    {"aligner.w2.weight", Rule::Rows},
+    {"aligner.w2.bias", Rule::Rows},
+    {"image_start", Rule::Rep},
+    {"image_newline", Rule::Rep},
+    {"image_end", Rule::Rep},
+};
+
 const Entry kMtpOnly[] = {
     {"main_proj.weight", Rule::Rows, L1},  // mtp.0 only: 15360 -> 5120, split by output
     {"main_proj.scale", Rule::Rows},
@@ -108,7 +133,21 @@ const Entry kMtpOnly[] = {
     {"confidence_head.proj.weight", Rule::Rep},  // [1][5376]: one row does not fit L2's 8-row tiles
 };
 
-constexpr uint32_t kSegs = 5;  // RowsSeg5
+uint32_t segs_of(Rule r) { return r == Rule::RowsSeg5 ? 5 : r == Rule::RowsSeg3 ? 3 : 2; }
+
+const std::unordered_map<std::string, Entry>& vision_rules() {
+  static const auto table = [] {
+    std::unordered_map<std::string, Entry> m;
+    for (auto& e : kVision)
+      if (!m.emplace(e.name, e).second) die("vision table lists %s twice", e.name);
+    return m;
+  }();
+  return table;
+}
+
+bool is_vision_name(const std::string& n) {
+  return n.rfind("vision.", 0) == 0 || n.rfind("aligner.", 0) == 0 || n.rfind("image_", 0) == 0;
+}
 
 const std::unordered_map<std::string, Entry>& rules() {
   static const auto table = [] {
@@ -129,7 +168,10 @@ std::string component_of(const std::string& n) {
   bool mtp = n.rfind("mtp.", 0) == 0;
   const char* c;
   auto has = [&](const char* s) { return n.find(s) != std::string::npos; };
-  if (n == "embed.weight") c = "embed";
+  if (n.rfind("vision.", 0) == 0) c = "vision tower";
+  else if (n.rfind("aligner.", 0) == 0) c = "aligner";
+  else if (n.rfind("image_", 0) == 0) c = "image delimiters";
+  else if (n == "embed.weight") c = "embed";
   else if (n == "head.weight") c = "head";
   else if (has(".experts.N.")) c = "routed experts";
   else if (has("shared_experts")) c = "shared expert";
@@ -224,14 +266,17 @@ Cut cut(const SrcTensor& t, Rule rule, int r, int w, uint64_t base) {
       c.desc = buf;
       break;
     }
-    case Rule::RowsSeg5: {
-      if (t.shape.empty() || v.rows % (kSegs * w)) die("%s: rows do not split into %u x %d", t.name.c_str(), kSegs, w);
-      uint64_t seg = v.rows / kSegs, n = seg / w;
-      for (uint32_t s = 0; s < kSegs; s++) c.pieces.push_back({&t, s * seg + n * r, n, 0, v.row_bytes, base + s * n * v.row_bytes});
-      c.shape[0] = n * kSegs;
+    case Rule::RowsSeg5:
+    case Rule::RowsSeg3:
+    case Rule::RowsSeg2: {
+      const uint32_t nsg = segs_of(rule);
+      if (t.shape.empty() || v.rows % (nsg * w)) die("%s: rows do not split into %u x %d", t.name.c_str(), nsg, w);
+      uint64_t seg = v.rows / nsg, n = seg / w;
+      for (uint32_t s = 0; s < nsg; s++) c.pieces.push_back({&t, s * seg + n * r, n, 0, v.row_bytes, base + s * n * v.row_bytes});
+      c.shape[0] = n * nsg;
       c.kind = SliceKind::RowsSeg;
-      c.nseg = kSegs;
-      std::snprintf(buf, sizeof buf, "%u segments of %llu rows, each rows [%llu*r, +%llu)", kSegs,
+      c.nseg = nsg;
+      std::snprintf(buf, sizeof buf, "%u segments of %llu rows, each rows [%llu*r, +%llu)", nsg,
                     (unsigned long long)seg, (unsigned long long)n, (unsigned long long)n);
       c.desc = buf;
       break;
@@ -296,7 +341,11 @@ std::string normalize(const std::string& name) {
   return out;
 }
 
-Plan make_plan(const Checkpoint& ck, int rank, int world) {
+namespace {
+
+// The rank files' plan (vision == false: the vision tensors and the Engram tables are left out) or the vision weight
+// files' plan (vision == true: only the tensors of the image encoder; every other tensor is left out).
+Plan build_plan(const Checkpoint& ck, int rank, int world, bool vision) {
   if (world < 1 || rank < 0 || rank >= world) die("bad rank %d / world %d", rank, world);
   Plan plan;
   plan.rank = rank;
@@ -311,14 +360,15 @@ Plan make_plan(const Checkpoint& ck, int rank, int world) {
   };
   std::map<std::string, Group> groups;
   std::vector<std::string> unknown;
+  const auto& table = vision ? vision_rules() : rules();
   for (auto& [name, t] : ck.tensors) {
-    if (name.rfind("vision.", 0) == 0 || name.rfind("aligner.", 0) == 0) {
+    if (vision ? !is_vision_name(name) : (name.rfind("vision.", 0) == 0 || name.rfind("aligner.", 0) == 0)) {
       plan.skipped.push_back(name);
       continue;
     }
     std::string norm = normalize(name);
-    auto it = rules().find(norm);
-    if (it == rules().end()) {
+    auto it = table.find(norm);
+    if (it == table.end()) {
       unknown.push_back(name);
       continue;
     }
@@ -424,7 +474,24 @@ Plan make_plan(const Checkpoint& ck, int rank, int world) {
   return plan;
 }
 
-void check_coverage(const Checkpoint& ck, int world) {
+}  // namespace
+
+Plan make_plan(const Checkpoint& ck, int rank, int world) { return build_plan(ck, rank, world, false); }
+
+Plan make_vision_plan(const Checkpoint& ck, int rank, int world) {
+#ifdef PICO_OLD_RULES
+  // without the feature: no vision weight file (the image encoder's tensors are left out, as the rank files leave them)
+  Plan p = build_plan(ck, rank, world, false);
+  p.tensors.clear();
+  p.data_offset = align_up(p.toc_offset);
+  p.file_bytes = p.data_offset;
+  return p;
+#else
+  return build_plan(ck, rank, world, true);
+#endif
+}
+
+void check_coverage(const Checkpoint& ck, int world, bool vision) {
   struct Rect {
     int rank;
     uint64_t r0, r1, c0, c1;
@@ -433,7 +500,7 @@ void check_coverage(const Checkpoint& ck, int world) {
   std::unordered_map<const SrcTensor*, SliceKind> kind;
   size_t skipped = 0;
   for (int r = 0; r < world; r++) {
-    Plan p = make_plan(ck, r, world);
+    Plan p = vision ? make_vision_plan(ck, r, world) : make_plan(ck, r, world);
     skipped = p.skipped.size();
     for (auto& o : p.tensors)
       for (auto& pc : o.pieces) {

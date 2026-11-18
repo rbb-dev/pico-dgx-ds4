@@ -1,6 +1,9 @@
 // dsw_verify: check a rank's weight file against the checkpoint, byte for byte.
 //
-//   dsw_verify --ckpt DIR --file FILE [--threads 8] [--crc-only]
+//   dsw_verify --ckpt DIR --file FILE [--threads 8] [--crc-only] [--vision]
+//
+// --vision: FILE is a vision weight file (dsw_convert --vision): the sources are the image encoder's tensors
+// (vision.*, aligner.*, image_*), each referenced exactly once, and the text model's are the ones left out.
 //
 // It does not reuse the converter's plan: each TOC entry's declarative description (kind, rank,
 // world, source shape, stacking, segments) is turned back into source rows and columns here, so a
@@ -23,7 +26,10 @@ using namespace dsw;
 
 namespace {
 
+bool vision_file = false;
+
 bool left_out(const std::string& n) {  // what the file deliberately omits
+  if (vision_file) return !(n.rfind("vision.", 0) == 0 || n.rfind("aligner.", 0) == 0 || n.rfind("image_", 0) == 0);
   return n.rfind("vision.", 0) == 0 || n.rfind("aligner.", 0) == 0 || n.rfind("image_", 0) == 0 ||
          n.find(".engram.embed.") != std::string::npos;
 }
@@ -87,10 +93,11 @@ int main(int argc, char** argv) {
     else if (a == "--file") file = next();
     else if (a == "--threads") threads = std::stoi(next());
     else if (a == "--crc-only") crc_only = true;
+    else if (a == "--vision") vision_file = true;
     else if (a == "--subset") subset = true;  // a test file from dsw_convert --only
     else die("unknown argument %s", a.c_str());
   }
-  if (file.empty() || (ckpt.empty() && !crc_only)) die("usage: dsw_verify --ckpt DIR --file FILE [--threads 8] [--crc-only]");
+  if (file.empty() || (ckpt.empty() && !crc_only)) die("usage: dsw_verify --ckpt DIR --file FILE [--threads 8] [--crc-only] [--vision]");
 
   double t0 = now_s();
   int fd = open_or_die(file, O_RDONLY | O_DIRECT);
@@ -148,9 +155,9 @@ int main(int argc, char** argv) {
       expected_n++;
       if (used.count(name) != 1) die("%s is referenced %zu times", name.c_str(), used.count(name));
     }
-    if (used.size() != expected_n) die("TOC references %zu sources, the text model has %zu", used.size(), expected_n);
-    std::printf("sources: %s %zu text-model tensors referenced once (%.1f s)\n", subset ? "the" : "all", expected_n,
-                now_s() - t0);
+    if (used.size() != expected_n) die("TOC references %zu sources, the checkpoint has %zu to cover", used.size(), expected_n);
+    std::printf("sources: %s %zu %s tensors referenced once (%.1f s)\n", subset ? "the" : "all", expected_n,
+                vision_file ? "vision" : "text-model", now_s() - t0);
   }
 
   std::atomic<size_t> next{0}, bad{0}, tiled{0}, woa{0};

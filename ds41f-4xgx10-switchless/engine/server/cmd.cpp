@@ -70,7 +70,7 @@ void apply_state(model::Model& m, const StateOp& o) {
     case kStSpill: m.state_spill(o.h); break;
     case kStUnspill: m.state_unspill(o.h); break;
     case kStKeep: m.state_keep((uint64_t)(uint32_t)o.a | (uint64_t)(uint32_t)o.b << 32); break;
-    case kStReserve: m.slot_reserve(o.a, o.b); break;
+    case kStReserve: m.slot_reserve(o.a, o.b, o.h); break;
     case kStRelease: m.slot_release(o.a); break;
     case kStPin: break;  // apply_ops pinned its session
     case kStAttach: m.slot_attach(o.a, o.h); break;
@@ -115,7 +115,8 @@ void apply_ops(model::Model& m, const Cmd& c) {
       last.push_back(c.ops[i].h);
       continue;
     }
-    if (c.ops[i].op == kStUnreserve) continue;  // names a slot, no session
+    if (c.ops[i].op == kStUnreserve || c.ops[i].op == kStReserve || c.ops[i].op == kStImgTake || c.ops[i].op == kStImgFree)
+      continue;  // names a slot or a flight, no session
     pin.push_back(c.ops[i].h);
     if (c.ops[i].op == kStCopySnaps) pin.push_back(c.ops[i].a);
   }
@@ -909,15 +910,21 @@ void follow(model::Model& m, comm::Ring& ring, Watchdog& wd, int rank) {
       m.set_tokens(c.pos0, c.n, t.data());
     } else if (c.op == kCmdImages) {
       if (c.n <= 0) {
-        m.set_images(0, nullptr, nullptr, nullptr);
+        m.set_images(0, nullptr, nullptr, 0);
       } else {
         std::vector<int32_t> lh(2 * c.n);
         bcast_payload(ring, lh.data(), lh.size() * 4, rank);
         size_t rows = 0;
         for (int i = 0; i < c.n; ++i) rows += lh[c.n + i] - lh[i];
-        std::vector<uint16_t> img(rows * 5120);
-        bcast_payload(ring, img.data(), img.size() * 2, rank);
-        m.set_images(c.n, lh.data(), lh.data() + c.n, img.data());
+        if (c.rows) {  // the first go: the rows follow, a piece at a time into the numbers kStImgTake took
+          std::vector<uint16_t> piece(model::Model::kImgStageRows * 5120);
+          for (size_t r0 = 0; r0 < rows; r0 += model::Model::kImgStageRows) {
+            const size_t n = std::min(model::Model::kImgStageRows, rows - r0);
+            bcast_payload(ring, piece.data(), n * 5120 * 2, rank);
+            m.image_fill(c.pos0, r0, n, piece.data());
+          }
+        }
+        m.set_images(c.n, lh.data(), lh.data() + c.n, c.pos0);
       }
     } else if (c.op == kCmdWindow) {
       wd.started = now_s();  // capturing the graphs takes seconds of CPU

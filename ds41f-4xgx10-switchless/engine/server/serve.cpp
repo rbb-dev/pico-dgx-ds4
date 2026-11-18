@@ -48,6 +48,7 @@
 #include "server/serve.h"
 #include "server/bounds.h"
 #include "server/cancel.h"
+#include "server/img_hold.h"
 #include "server/reclaim.h"
 #include "server/turns.h"
 
@@ -518,6 +519,7 @@ struct Flight {
   bool done_sent = false;            // its DONE went out when it ended inside a batch (finish() sends no other)
   int fac = kBaseFactor;             // the factor its next run needs: its prompt's, then what its response has grown to
   bool cross = false;                // its decode reached the window of fac: cross() before its next run
+  imghold::Hold img;                 // its image rows in the store: the key the ranks hold them under, and how many rows
 };
 
 // b's drafts and steps added to a's (a request's decode slices)
@@ -612,6 +614,12 @@ class Server {
     const int64_t n = reclaim::idle_reserves(v);
     if (n != 0 && n != idle_reserved_) std::printf("serve: BUG: idle line holds a reservation (%lld numbers reserved, nothing in flight)\n", (long long)n);
     idle_reserved_ = n;
+    // and no image rows: a number held with nothing in flight means a path ended a flight without freeing its rows
+    if (imghold::tripwire(flying_.size() + rot_.size() + pfq_.size(), m_.image_numbers())) {
+      std::printf("serve: BUG: %zu image numbers held with nothing in flight; freed\n", m_.image_numbers());
+      state({{kStImgFree, 0, 0, 0}});
+    }
+    if (wait_.empty() && held_.empty() && ready_.empty()) img_ask_.clear();  // an ask whose request is gone
   }
   int64_t idle_reserved_ = 0;
 
@@ -1098,6 +1106,7 @@ class Server {
     if (reason == fe::kCancelled && Io::stopping(rq)) reason = fe::kError, err = "the server is stopping";
     const double t_end = now_s();
     if (t_first <= 0) t_first = t_end;
+    img_ask_.ended(rq.h.session_id, rq.h.req_id);
     fe::DoneHeader d{};
     d.req_id = rq.h.req_id;
     d.reason = reason;
@@ -1120,6 +1129,7 @@ class Server {
       return Io::forget(rq);
     }
     if (flying_.count(rq.h.session_id)) return held_.push_back(std::move(rq));
+    note_image_ask(rq);
     const Session* cs = find_at(rq.h.session_id, factor_for((int64_t)rq.prompt.size()));  // its session at its factor
     const int need = need_clamped(rq);
     const uint64_t sid = rq.h.session_id;
@@ -1186,6 +1196,7 @@ class Server {
     }
     f.sp.seed = (h.flags & fe::kFlagSeed) ? h.seed : rng_();
     f.sp.ablit = (h.flags & fe::kFlagAblit) ? 1.f : 0.f;  // the runtime abliteration on this request (--ablit)
+    for (const fe::ImageSpan& sp : f.rq.spans) f.img.rows += sp.rows;
     flying_.insert(h.session_id);
     const int rows = il_.on ? rows_to_compute(f) : 0;
     if (il_.on && !il::read_whole(il_, rows)) {
@@ -1498,7 +1509,7 @@ class Server {
       // one count with the request's own reservation (make_room above): the copy's numbers must not come out of what the
       // reservation was admitted against
       if (cow > 0)
-        give_back((int64_t)m_.slot_chunks_for(s, need) - own(s, keep, sid, base) + cow, keep, sid, base, s, 0,
+        give_back((int64_t)m_.slot_chunks_for(s, need) - own(s, keep, sid, base) + cow + img_extra(sid), keep, sid, base, s, 0,
                   "a request and its copy at the restart point");
     }
     std::vector<StateOp> v, pv;  // pv: a fork's base's turn on this line, saved after the reservation
@@ -1512,7 +1523,8 @@ class Server {
       if (!src_live) v.push_back({kStRelease, 0, s, 0});
       slot_[s] = 0;
     }
-    v.push_back({kStReserve, 0, s, need});  // the request's prompt and a horizon of response are committed (growth)
+    // the request's prompt and a horizon of response are committed (growth), and the numbers its image rows will take
+    v.push_back({kStReserve, (int32_t)img_extra(sid), s, need});
     f.upto = need;
     v.insert(v.end(), pv.begin(), pv.end());
     if (!S) {
@@ -1580,7 +1592,7 @@ class Server {
         for (int k = std::max<int>(sp.start, c.pos0); k < (int)(sp.start + sp.rows); ++k) t[k - c.pos0] = -1;
       bcast_payload(ring_, t.data(), t.size() * 4, 0);
       m_.set_tokens(c.pos0, c.n, t.data());
-      if (!f.rq.spans.empty()) images(f.rq, s);
+      if (!f.rq.spans.empty()) images(f, s, sid, base);
       tu.ops_ms = 1e3 * (now_s() - (resume ? t0 : f.t_start));
     }
     r.S = S, r.s = s, r.n = n, r.q = q, r.ced = ced, r.pos = q;
@@ -1673,7 +1685,7 @@ class Server {
       c.slot = s;
       c.n = 0;
       issue(c);
-      m_.set_images(0, nullptr, nullptr, nullptr);
+      m_.set_images(0, nullptr, nullptr, 0);  // the view only: the rows stay in the store until the request ends
     }
     const double t_first = now_s();
     if (resume) f.resume_s += t_first - t0;
@@ -1714,24 +1726,48 @@ class Server {
     return true;
   }
 
-  // Vision: rq's spans and rows to every rank (kCmdImages), slot s's: for its prefill chunks, whatever runs between them.
-  void images(const Request& rq, int s) {
+  // Vision: the flight's spans to every rank for slot s's prefill chunks (kCmdImages), whatever runs between them. Its first
+  // go takes the rows' numbers from the store (kStImgTake, the request's own conversation and its base pinned) and sends
+  // the rows in pieces, straight from rank 0's copy, which is freed after the last; every later go (a resume included)
+  // sends the spans only, and the ranks read the rows they hold. They are freed when the request ends (finish).
+  void images(Flight& f, int s, uint64_t sid, uint64_t base) {
     const double t0 = now_s();
+    Request& rq = f.rq;
+    const imghold::Go g = imghold::on_go(f.img);
     Cmd c{};
     c.op = kCmdImages;
     c.slot = s;
     c.n = (int)rq.spans.size();
+    if (g.take) {
+      f.img.key = next_img_++;
+      for (const int h : pins(sid, base)) c.ops[c.n_ops++] = {kStPin, h, 0, 0};
+      c.ops[c.n_ops++] = {kStImgTake, f.img.key, (int32_t)f.img.rows, s};
+      img_ask_.taken(sid);
+    }
+    c.rows = g.fill ? 1 : 0;
+    c.pos0 = f.img.key;
     issue(c);
+    if (g.take) digest("image take");
     std::vector<int32_t> lh(2 * rq.spans.size());
     for (size_t i = 0; i < rq.spans.size(); ++i)
       lh[i] = (int32_t)rq.spans[i].start, lh[rq.spans.size() + i] = (int32_t)(rq.spans[i].start + rq.spans[i].rows);
     bcast_payload(ring_, lh.data(), lh.size() * 4, 0);
-    std::vector<uint16_t> rows(rq.img);
-    bcast_payload(ring_, rows.data(), rows.size() * 2, 0);
-    m_.set_images(c.n, lh.data(), lh.data() + c.n, rows.data());
-    std::printf("serve: req %llu images: %d spans, %zu rows, sent to every rank in %.1f ms\n",
-                (unsigned long long)rq.h.req_id, c.n, rows.size() / fe::kImageDim, 1e3 * (now_s() - t0));
+    if (g.fill && !px) {
+      const size_t total = rq.img.size() / fe::kImageDim;
+      for (size_t r0 = 0; r0 < total; r0 += model::Model::kImgStageRows) {
+        const size_t n = std::min(model::Model::kImgStageRows, total - r0);
+        uint16_t* piece = rq.img.data() + r0 * fe::kImageDim;
+        bcast_payload(ring_, piece, n * fe::kImageDim * 2, 0);
+        m_.image_fill(f.img.key, r0, n, piece);
+      }
+      std::vector<uint16_t>().swap(rq.img);  // rank 0 keeps no copy: the store has the rows
+    }
+    m_.set_images(c.n, lh.data(), lh.data() + c.n, f.img.key);
+    std::printf("serve: req %llu images: %d spans, %zu rows, %s in %.1f ms (%zu image numbers held)\n",
+                (unsigned long long)rq.h.req_id, c.n, f.img.rows, g.fill ? "taken and sent to every rank" : "held", 1e3 * (now_s() - t0),
+                m_.image_numbers());
   }
+  int next_img_ = 1;  // the keys the ranks hold flights' image rows under
 
   bool ended(Flight& f, uint32_t why) {
     finish(f, why);
@@ -1809,6 +1845,18 @@ class Server {
     }
     return n;
   }
+  // The numbers a request's image rows will take at its first go, counted in its want like a restore: admission and room_for
+  // find them before the request is let in, and kStReserve reserves them until kStImgTake takes them.
+  void note_image_ask(const Request& rq) {
+    if (rq.spans.empty()) return;
+    size_t rows = 0;
+    for (const fe::ImageSpan& sp : rq.spans) rows += sp.rows;
+    imghold::Hold h;
+    h.rows = rows;
+    img_ask_.note(rq.h.session_id, rq.h.req_id, imghold::admission_numbers(h));
+  }
+  int64_t img_extra(uint64_t sid) const { return img_ask_.extra(sid); }
+  imghold::Asks img_ask_;  // session id -> numbers its admitted request's image rows will take (until taken or it ends)
   // What slot s's commitment gives a request that takes it: all of it, unless the slot's session stays (the request's base,
   // or one the run keeps). That session keeps its chunk numbers when the request's session takes the line (a line holds
   // no memory of its own; a fork's base is copied into new numbers), so only the reservation above them is the request's.
@@ -1830,7 +1878,7 @@ class Server {
               MemCache* mc = nullptr) const {
     MemCache tmp;
     MemCache& c = mc ? *mc : tmp;
-    if (!c.ex) c.extra = restore_extra(sid, base), c.ex = true;
+    if (!c.ex) c.extra = restore_extra(sid, base) + img_extra(sid), c.ex = true;
     const int64_t want = (int64_t)m_.slot_chunks_for(s, need) + c.extra;
     int64_t have = (int64_t)m_.slot_uncommitted() + own(s, keep, sid, base);
     for (int t = 0; t < (int)slot_.size() && have < want; ++t)
@@ -1861,7 +1909,7 @@ class Server {
   bool room_for(int s, int need, const std::set<uint64_t>& keep, uint64_t sid, uint64_t base) {
     char why[48];
     std::snprintf(why, sizeof why, "a request of %d positions", need);
-    return give_back((int64_t)m_.slot_chunks_for(s, need) - own(s, keep, sid, base), keep, sid, base, s, 0, why);
+    return give_back((int64_t)m_.slot_chunks_for(s, need) - own(s, keep, sid, base) + img_extra(sid), keep, sid, base, s, 0, why);
   }
   // Whether every request in flight holds what it was reserved beyond what is free and what eviction gives: the numbers
   // a consumer asks for (`n`, and best effort `margin` more) must come from free and unreserved numbers and from the
@@ -2283,6 +2331,7 @@ class Server {
     sf.version = fe::kStatsVersion, sf.n_fields = fe::kStatsFields;
     sf.pool_numbers = ps.numbers, sf.pool_free = ps.free, sf.pool_held = ps.held, sf.pool_shared = ps.shared;
     sf.pool_reserved = ps.reserved, sf.number_bytes = ps.number_bytes;
+    sf.image_numbers = ps.image_numbers;
     sf.pool_positions = ps.numbers * 16384 / 5;  // a conversation takes 5 numbers every 16,384 positions (3 half-rate sources, layer 20)
     sf.conv_on_lines = ps.on_lines, sf.conv_in_memory = ps.in_memory, sf.conv_on_disk = ps.on_disk, sf.conv_sharing = ps.sharing;
     sf.lines = (uint64_t)m_.slots();
@@ -2353,6 +2402,10 @@ class Server {
     const fe::SubmitHeader& h = f.rq.h;
     if (!f.done_sent) done(f.rq, why, (uint32_t)f.q, (uint32_t)f.out.size(), f.t_start, f.t_first);
     Io::forget(f.rq);
+    if (imghold::free_at_end(f.img)) {  // every way a request ends: its image rows go back to the pool
+      state({{kStImgFree, f.img.key, 0, 0}});
+      f.img.key = 0;
+    }
     const double t_end = now_s();
     flying_.erase(h.session_id);
     const bool released = later_.erase(h.session_id) > 0;  // the front-end let it go meanwhile
@@ -2655,6 +2708,15 @@ class Server {
       const reclaim::WindowActions act =
           reclaim::window_actions(holders, [&](uint64_t id) { return idle_id(id, keep, 0, 0); });
       if (!act.running.empty()) return window_wait(req, fac, act.running);  // no command while a running request holds it
+      if (plan.image_numbers > 0) {  // image rows never move: the window waits for those flights to end (finish() ends the wait)
+        win_retry_at_ = now_s() + 1.0;
+        if (now_s() - win_note_ > 10) {
+          win_note_ = now_s();
+          std::printf("serve: req %llu waits for the window of factor %d: %d image flights hold %lld image numbers it needs\n",
+                      (unsigned long long)req, fac, plan.image_flights, (long long)plan.image_numbers);
+        }
+        return kWinWait;
+      }
       for (const int t : act.detach) {
         std::printf("serve: slot %d (session %016llx) gives its %d chunks back to the pool for the window of factor %d\n", t,
                     (unsigned long long)slot_[t], m_.slot_committed(t), fac);

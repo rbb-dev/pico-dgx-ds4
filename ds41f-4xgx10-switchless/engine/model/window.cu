@@ -57,47 +57,6 @@ size_t Model::Impl::scan_bytes(int f, bool prefill) const {
   return (pk + (size_t)kIdxBatch * stride / 8) * sizeof(uint16_t);
 }
 
-namespace {
-// whether session x holds a chunk number at or above `from` (in a list, a window bookmark or the end bookmark)
-bool holds_from(const Store::Sess& x, uint32_t from) {
-  for (const Nums& l : x.lists)
-    for (const uint32_t c : l)
-      if (c >= from) return true;
-  for (const auto& sn : x.snaps)
-    for (const uint32_t c : sn.second)
-      if (c >= from) return true;
-  for (const uint32_t c : x.end)
-    if (c >= from) return true;
-  return false;
-}
-}  // namespace
-
-// Makes the numbers at or above `from` free: the conversations that hold them go, a piece at a time (to the disk tier, or
-// whole without one; the same on every rank), the command's evict-last sessions after the others, then the least recently
-// used. 0: none is taken; 1: a line, a pinned or a running conversation holds one (the pieces of the holders evicted before
-// it was found stay evicted: they are cache), or no piece is left to give.
-int Model::Impl::pool_vacate(uint32_t from) {
-  Store& s = store_of();
-  for (;;) {
-    if (!calloc->first_taken_from(from)) return 0;
-    rules::VictimPick pick;
-    bool busy = false;
-    for (const auto& [k, x] : s.sess) {
-      if (!holds_from(x, from)) continue;
-      if (rules::holder_busy({k, x.line, x.used}, s.pinned, s.live, s.last)) busy = true;
-      else pick.offer(k, x.used, has(s.last, k));
-    }
-    const int victim = pick.victim;
-    if (busy || victim < 0) return 1;
-    if (!s.disk) {
-      state_free(victim);
-      s.evicted.push_back(victim);
-    } else if (!evict_piece(victim, 0)) {
-      return 1;
-    }
-  }
-}
-
 // The pool's top number with `g` more groups of factor f's window out of it; false when the pool could not hold one
 // conversation of the window even whole.
 bool Model::Impl::window_top(int f, int g, uint32_t* top) const {
@@ -418,6 +377,7 @@ Model::WindowPlan Model::window_plan(int f, int g) const {
   p.removed = (int64_t)m.calloc->numbers() - (int64_t)top;
   for (const auto& [k, x] : m.store_s->sess)
     if (holds_from(x, top)) p.holders.push_back({k, x.line, k <= 0});
+  p.image_numbers = (int64_t)image_numbers_from(m.store_s->img, top, &p.image_flights);
   return p;
 }
 

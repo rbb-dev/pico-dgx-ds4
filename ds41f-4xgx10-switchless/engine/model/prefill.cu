@@ -728,7 +728,9 @@ uint64_t Model::Impl::prefill(int a, int M, const Sampling* sp, int handle, cons
   if (!img_span.empty() && p.n > 0)
     img_runs(a + p.r0, p.n, [&](size_t k, int i0, int i1) {
       const size_t row = img_row0[k] + (size_t)(a + p.r0 + i0 - img_span[k].first);
-      ops::inject_rows(reinterpret_cast<const bf16*>(img_rows) + row * kDim, i1 - i0, p.x + (size_t)i0 * kHcDim, st);
+      imgrows::runs(row, row + (size_t)(i1 - i0), [&](size_t r, size_t cnt) {  // the rows sit 204 to a number
+        ops::inject_rows(reinterpret_cast<const bf16*>(img_row(img_key, r)), (int)cnt, p.rs->x + (size_t)(i0 + (r - row)) * kHcDim, st);
+      });
     });
   if (ced && a != p.ced_end) std::fill(p.ced_pos, p.ced_pos + kReplay, -1);  // a new run of positions
   p.ced_end = ced ? a + M : -1;
