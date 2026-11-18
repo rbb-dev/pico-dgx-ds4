@@ -58,8 +58,13 @@ pub struct ServerConfig {
     /// How long a request waits while the engine is down (the ring lent, or a restart) before it is
     /// answered 503 with Retry-After.
     pub hold: Duration,
-    /// vision: the image encoder's address (host:port); None: image input is refused as before
+    /// vision: the encoder container's address (host:port, --vision-addr), used with `VisionKind::Container`
     pub vision_addr: Option<String>,
+    /// vision: where images are encoded (--vision): `Container` asks `vision_addr` for rows; `Engine` asks the media worker at
+    /// `media_addr` for padded pixels and sends them in the SUBMIT
+    pub vision: crate::vision::VisionKind,
+    /// vision: the media worker's address (--media-addr), used with `VisionKind::Engine`
+    pub media_addr: Option<String>,
     /// vision: the most rows (image tokens) the images of one request may take together
     /// (--max-image-rows); memory on rank 0's box follows rows, not the number of images
     pub max_image_rows: usize,
@@ -68,7 +73,7 @@ pub struct ServerConfig {
     /// vision: the most rows the image requests being answered may take together
     /// (--max-image-rows-in-flight); a request that does not fit is answered 429 with Retry-After
     pub max_image_rows_in_flight: usize,
-    /// The fan tool (`--fan-tool`, src/fans.rs): None, and the dashboard has no FANS box
+    /// The fan tool (`--fan-tool`, src/fans.rs): None, and the dashboard has no COOLING AND CLOCK box
     pub fan_tool: Option<std::path::PathBuf>,
     /// The most memory the session table may hold, in MiB, counted by what its buffers allocate (--front-table-mib;
     /// 0, the default: no limit); the oldest idle sessions go first.
@@ -450,7 +455,7 @@ pub(crate) fn check_auth(app: &App, headers: &HeaderMap) -> Result<(), Box<Respo
     if ok {
         Ok(())
     } else {
-        Err(error(StatusCode::UNAUTHORIZED, "authentication_error", "invalid API key"))
+        Err(Box::new(error(StatusCode::UNAUTHORIZED, "authentication_error", "invalid API key")))
     }
 }
 
@@ -722,7 +727,7 @@ pub fn prepare(cfg: &ServerConfig, req: &Value) -> Result<Prepared, String> {
             return Err("only n = 1 is supported".into());
         }
     }
-    let mut messages = convert_messages(msgs, cfg.vision_addr.is_some())?;
+    let mut messages = convert_messages(msgs, cfg.image_addr().is_some())?;
     messages.iter_mut().for_each(crate::encoding::neutralize_image_placeholder);
 
     // tools, hosted on a leading system message
@@ -884,7 +889,16 @@ struct Gen {
     prompt_text: String,
     /// The prompt's images, for the session table (empty for text).
     images: Vec<ImageKey>,
-    prompt_ids: Vec<u32>,
+    /// Where the ids this request carries begin in the prompt (`Cut::START`: they are the whole prompt's), and the ids.
+    from: Cut,
+    state: Resume,
+    suffix: Vec<u32>,
+    /// The prompt's size in ids.
+    n_prompt: usize,
+    /// Whether the connection's DONEs carry the tail (a DONE without one then did not run the request).
+    expects_tail: bool,
+    /// What a request that went with a prefix needs to go again whole if the engine no longer holds it.
+    retry: Option<Retry>,
     rx: mpsc::UnboundedReceiver<EngineEvent>,
     stop_ids: Vec<u32>,
     stopper: StopMatcher,
@@ -902,14 +916,40 @@ struct Gen {
     first_token: Option<Instant>,
 }
 
+/// What it takes to send a request again with its whole prompt: the request as it went (without its ids), what the dashboard shows
+/// of it, and the room for its output.
+struct Retry {
+    submit: Submit,
+    meta: ReqMeta,
+    ctx: usize,
+    max_tokens: u32,
+}
+
+/// A generation that ended in failure: the HTTP status it is answered with, the error type and the text.
+#[derive(Debug, PartialEq)]
+pub(crate) struct GenError {
+    pub status: StatusCode,
+    pub kind: &'static str,
+    pub msg: String,
+}
+
+impl GenError {
+    fn server(msg: String) -> GenError {
+        GenError { status: StatusCode::INTERNAL_SERVER_ERROR, kind: "server_error", msg }
+    }
+    fn too_large(msg: String) -> GenError {
+        GenError { status: StatusCode::PAYLOAD_TOO_LARGE, kind: "invalid_request_error", msg }
+    }
+}
+
 impl Gen {
     /// Feed engine events until something can be sent. Returns the deltas and, at the end, the
     /// finish reason and usage.
-    async fn next(&mut self, out: &mut Vec<Delta>) -> Option<Result<(Finish, Usage), String>> {
+    async fn next(&mut self, out: &mut Vec<Delta>) -> Option<Result<(Finish, Usage), GenError>> {
         loop {
             let ev = match self.rx.recv().await {
                 Some(ev) => ev,
-                None => return Some(Err("engine stream ended".into())),
+                None => return Some(Err(GenError::server("engine stream ended".into()))),
             };
             match ev {
                 EngineEvent::Tokens(t) => {
@@ -956,11 +996,24 @@ impl Gen {
                     }
                 }
                 EngineEvent::Done(d) => {
+                    if d.reason == DoneReason::PrefixGone {
+                        if let Err(e) = self.resend(&d.error).await {
+                            self.done = true;
+                            self.give_up();
+                            return Some(Err(e));
+                        }
+                        continue;
+                    }
                     self.done = true;
-                    if d.reason == DoneReason::Error {
+                    if d.reason == DoneReason::Error || d.reason == DoneReason::TooLarge {
                         self.app.sessions.lock().unwrap().abandon(self.session_id);
                         self.app.engine.release(self.session_id);
-                        return Some(Err(if d.error.is_empty() { "engine error".into() } else { d.error }));
+                        // a frame over the engine's limit is the client's request that is too large: 413 with the limit in the text
+                        return Some(Err(if d.reason == DoneReason::TooLarge {
+                            GenError::too_large(if d.error.is_empty() { "the request is larger than the engine reads in one frame".into() } else { d.error })
+                        } else {
+                            GenError::server(if d.error.is_empty() { "engine error".into() } else { d.error })
+                        }));
                     }
                     if self.stopped.is_none() {
                         self.flush(out);
@@ -1028,6 +1081,42 @@ impl Gen {
         }
     }
 
+    /// The engine does not hold the prefix this request continued (`why`: its reason): the whole prompt is tokenised and sent again,
+    /// and the session's cuts come from that request. Nothing of the request had run, so nothing it sent is lost.
+    async fn resend(&mut self, why: &str) -> Result<(), GenError> {
+        let Some(r) = self.retry.take() else {
+            return Err(GenError::server("the engine lost a prefix this request did not name".into()));
+        };
+        let (app, text) = (self.app.clone(), self.prompt_text.clone());
+        let ids = tokio::task::spawn_blocking(move || app.tok.encode_parallel(&text, app.cfg.tokenize_threads))
+            .await
+            .map_err(|e| GenError::server(e.to_string()))?;
+        let Some(max_new) = reply_room(r.ctx, ids.len(), r.max_tokens) else {
+            return Err(GenError::server(format!("the prompt is {} tokens; the context window is {}", ids.len(), r.ctx)));
+        };
+        let mut submit = r.submit;
+        submit.prompt = ids.clone();
+        submit.prefix = None;
+        submit.max_new_tokens = max_new;
+        let meta = ReqMeta { prompt_tokens: ids.len() as u32, ..r.meta };
+        let (req_id, rx) = self.app.engine.submit(submit, meta).map_err(GenError::server)?;
+        eprintln!("req {} session {}: the engine does not hold the prefix ({why}); sent whole as req {req_id}", self.req_id, self.session_id);
+        self.req_id = req_id;
+        self.rx = rx;
+        self.from = Cut::START;
+        self.state = Resume::start();
+        self.n_prompt = ids.len();
+        self.suffix = ids;
+        Ok(())
+    }
+
+    /// The request ended without the session's state being known: the session is as it was before it, or gone if it never had one.
+    fn give_up(&self) {
+        if self.app.sessions.lock().unwrap().give_up(self.session_id) {
+            self.app.engine.release(self.session_id);
+        }
+    }
+
     fn parser_was_thinking(&self) -> bool {
         self.prompt_text.ends_with(crate::encoding::THINK_START)
     }
@@ -1080,17 +1169,18 @@ async fn start(app: &Arc<App>, p: &Prepared, pass: Pass) -> Result<Gen, ApiError
         return Err(ApiError(
             StatusCode::BAD_REQUEST,
             "invalid_request_error".into(),
-            format!("the prompt is {} tokens; the context window is {ctx}", plan.ids.len()),
+            format!("the prompt is {n_prompt} tokens; the context window is {ctx}"),
         ));
     };
     let mut stop_ids = p.stop_ids.clone();
     if !p.ignore_eos {
         stop_ids.push(info.eos_id);
     }
-    let submit = Submit {
+    // what is sent again whole if the engine no longer holds the prefix: the request without its ids
+    let template = Submit {
         req_id: 0,
-        session_id: plan.session_id,
-        base_session_id: plan.base_session_id,
+        session_id,
+        base_session_id,
         seed: p.seed.unwrap_or(0),
         temperature: p.temperature,
         top_p: p.top_p,
@@ -1112,12 +1202,12 @@ async fn start(app: &Arc<App>, p: &Prepared, pass: Pass) -> Result<Gen, ApiError
     let (req_id, rx) = match app.engine.submit(submit, meta) {
         Ok(x) => x,
         Err(e) => {
-            app.sessions.lock().unwrap().abandon(plan.session_id);
+            app.sessions.lock().unwrap().abandon(session_id);
             return Err(unavailable(e));
         }
     };
     // where it starts (counts only); rank 0's "serve: req N restart:" line says what the engine found
-    eprintln!("req {req_id} plan: {}", plan.describe(p.prompt.len()));
+    eprintln!("req {req_id} plan: {describe}");
     Ok(Gen {
         app: app.clone(),
         _pass: pass,
@@ -1147,19 +1237,39 @@ async fn start(app: &Arc<App>, p: &Prepared, pass: Pass) -> Result<Gen, ApiError
     })
 }
 
+/// The whole prompt's ids, tokenised outside the table's lock.
+async fn whole_ids(app: &Arc<App>, text: &str) -> Result<Vec<u32>, ApiError> {
+    let (app, text) = (app.clone(), text.to_string());
+    tokio::task::spawn_blocking(move || app.tok.encode_parallel(&text, app.cfg.tokenize_threads))
+        .await
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "server_error".into(), e.to_string()))
+}
+
 /// A request with images (docs/vision.md): its images through the encoder, the placeholders expanded into
 /// their spans (in the text as well as in the ids), and then the same session table as a text request, with
 /// each image's content hash in what a session must match (session.rs): a conversation that re-sends its
 /// images continues its session or forks from it, and a changed image is never carried over.
 async fn start_images(app: &Arc<App>, p: &Prepared, pass: Pass, info: crate::protocol::HelloEngine) -> Result<Gen, ApiError> {
     let bad = |msg: String| ApiError(StatusCode::BAD_REQUEST, "invalid_request_error".into(), msg);
-    let Some(addr) = app.cfg.vision_addr.clone() else {
+    let Some(addr) = app.cfg.image_addr().map(str::to_string) else {
         return Err(bad("image, audio and video input are not supported".into()));
     };
     // Each URL fetch can take 20 s; allow a full 100-image request to finish encoding.
     let image_timeout = Duration::from_secs(90 + 20 * p.images.len().saturating_sub(1) as u64);
-    let enc = crate::vision::encode(&addr, &p.images, image_timeout, app.cfg.max_image_rows).await.map_err(|e| {
-        if crate::vision::is_request_error(&e) { bad(e) } else { ApiError(StatusCode::SERVICE_UNAVAILABLE, "server_error".into(), e) }
+    let pixels = app.cfg.vision == crate::vision::VisionKind::Engine;
+    let enc = if pixels {
+        crate::vision::encode_pixels_counted(&addr, &p.images, image_timeout, app.cfg.max_image_rows, if app.cfg.front_image_mib == 0 { usize::MAX } else { app.cfg.front_image_mib << 20 }, p.rows_held.as_ref()).await
+    } else {
+        crate::vision::encode(&addr, &p.images, image_timeout, app.cfg.max_image_rows).await
+    }
+    .map_err(|e| {
+        if pixels && crate::vision::is_too_large(&e) {
+            ApiError(StatusCode::PAYLOAD_TOO_LARGE, "invalid_request_error".into(), e)
+        } else if crate::vision::is_request_error(&e) {
+            bad(e)
+        } else {
+            ApiError(StatusCode::SERVICE_UNAVAILABLE, "server_error".into(), e)
+        }
     })?;
     let (text, ats) = crate::vision::expand_text(&p.prompt, &enc.rows).map_err(bad)?;
     let keys: Vec<ImageKey> = (0..ats.len()).map(|i| ImageKey { at: ats[i], rows: enc.rows[i], hash: enc.hashes[i] }).collect();
@@ -1179,6 +1289,13 @@ async fn start_images(app: &Arc<App>, p: &Prepared, pass: Pass, info: crate::pro
     // the encoder has said what the images really take: hold that, not the estimate
     if let Some(held) = &p.rows_held {
         held.shrink_to(n_rows as usize);
+        if enc.pixels {
+            held.set_pixel_bytes(enc.data.len());
+        }
+    }
+    {
+        // the table's cap sees the pixels now held
+        app.sessions.lock().unwrap().set_image_bytes(app.image_rows.image_bytes());
     }
     for s in released {
         app.engine.release(s);
@@ -1265,7 +1382,7 @@ async fn start_images(app: &Arc<App>, p: &Prepared, pass: Pass, info: crate::pro
 
 async fn chat(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> Response {
     if let Err(r) = check_auth(&app, &headers) {
-        return r;
+        return *r;
     }
     let mut req: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
@@ -1274,7 +1391,7 @@ async fn chat(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> R
     // A request with inline images is megabytes: each copy is freed when its last reader is done,
     // rather than held until the answer ends. The body's bytes are not needed once parsed.
     drop(body);
-    if let Err(e) = crate::video::expand(&mut req, app.cfg.vision_addr.as_deref()).await {
+    if let Err(e) = crate::video::expand(&mut req, app.cfg.image_addr()).await {
         return if e.starts_with("cannot read") { bad_request(e) } else { error(StatusCode::SERVICE_UNAVAILABLE, "server_error", e) };
     }
     let mut p = match prepare(&app.cfg, &req) {
@@ -1327,7 +1444,7 @@ async fn chat(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> R
         match end {
             None => continue,
             Some(Ok(x)) => break x,
-            Some(Err(e)) => return error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", e),
+            Some(Err(e)) => return error(e.status, e.kind, e.msg),
         }
     };
     let mut message = json!({"role": "assistant",
@@ -1347,7 +1464,8 @@ async fn chat(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> R
 /// The request's record, with --dump-dir.
 fn dump(app: &App, req: &Value, p: &Prepared, gen: &Gen) {
     if let Some(dir) = &app.cfg.dump_dir {
-        let rec = json!({"request": req, "prompt": p.prompt, "ids": gen.prompt_ids, "session": gen.session_id, "req_id": gen.req_id});
+        // the ids the request carried: with a prefix, the text after the engine's own `prefix_ids` ids
+        let rec = json!({"request": req, "prompt": p.prompt, "ids": gen.suffix, "prefix_ids": gen.from.ids, "session": gen.session_id, "req_id": gen.req_id});
         if let Err(e) = std::fs::write(dir.join(format!("{:06}.json", gen.req_id)), rec.to_string()) {
             eprintln!("dump: {e}");
         }
@@ -1433,7 +1551,7 @@ fn stream(app: Arc<App>, p: Prepared, req: Value, pass: Option<Pass>) -> Respons
                     break;
                 }
                 Some(Err(e)) => {
-                    let _ = send(json!({"error": {"message": e, "type": "server_error", "param": null, "code": 500}})).await;
+                    let _ = send(json!({"error": {"message": e.msg, "type": e.kind, "param": null, "code": e.status.as_u16()}})).await;
                     break;
                 }
             }
@@ -1466,6 +1584,8 @@ pub(crate) mod tests {
             dump_dir: None,
             hold: Duration::from_secs(600),
             vision_addr: None,
+            vision: crate::vision::VisionKind::Container,
+            media_addr: None,
             max_image_rows: crate::vision::DEFAULT_MAX_IMAGE_ROWS,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             max_image_rows_in_flight: crate::vision::DEFAULT_MAX_IMAGE_ROWS_IN_FLIGHT,
@@ -1905,6 +2025,14 @@ pub(crate) mod tests {
         assert_eq!(prepare(&cfg, &request()).unwrap().mode, ThinkingMode::Chat);
         r["reasoning"] = json!({"effort": "low"});
         assert_eq!(prepare(&cfg, &r).unwrap().mode, ThinkingMode::Thinking);
+    }
+
+    #[test]
+    fn the_table_bound_follows_the_one_memory_cap() {
+        assert_eq!(table_mib_from_front(840, 400), 256, "840 MiB: the formula's example, 30M tokens at 8.8 B a token");
+        assert_eq!(table_mib_from_front(0, 400), 0, "no cap, no derived bound");
+        assert_eq!(table_mib_from_front(300, 400), 16, "a cap under the base and the image rows still bounds the table");
+        assert_eq!(table_mib_from_front(1100, 400), 493);
     }
 
     #[test]

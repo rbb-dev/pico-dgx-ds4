@@ -1093,7 +1093,8 @@ async fn fans_get(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
     }
 }
 
-/// `{"profile": "<id>"}`: one profile of the fixed list, set on all four Sparks by the tool. 409 while a timing window pins it.
+/// `{"profile": "<id>"}` (a profile of the fixed list) or `{"gpu_clock": "<MHz>"}` (one of four), set on all four Sparks by the tool.
+/// 409 while the fan tool reports the fans and clock as pinned.
 async fn fans_post(State(app): State<Arc<App>>, parts: Parts, body: Bytes) -> Response {
     if let Err(r) = authed(&app, &parts.headers) {
         return *r;
@@ -1108,24 +1109,28 @@ async fn fans_post(State(app): State<Arc<App>>, parts: Parts, body: Bytes) -> Re
         Ok(v) => v,
         Err(e) => return failure(StatusCode::BAD_REQUEST, &format!("fans: {e}")),
     };
-    let profile = match crate::fans::parse_fan_request(&v) {
-        Ok(p) => p,
+    let change = match crate::fans::parse_fan_request(&v) {
+        Ok(c) => c,
         Err(e) => return failure(StatusCode::BAD_REQUEST, &e),
     };
+    let what = match change {
+        crate::fans::FanChange::Profile(p) => format!("profile={p}"),
+        crate::fans::FanChange::GpuClock(c) => format!("gpu_clock={c}"),
+    };
     let peer = parts.extensions.get::<ConnectInfo<std::net::SocketAddr>>().map_or("unknown".to_string(), |c| c.0.ip().to_string());
-    match app.fans.set(profile).await {
+    match app.fans.set(change).await {
         crate::fans::SetOutcome::Done(v) => {
             let n = v["nodes"].as_array().map_or(0, |a| a.len());
             let ok = v["nodes"].as_array().map_or(0, |a| a.iter().filter(|x| x["ok"] == json!(true)).count());
-            eprintln!("fan: profile={profile} ok={ok}/{n} peer={peer}");
+            eprintln!("fan: {what} ok={ok}/{n} peer={peer}");
             json_response(StatusCode::OK, v)
         }
         crate::fans::SetOutcome::Pinned(why) => {
-            eprintln!("fan: profile={profile} refused, pinned ({why}) peer={peer}");
-            failure(StatusCode::CONFLICT, &format!("the fans are pinned: {why}"))
+            eprintln!("fan: {what} refused, pinned ({why}) peer={peer}");
+            failure(StatusCode::CONFLICT, &format!("the fans and the clock are pinned: {why}"))
         }
         crate::fans::SetOutcome::Failed(e) => {
-            eprintln!("fan: profile={profile} failed ({e}) peer={peer}");
+            eprintln!("fan: {what} failed ({e}) peer={peer}");
             failure(StatusCode::BAD_GATEWAY, &format!("fans: {e}"))
         }
     }

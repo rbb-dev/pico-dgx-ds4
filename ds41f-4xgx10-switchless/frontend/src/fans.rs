@@ -25,23 +25,46 @@ pub const STALE_S: f64 = 10.0;
 const CACHE: Duration = Duration::from_secs(4);
 const STATUS_TIMEOUT: Duration = Duration::from_secs(20);
 const SET_TIMEOUT: Duration = Duration::from_secs(25);
+/// The clock is applied by nvidia-smi on each Spark, one that does not answer is asked again for up to 20 s.
+const CLOCK_TIMEOUT: Duration = Duration::from_secs(60);
 /// The tool's answer is one JSON object; a longer one is refused.
 const MAX_OUT: usize = 1 << 20;
+
+/// The GPU clock limits the page offers (MHz); the clock is never set to unlocked from here.
+pub const CLOCKS: &[&str] = &["2400", "2200", "2000", "1800"];
+
+/// One change from the page.
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum FanChange {
+    Profile(&'static str),
+    GpuClock(&'static str),
+}
 
 pub fn profile_list() -> Value {
     Value::Array(PROFILES.iter().map(|(id, label, group)| json!({"id": id, "label": label, "group": group})).collect())
 }
 
-/// A change from the page: exactly `{"profile": "<id>"}` with an id of `PROFILES`; anything else is refused with the list.
-pub fn parse_fan_request(v: &Value) -> Result<&'static str, String> {
+/// A change from the page: exactly one key, `{"profile": "<id>"}` with an id of `PROFILES` or `{"gpu_clock": "<MHz>"}` with a
+/// string of `CLOCKS`; anything else is refused with the lists.
+pub fn parse_fan_request(v: &Value) -> Result<FanChange, String> {
     let ids = || PROFILES.iter().map(|p| p.0).collect::<Vec<_>>().join(", ");
-    let Some(o) = v.as_object() else { return Err(format!("a JSON object with one key, profile: one of {}", ids())) };
-    if let Some(k) = o.keys().find(|k| k.as_str() != "profile") {
-        return Err(format!("{k}: not a fan setting (profile is the only one)"));
+    let clocks = || CLOCKS.join(", ");
+    let Some(o) = v.as_object() else { return Err(format!("a JSON object with one key: profile (one of {}) or gpu_clock (one of {})", ids(), clocks())) };
+    if o.len() != 1 {
+        return Err(format!("exactly one key: profile (one of {}) or gpu_clock (one of {})", ids(), clocks()));
     }
-    let Some(p) = o.get("profile") else { return Err(format!("profile: one of {}", ids())) };
-    let Some(p) = p.as_str() else { return Err(format!("profile: a name, one of {}", ids())) };
-    PROFILES.iter().find(|x| x.0 == p).map(|x| x.0).ok_or_else(|| format!("profile {p:?} is not one of {}", ids()))
+    let (k, x) = o.iter().next().unwrap();
+    match k.as_str() {
+        "profile" => {
+            let Some(p) = x.as_str() else { return Err(format!("profile: a name, one of {}", ids())) };
+            PROFILES.iter().find(|y| y.0 == p).map(|y| FanChange::Profile(y.0)).ok_or_else(|| format!("profile {p:?} is not one of {}", ids()))
+        }
+        "gpu_clock" => {
+            let Some(c) = x.as_str() else { return Err(format!("gpu_clock: a string, one of {}", clocks())) };
+            CLOCKS.iter().find(|y| **y == c).map(|y| FanChange::GpuClock(y)).ok_or_else(|| format!("gpu_clock {c:?} is not one of {} (the clock is never unlocked from here)", clocks()))
+        }
+        _ => Err(format!("{k}: not a fan setting (profile or gpu_clock)")),
+    }
 }
 
 fn unix_ms() -> u64 {
@@ -79,14 +102,21 @@ pub fn merge_status(tool: &Value, at_ms: u64) -> Result<Value, String> {
             "ok": ok, "stale": stale, "fallback": fallback,
             "profile": get("profile"), "requested": get("requested"), "profile_error": get("profile_error"),
             "state": get("state"), "floor_rpm": get("floor_rpm"), "hottest_c": get("hottest_c"), "rpm": get("rpm"),
-            "guard": get("zero_rpm_guard"), "age_s": age, "error": n.get("error").cloned().unwrap_or(Value::Null),
+            "guard": get("zero_rpm_guard"), "gpu_clock": n.get("gpu_clock").filter(|c| c.is_object()).cloned().unwrap_or(Value::Null), "age_s": age, "error": n.get("error").cloned().unwrap_or(Value::Null),
         }));
     }
+    let limits: Vec<&str> = out.iter().filter(|n| n["ok"] == json!(true)).filter_map(|n| n["gpu_clock"]["limit"].as_str()).collect();
+    let clock = match limits.first() {
+        Some(c) if limits.iter().all(|x| x == c) && limits.len() == out.iter().filter(|n| n["ok"] == json!(true)).count() => json!(c),
+        _ => Value::Null,
+    };
+    let clock_mixed = limits.iter().any(|x| *x != limits[0]);
     let wanted = match asked.first() {
         Some(Some(p)) if asked.iter().all(|a| a.as_deref() == Some(p.as_str())) => json!(p),
         _ => Value::Null,
     };
     Ok(json!({"at_ms": at_ms, "tool": true, "profiles": profile_list(), "wanted": wanted, "mixed": seen.len() > 1,
+              "clocks": CLOCKS, "clock": clock, "clock_mixed": clock_mixed,
               "pinned": tool.get("pinned").cloned().unwrap_or(Value::Null), "nodes": out}))
 }
 
@@ -102,7 +132,7 @@ pub enum SetOutcome {
 }
 
 /// The tool's exit code and output for `set --json PROFILE`: 0 every Spark took it, 1 some did not, 3 pinned.
-pub fn interpret_set(code: Option<i32>, stdout: &str, profile: &str) -> SetOutcome {
+pub fn interpret_set(code: Option<i32>, stdout: &str, key: &str, value: &str) -> SetOutcome {
     let v: Option<Value> = serde_json::from_str(stdout.trim()).ok();
     match code {
         Some(3) => SetOutcome::Pinned(v.and_then(|v| v.get("pinned").and_then(Value::as_str).map(str::to_string)).unwrap_or_else(|| "pinned".into())),
@@ -112,10 +142,10 @@ pub fn interpret_set(code: Option<i32>, stdout: &str, profile: &str) -> SetOutco
             };
             let took = nodes.iter().filter(|n| n.get("ok").and_then(Value::as_bool) == Some(true)).count();
             if took == 0 {
-                return SetOutcome::Failed("no Spark took the profile".into());
+                return SetOutcome::Failed(format!("no Spark took the {}", if key == "gpu_clock" { "clock limit" } else { "profile" }));
             }
             let slim: Vec<Value> = nodes.iter().map(|n| json!({"rank": n.get("rank"), "ok": n.get("ok"), "error": n.get("error")})).collect();
-            SetOutcome::Done(json!({"sent": {"profile": profile}, "nodes": slim}))
+            SetOutcome::Done(json!({"sent": {key: value}, "nodes": slim}))
         }
         Some(c) => SetOutcome::Failed(format!("the fan tool exited {c}")),
         None => SetOutcome::Failed("the fan tool was stopped".into()),
@@ -156,12 +186,16 @@ impl Fans {
         Ok(merged)
     }
 
-    pub async fn set(&self, profile: &'static str) -> SetOutcome {
+    pub async fn set(&self, change: FanChange) -> SetOutcome {
         let Some(tool) = &self.tool else { return SetOutcome::Failed("no fan tool".into()) };
         let mut cache = self.cache.lock().await;
         *cache = None;
-        match run(tool, &["set", "--json", profile], SET_TIMEOUT).await {
-            Ok((code, out)) => interpret_set(code, &out, profile),
+        let (args, key, value, limit): (Vec<&str>, &str, &str, Duration) = match change {
+            FanChange::Profile(p) => (vec!["set", "--json", p], "profile", p, SET_TIMEOUT),
+            FanChange::GpuClock(c) => (vec!["clock", "set", "--json", c], "gpu_clock", c, CLOCK_TIMEOUT),
+        };
+        match run(tool, &args, limit).await {
+            Ok((code, out)) => interpret_set(code, &out, key, value),
             Err(e) => SetOutcome::Failed(e),
         }
     }
@@ -201,16 +235,48 @@ mod tests {
     #[test]
     fn a_request_names_one_profile_of_the_fixed_list() {
         for (id, _, _) in PROFILES {
-            assert_eq!(parse_fan_request(&json!({"profile": id})), Ok(*id), "{id}");
+            assert_eq!(parse_fan_request(&json!({"profile": id})), Ok(FanChange::Profile(id)), "{id}");
         }
         for bad in [json!({}), json!({"profile": ""}), json!({"profile": "hold-5000"}), json!({"profile": "Max"}), json!({"profile": "quiet"}),
                     json!({"profile": 3}), json!({"profile": null}), json!({"profile": ["max"]}), json!({"profile": "max", "gpu_clock": "2200"}),
-                    json!({"profile": "max", "x": 1}), json!({"gpu_clock": "2200"}), json!(["max"]), json!("max"), json!(5), json!(null),
+                    json!({"profile": "max", "x": 1}), json!({"gpu": "2200"}), json!(["max"]), json!("max"), json!(5), json!(null),
                     json!({"profile": "max;rm"}), json!({"profile": "../max"}), json!({"profile": "hold-13500"})] {
             assert!(parse_fan_request(&bad).is_err(), "{bad}");
         }
         let e = parse_fan_request(&json!({"profile": "quiet"})).unwrap_err();
         assert!(e.contains("stock") && e.contains("hold-9000"), "the list is in the message: {e}");
+    }
+
+    #[test]
+    fn a_request_may_name_one_gpu_clock_of_the_four() {
+        for c in ["2400", "2200", "2000", "1800"] {
+            assert_eq!(parse_fan_request(&json!({"gpu_clock": c})), Ok(FanChange::GpuClock(CLOCKS.iter().find(|x| **x == c).unwrap())), "{c}");
+        }
+        for bad in [json!({"gpu_clock": "unlocked"}), json!({"gpu_clock": "Unlocked"}), json!({"gpu_clock": "2300"}), json!({"gpu_clock": 2200}),
+                    json!({"gpu_clock": 2200.0}), json!({"gpu_clock": ""}), json!({"gpu_clock": null}), json!({"gpu_clock": ["2200"]}),
+                    json!({"gpu_clock": "2200 "}), json!({"gpu_clock": "0"}), json!({"gpu_clock": "2200; reboot"}),
+                    json!({"gpu_clock": "2200", "profile": "max"}), json!({"gpu_clock": "2200", "x": 1}), json!({"gpu_clock": "2200", "gpu_clock2": "2000"})] {
+            assert!(parse_fan_request(&bad).is_err(), "{bad}");
+        }
+        let e = parse_fan_request(&json!({"gpu_clock": "unlocked"})).unwrap_err();
+        assert!(e.contains("2400") && e.contains("1800") && !e.contains("2300"), "the four are in the message: {e}");
+        assert!(!CLOCKS.contains(&"unlocked"));
+    }
+
+    #[test]
+    fn the_status_carries_each_sparks_clock_and_the_common_limit() {
+        let with = |rank: u64, limit: &str| {
+            let mut n = node(rank, "medium", 1.0);
+            n["gpu_clock"] = json!({"limit": limit, "at": 1.0, "ok": true, "error": null});
+            n
+        };
+        let m = merge_status(&json!({"nodes": [with(0, "2200"), with(1, "2200"), with(2, "2200"), with(3, "2200")]}), 0).unwrap();
+        assert_eq!((m["clock"].clone(), m["clock_mixed"].clone(), m["clocks"].clone()), (json!("2200"), json!(false), json!(["2400", "2200", "2000", "1800"])));
+        assert_eq!(m["nodes"][2]["gpu_clock"]["limit"], json!("2200"));
+        let m = merge_status(&json!({"nodes": [with(0, "2200"), with(1, "2200"), with(2, "2000"), with(3, "2200")]}), 0).unwrap();
+        assert_eq!((m["clock"].clone(), m["clock_mixed"].clone()), (Value::Null, json!(true)));
+        let m = merge_status(&json!({"nodes": [with(0, "2200"), node(1, "medium", 1.0)]}), 0).unwrap();
+        assert!(m["nodes"][1]["gpu_clock"].is_null() && m["clock"].is_null() && m["clock_mixed"] == json!(false), "a Spark with no record: no common limit, not mixed");
     }
 
     fn node(rank: u64, profile: &str, age: f64) -> Value {
@@ -284,21 +350,26 @@ mod tests {
     #[test]
     fn set_answers_are_read_by_exit_code() {
         let ok = r#"{"profile":"max","pinned":null,"nodes":[{"rank":0,"ok":true,"error":null},{"rank":1,"ok":false,"error":"no answer"}]}"#;
-        match interpret_set(Some(1), ok, "max") {
+        match interpret_set(Some(1), ok, "profile", "max") {
             SetOutcome::Done(v) => {
                 assert_eq!(v["sent"], json!({"profile": "max"}));
                 assert_eq!(v["nodes"][1], json!({"rank": 1, "ok": false, "error": "no answer"}));
             }
             o => panic!("{o:?}"),
         }
-        assert!(matches!(interpret_set(Some(0), ok, "max"), SetOutcome::Done(_)));
+        assert!(matches!(interpret_set(Some(0), ok, "profile", "max"), SetOutcome::Done(_)));
+        let clk = r#"{"gpu_clock":"2200","pinned":null,"nodes":[{"rank":0,"ok":true,"error":null},{"rank":1,"ok":true,"error":null}]}"#;
+        match interpret_set(Some(0), clk, "gpu_clock", "2200") {
+            SetOutcome::Done(v) => assert_eq!(v["sent"], json!({"gpu_clock": "2200"})),
+            o => panic!("{o:?}"),
+        }
         let none = r#"{"profile":"max","nodes":[{"rank":0,"ok":false,"error":"x"}]}"#;
-        assert!(matches!(interpret_set(Some(1), none, "max"), SetOutcome::Failed(_)), "no Spark took it");
-        assert_eq!(interpret_set(Some(3), r#"{"pinned":"window 7","nodes":[]}"#, "max"), SetOutcome::Pinned("window 7".into()));
-        assert_eq!(interpret_set(Some(3), "garbage", "max"), SetOutcome::Pinned("pinned".into()));
-        assert!(matches!(interpret_set(Some(2), ok, "max"), SetOutcome::Failed(_)));
-        assert!(matches!(interpret_set(Some(0), "not json", "max"), SetOutcome::Failed(_)));
-        assert!(matches!(interpret_set(None, ok, "max"), SetOutcome::Failed(_)));
+        assert!(matches!(interpret_set(Some(1), none, "profile", "max"), SetOutcome::Failed(_)), "no Spark took it");
+        assert_eq!(interpret_set(Some(3), r#"{"pinned":"pinned for a test","nodes":[]}"#, "profile", "max"), SetOutcome::Pinned("pinned for a test".into()));
+        assert_eq!(interpret_set(Some(3), "garbage", "profile", "max"), SetOutcome::Pinned("pinned".into()));
+        assert!(matches!(interpret_set(Some(2), ok, "profile", "max"), SetOutcome::Failed(_)));
+        assert!(matches!(interpret_set(Some(0), "not json", "profile", "max"), SetOutcome::Failed(_)));
+        assert!(matches!(interpret_set(None, ok, "profile", "max"), SetOutcome::Failed(_)));
     }
 
     #[tokio::test]
@@ -306,7 +377,7 @@ mod tests {
         let f = Fans::new(None);
         assert!(!f.present());
         assert!(f.status().await.is_err());
-        assert!(matches!(f.set("max").await, SetOutcome::Failed(_)));
+        assert!(matches!(f.set(FanChange::Profile("max")).await, SetOutcome::Failed(_)));
     }
 
     #[tokio::test]
@@ -314,6 +385,6 @@ mod tests {
         let f = Fans::new(Some(PathBuf::from("/nonexistent/dgx-fan-fleet")));
         assert!(f.present());
         assert!(f.status().await.unwrap_err().contains("did not start"));
-        assert!(matches!(f.set("max").await, SetOutcome::Failed(_)));
+        assert!(matches!(f.set(FanChange::Profile("max")).await, SetOutcome::Failed(_)));
     }
 }

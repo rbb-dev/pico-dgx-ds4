@@ -1191,29 +1191,35 @@ function clockOdd(f) {
   return !!(f.clock_mixed || new Set(lims).size > 1 || (f.clock && lims.some((l) => l !== String(f.clock))) || f.nodes.some((n) => !n.ok));
 }
 function fansBox() {
-  const sel = h('select', { 'aria-label': 'Fan profile', disabled: true, onchange: async () => {
-    const v = sel.value;
+  // one change at a time, one key a request: the profile or the GPU clock limit
+  const apply = async (sel, body, what) => {
     sel.disabled = true;
-    const r = await api('fans', null, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ profile: v }) });
+    const r = await api('fans', null, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
     sel.disabled = false;
     note.classList.toggle('bad', !r.ok);
     note.classList.remove('warn');
     const failed = r.ok && r.body && r.body.nodes ? r.body.nodes.filter((n) => !n.ok) : [];
     setText(note, !r.ok ? ((r.body && r.body.error && r.body.error.message) || 'not set: HTTP ' + r.status)
       : failed.length ? `set on ${r.body.nodes.length - failed.length} of ${r.body.nodes.length} Sparks; Spark ${failed.map((n) => n.rank + 1).join(', ')} did not take it (${failed[0].error || 'no answer'}); choose it again when it is back`
-      : profileLabel(v) + ' set on all four; each Spark shows it within a few seconds');
+      : what + ' set on all four; each Spark shows it within a few seconds');
     if (r.ok) { const f = await api('fans'); if (f.ok) S.fans = f.body; }
-  } });
+  };
+  const sel = h('select', { 'aria-label': 'Fan profile', disabled: true, onchange: () => apply(sel, { profile: sel.value }, profileLabel(sel.value)) });
+  const clk = h('select', { 'aria-label': 'GPU clock limit', disabled: true, onchange: () => apply(clk, { gpu_clock: clk.value }, 'GPU clock limit ' + clk.value + ' MHz') });
   const note = h('span', { class: 'note' });
   const shown = h('span', { class: 'v', text: '-' });
+  const clockShown = h('span', { class: 'v', text: '-' });
   const shownField = h('div', { class: 'field', hidden: true, title: 'Shown only when the Sparks differ or one did not take the choice: what each Spark runs now, from their daemons.' }, h('span', { class: 'k', text: 'IN FORCE' }), shown);
   const clockField = h('div', { class: 'field', hidden: true, title: 'Shown only when the Sparks differ or one did not take the choice: the limit each Spark recorded when it was last set.' }, h('span', { class: 'k', text: 'CLOCK IN FORCE' }), clockShown);
   const grid = h('div', { class: 'settings' },
     h('label', { class: 'field', title: 'One profile for all four Sparks: the engine runs in lockstep, so the hottest Spark paces the others and a mix cannot be compared. Curves follow the temperature; Fixed keeps a floor (a Hold still rises with the heat). A floor is a minimum: the Spark\'s own controller takes the higher of its demand and the floor, so nothing here cools less than stock.' },
       h('span', { class: 'k', text: 'FAN PROFILE' }), sel),
-    h('div', { class: 'field', title: 'What the four Sparks run now, from their daemons.' }, h('span', { class: 'k', text: 'IN FORCE' }), shown),
+    shownField,
+    h('label', { class: 'field', title: 'The highest GPU clock, in MHz, on all four Sparks (nvidia-smi -lgc 0,LIMIT). Lower limits run cooler and slower. The limit lasts until the next engine start, which sets the clock again from the serving file; a reboot clears it. Only these four limits are offered.' },
+      h('span', { class: 'k', text: 'GPU CLOCK LIMIT' }), clk),
+    clockField,
     note);
-  const b = box('fans', 'FANS', 'The fan profile of the four Sparks. Changes apply within seconds on every Spark and last until the next change (a reboot keeps them); the page only writes a profile name, each Spark\'s daemon sets the fans. A timing window can pin the profile; then this box shows why and refuses changes.', grid);
+  const b = box('fans', 'COOLING AND CLOCK', 'The fan profile and the GPU clock limit of the four Sparks. A profile applies within seconds on every Spark and lasts until the next change (a reboot keeps it); the page only writes a profile name, each Spark\'s daemon sets the fans. The clock limit lasts until the next engine start. The fan tool can pin both; then this box shows why and refuses changes.', grid);
   b.el.hidden = true;
   function update(f) {
     const there = !!(f && f.tool);
@@ -1224,11 +1230,17 @@ function fansBox() {
         sel.append(h('optgroup', { label: g }, f.profiles.filter((p) => p.group === g).map((p) => { PROFILE_LABELS.set(p.id, p.label); return h('option', { value: p.id, text: p.label }); })));
       }
     }
+    if (!clk.options.length && f.clocks) for (const c of f.clocks) clk.append(h('option', { value: c, text: c + ' MHz' }));
     const down = f.nodes.filter((n) => !n.ok || n.stale);
     sel.disabled = !!f.pinned;
+    clk.disabled = !!f.pinned || !f.clocks;
     if (document.activeElement !== sel) {
       if (f.wanted && sel.value !== f.wanted) sel.value = f.wanted;
       if (!f.wanted) sel.selectedIndex = -1;
+    }
+    if (document.activeElement !== clk) {
+      if (f.clock && clk.value !== f.clock) clk.value = f.clock;
+      if (!f.clock) clk.selectedIndex = -1;
     }
     const seen = [...new Set(f.nodes.filter((n) => n.ok && n.profile).map((n) => n.profile))];
     const wrongP = f.nodes.some((n) => n.ok && n.profile && f.wanted && n.profile !== f.wanted);
@@ -1236,8 +1248,12 @@ function fansBox() {
     shownField.hidden = !showP;
     setText(shown, showP ? inForceText(f) : '-');
     shown.classList.toggle('warn', f.mixed || down.length > 0);
-    setText(b.right, f.pinned ? 'pinned: ' + f.pinned : f.mixed ? 'mixed: choose a profile again' : down.length ? `${down.length} not answering` : '');
-    if (f.pinned && !note.classList.contains('bad')) setText(note, 'Pinned for a timing window: only the command line changes it (dgx-fan-fleet unpin).');
+    const limits = [...new Set(f.nodes.filter((n) => n.ok && n.gpu_clock && n.gpu_clock.limit).map((n) => n.gpu_clock.limit))];
+    setText(clockShown, f.clock_mixed ? 'mixed: ' + limits.join(', ') + ' MHz' : limits.length ? limits[0] + ' MHz' : '-');
+    clockShown.classList.toggle('warn', !!f.clock_mixed);
+    clockField.hidden = !clockOdd(f);
+    setText(b.right, f.pinned ? 'pinned: ' + f.pinned : f.mixed ? 'mixed: choose a profile again' : f.clock_mixed ? 'clock differs: choose a limit again' : down.length ? `${down.length} not answering` : '');
+    if (f.pinned && !note.classList.contains('bad')) setText(note, 'Pinned: only the command line changes it (dgx-fan-fleet unpin).');
   }
   return { el: b.el, update };
 }

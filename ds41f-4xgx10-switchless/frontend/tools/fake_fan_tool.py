@@ -3,7 +3,7 @@
 (`status --json`, `set --json PROFILE`, `clock set --json MHZ`), four fake Sparks, no ssh and no fan.
 
 State is a JSON file named by FAKE_FAN_STATE: {"profiles": [four names], "pinned": null | "reason", "down": [ranks],
-"stale": [ranks]}; every call's arguments are appended, one JSON list a line, to FAKE_FAN_LOG when it is set.
+"stale": [ranks], "clocks": [four limits]}; every call's arguments are appended, one JSON list a line, to FAKE_FAN_LOG when it is set.
 """
 import json
 import os
@@ -20,7 +20,7 @@ def load():
         with open(path) as f:
             return json.load(f)
     except OSError:
-        return {"profiles": ["performance"] * 4, "pinned": None, "down": [], "stale": []}
+        return {"profiles": ["performance"] * 4, "pinned": None, "down": [], "stale": [], "clocks": ["2200"] * 4}
 
 
 def save(st):
@@ -44,7 +44,7 @@ def main(argv):
             p = st["profiles"][r]
             s = FLOOR.get(p, 5)
             nodes.append({"rank": r, "host": f"spark{r + 1}", "ok": True, "stale": r in st["stale"], "age_s": 30.0 if r in st["stale"] else 1.0,
-                          "error": None,
+                          "error": None, "gpu_clock": {"limit": st.get("clocks", ["2200"] * 4)[r], "at": time.time(), "ok": True, "error": None},
                           "status": {"v": 1, "at": time.time(), "profile": p, "requested": p, "profile_error": None, "state": s,
                                      "floor_rpm": RPM[s], "hottest_c": 55.0 + r, "filtered_c": 55.0 + r, "rpm": [3000 + 100 * r, 4500],
                                      "zero_rpm_guard": False, "driver": "0.1.4"}})
@@ -66,6 +66,23 @@ def main(argv):
                 nodes.append({"rank": r, "host": f"spark{r + 1}", "ok": True, "error": None})
         save(st)
         print(json.dumps({"profile": p, "pinned": None, "nodes": nodes}))
+        return 0 if all(n["ok"] for n in nodes) else 1
+    if len(argv) == 4 and argv[:3] == ["clock", "set", "--json"]:
+        c = argv[3]
+        if st["pinned"]:
+            print(json.dumps({"gpu_clock": c, "pinned": st["pinned"], "nodes": []}))
+            return 3
+        clocks = st.get("clocks", ["2200"] * 4)
+        nodes = []
+        for r in range(4):
+            if r in st["down"]:
+                nodes.append({"rank": r, "host": f"spark{r + 1}", "ok": False, "error": "no answer: ssh: connect: Connection refused"})
+            else:
+                clocks[r] = c
+                nodes.append({"rank": r, "host": f"spark{r + 1}", "ok": True, "error": None})
+        st["clocks"] = clocks
+        save(st)
+        print(json.dumps({"gpu_clock": c, "pinned": None, "nodes": nodes}))
         return 0 if all(n["ok"] for n in nodes) else 1
     print("fake_fan_tool: unexpected arguments " + json.dumps(argv), file=sys.stderr)
     return 2

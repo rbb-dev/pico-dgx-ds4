@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# gpu-clock LIMIT [SSH_TARGET ...]: set the GPU clock limit of this machine and of each SSH_TARGET to 0..LIMIT MHz with
+# `sudo -n nvidia-smi -lgc 0,LIMIT`, judged by its exit code and its words ("clocks set to ..." and no error word).
+#
+# LIMIT is one of 2400 2200 2000 1800; anything else is refused (exit 2) and nothing runs. The clock is never reset or
+# unlocked here. Each machine is set at once and prints one line, in the order given (this machine first):
+#   <name>: clocks set to LIMIT MHz        or        <name>: FAILED: <reason>
+# Exit 0 when every machine took the limit, else 1 (each failure is named; the other machines are still set).
+#
+# The outcome is also written to a JSON state file, replaced whole:
+#   {"limit": N, "at": <unix time>, "ok": true|false, "error": null|"<the failures>"}
+# at $GPU_CLOCK_STATE (default /run/user/$UID/gpu-clock.json). A lock lasts until the machine reboots.
+set -u
+PRESETS="2400 2200 2000 1800"
+limit=${1:-}
+[[ -n $limit && " $PRESETS " == *" $limit "* ]] ||
+  { echo "usage: gpu-clock LIMIT [SSH_TARGET ...]: LIMIT must be one of $PRESETS" >&2; exit 2; }
+shift
+state=${GPU_CLOCK_STATE:-/run/user/$(id -u)/gpu-clock.json}
+
+# on each machine (argument: the limit): apply and judge; the last line is "OK" or "ERR <reason>"
+read -r -d '' apply <<'APPLY'
+limit=$1
+out=$(timeout 30 sudo -n nvidia-smi -lgc "0,$limit" 2>&1); rc=$?
+flat=$(tr '\n' ' ' <<<"$out" | cut -c1-200)
+if (( rc != 0 )); then echo "ERR nvidia-smi -lgc 0,$limit exit $rc: $flat"
+elif ! grep -qi 'clocks set' <<<"$out" || grep -qiE 'not supported|error|fail|unable|invalid|permission|not permitted' <<<"$out"; then
+  echo "ERR nvidia-smi -lgc 0,$limit said: $flat"
+else echo OK; fi
+APPLY
+
+one() {   # one machine: its name, then the command that applies the clock; exit 1 on failure
+  local name=$1 line; shift
+  line=$(timeout -k 5 50 "$@" 2>&1 | tail -n 1)
+  if [[ $line == OK ]]; then echo "$name: clocks set to $limit MHz"
+  elif [[ $line == ERR* ]]; then echo "$name: FAILED: ${line#ERR }"; return 1
+  else echo "$name: FAILED: no answer (${line:-nothing said})"; return 1; fi
+}
+
+out=$(mktemp -d); trap 'rm -rf "$out"' EXIT
+names=("$(hostname -s)")
+one "${names[0]}" bash -c "$apply" _ "$limit" > "$out/0" 2>&1 & pids=($!)
+n=0
+for t in "$@"; do
+  n=$((n + 1)); names+=("$t")
+  one "$t" ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$t" "bash -c $(printf '%q' "$apply") _ $limit" > "$out/$n" 2>&1 & pids+=($!)
+done
+bad=0 failed=()
+for i in "${!pids[@]}"; do
+  wait "${pids[i]}" || { bad=1; failed+=("$(sed -n 1p "$out/$i")"); }
+  cat "$out/$i"
+done
+
+err=$(IFS=';'; echo "${failed[*]:-}")
+dir=$(dirname "$state")
+wrote=0
+if python3 -c 'import json, sys, time
+e = sys.argv[2]
+print(json.dumps({"limit": int(sys.argv[1]), "at": time.time(), "ok": not e, "error": e or None}))' "$limit" "$err" > "$out/state" &&
+  mkdir -p "$dir" 2>/dev/null && cp "$out/state" "$state.new" 2>/dev/null && mv -f "$state.new" "$state"; then wrote=1; fi
+if (( ! wrote )); then echo "${names[0]}: FAILED: the state file $state could not be written"; bad=1; fi
+exit $bad

@@ -470,7 +470,7 @@ def main():
 
 
 def fan_state(**kw):
-    st = {"profiles": ["performance"] * 4, "pinned": None, "down": [], "stale": []}
+    st = {"profiles": ["performance"] * 4, "pinned": None, "down": [], "stale": [], "clocks": ["2200"] * 4}
     st.update(kw)
     with open(FAN_STATE, "w") as f:
         json.dump(st, f)
@@ -513,18 +513,52 @@ def fan_checks():
     check(sets == [["set", "--json", pid] for pid in ids], f"the tool was run only with set --json and the id: {sets}")
     before = len(fan_calls())
     for bad in ({}, {"profile": ""}, {"profile": "hold-5000"}, {"profile": "Max"}, {"profile": "quiet"}, {"profile": 3}, {"profile": ["max"]},
-                {"profile": "max", "gpu_clock": "2200"}, {"gpu_clock": "2200"}, ["max"], "max", {"profile": "max; rm -rf /"}):
+                {"profile": "max", "gpu_clock": "2200"}, {"gpu_clock": "2200", "x": 1}, ["max"], "max", {"profile": "max; rm -rf /"}):
         check(http_("POST", route, bad)[0] == 400, f"POST fans {json.dumps(bad)} is refused (400)")
     st, raw, _ = http_("POST", route, b"not json", headers={"Content-Type": "application/json"})
     check(st == 400, "POST fans with a body that is not JSON is 400")
     st, raw, _ = http_("POST", route, {"profile": "quiet"})
     check("hold-9000" in json.loads(raw)["error"]["message"], "a refusal names the profiles")
     check(len(fan_calls()) == before, "a refused request never reached the tool")
-    fan_state(pinned="timing window 3")
+    # ---- the GPU clock limit, on the same route and path
+    f = get_json(route)[1]
+    check(f["clocks"] == ["2400", "2200", "2000", "1800"] and f["clock"] == "2200" and f["clock_mixed"] is False
+          and f["nodes"][0]["gpu_clock"]["limit"] == "2200", f"GET fans: the four limits, the clock in force {f['clock']}")
+    for c in ("2400", "2200", "2000", "1800"):
+        st, raw, _ = http_("POST", route, {"gpu_clock": c})
+        d = json.loads(raw)
+        check(st == 200 and d["sent"] == {"gpu_clock": c} and [x["ok"] for x in d["nodes"]] == [True] * 4, f"POST gpu_clock {c}: sent on four Sparks")
+        got = get_json(route)[1]
+        check(got["clock"] == c and all(x["gpu_clock"]["limit"] == c for x in got["nodes"]), f"and read back: {c}")
+    check(get_json(route)[1]["wanted"] == "hold-9000", "a clock change leaves the profile as it was")
+    sets = [c for c in fan_calls() if c[0] == "clock"]
+    check(sets == [["clock", "set", "--json", c] for c in ("2400", "2200", "2000", "1800")], f"the tool was run with clock set --json and the limit only: {sets}")
+    before = len(fan_calls())
+    for bad in ({"gpu_clock": "unlocked"}, {"gpu_clock": "2300"}, {"gpu_clock": 2200}, {"gpu_clock": ""}, {"gpu_clock": ["2200"]},
+                {"gpu_clock": "2200", "profile": "max"}, {"gpu_clock": "2200", "gpu_clock2": "2000"}):
+        check(http_("POST", route, bad)[0] == 400, f"POST fans {json.dumps(bad)} is refused (400)")
+    st, raw, _ = http_("POST", route, {"gpu_clock": "unlocked"})
+    check("2400" in json.loads(raw)["error"]["message"], "a refused clock names the four limits")
+    check(len(fan_calls()) == before, "a refused clock never reached the tool")
+    fan_state(clocks=["2200"] * 4, down=[1])
+    st, raw, _ = http_("POST", route, {"gpu_clock": "2000"})
+    d = json.loads(raw)
+    check(st == 200 and [x["ok"] for x in d["nodes"]] == [True, False, True, True], "a Spark down: the clock is 200 with that Spark named")
+    time.sleep(4.2)
+    got = get_json(route)[1]
+    check(got["nodes"][1]["ok"] is False and got["clock"] == "2000", "and the Spark that is down does not count for the clock in force")
+    fan_state(clocks=["2200", "2000", "2200", "2200"])
+    time.sleep(4.2)
+    got = get_json(route)[1]
+    check(got["clock_mixed"] is True and got["clock"] is None, "Sparks on different limits: clock_mixed")
+    fan_state()
+    fan_state(pinned="pinned for a test")
+    st, raw, _ = http_("POST", route, {"gpu_clock": "2000"})
+    check(st == 409 and "pinned for a test" in json.loads(raw)["error"]["message"], "pinned: the clock is refused too (409)")
     st, raw, _ = http_("POST", route, {"profile": "max"})
-    check(st == 409 and "timing window 3" in json.loads(raw)["error"]["message"], "pinned: POST is 409 with the reason")
+    check(st == 409 and "pinned for a test" in json.loads(raw)["error"]["message"], "pinned: POST is 409 with the reason")
     time.sleep(4.2)  # the status is reused for a few seconds
-    check(get_json(route)[1]["pinned"] == "timing window 3", "pinned: GET carries the reason")
+    check(get_json(route)[1]["pinned"] == "pinned for a test", "pinned: GET carries the reason")
     fan_state(down=[2])
     st, raw, _ = http_("POST", route, {"profile": "medium"})
     d = json.loads(raw)
@@ -544,6 +578,8 @@ def fan_checks():
     page = raw.decode()
     check(st == 200 and "fansBox" in page and "'fans'" in page and "FANS" in page and "api('fans'" in page, "the page has the FANS box and reads the route")
     check("'fan-1'" in page and "'fan-2'" in page and "'fan-profile'" in page, "and the node card has its FANS rows: fan 1, fan 2, the profile")
+    check("gpu_clock" in page and "until the next engine start" in page and "GPU CLOCK" in page, "the page has the GPU clock dropdown and says how long it lasts")
+    check("unlocked" not in page.lower(), "and no unlocked choice on the page")
     check("fan-floor" not in page and "fan-temp" not in page and "'Floor'" not in page and "'Hottest'" not in page,
           "and no floor row and no hottest row (the card's TEMP. group has the temperatures)")
     # no tool: the box is hidden, the route answers empty and refuses a change; and no engine connected: still answers
@@ -559,6 +595,7 @@ def fan_checks():
     st, f = get_json(route, port=p2)
     check(st == 200 and f["tool"] is False and f["profiles"] == [] and f["nodes"] == [], f"without --fan-tool: GET fans is empty and says tool false: {f}")
     check(http_("POST", route, {"profile": "max"}, port=p2)[0] == 503, "without --fan-tool: POST fans is 503")
+    check(http_("POST", route, {"gpu_clock": "2200"}, port=p2)[0] == 503, "without --fan-tool: POST gpu_clock is 503")
     check(http_("GET", route, headers={"Authorization": None}, port=p2)[0] == 401, "without --fan-tool: still 401 without the key")
     st, f = get_json(route, port=p3)
     check(st == 200 and f["tool"] is True and len(f["nodes"]) == 4, "with no engine connected GET fans still answers")

@@ -58,10 +58,15 @@ fn usage() -> ! {
                                 /dashboard polls them while it is open; without them its NODE HEALTH is empty
       --dashboard-host NAME     a host name the dashboard also answers (repeat it), e.g. a proxy's; it always
                                 answers localhost and the listen addresses, and refuses every other Host
-      --fan-tool PATH           the fan tool (dgx-fan-fleet, docs/dashboard.md): the dashboard then has a FANS box that sets
-                                the Sparks' fan profile and shows their fans; without it the box is absent
-      --vision-addr HOST:PORT   accept image_url / image parts: the image encoder (tools/vision) turns
-                                them into embedding rows (docs/vision.md); without it images are refused
+      --fan-tool PATH           the fan tool (dgx-fan-fleet, docs/dashboard.md): the dashboard then has a COOLING AND CLOCK box
+                                that sets the Sparks' fan profile and GPU clock limit; without it the box is absent
+      --vision-addr HOST:PORT   with --vision container: the image encoder (tools/vision) that turns images into
+                                embedding rows (docs/vision.md); without it, under that flag, images are refused
+      --vision engine|container where images are encoded: container (the rollback) asks the encoder at --vision-addr for
+                                embedding rows and sends them in the request; engine asks the media worker at --media-addr
+                                for each image's padded pixels and sends those, and the engine encodes them (docs/vision.md)
+      --media-addr HOST:PORT    the media worker (tools/vision/media_worker.py), which reads and pads
+                                the images and decodes video, and holds no model; required with an explicit --vision engine; without --media-addr images are refused
       --max-body-mb N           the largest request body taken, in MiB: 64; a larger one is answered
                                 413. Raise it for requests that carry many large images or video
                                 inline; a body costs several times its size in memory while its
@@ -80,6 +85,7 @@ fn usage() -> ! {
       --socket PATH             /tmp/dsgb10-engine.sock
       --delay-ms N              per generated token: 5
       --prefill-tps N           simulated prefill tokens/s: 20000
+      --mock-version N          the newest protocol version it speaks (4 or 5): 5
       --max-context N           1048576
   dsfront mock-node-stats --port P --rank R           a rank's sampler stand-in on 127.0.0.1:P (docs/dashboard.md)
   dsfront tokcheck <cases.jsonl>                      compare against reference ids ({{\"text\",\"ids\"}} per line)
@@ -156,7 +162,7 @@ fn serve(args: &[String]) {
     let mut dashboard_hosts: Vec<String> = vec!["localhost".into()];
     dashboard_hosts.extend(listen.iter().map(|a| a.ip().to_string()));
     dashboard_hosts.extend(opts(args, "--dashboard-host").into_iter().map(|h| h.to_ascii_lowercase()));
-    let cfg = ServerConfig {
+    let mut cfg = ServerConfig {
         dashboard_hosts,
         model_name: opt(args, "--model-name").unwrap_or_else(|| "deepseek-v4.1-flash-uncensored".into()),
         ablit_alias: !args.iter().any(|a| a == "--no-ablit-alias"),
@@ -172,6 +178,8 @@ fn serve(args: &[String]) {
         dump_dir: opt(args, "--dump-dir").map(Into::into),
         hold: std::time::Duration::from_secs(parse_opt(args, "--hold-s", 600u64)),
         vision_addr: opt(args, "--vision-addr"),
+        vision,
+        media_addr: opt(args, "--media-addr"),
         max_image_rows: max_image_rows(args),
         max_body_bytes: max_body_bytes(args),
         max_image_rows_in_flight: max_image_rows_in_flight(args),
@@ -192,8 +200,9 @@ fn serve(args: &[String]) {
     dsfront::session::cap_heap_arenas(2);
     let tok = std::sync::Arc::new(load_tokenizer(args));
     let socket = opt(args, "--engine-socket").unwrap_or_else(|| dsfront::protocol::DEFAULT_SOCKET.into());
+    let prefix = !args.iter().any(|a| a == "--no-prefix");
     runtime().block_on(async move {
-        let engine = dsfront::engine::EngineClient::start(socket.into());
+        let engine = dsfront::engine::EngineClient::start_with(socket.into(), prefix);
         let app = App::new(cfg, tok, engine);
         dsfront::dashboard::spawn(app.clone(), node_stats);
         if let Some(t) = &table {
@@ -302,6 +311,8 @@ fn mock_engine(args: &[String]) {
         delay: std::time::Duration::from_millis(parse_opt(args, "--delay-ms", 5u64)),
         prefill_tok_per_s: parse_opt(args, "--prefill-tps", 20000f64),
         max_context: parse_opt(args, "--max-context", 1048576u32),
+        version: parse_opt(args, "--mock-version", dsfront::protocol::VERSION_PREFIX),
+        seen: None,
     };
     if let Err(e) = runtime().block_on(dsfront::mock::run(cfg)) {
         eprintln!("mock engine: {e}");
@@ -343,6 +354,20 @@ fn max_body_bytes(args: &[String]) -> usize {
     mb << 20
 }
 
+/// --vision: engine (the default: the engine encodes the media worker's pixels) or container (the rollback: the encoder at
+/// --vision-addr answers rows). An explicit engine needs --media-addr; without it and without --vision, images are refused.
+fn vision_opt(args: &[String]) -> Result<dsfront::vision::VisionKind, String> {
+    use dsfront::vision::VisionKind;
+    let kind = match opt(args, "--vision") {
+        None => VisionKind::Engine,
+        Some(v) => VisionKind::parse(&v).ok_or_else(|| format!("bad value for --vision: {v} (container or engine)"))?,
+    };
+    if kind == VisionKind::Engine && opt(args, "--vision").is_some() && opt(args, "--media-addr").is_none() {
+        return Err("--vision engine needs --media-addr HOST:PORT (the media worker)".into());
+    }
+    Ok(kind)
+}
+
 /// --max-image-rows: 1 to what the engine's frame has room for (100 images of 1100 rows).
 fn max_image_rows(args: &[String]) -> usize {
     use dsfront::vision::{DEFAULT_MAX_IMAGE_ROWS, MAX_TOTAL_IMAGE_ROWS};
@@ -367,7 +392,7 @@ fn max_image_rows_in_flight(args: &[String]) -> usize {
 
 #[cfg(test)]
 mod limit_tests {
-    use super::{max_body_bytes, max_image_rows, max_image_rows_in_flight};
+    use super::{max_body_bytes, max_image_rows, max_image_rows_in_flight, vision_opt};
 
     fn args(s: &str) -> Vec<String> {
         s.split_whitespace().map(String::from).collect()
@@ -384,6 +409,17 @@ mod limit_tests {
         assert_eq!(max_image_rows_in_flight(&args("dsfront serve --max-image-rows-in-flight 200000")), 200_000);
         // a raised request cap raises the default with it: one full request always fits
         assert_eq!(max_image_rows_in_flight(&args("dsfront serve --max-image-rows 99400")), 99_400);
+    }
+
+    #[test]
+    fn the_vision_flag() {
+        use dsfront::vision::VisionKind;
+        assert_eq!(vision_opt(&args("dsfront serve")), Ok(VisionKind::Engine), "the engine's encoder unless the rollback is asked");
+        assert_eq!(vision_opt(&args("dsfront serve --media-addr 127.0.0.1:18951")), Ok(VisionKind::Engine));
+        assert_eq!(vision_opt(&args("dsfront serve --vision container")), Ok(VisionKind::Container));
+        assert_eq!(vision_opt(&args("dsfront serve --vision engine --media-addr 127.0.0.1:18951")), Ok(VisionKind::Engine));
+        assert!(vision_opt(&args("dsfront serve --vision engine")).unwrap_err().contains("--media-addr"), "the engine's images come from the media worker");
+        assert!(vision_opt(&args("dsfront serve --vision gpu")).unwrap_err().contains("container or engine"));
     }
 }
 
