@@ -125,6 +125,12 @@ struct SampleOut {
   int32_t sess_pos0[kMaxSess];  // its first row's position
   int32_t next_srows[kMaxSess], next_spos0[kMaxSess];  // its rows of the next step (0: it was off this step)
   int32_t next_stok[kMaxSess][kSessTok];
+  // DSGB10_GATE_DUMP (data collection only; written by the batch gate when it is on): entry k's survival as the head
+  // shipped it, as the confidence MLP gave it (0 without the MLP), as the gate used it (after DSGB10_BATCH_CAL), the
+  // MLP's inputs (shipped logits, margins, log p1; 5 each; 0 without the MLP), and the drafts the gate kept
+  float gate_ship[kMaxSess][kDrafts], gate_mlp[kMaxSess][kDrafts], gate_used[kMaxSess][kDrafts];
+  float gate_feat[kMaxSess][16];
+  int32_t gate_keep[kMaxSess];
 };
 // The device's side of speculative steps (spec.cu), in device memory: what a spec step's sampling
 // decided, and the rows of the verify step after it.

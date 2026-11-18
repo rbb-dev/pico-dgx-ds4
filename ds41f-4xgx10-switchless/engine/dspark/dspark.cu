@@ -7,9 +7,12 @@
 #include "attn/attn_common.cuh"
 #include "attn/launch.h"
 #include "common/check.h"
+#include "common/embed_shard.h"
 #include "weights/loader.h"
 
 namespace dspark {
+static_assert(embed_shard::kVocab == kVocab && embed_shard::kPart == kVocabRank && embed_shard::kRanks == kRanks,
+              "the embedding tables are cut like the head");
 namespace {
 
 using attn::bf2f;
@@ -60,17 +63,51 @@ __global__ void __launch_bounds__(256) accept_prep_kernel(const uint16_t* mh, co
   if ((threadIdx.x & 31) == 0) hs[(size_t)r * (kMainK / 32) + c / 32] = attn::f_to_ue8m0(sc);
 }
 
+// The embedding exchange of a pass (rows by vocabulary, common/embed_shard.h): this rank's part of the slot rows
+// [n token rows][the noise token's row][n Markov rows of the tokens], n = gridDim.x / 2: block b < n the embedding of
+// entry b's token (tok[ent[b] * tok_stride], ent null: entry 0), block n the noise token's, block n + 1 + q the Markov
+// embedding of entry q's token. A row this rank's shard does not hold is bf16 -0.0, and the all-reduce makes it whole.
+__global__ void __launch_bounds__(kDim / 8) prep_part_kernel(const int* ent, const int* tok, int tok_stride,
+                                                             const uint16_t* embed, const uint16_t* membed, int base,
+                                                             uint16_t* out) {
+  pdl_trigger();
+  pdl_wait();
+  const int n = gridDim.x / 2, b = blockIdx.x, t = threadIdx.x;
+  const bool mk = b > n;
+  const int q = b < n ? b : b - n - 1;
+  const int id = b == n ? kNoiseToken : tok[(ent ? ent[q] : 0) * tok_stride];
+  if (!embed_shard::id_ok(id)) __trap();
+  const int words = mk ? kMarkov / 2 : kDim / 2;
+  uint32_t* dst = reinterpret_cast<uint32_t*>(out + (mk ? (size_t)(n + 1) * kDim + (size_t)q * kMarkov : (size_t)b * kDim));
+  const uint32_t* src = reinterpret_cast<const uint32_t*>(mk ? membed : embed);
+  for (int i = t; i < words; i += blockDim.x) dst[i] = embed_shard::slot_word(src, base, id, words, i);
+}
+
+// Markov step j's slot rows [rows][kMarkov]: row q the Markov embedding of entry q's token, forced[j] when given, else
+// the gathered argmax of step j - 1 (column q of the candidates, cs apart), this rank's part as prep_part_kernel's.
+__global__ void __launch_bounds__(kMarkov / 8) markov_part_kernel(int j, const int* forced, const Cand* gcand, int cs,
+                                                                  const uint16_t* membed, int base, uint16_t* out) {
+  pdl_trigger();
+  pdl_wait();
+  const int q = blockIdx.x;
+  const int id = forced ? forced[j] : gcand[(j - 1) * cs + q].id;
+  if (!embed_shard::id_ok(id)) __trap();
+  const uint32_t* src = reinterpret_cast<const uint32_t*>(membed);
+  uint32_t* dst = reinterpret_cast<uint32_t*>(out + (size_t)q * kMarkov);
+  for (int i = threadIdx.x; i < kMarkov / 2; i += blockDim.x) dst[i] = embed_shard::slot_word(src, base, id, kMarkov / 2, i);
+}
+
 // draft, kernel 1: the block's input stream (row 0 the token at start + 1, rows 1-4 the noise token; each embedded
-// and copied 4 times), the rows' positions start + 1 .. start + 5 and window bounds, the identity pre-mix, ids[0].
-// Block j: row j.
+// and copied 4 times: rows = the exchange's summed rows, the token's then the noise token's), the rows' positions
+// start + 1 .. start + 5 and window bounds, the identity pre-mix, ids[0]. Block j: row j.
 __global__ void __launch_bounds__(kDim / 8) draft_prep_kernel(const int* token, const int* start,
-                                                              const uint16_t* embed, uint16_t* x, int* pos, int* lo,
+                                                              const uint16_t* rows, uint16_t* x, int* pos, int* lo,
                                                               int* hi, float* pre, int* ids) {
   pdl_trigger();
   pdl_wait();
   const int j = blockIdx.x, t = threadIdx.x;
   const int id = j == 0 ? *token : kNoiseToken;
-  const uint4 v = reinterpret_cast<const uint4*>(embed + (size_t)id * kDim)[t];
+  const uint4 v = reinterpret_cast<const uint4*>(rows + (j == 0 ? 0 : (size_t)kDim))[t];
   uint4* dst = reinterpret_cast<uint4*>(x + (size_t)j * kHc * kDim);
 #pragma unroll
   for (int c = 0; c < kHc; ++c) dst[c * (kDim / 8) + t] = v;
@@ -85,10 +122,11 @@ __global__ void __launch_bounds__(kDim / 8) draft_prep_kernel(const int* token, 
 }
 
 // draft_batch, kernel 1 (B3 phase 2a): draft_prep_kernel over a pass's rows. Block (j, q) is row kDraft q + j,
-// entry ent[q]'s: its token (j = 0, tok[ent * tok_stride]) or the noise token, embedded and copied 4 times; its
-// positions and window bounds from its own anchor start[ent]; the identity pre-mix; ids[8 ent] its token.
+// entry ent[q]'s: its token (j = 0, tok[ent * tok_stride]) or the noise token, embedded and copied 4 times (rows: the
+// exchange's summed rows, entry q's token row at q and the noise row at gridDim.y); its positions and window bounds
+// from its own anchor start[ent]; the identity pre-mix; ids[8 ent] its token.
 __global__ void __launch_bounds__(kDim / 8) draft_prep_batch_kernel(const int* ent, const int* tok, int tok_stride,
-                                                                    const int* start, const uint16_t* embed,
+                                                                    const int* start, const uint16_t* rows,
                                                                     uint16_t* x, int* pos, int* lo, int* hi,
                                                                     float* pre, int* ids) {
   pdl_trigger();
@@ -96,7 +134,7 @@ __global__ void __launch_bounds__(kDim / 8) draft_prep_batch_kernel(const int* e
   const int j = blockIdx.x, q = blockIdx.y, r = q * kDraft + j, t = threadIdx.x;
   const int e = ent[q];
   const int id = j == 0 ? tok[e * tok_stride] : kNoiseToken;
-  const uint4 v = reinterpret_cast<const uint4*>(embed + (size_t)id * kDim)[t];
+  const uint4 v = reinterpret_cast<const uint4*>(rows + (size_t)(j == 0 ? q : gridDim.y) * kDim)[t];
   uint4* dst = reinterpret_cast<uint4*>(x + (size_t)r * kHc * kDim);
 #pragma unroll
   for (int c = 0; c < kHc; ++c) dst[c * (kDim / 8) + t] = v;
@@ -163,8 +201,9 @@ __global__ void __launch_bounds__(32 * kDraft) router3_kernel(const float* logit
   }
 }
 
-// Step j of the Markov chain on this rank's vocab slice: the Markov embedding e of the step's token (ids[0] for
-// j = 0, else the gathered argmax of step j - 1; forced[j] when given), bias = head slice . e (fp32), dl[j] =
+// Step j of the Markov chain on this rank's vocab slice: the Markov embedding e of the step's token (mrows' row q: ids[0]
+// for j = 0, else the gathered argmax of step j - 1; forced[j] when given; summed over the ranks by markov_part_kernel or
+// prep_part_kernel), bias = head slice . e (fp32), dl[j] =
 // logits[j] + bias, and dl[j]'s argmax (ties: the lowest id). A warp per L2 row group of 8 rows: lane l holds 8
 // values of row l/4 per 512-byte chunk; the last CTA to finish reduces the CTAs' candidates into cand[j].
 // F8: the Markov head as markov_fp8() lays it out (mhead e4m3, mscale its 32x32 blocks' ue8m0), the same values
@@ -175,11 +214,10 @@ __global__ void __launch_bounds__(32 * kDraft) router3_kernel(const float* logit
 // candidates and counter: the chain of each entry as alone, in the same order. Without BATCH every offset is
 // zero and the kernel is the one-session one.
 template <bool F8, bool BATCH>
-__global__ void __launch_bounds__(256) markov_kernel(int j, const int* ids, const Cand* gcand, const int* forced,
-                                                     const uint16_t* membed, const uint8_t* mhead,
+__global__ void __launch_bounds__(256) markov_kernel(int j, const uint16_t* mrows, const uint8_t* mhead,
                                                      const uint8_t* mscale, const float* logits, float* dl,
                                                      float* bias_out, uint16_t* emb, Cand* cta, Cand* cand,
-                                                     unsigned* counter, int vbase, const int* ent) {
+                                                     unsigned* counter, int vbase) {
   __shared__ float e[kMarkov];
   __shared__ Cand red[8];
   __shared__ bool last;
@@ -188,7 +226,6 @@ __global__ void __launch_bounds__(256) markov_kernel(int j, const int* ids, cons
   const int g = blockIdx.x * 8 + warp;
   const int q = BATCH ? blockIdx.y : 0, jr = BATCH ? q * kDraft + j : j, cs = BATCH ? kCandStride : 1;
   if constexpr (BATCH) {
-    ids += 8 * ent[q];
     cta += q * kMarkovCtas;
     counter += q;
   }
@@ -205,9 +242,8 @@ __global__ void __launch_bounds__(256) markov_kernel(int j, const int* ids, cons
       w[kc] = __ldg(reinterpret_cast<const uint4*>(mhead + (size_t)g * 4096 + kc * 512 + lane * 16));
   }
   pdl_wait();
-  const int tok = forced ? forced[j] : j == 0 ? ids[0] : gcand[(j - 1) * cs + q].id;
   if (threadIdx.x < kMarkov / 2) {
-    const uint32_t v = reinterpret_cast<const uint32_t*>(membed + (size_t)tok * kMarkov)[threadIdx.x];
+    const uint32_t v = reinterpret_cast<const uint32_t*>(mrows + (size_t)q * kMarkov)[threadIdx.x];
     e[2 * threadIdx.x] = bf2f(v & 0xFFFF);
     e[2 * threadIdx.x + 1] = bf2f(v >> 16);
     if (blockIdx.x == 0) reinterpret_cast<uint32_t*>(emb + jr * kMarkov)[threadIdx.x] = v;
@@ -486,27 +522,25 @@ __global__ void __launch_bounds__(1024) cf_scan_kernel(const float* dl, int vbas
   block_best(m2, m2i, sv, si);
   if (threadIdx.x == 0) rec[4 * j] = m, rec[4 * j + 1] = m2, rec[4 * j + 2] = s, rec[4 * j + 3] = 0.f;
 }
-// Every rank's records (gathered in rank order) and the shipped confidence logits -> the MLP's logits in conf[0..4] and
-// their survival in conf[8..12]. One thread, a fixed order of fp32 operations: the same bits on every rank.
-__global__ void cf_mlp_kernel(const float* grec, const float* w, float* conf, int dbg, float* rawout) {
-  pdl_trigger();
-  pdl_wait();
-  if (threadIdx.x) return;
+// Every rank's records (gathered in rank order) and the shipped confidence logits -> the MLP's logits in out[0..4] and
+// their survival in out[8..12]. One thread, a fixed order of fp32 operations: the same bits on every rank. rec(r, j): rank
+// r's record of depth j (4 floats); cin: the shipped logits [5]; raw: this draft's 15 inputs are written to rawout.
+template <class Rec>
+__device__ void cf_mlp_core(Rec rec, const float* cin, const float* w, float* out_conf, int dbg, float* rawout) {
   float x[kCfIn], raw[kCfIn], c[kDraft];
   for (int j = 0; j < kDraft; ++j) {
-    auto rec = [&](int r) { return grec + (r * kDraft + j) * 4; };
     float M = -INFINITY;
-    for (int r = 0; r < kRanks; ++r) M = fmaxf(M, rec(r)[0]);
+    for (int r = 0; r < kRanks; ++r) M = fmaxf(M, rec(r, j)[0]);
     float S2 = -INFINITY, s = 0.f;
     bool skipped = false;
     for (int r = 0; r < kRanks; ++r) {
-      const float a = rec(r)[0];
+      const float a = rec(r, j)[0];
       if (a == M && !skipped) skipped = true;
       else S2 = fmaxf(S2, a);
-      S2 = fmaxf(S2, rec(r)[1]);
-      s = __fmaf_rn(rec(r)[2], expf(a - M), s);
+      S2 = fmaxf(S2, rec(r, j)[1]);
+      s = __fmaf_rn(rec(r, j)[2], expf(a - M), s);
     }
-    c[j] = conf[j];
+    c[j] = cin[j];
     raw[j] = c[j], raw[kDraft + j] = M - S2, raw[2 * kDraft + j] = -logf(s);
   }
   for (int i = 0; i < kCfIn; ++i) rawout[i] = raw[i];
@@ -525,9 +559,28 @@ __global__ void cf_mlp_kernel(const float* grec, const float* w, float* conf, in
   for (int j = 0; j < kDraft; ++j) {
     const float lg = __fmaf_rn(a[j], c[j], out[j]);
     p *= 1.f / (1.f + expf(-lg));
-    if (dbg == 0) conf[j] = lg, conf[8 + j] = p;
-    else conf[8 + j] = raw[dbg * kDraft + j];
+    if (dbg == 0) out_conf[j] = lg, out_conf[8 + j] = p;
+    else out_conf[8 + j] = raw[dbg * kDraft + j];
   }
+}
+__global__ void cf_mlp_kernel(const float* grec, const float* w, float* conf, int dbg, float* rawout) {
+  pdl_trigger();
+  pdl_wait();
+  if (threadIdx.x) return;
+  auto rec = [&](int r, int j) { return grec + (r * kDraft + j) * 4; };
+  cf_mlp_core(rec, conf, w, conf, dbg, rawout);
+}
+// BATCH: a thread of block q for the pass's entry q (entry ent[q], rows kDraft q ..): its records from every rank (a
+// rank's block of the gather holds the pass's rows, nrows of them), its shipped logits in conf (entry stride 16) -> its
+// MLP logits and survival in out and its inputs in raw (the shipped results stay in conf).
+__global__ void cf_mlp_batch_kernel(const float* grec, int nrows, const float* w, const float* conf, float* out, float* raw,
+                                    const int* ent) {
+  pdl_trigger();
+  pdl_wait();
+  if (threadIdx.x) return;
+  const int q = blockIdx.x, k = ent[q];
+  auto rec = [&](int r, int j) { return grec + ((size_t)r * nrows + q * kDraft + j) * 4; };
+  cf_mlp_core(rec, conf + 16 * k, w, out + 16 * k, 0, raw + 16 * k);
 }
 
 // ---- STAND-IN collectives -----------------------------------------------------------------------------------
@@ -638,9 +691,9 @@ Weights weights_from(std::initializer_list<const dsw::WeightFile*> files) {
   w.main_proj_s = f.u8("mtp.0.main_proj.scale", 40 * 480);
   w.main_norm = f.u16("mtp.0.main_norm.weight", kDim);
   w.norm = f.u16("mtp.2.norm.weight", kDim);
-  w.embed = f.u16("embed.weight", (uint64_t)kVocab * kDim);
+  w.embed = f.u16("embed.weight", (uint64_t)kVocabRank * kDim);
   w.head = f.u8("head.weight", (uint64_t)kVocabRank * kDim * 2);
-  w.markov_embed = f.u16("mtp.2.markov_head.embed.weight", (uint64_t)kVocab * kMarkov);
+  w.markov_embed = f.u16("mtp.2.markov_head.embed.weight", (uint64_t)kVocabRank * kMarkov);
   w.markov_head = f.u8("mtp.2.markov_head.head.weight", (uint64_t)kVocabRank * kMarkov * 2);
   w.conf = f.u16("mtp.2.confidence_head.proj.weight", kDim + kMarkov);
   return w;
@@ -865,6 +918,8 @@ struct Draft::Buf {
   uint16_t *xa, *xb;
   float *chunks_r, *chunks, *pre, *post, *comb;
   uint16_t *y, *qa_r, *kvp_r, *qa, *kvp, *qb, *o, *part, *sub, *hx, *hxn, *emb;
+  // the embedding exchanges: a pass's part and sum (prep_part_kernel), a Markov step's (markov_part_kernel)
+  uint16_t *epart, *esum, *mpart, *msum;
   uint8_t *xq, *xs, *qq, *qs, *oq, *os;
   float *so, *sml, *lg_r, *lg, *wts, *ymoe, *logits, *dl;
   int* idx;
@@ -885,10 +940,11 @@ struct Draft::Buf {
   void* batch_arena = nullptr;
   int *bstart, *bids;
   float* bconf;
+  float *bcfo, *bcfr, *bcfrec, *bcfgrec;  // enable_cf_batch: the MLP's results and inputs per entry [16], the rows' records
   int *bpos, *blo, *bhi;
   uint16_t *bxa, *bxb;
   float *bchunks_r, *bchunks, *bpre, *bpost, *bcomb;
-  uint16_t *by, *bqa_r, *bkvp_r, *bqa, *bkvp, *bqb, *bo, *bpart, *bsub, *bhx, *bhxn, *bemb;
+  uint16_t *by, *bqa_r, *bkvp_r, *bqa, *bkvp, *bqb, *bo, *bpart, *bsub, *bhx, *bhxn, *bemb, *bepart, *besum, *bmpart, *bmsum;
   uint8_t *bxq, *bxs, *bqq, *bqs, *boq, *bos;
   float *bso, *bsml, *blg_r, *blg, *bwts, *bymoe, *blogits, *bdl;
   int* bidx;
@@ -931,6 +987,7 @@ Draft::Draft(const Weights& w, int rank, Comm* comm, const float2* table, int sl
     take(b.hx, R * kDim * 2), take(b.hxn, R * kDim * 2), take(b.logits, R * kVocabRank * 4), take(b.dl, R * kVocabRank * 4);
     take(b.emb, R * kMarkov * 2), take(b.cta, kMarkovCtas * sizeof(Cand)), take(b.cand, 8 * sizeof(Cand));
     take(b.gcand, 8 * sizeof(Cand)), take(b.counter, 4), take(b.ids, 8 * 4), take(b.conf, 16 * 4);
+    take(b.epart, (2 * kDim + kMarkov) * 2), take(b.esum, (2 * kDim + kMarkov) * 2), take(b.mpart, kMarkov * 2), take(b.msum, kMarkov * 2);
     if (pass == 0) {
       CUDA_CHECK(cudaMalloc(&b.arena, off));
       CUDA_CHECK(cudaMemset(b.arena, 0, off));
@@ -1036,6 +1093,24 @@ void Draft::mix(const uint16_t* x, const float* fn, const float* fn_all, const f
                b.pre);
 }
 
+// The pass's embedding lookups, by vocabulary rows: this rank's part of the n entries' token rows, the noise token's row
+// and the n Markov rows (prep_part_kernel), summed over the ranks into sum (the rows' layout there is the kernel's).
+void Draft::embed_exchange(const int* ent, const int* tok, int tok_stride, int n, uint16_t* part, uint16_t* sum,
+                           cudaStream_t s) {
+  launch(prep_part_kernel, dim3(2 * n + 1), dim3(kDim / 8), 0, s, true, ent, tok, tok_stride, w_.embed, w_.markov_embed,
+         kVocabRank * rank_, part);
+  comm_->all_reduce(part, false, sum, (size_t)(n + 1) * kDim + (size_t)n * kMarkov, s);
+}
+
+// Markov step j's rows for n entries, summed over the ranks: row q of the result is entry q's token's Markov embedding.
+const uint16_t* Draft::markov_exchange(int j, const int* forced, const Cand* gcand, int cs, int n, uint16_t* part,
+                                       uint16_t* sum, cudaStream_t s) {
+  launch(markov_part_kernel, dim3(n), dim3(kMarkov / 8), 0, s, true, j, forced, gcand, cs, w_.markov_embed,
+         kVocabRank * rank_, part);
+  comm_->all_reduce(part, false, sum, (size_t)n * kMarkov, s);  // COLLECTIVE: all-reduce of the Markov rows of the step's tokens
+  return sum;
+}
+
 void Draft::draft(const int* token, cudaStream_t s, const int* slot) {
   Buf& b = *b_;
   // wq_b and wo_b with two MMA tiles per warp: half the CTAs, each row's sums as with one (~10 us less per block)
@@ -1044,8 +1119,9 @@ void Draft::draft(const int* token, cudaStream_t s, const int* slot) {
   dsk::MoeCfg mc{};
   mc.down = 4;
   const size_t rows_bytes = (size_t)kDraft * kDim * 2;
-  launch(draft_prep_kernel, dim3(kDraft), dim3(kDim / 8), 0, s, true, token, (const int*)b.start, w_.embed, b.xa,
-         b.pos, b.lo, b.hi, b.pre, ids_);
+  embed_exchange(nullptr, token, 1, 1, b.epart, b.esum, s);  // COLLECTIVE: all-reduce of the token's and the noise token's rows
+  launch(draft_prep_kernel, dim3(kDraft), dim3(kDim / 8), 0, s, true, token, (const int*)b.start, (const uint16_t*)b.esum,
+         b.xa, b.pos, b.lo, b.hi, b.pre, ids_);
   for (int i = 0; i < kBlocks; ++i) {
     const BlockW& w = w_.b[i];
     // ---- attention sublayer: SWA over the window's last 128 main positions and the block itself
@@ -1113,12 +1189,20 @@ void Draft::draft(const int* token, cudaStream_t s, const int* slot) {
   else
     dsk::gemv_bf16(bf(b.hxn), kDraft, w_.head, kVocabRank, kDim, b.logits, nullptr, ch, false, s);
   tap(taps.logits, b.logits, (size_t)kDraft * kVocabRank * 4, s);
+  const bool carry = comm_->carries_rows() && !inject.ids;
   for (int j = 0; j < kDraft; ++j) {
+    // step 0's Markov row came with the embedding exchange; a later step's token is the previous step's argmax
+    // (or the test's injected one), whose row the argmax carried (carry) or an all-reduce brings
+    const uint16_t* mrows = (const uint16_t*)b.esum + 2 * kDim;
+    if (inject.ids) mrows = markov_exchange(j, inject.ids, b.gcand, 1, 1, b.mpart, b.msum, s);
+    else if (j > 0) mrows = carry ? b.msum : markov_exchange(j, nullptr, b.gcand, 1, 1, b.mpart, b.msum, s);
     launch(w_.markov8 ? markov_kernel<true, false> : markov_kernel<false, false>, dim3(vrows_ / 64), dim3(256), 0, s,
-           true, j, (const int*)ids_, (const Cand*)b.gcand, inject.ids, w_.markov_embed,
-           w_.markov8 ? w_.markov8 : w_.markov_head, w_.markov8_s, (const float*)b.logits, b.dl, taps.bias, b.emb,
-           b.cta, b.cand, b.counter, kVocabRank * rank_, (const int*)nullptr);
-    comm_->argmax(b.cand + j, b.gcand + j, s);  // COLLECTIVE: argmax over the ranks' candidates
+           true, j, mrows, w_.markov8 ? w_.markov8 : w_.markov_head, w_.markov8_s, (const float*)b.logits, b.dl,
+           taps.bias, b.emb, b.cta, b.cand, b.counter, kVocabRank * rank_);
+    if (carry && j + 1 < kDraft)  // the winner's Markov row travels with it: it is step j + 1's
+      comm_->argmax_rows_row(b.cand + j, b.gcand + j, 1, w_.markov_embed, kVocabRank * rank_, b.msum, s);  // COLLECTIVE
+    else
+      comm_->argmax(b.cand + j, b.gcand + j, s);  // COLLECTIVE: argmax over the ranks' candidates
   }
   tap(taps.markov_embed, b.emb, kDraft * kMarkov * 2, s);
   launch(conf_kernel<false>, dim3(1), dim3(32 * kDraft), 0, s, true, (const uint16_t*)b.hx, (const uint16_t*)b.emb,
@@ -1144,6 +1228,20 @@ void Draft::enable_cf(const float* w, int dbg) {
   cf_dbg_ = dbg;
 }
 
+void Draft::enable_cf_batch() {
+  if (!cf_w_) die("dspark::Draft: enable_cf_batch() before enable_cf()");
+  if (!b_->batch_arena) die("dspark::Draft: enable_cf_batch() before enable_batch()");
+  cf_batch_ = true;
+}
+const float* Draft::batch_cf_confidence(int k) const {
+  if (!b_->batch_arena || k < 0 || k >= kMaxEnts) die("dspark::Draft: batch_cf_confidence(%d)", k);
+  return b_->bcfo + 16 * k;
+}
+const float* Draft::batch_cf_raw(int k) const {
+  if (!b_->batch_arena || k < 0 || k >= kMaxEnts) die("dspark::Draft: batch_cf_raw(%d)", k);
+  return b_->bcfr + 16 * k;
+}
+
 // ---- B3 phase 2a: one pass over several entries (docs/batching.md) ------------------------------------------------
 // draft() over a pass's rows, side by side, in the batch buffers: the same launches with rows = kDraft n and the
 // kernels' row dimension (an activation row per MMA lane group; hc_mix, decode_prep and the attention a CTA per
@@ -1165,6 +1263,8 @@ void Draft::enable_batch() {
   for (int pass = 0; pass < 2; ++pass) {
     off = 0;
     take(b.bstart, kMaxEnts * 4), take(b.bids, kMaxEnts * 8 * 4), take(b.bconf, kMaxEnts * 16 * 4);
+    take(b.bcfo, kMaxEnts * 16 * 4), take(b.bcfr, kMaxEnts * 16 * 4);
+    take(b.bcfrec, kWideRows * 16), take(b.bcfgrec, kRanks * kWideRows * 16);
     take(b.bpos, R * 4), take(b.blo, R * 4), take(b.bhi, R * 4);
     take(b.bxa, R * kHc * kDim * 2), take(b.bxb, R * kHc * kDim * 2);
     take(b.bchunks_r, 10 * R * 25 * 4), take(b.bchunks, kHcChunks * R * 25 * 4);
@@ -1178,6 +1278,8 @@ void Draft::enable_batch() {
     take(b.bymoe, R * kDim * 4), take(b.bmoe_ws, dsk::moe_workspace_bytes());
     take(b.bhx, R * kDim * 2), take(b.bhxn, R * kDim * 2), take(b.blogits, R * kVocabRank * 4), take(b.bdl, R * kVocabRank * 4);
     take(b.bemb, R * kMarkov * 2), take(b.bcta, E * kMarkovCtas * sizeof(Cand)), take(b.bcand, C * sizeof(Cand));
+    take(b.bepart, ((E + 1) * kDim + E * kMarkov) * 2), take(b.besum, ((E + 1) * kDim + E * kMarkov) * 2);
+    take(b.bmpart, E * kMarkov * 2), take(b.bmsum, E * kMarkov * 2);
     take(b.bgcand, C * sizeof(Cand)), take(b.bcounter, E * 4);
     take(b.bpws, dsk::moe_prefill_workspace_bytes(kWideRows, kExperts));
     if (pass == 0) {
@@ -1228,8 +1330,9 @@ void Draft::draft_batch(const BatchPass& p, cudaStream_t s) {
   c8k.tiled = cqb.tiled = cob.tiled = true;
   dsk::MoeCfg mc{};
   mc.down = 4;
+  embed_exchange(p.ent, p.tok, p.tok_stride, p.n, b.bepart, b.besum, s);  // COLLECTIVE: all-reduce of the entries' token rows
   launch(draft_prep_batch_kernel, dim3(kDraft, p.n), dim3(kDim / 8), 0, s, true, p.ent, p.tok, p.tok_stride,
-         (const int*)b.bstart, w_.embed, b.bxa, b.bpos, b.blo, b.bhi, b.bpre, b.bids);
+         (const int*)b.bstart, (const uint16_t*)b.besum, b.bxa, b.bpos, b.blo, b.bhi, b.bpre, b.bids);
   for (int i = 0; i < kBlocks; ++i) {
     const BlockW& w = w_.b[i];
     // ---- attention sublayer: each row's SWA over its own window's last 128 main positions and its block
@@ -1294,15 +1397,28 @@ void Draft::draft_batch_head(const BatchPass& p, int R, cudaStream_t s) {
     }
   }
   const int ncand = (p.n + 1) & ~1;  // the pass's candidates per step, an even count (argmax_rows's 16 bytes)
+  const bool carry = comm_->carries_rows();
   for (int j = 0; j < kDraft; ++j) {
+    const uint16_t* mrows = (const uint16_t*)b.besum + (size_t)(p.n + 1) * kDim;  // step 0's came with the prep exchange
+    if (j > 0) mrows = carry ? b.bmsum : markov_exchange(j, nullptr, b.bgcand, kCandStride, p.n, b.bmpart, b.bmsum, s);
     launch(w_.markov8 ? markov_kernel<true, true> : markov_kernel<false, true>, dim3(vrows_ / 64, p.n), dim3(256), 0,
-           s, true, j, (const int*)b.bids, (const Cand*)b.bgcand, (const int*)nullptr, w_.markov_embed,
-           w_.markov8 ? w_.markov8 : w_.markov_head, w_.markov8_s, (const float*)b.blogits, b.bdl, (float*)nullptr,
-           b.bemb, b.bcta, b.bcand, b.bcounter, kVocabRank * rank_, p.ent);
-    comm_->argmax_rows(b.bcand + j * kCandStride, b.bgcand + j * kCandStride, ncand, s);  // COLLECTIVE
+           s, true, j, mrows, w_.markov8 ? w_.markov8 : w_.markov_head, w_.markov8_s, (const float*)b.blogits, b.bdl,
+           (float*)nullptr, b.bemb, b.bcta, b.bcand, b.bcounter, kVocabRank * rank_);
+    if (carry && j + 1 < kDraft)  // the winners' Markov rows travel with them: step j + 1's
+      comm_->argmax_rows_row(b.bcand + j * kCandStride, b.bgcand + j * kCandStride, ncand, w_.markov_embed,
+                             kVocabRank * rank_, b.bmsum, s);  // COLLECTIVE
+    else
+      comm_->argmax_rows(b.bcand + j * kCandStride, b.bgcand + j * kCandStride, ncand, s);  // COLLECTIVE
   }
   launch(conf_kernel<true>, dim3(p.n), dim3(32 * kDraft), 0, s, true, (const uint16_t*)b.bhx, (const uint16_t*)b.bemb,
          w_.conf, (const Cand*)b.bgcand, b.bids, b.bconf, p.ent);
+  if (cf_batch_) {  // the one-session confidence MLP over each entry's rows: the records of the rows' biased logits
+    launch(cf_scan_kernel, dim3(R), dim3(1024), 0, s, true, (const float*)b.bdl, kVocabRank * rank_, b.bcfrec);
+    const GatherSeg g{b.bcfrec, (size_t)R * 16, b.bcfgrec, (size_t)R * 16, (size_t)R * 16, 1};
+    comm_->all_gather(&g, 1, s);  // COLLECTIVE: all-gather of the ranks' (max, second, sum exp) per row
+    launch(cf_mlp_batch_kernel, dim3(p.n), dim3(32), 0, s, true, (const float*)b.bcfgrec, R, (const float*)cf_w_,
+           (const float*)b.bconf, b.bcfo, b.bcfr, p.ent);
+  }
 }
 
 // wide64, the one-pass drafter: every entry's rows in one pass (up to kWideEnts entries, kWideRows rows), the dense
@@ -1317,8 +1433,9 @@ void Draft::draft_batch_wide(const BatchPass& p, cudaStream_t s) {
   c8k.tiled = cqb.tiled = cob.tiled = true;
   // DSGB10_DRAFT1_GEMM=0: wq_b, wo_a and wo_b as the narrow pass's GEMV calls too (only the MoE and head wide)
   static const bool gemm = !getenv("DSGB10_DRAFT1_GEMM") || atoi(getenv("DSGB10_DRAFT1_GEMM")) != 0;
+  embed_exchange(p.ent, p.tok, p.tok_stride, p.n, b.bepart, b.besum, s);  // COLLECTIVE: all-reduce of the entries' token rows
   launch(draft_prep_batch_kernel, dim3(kDraft, p.n), dim3(kDim / 8), 0, s, true, p.ent, p.tok, p.tok_stride,
-         (const int*)b.bstart, w_.embed, b.bxa, b.bpos, b.blo, b.bhi, b.bpre, b.bids);
+         (const int*)b.bstart, (const uint16_t*)b.besum, b.bxa, b.bpos, b.blo, b.bhi, b.bpre, b.bids);
   for (int i = 0; i < kBlocks; ++i) {
     const BlockW& w = w_.b[i];
     bmix(b.bxa, R, w.attn_fn, w.attn_fn_all, w.attn_scale, w.attn_base, w.attn_norm, s);
@@ -1412,11 +1529,12 @@ void Draft::probe(const int* path, cudaStream_t s) {
   if (!b.probe_arena) die("dspark::Draft: probe() before enable_probe()");
   const int vbase = kVocabRank * rank_;
   launch(probe_prep_kernel, dim3(1), dim3(32), 0, s, true, (const int*)ids_, path, b.pr_forced);
-  for (int j = 0; j < kDraft; ++j)
+  for (int j = 0; j < kDraft; ++j) {
+    const uint16_t* mrows = markov_exchange(j, b.pr_forced, b.gcand, 1, 1, b.mpart, b.msum, s);  // the path's token, every step
     launch(w_.markov8 ? markov_kernel<true, false> : markov_kernel<false, false>, dim3(kMarkovCtas), dim3(256), 0, s,
-           true, j, (const int*)ids_, (const Cand*)b.gcand, (const int*)b.pr_forced, w_.markov_embed,
-           w_.markov8 ? w_.markov8 : w_.markov_head, w_.markov8_s, (const float*)b.logits, b.pr_dl, nullptr,
-           b.pr_emb, b.cta, b.pr_cand, b.counter, vbase, (const int*)nullptr);
+           true, j, mrows, w_.markov8 ? w_.markov8 : w_.markov_head, w_.markov8_s, (const float*)b.logits, b.pr_dl,
+           nullptr, b.pr_emb, b.cta, b.pr_cand, b.counter, vbase);
+  }
   launch(probe_topk_kernel, dim3(kDraft), dim3(1024), 0, s, true, (const float*)b.pr_dl, path, vbase, b.pr_rec);
   launch(conf_kernel<false>, dim3(1), dim3(32 * kDraft), 0, s, true, (const uint16_t*)b.hx, (const uint16_t*)b.pr_emb,
          w_.conf, (const Cand*)b.pr_cand, b.pr_ids, b.pr_conf, (const int*)nullptr);

@@ -675,6 +675,28 @@ std::vector<DecodeEnd> spec_batch_loop(model::Model& m, const Cmd& c, const std:
     int32_t tok[model::ops::kSessTok] = {};
   };
   std::vector<Next> nx(n);
+  // DSGB10_GATE_DUMP (with DSGB10_GATE_DUMP_FILE=FILE, rank 0's server only: the callback is its mark): a line a verified
+  // entry and batch step: the step's entries and rows, the drafts verified, the drafts accepted, and what the gate saw
+  // for those drafts (the shipped survival, the MLP's, the one it used, the MLP's inputs), taken from the step that chose them
+  static FILE* const gdump = [&] {
+    const char* v = getenv("DSGB10_GATE_DUMP_FILE");
+    if (!on || !v || !*v || !getenv("DSGB10_GATE_DUMP") || !atoi(getenv("DSGB10_GATE_DUMP"))) return (FILE*)nullptr;
+    FILE* f = std::fopen(v, "a");
+    if (f && std::ftell(f) == 0) {
+      std::fprintf(f, "tag,step,entry,sessions,step_rows,verified,accepted");
+      for (const char* nm : {"ship", "mlp", "used"})
+        for (int j = 1; j <= kD; ++j) std::fprintf(f, ",%s%d", nm, j);
+      for (int j = 0; j < 15; ++j) std::fprintf(f, ",f%d", j);
+      std::fprintf(f, "\n");
+    }
+    return f;
+  }();
+  struct GateRec {
+    bool valid = false;
+    int keep = 0;
+    float v[3 * model::ops::kDrafts + 16] = {};
+  };
+  std::vector<GateRec> grec(n);
   std::vector<int> pin, live_h;
   for (const int32_t h : c.live)
     if (h > 0) live_h.push_back(h);
@@ -810,6 +832,28 @@ std::vector<DecodeEnd> spec_batch_loop(model::Model& m, const Cmd& c, const std:
       stats.gpu_ms[std::min(prev_R, model::kMaxRows)] += m.gpu_ms(prev_id), ++stats.gpu_n[std::min(prev_R, model::kMaxRows)];
     prev_id = s.id, prev_R = o.step_rows;
     ++stats.steps, stats.rows += o.step_rows;
+    if (gdump) {
+      static const char* const tag = getenv("DSGB10_GATE_TAG") ? getenv("DSGB10_GATE_TAG") : "";
+      int son = 0;
+      for (int k = 0; k < n; ++k) son += s.on[k] ? 1 : 0;
+      for (int k = 0; k < n; ++k) {
+        if (!s.on[k]) continue;
+        GateRec& g = grec[k];
+        const int sr = o.sess_step_rows[k], er = o.sess_rows[k];
+        if (g.valid && sr - 1 == g.keep && sr >= 1 && er >= 1 && er <= sr) {
+          std::fprintf(gdump, "%s,%d,%d,%d,%d,%d,%d", tag, i, k, son, o.step_rows, sr - 1, er - 1);
+          for (int j = 0; j < 3 * kD; ++j) std::fprintf(gdump, ",%.7g", g.v[j]);
+          for (int j = 0; j < 15; ++j) std::fprintf(gdump, ",%.7g", g.v[3 * kD + j]);
+          std::fprintf(gdump, "\n");
+        }
+        g.valid = true, g.keep = o.gate_keep[k];
+        std::copy(o.gate_ship[k], o.gate_ship[k] + kD, g.v);
+        std::copy(o.gate_mlp[k], o.gate_mlp[k] + kD, g.v + kD);
+        std::copy(o.gate_used[k], o.gate_used[k] + kD, g.v + 2 * kD);
+        std::copy(o.gate_feat[k], o.gate_feat[k] + 15, g.v + 3 * kD);
+      }
+      std::fflush(gdump);
+    }
     for (int k = 0; k < n; ++k) {
       if (!s.on[k]) continue;
       DecodeEnd& d = end[k];

@@ -65,9 +65,9 @@ struct Weights {
   BlockW b[kBlocks];
   const uint8_t *main_proj, *main_proj_s;  // e4m3 [1280][15360] L1 (this rank's outputs), ue8m0 [40][480]
   const uint16_t *main_norm, *norm;        // mtp.0.main_norm; mtp.2.norm (the head's)
-  const uint16_t* embed;                   // bf16 [129280][5120], the main model's (replicated)
+  const uint16_t* embed;                   // bf16 [32320][5120], the main model's rows of this rank's vocab slice
   const uint8_t* head;                     // bf16 [32320][5120] L2, the main model's vocab slice
-  const uint16_t* markov_embed;            // bf16 [129280][256] (replicated)
+  const uint16_t* markov_embed;            // bf16 [32320][256], the same vocab slice
   const uint8_t* markov_head;              // bf16 [32320][256] L2, the same vocab slice
   const uint16_t* conf;                    // bf16 [5376]: confidence_head.proj
   // Optional: an FP8 copy of the head slice (head_fp8()), which the pass then reads instead, half the bytes.
@@ -149,6 +149,11 @@ class Comm {
   virtual void argmax_rows(const Cand* src, Cand* dst, int rows, cudaStream_t s) {
     for (int r = 0; r < rows; ++r) argmax(src + r, dst + r, s);
   }
+  // The same, and the winner's row of `table` (a vocabulary slice of kMarkov bf16 a row, from id `base`, kVocabRank rows) lands
+  // at rows_out [rows][kMarkov] for each row: a rank's candidate lies in its own slice, so the row travels with it. Only
+  // where carries_rows(); the others exchange the rows with all_reduce.
+  virtual bool carries_rows() const { return false; }
+  virtual void argmax_rows_row(const Cand*, Cand*, int, const uint16_t*, int, uint16_t*, cudaStream_t) {}
 };
 // STAND-INs for timing one rank alone: every collective is one local PDL kernel that puts this rank's data where
 // the result would land (gathers fill every rank's slot with it, reductions take it as the sum).
@@ -266,6 +271,14 @@ class Draft {
   // capture of draft(). dbg 1 / 2: survival() carries the margins / the log p instead (measurement only).
   void enable_cf(const float* w, int dbg);
   const float* cf_raw() const { return cf_w_ ? cf_raw_ : nullptr; }  // device [16]: the MLP's inputs of the last draft()
+  // The same MLP over a batch pass's rows (after enable_cf and enable_batch, before any capture of a batch pass): each
+  // entry's MLP logits and survival beside the shipped ones (batch_confidence / batch_survival keep the shipped head's)
+  // and its inputs. Every row's inputs are what draft() computes for it alone, so the MLP's values are draft()'s.
+  void enable_cf_batch();
+  bool cf_batch() const { return cf_batch_; }
+  const float* batch_cf_confidence(int k) const;  // [5]: the MLP's logits (conf of batch_confidence's layout)
+  const float* batch_cf_survival(int k) const { return batch_cf_confidence(k) + 8; }
+  const float* batch_cf_raw(int k) const;         // [16]: the MLP's inputs (shipped logits, margins, log p1; 5 each)
 
   // EXPERIMENT, bench only (docs/engine.md, "Draft trees"; ProbeOut): enable_probe() once, before any capture
   // of probe(). After draft(), probe(path) runs the Markov chain again along path (kDraft tokens on the device,
@@ -292,6 +305,9 @@ class Draft {
            const uint16_t* norm, cudaStream_t s);
   // mix() over a batch pass's rows, in the batch buffers (hc_project's rows per CTA group and hc_mix's CTA per
   // row keep every row's arithmetic its own)
+  void embed_exchange(const int* ent, const int* tok, int tok_stride, int n, uint16_t* part, uint16_t* sum, cudaStream_t s);
+  const uint16_t* markov_exchange(int j, const int* forced, const Cand* gcand, int cs, int n, uint16_t* part,
+                                  uint16_t* sum, cudaStream_t s);
   void draft_batch_wide(const BatchPass& p, cudaStream_t s);        // wide64: more than kBatchEnts entries
   void draft_batch_head(const BatchPass& p, int R, cudaStream_t s);  // a pass's head, Markov chains, confidence
   void bmix(const uint16_t* x, int rows, const float* fn, const float* fn_all, const float* scale, const float* base,
@@ -308,6 +324,7 @@ class Draft {
   int vrows_ = kVocabRank;
   float *cf_w_ = nullptr, *cf_rec_ = nullptr, *cf_grec_ = nullptr, *cf_raw_ = nullptr;  // stack4: the confidence MLP (enable_cf)
   int cf_dbg_ = 0;
+  bool cf_batch_ = false;  // enable_cf_batch
   Buf* b_;
   int* ids_;
   float* conf_;
