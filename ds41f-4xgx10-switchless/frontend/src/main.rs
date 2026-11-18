@@ -58,6 +58,8 @@ fn usage() -> ! {
                                 /dashboard polls them while it is open; without them its NODE HEALTH is empty
       --dashboard-host NAME     a host name the dashboard also answers (repeat it), e.g. a proxy's; it always
                                 answers localhost and the listen addresses, and refuses every other Host
+      --fan-tool PATH           the fan tool (dgx-fan-fleet, docs/dashboard.md): the dashboard then has a FANS box that sets
+                                the Sparks' fan profile and shows their fans; without it the box is absent
       --vision-addr HOST:PORT   accept image_url / image parts: the image encoder (tools/vision) turns
                                 them into embedding rows (docs/vision.md); without it images are refused
       --max-body-mb N           the largest request body taken, in MiB: 64; a larger one is answered
@@ -173,6 +175,7 @@ fn serve(args: &[String]) {
         max_image_rows: max_image_rows(args),
         max_body_bytes: max_body_bytes(args),
         max_image_rows_in_flight: max_image_rows_in_flight(args),
+        fan_tool: opt(args, "--fan-tool").map(Into::into),
         front_table_mib: parse_opt(args, "--front-table-mib", dsfront::server::DEFAULT_FRONT_TABLE_MIB),
         front_mib: parse_opt(args, "--front-mib", dsfront::server::DEFAULT_FRONT_MIB),
         front_image_mib: parse_opt(args, "--front-image-mib", dsfront::server::DEFAULT_FRONT_IMAGE_MIB),
@@ -239,7 +242,7 @@ fn serve(args: &[String]) {
             let shutdown = async move {
                 let _ = stop.wait_for(|s| *s).await;
             };
-            servers.spawn(std::future::IntoFuture::into_future(axum::serve(l, routes.clone()).with_graceful_shutdown(shutdown)));
+            servers.spawn(std::future::IntoFuture::into_future(axum::serve(l, routes.clone().into_make_service_with_connect_info::<std::net::SocketAddr>()).with_graceful_shutdown(shutdown)));
         }
         while let Some(r) = servers.join_next().await {
             r.expect("server task").expect("server");

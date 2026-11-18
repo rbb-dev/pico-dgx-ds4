@@ -4,7 +4,8 @@
 
 use crate::protocol::{ConfigFrame, Done, DoneReason, EngineStats};
 use crate::server::App;
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
+use axum::http::request::Parts;
 use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::body::Bytes;
@@ -1077,6 +1078,59 @@ async fn settings_post(State(app): State<Arc<App>>, headers: HeaderMap, body: By
     }
 }
 
+/// The fans of the Sparks (src/fans.rs): without `--fan-tool` the box is absent and the answer says so.
+async fn fans_get(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
+    if let Err(r) = authed(&app, &headers) {
+        return *r;
+    }
+    app.engine.telemetry().watch();
+    if !app.fans.present() {
+        return json_response(StatusCode::OK, json!({"at_ms": unix_ms(), "tool": false, "profiles": [], "wanted": null, "mixed": false, "pinned": null, "nodes": []}));
+    }
+    match app.fans.status().await {
+        Ok(v) => json_response(StatusCode::OK, v),
+        Err(e) => failure(StatusCode::BAD_GATEWAY, &format!("fans: {e}")),
+    }
+}
+
+/// `{"profile": "<id>"}`: one profile of the fixed list, set on all four Sparks by the tool. 409 while a timing window pins it.
+async fn fans_post(State(app): State<Arc<App>>, parts: Parts, body: Bytes) -> Response {
+    if let Err(r) = authed(&app, &parts.headers) {
+        return *r;
+    }
+    if let Err(r) = json_body(&parts.headers) {
+        return *r;
+    }
+    if !app.fans.present() {
+        return failure(StatusCode::SERVICE_UNAVAILABLE, "no fan tool: start dsfront with --fan-tool");
+    }
+    let v: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => return failure(StatusCode::BAD_REQUEST, &format!("fans: {e}")),
+    };
+    let profile = match crate::fans::parse_fan_request(&v) {
+        Ok(p) => p,
+        Err(e) => return failure(StatusCode::BAD_REQUEST, &e),
+    };
+    let peer = parts.extensions.get::<ConnectInfo<std::net::SocketAddr>>().map_or("unknown".to_string(), |c| c.0.ip().to_string());
+    match app.fans.set(profile).await {
+        crate::fans::SetOutcome::Done(v) => {
+            let n = v["nodes"].as_array().map_or(0, |a| a.len());
+            let ok = v["nodes"].as_array().map_or(0, |a| a.iter().filter(|x| x["ok"] == json!(true)).count());
+            eprintln!("fan: profile={profile} ok={ok}/{n} peer={peer}");
+            json_response(StatusCode::OK, v)
+        }
+        crate::fans::SetOutcome::Pinned(why) => {
+            eprintln!("fan: profile={profile} refused, pinned ({why}) peer={peer}");
+            failure(StatusCode::CONFLICT, &format!("the fans are pinned: {why}"))
+        }
+        crate::fans::SetOutcome::Failed(e) => {
+            eprintln!("fan: profile={profile} failed ({e}) peer={peer}");
+            failure(StatusCode::BAD_GATEWAY, &format!("fans: {e}"))
+        }
+    }
+}
+
 // ------------------------------------------------------------------ routes
 
 pub fn routes() -> Router<Arc<App>> {
@@ -1088,6 +1142,16 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/dashboard/api/v1/series", get(series))
         .route("/dashboard/api/v1/ledger", get(ledger))
         .route("/dashboard/api/v1/settings", get(settings_get).post(settings_post))
+        .route("/dashboard/api/v1/fans", get(fans_get).post(fans_post))
+        .layer(axum::middleware::map_response(framing_headers))
+}
+
+/// No page of another site may frame the dashboard: every answer of its routes says so. No script policy is set: the page's script is inline.
+async fn framing_headers(mut r: Response) -> Response {
+    let h = r.headers_mut();
+    h.insert("x-frame-options", axum::http::HeaderValue::from_static("DENY"));
+    h.insert("content-security-policy", axum::http::HeaderValue::from_static("frame-ancestors 'none'"));
+    r
 }
 
 /// A request's host name (the Host header without its port), lower case.

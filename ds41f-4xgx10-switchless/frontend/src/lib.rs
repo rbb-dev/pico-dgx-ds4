@@ -3,6 +3,7 @@
 pub mod dashboard;
 pub mod encoding;
 pub mod engine;
+pub mod fans;
 pub mod gate;
 pub mod guard;
 pub mod mock;

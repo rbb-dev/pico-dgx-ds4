@@ -68,6 +68,8 @@ pub struct ServerConfig {
     /// vision: the most rows the image requests being answered may take together
     /// (--max-image-rows-in-flight); a request that does not fit is answered 429 with Retry-After
     pub max_image_rows_in_flight: usize,
+    /// The fan tool (`--fan-tool`, src/fans.rs): None, and the dashboard has no FANS box
+    pub fan_tool: Option<std::path::PathBuf>,
     /// The most memory the session table may hold, in MiB, counted by what its buffers allocate (--front-table-mib;
     /// 0, the default: no limit); the oldest idle sessions go first.
     pub front_table_mib: usize,
@@ -119,6 +121,8 @@ pub struct App {
     pub gate: Arc<Gate>,
     /// vision: the rows held by the image requests in flight (text requests never touch it)
     pub image_rows: Arc<crate::vision::RowsInFlight>,
+    /// The Sparks' fan profile, through the fan tool (none without `--fan-tool`)
+    pub fans: crate::fans::Fans,
     sessions: Mutex<SessionTable>,
     governor: Mutex<crate::session::Governor>,
     think_end_id: Option<u32>,
@@ -130,6 +134,8 @@ impl App {
         let think_end_id = tok.token_id("</think>");
         let gate = Gate::new(cfg.hold);
         let image_rows = crate::vision::RowsInFlight::new(cfg.max_image_rows_in_flight);
+        image_rows.set_pixels(cfg.vision == crate::vision::VisionKind::Engine);
+        let fans = crate::fans::Fans::new(cfg.fan_tool.clone());
         let mut table = SessionTable::new(256, 16 << 20);
         table.set_byte_limits(cfg.front_table_mib << 20, cfg.front_image_mib << 20);
         table.defer_limits();
@@ -139,6 +145,7 @@ impl App {
             engine,
             gate,
             image_rows,
+            fans,
             sessions: Mutex::new(table),
             governor: Mutex::new(Default::default()),
             think_end_id,
@@ -1462,6 +1469,7 @@ pub(crate) mod tests {
             max_image_rows: crate::vision::DEFAULT_MAX_IMAGE_ROWS,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             max_image_rows_in_flight: crate::vision::DEFAULT_MAX_IMAGE_ROWS_IN_FLIGHT,
+            fan_tool: None,
             front_table_mib: DEFAULT_FRONT_TABLE_MIB,
             front_mib: DEFAULT_FRONT_MIB,
             front_image_mib: DEFAULT_FRONT_IMAGE_MIB,

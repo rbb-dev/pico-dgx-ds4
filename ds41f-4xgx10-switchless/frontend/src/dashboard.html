@@ -69,9 +69,11 @@ main#view:focus { outline: none; }
 [hidden] { display: none !important; }
 /* ---- the Overview: a status board's front page (its colours, type and density) ---- */
 /* the board: the ENGINE strip across the top; LINES beside DECODE over PREFILL (the charts take the LINES height); NODE HEALTH
-   across; the settings box across */
-.board { display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(0, 1fr); grid-template-areas: "engine engine" "lines plots" "health health" "reading reading"; gap: 12px; align-items: stretch; }
+   across; the settings box beside the fans box (each two rows of fields, so neither stretches) */
+.board { display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(0, 1fr); grid-template-areas: "engine engine" "lines plots" "health health" "reading fans"; gap: 6px; align-items: stretch; }
 .board > [data-box="reading"] { grid-area: reading; }
+.board > [data-box="fans"] { grid-area: fans; }
+.board:has(> [data-box="fans"][hidden]) > [data-box="reading"] { grid-column: 1 / -1; }
 .board > [data-box="lines"] { grid-area: lines; }
 .board > [data-box="health"] { grid-area: health; }
 .board > [data-box="engine"] { grid-area: engine; }
@@ -170,6 +172,7 @@ nav.sections button[aria-current="page"] { background: transparent; color: var(-
 .ntab tr.old td:not(.who), .ntab td.old { opacity: .5; }
 [data-box="health"] { padding: 8px 12px; gap: 1px; }
 @container (max-width: 1400px) { .ntab thead .col th { white-space: normal; } }
+.ntab.nofans [data-g="fans"] { display: none; }
 [data-box="health"] { container-type: inline-size; }
 .nhead { grid-column: 1 / -1; display: flex; justify-content: space-between; align-items: baseline; border-bottom: 1px solid #1a1e1f; padding-bottom: 5px; }
 .nn { font-family: var(--mono); font-size: 12px; letter-spacing: .1em; color: var(--t2); }
@@ -227,7 +230,7 @@ nav.sections button[aria-current="page"] { background: transparent; color: var(-
 .pfoot > .rfoot { width: var(--gr, 0px); flex: none; }
 .xlab { flex: 1; display: flex; justify-content: space-between; font-family: var(--mono); font-size: 9px; color: #5a6165; }
 
-@media (max-width: 1099px) { .board { grid-template-columns: minmax(0, 1fr); grid-template-areas: "engine" "lines" "plots" "health" "reading"; } .tiles { margin-left: 0; } }
+@media (max-width: 1099px) { .board { grid-template-columns: minmax(0, 1fr); grid-template-areas: "engine" "lines" "plots" "health" "reading" "fans"; } .tiles { margin-left: 0; } }
 @media (max-width: 1099px) { .plots .pbody { min-height: 110px; } }
 @media (max-width: 720px) { .lrow { grid-template-columns: 18px 56px minmax(30px, 1fr) 62px 52px 70px; } .lrow > span:nth-child(n+7) { display: none; } }
 
@@ -254,11 +257,17 @@ nav.sections button[aria-current="page"] { background: transparent; color: var(-
 .signin button, .settings select, button.signout { background: var(--raise); border: 1px solid var(--line2); padding: 5px 9px; }
 button.signout { font-family: var(--mono); font-size: 11px; letter-spacing: .08em; margin-left: 12px; color: var(--t4); }
 .settings { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px 16px; align-items: end; font-size: 13px; }
+/* beside each other the two settings boxes are two rows of fields each: four columns of eight, two of four */
+[data-box="reading"], [data-box="fans"] { container-type: inline-size; }
+@container (min-width: 700px) { [data-box="reading"] .settings { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
+@container (min-width: 400px) { [data-box="fans"] .settings { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 .settings .field { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
 .settings .k { color: var(--t4); font-family: var(--mono); font-size: 11px; letter-spacing: .08em; text-transform: uppercase; }
 .settings .note { grid-column: 1 / -1; color: var(--t5); font-size: 12px; }
 .settings .field.check input { width: 18px; height: 18px; margin: 4px 0; accent-color: #9d8bd0; }
 .settings .note.bad { color: var(--bad); }
+.settings .note.warn, .settings .v.warn { color: var(--warn, #e0a33e); }
+.settings select optgroup { color: var(--t4); }
 </style>
 </head>
 <body>
@@ -671,10 +680,12 @@ const NODE_COLS = [
   ['split', 'MEMORY', 'Weights · work · pool', 'GiB', `How this Spark's memory was divided when the engine started, in GiB: the model weights; work, which is everything else in use then (the engine's buffers and graphs, other programs on the box: what is left after the other two, not a figure measured by itself); and the memory pool (the conversations' caches, their bookmarks, image rows, the lines' own chunks and the split cache's pieces).`],
   ['tz', 'TEMP.', 'Hot', '°C', `The hottest of this Spark's ACPI thermal zones, in °C (/sys/class/thermal). ${TEMP_TIP} The zones trip at ${TEMP_TRIP_C} °C.`, true],
   ['tg', 'TEMP.', 'GPU', '°C', `The GPU die temperature in °C (NVML). ${TEMP_TIP}`, true],
+  ['fan-1', 'FANS', 'Fan 1', 'RPM', `The first fan's speed in RPM (it tops out at 9,000), read by the fan daemon from the driver.`],
+  ['fan-2', 'FANS', 'Fan 2', 'RPM', `The second fan's speed in RPM (it tops out at 13,500), read by the fan daemon from the driver.`],
   ['gb', 'GPU', 'Busy', '%', `GPU utilisation in per cent over NVML's last sample window.`],
-  ['gc', 'GPU', 'Clock', 'MHz', `The GPU's current clock and the highest clock NVML names, in MHz. The limit is set in COOLING AND CLOCK. The reasons NVML gives for holding it down show here when any is set.`],
+  ['gc', 'GPU', 'Clock', 'MHz', `The GPU's clock now, in MHz; its limit is in the tip. The cell turns amber when NVML gives a reason for holding the clock down other than the limit itself; the reasons are in the tip, in words.`],
   ['gp', 'GPU', 'Power', 'W', `GPU power draw in watts (NVML).`],
-  ['cl', 'CPU', 'Load', '', `One-minute load average over the CPU count (/proc/loadavg).`],
+  ['cl', 'CPU', 'Load', '', `The one-minute load average (/proc/loadavg), then the number of CPUs.`],
   ['cb', 'CPU', 'Busy', '%', `CPU busy time in per cent over all CPUs since the last report (/proc/stat).`],
   ['tn', 'NVMe', 'Temp', '°C', `The NVMe drive's temperature in °C (the SMART page's composite). ${TEMP_TIP}`, true],
   ['nw', 'NVMe', 'Wear', '%', NVME_TIP],
@@ -683,16 +694,22 @@ const NODE_COLS = [
   ['rb', 'RAILS IN/OUT', 'Rail B', '', RAIL_TIP[1]],
 ];
 const GROUP_START = new Set(NODE_COLS.filter((c, i) => i === 0 || NODE_COLS[i - 1][1] !== c[1]).map((c) => c[0]));
+const FAN_KEYS = ['fan-1', 'fan-2'];
 // each column's width in characters, room for its widest value: a reading that changes moves no other column; the two
 // rails cells each hold a box of 14 characters (99.9/99.9 Gbps); the box's width left over is shared equally between the
 // columns' sides (healthBox's fit)
-const NODE_W = { mem: 12, split: 18, tz: 5, tg: 5, gb: 3, gc: 13, gp: 5, cl: 9, cb: 5, tn: 5,
+const NODE_W = { mem: 12, split: 18, tz: 5, tg: 5, 'fan-1': 5, 'fan-2': 6, gb: 3, gc: 13, gp: 5, cl: 9, cb: 5, tn: 5,
   nw: 3, ns: 9 };
+// the GPU clock cell: the clock now; the limit in force (the fan tool's gpu_clock.limit) and the chip's top clock are in the tip
+function gpuClockCell(gpu) { return none(gpu.clock_mhz) ? '-' : whole.format(Number(gpu.clock_mhz)); }
+// NVML's reasons for a held-down clock other than the clock limit itself (that one is set from COOLING AND CLOCK)
+function heldDown(gpu) { return !!(gpu.reasons && gpu.reasons.some((x) => x !== 'applications_clocks_setting')); }
 function nodeRow(rank) {
-  const f1 = (x) => one.format(none(x) ? 0 : Number(x));
-  const f0 = (x) => whole.format(none(x) ? 0 : Number(x));
+  const f1 = (x) => (none(x) ? '-' : one.format(Number(x)));
+  const f0 = (x) => (none(x) ? '-' : whole.format(Number(x)));
+  const tb = (x) => (none(x) ? '-' : one.format(Number(x) / 1e12));
   const td = {};
-  for (const [key, , , , tip] of NODE_COLS) td[key] = h('td', { 'data-row': key, class: GROUP_START.has(key) ? 'gs' : null, title: tip, text: '0', style: NODE_W[key] ? `width: ${NODE_W[key]}ch` : null });
+  for (const [key, g, , , tip] of NODE_COLS) td[key] = h('td', { 'data-row': key, 'data-g': g === 'FANS' ? 'fans' : null, class: GROUP_START.has(key) ? 'gs' : null, title: tip, text: '0', style: NODE_W[key] ? `width: ${NODE_W[key]}ch` : null });
   const rail = { ra: h('span', { class: 'rail', text: '0' }), rb: h('span', { class: 'rail', text: '0' }) };
   td.ra.replaceChildren(rail.ra); td.rb.replaceChildren(rail.rb);
   // the memory split: each number in its own colour (weights, working memory, the memory pool)
@@ -710,7 +727,18 @@ function nodeRow(rank) {
   const paintTemp = (cell, c) => { setColor(cell, tempColor(c)); setText(cell, f1(c)); };
   return {
     el,
-    update(r, nh, ledger) {
+    update(r, nh, ledger, fan) {
+      if (fan && fan.ok) {
+        const rpm = fan.rpm || [];
+        setText(td['fan-1'], none(rpm[0]) ? '-' : whole.format(rpm[0]));
+        setText(td['fan-2'], none(rpm[1]) ? '-' : whole.format(rpm[1]));
+        for (const k of FAN_KEYS) td[k].classList.toggle('old', !!fan.stale);
+        const fanNote = (fan.profile_error ? `\nThe profile file is bad (${fan.profile_error}): the daemon runs Performance.` : '') +
+          (fan.guard ? `\nA fan read 0 RPM while the box was warm: the daemon holds the maximum floor.` : '') +
+          (fan.stale ? `\nThis reading is ${none(fan.age_s) ? 'not from the daemon' : Math.round(fan.age_s) + ' s old'}: the daemon is not answering.` : '');
+        setTip(td['fan-1'], `The first fan's speed in RPM (it tops out at 9,000), read by the fan daemon from the driver.${fanNote}`);
+        setTip(td['fan-2'], `The second fan's speed in RPM (it tops out at 13,500), read by the fan daemon from the driver.${fanNote}`);
+      } else for (const k of FAN_KEYS) setText(td[k], '-');
       const have = r && r.age_ms != null;
       const old = have && (S.fails > 0 || r.age_ms > 6000);
       el.classList.toggle('old', !!old || !have);
@@ -851,11 +879,12 @@ function healthBox() {
   const rows = new Map();
   const groups = [];
   for (const [, g] of NODE_COLS) { const last = groups[groups.length - 1]; if (last && last.g === g) last.n++; else groups.push({ g, n: 1 }); }
+  const fanG = (g) => (g === 'FANS' ? 'fans' : null);
   const tbody = h('tbody');
   const table = h('table', { class: 'ntab' },
     h('thead', null,
-      h('tr', { class: 'grp' }, h('th'), groups.map(({ g, n }) => h('th', { class: 'gs', colspan: String(n), text: g }))),
-      h('tr', { class: 'col' }, h('th', { text: 'Spark' }), NODE_COLS.map(([key, , label, unit, tip]) => h('th', { class: GROUP_START.has(key) ? 'gs' : null, title: tip }, label, unit ? h('span', { class: 'unit', text: ' ' + unit }) : null)))),
+      h('tr', { class: 'grp' }, h('th'), groups.map(({ g, n }) => h('th', { class: 'gs', colspan: String(n), 'data-g': fanG(g), text: g }))),
+      h('tr', { class: 'col' }, h('th', { text: 'Spark' }), NODE_COLS.map(([key, g, label, unit, tip]) => h('th', { class: GROUP_START.has(key) ? 'gs' : null, 'data-g': fanG(g), title: tip }, label, unit ? h('span', { class: 'unit', text: ' ' + unit }) : null)))),
     tbody);
   const none_ = h('p', { class: 'dim', text: 'not reported by this engine', hidden: true });
   const wrap = h('div', { class: 'tscroll' }, table);
@@ -876,18 +905,19 @@ function healthBox() {
   let lastShape = '';
   return {
     el: b.el,
-    update(st, ledger) {
+    update(st, ledger, f) {
       const nh = st.node_health, list = nh && nh.ranks ? nh.ranks : [];
       // the ledger's store is the store's share of the chunk pool: the split shows the whole memory pool
       const pp = st.sessions && st.sessions.pool, pool = pp ? Number(pp.numbers) * Number(pp.number_bytes) : 0;
       const led = ledger && { get: (rk) => { const e = ledger.get(rk); return e && pool > e.k ? { w: e.w, k: pool, m: Math.max(0, e.m - (pool - e.k)), total: e.total, live: true } : e; } };
       b.el.hidden = false;
       none_.hidden = list.length > 0;
-      const shape = `${list.length}`;
+      const shape = `${list.length} ${!!(f && f.tool)}`;
       table.hidden = !list.length;
+      table.classList.toggle('nofans', !(f && f.tool));
       for (const r of list) {
         if (!rows.has(r.rank)) { const c = nodeRow(r.rank); rows.set(r.rank, c); tbody.append(c.el); }
-        rows.get(r.rank).update(r, nh, led);
+        rows.get(r.rank).update(r, nh, led, f && f.nodes ? f.nodes.find((n) => n.rank === r.rank) : null);
       }
       if (shape !== lastShape) { lastShape = shape; fit(); }
     },
@@ -1140,18 +1170,91 @@ function settingsBox() {
   return { el: b.el, update };
 }
 
+// The fans of the four Sparks (the fan tool, docs/dashboard.md): one profile for all four, applied by each Spark's own daemon from a small
+// file; what each Spark runs comes back from its daemon. The box is absent when dsfront runs without --fan-tool.
+const PROFILE_LABELS = new Map();
+const profileLabel = (id) => PROFILE_LABELS.get(id) || id;
+// the clock limit needs showing only when the Sparks differ from each other or from the choice, or one did not answer
+// IN FORCE, when it is shown: the Sparks that do not run the chosen profile, or did not answer, each named with what it runs
+function inForceText(f) {
+  const parts = f.nodes.map((n) => {
+    const who = `Spark ${n.rank + 1}`;
+    if (!n.ok) return `${who} not answering`;
+    if (n.stale) return `${who} not answering (last: ${n.profile ? profileLabel(n.profile) : 'none'})`;
+    if (n.profile && (f.wanted ? n.profile !== f.wanted : f.mixed)) return `${who} runs ${profileLabel(n.profile)}`;
+    return null;
+  }).filter(Boolean);
+  return parts.length ? parts.join('; ') : '-';
+}
+function clockOdd(f) {
+  const lims = f.nodes.filter((n) => n.ok && n.gpu_clock && n.gpu_clock.limit).map((n) => String(n.gpu_clock.limit));
+  return !!(f.clock_mixed || new Set(lims).size > 1 || (f.clock && lims.some((l) => l !== String(f.clock))) || f.nodes.some((n) => !n.ok));
+}
+function fansBox() {
+  const sel = h('select', { 'aria-label': 'Fan profile', disabled: true, onchange: async () => {
+    const v = sel.value;
+    sel.disabled = true;
+    const r = await api('fans', null, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ profile: v }) });
+    sel.disabled = false;
+    note.classList.toggle('bad', !r.ok);
+    note.classList.remove('warn');
+    const failed = r.ok && r.body && r.body.nodes ? r.body.nodes.filter((n) => !n.ok) : [];
+    setText(note, !r.ok ? ((r.body && r.body.error && r.body.error.message) || 'not set: HTTP ' + r.status)
+      : failed.length ? `set on ${r.body.nodes.length - failed.length} of ${r.body.nodes.length} Sparks; Spark ${failed.map((n) => n.rank + 1).join(', ')} did not take it (${failed[0].error || 'no answer'}); choose it again when it is back`
+      : profileLabel(v) + ' set on all four; each Spark shows it within a few seconds');
+    if (r.ok) { const f = await api('fans'); if (f.ok) S.fans = f.body; }
+  } });
+  const note = h('span', { class: 'note' });
+  const shown = h('span', { class: 'v', text: '-' });
+  const shownField = h('div', { class: 'field', hidden: true, title: 'Shown only when the Sparks differ or one did not take the choice: what each Spark runs now, from their daemons.' }, h('span', { class: 'k', text: 'IN FORCE' }), shown);
+  const clockField = h('div', { class: 'field', hidden: true, title: 'Shown only when the Sparks differ or one did not take the choice: the limit each Spark recorded when it was last set.' }, h('span', { class: 'k', text: 'CLOCK IN FORCE' }), clockShown);
+  const grid = h('div', { class: 'settings' },
+    h('label', { class: 'field', title: 'One profile for all four Sparks: the engine runs in lockstep, so the hottest Spark paces the others and a mix cannot be compared. Curves follow the temperature; Fixed keeps a floor (a Hold still rises with the heat). A floor is a minimum: the Spark\'s own controller takes the higher of its demand and the floor, so nothing here cools less than stock.' },
+      h('span', { class: 'k', text: 'FAN PROFILE' }), sel),
+    h('div', { class: 'field', title: 'What the four Sparks run now, from their daemons.' }, h('span', { class: 'k', text: 'IN FORCE' }), shown),
+    note);
+  const b = box('fans', 'FANS', 'The fan profile of the four Sparks. Changes apply within seconds on every Spark and last until the next change (a reboot keeps them); the page only writes a profile name, each Spark\'s daemon sets the fans. A timing window can pin the profile; then this box shows why and refuses changes.', grid);
+  b.el.hidden = true;
+  function update(f) {
+    const there = !!(f && f.tool);
+    b.el.hidden = !there;
+    if (!there) return;
+    if (!sel.options.length) {
+      for (const g of [...new Set(f.profiles.map((p) => p.group))]) {
+        sel.append(h('optgroup', { label: g }, f.profiles.filter((p) => p.group === g).map((p) => { PROFILE_LABELS.set(p.id, p.label); return h('option', { value: p.id, text: p.label }); })));
+      }
+    }
+    const down = f.nodes.filter((n) => !n.ok || n.stale);
+    sel.disabled = !!f.pinned;
+    if (document.activeElement !== sel) {
+      if (f.wanted && sel.value !== f.wanted) sel.value = f.wanted;
+      if (!f.wanted) sel.selectedIndex = -1;
+    }
+    const seen = [...new Set(f.nodes.filter((n) => n.ok && n.profile).map((n) => n.profile))];
+    const wrongP = f.nodes.some((n) => n.ok && n.profile && f.wanted && n.profile !== f.wanted);
+    const showP = !!(f.mixed || down.length > 0 || wrongP);
+    shownField.hidden = !showP;
+    setText(shown, showP ? inForceText(f) : '-');
+    shown.classList.toggle('warn', f.mixed || down.length > 0);
+    setText(b.right, f.pinned ? 'pinned: ' + f.pinned : f.mixed ? 'mixed: choose a profile again' : down.length ? `${down.length} not answering` : '');
+    if (f.pinned && !note.classList.contains('bad')) setText(note, 'Pinned for a timing window: only the command line changes it (dgx-fan-fleet unpin).');
+  }
+  return { el: b.el, update };
+}
+
 function overview() {
-  const lines = linesBox(), health = healthBox(), rate = rateTiles(), kv = sessionsTiles(), tier = tierTiles(), eg = engramTile(), reading = settingsBox();
-  const cd = chart('DECODE', 'Tokens a second the engine generates, all streams, the last 15 minutes. Fixed 10-second buckets: a bucket keeps its value as the window moves; hover for the bucket\'s mean and peak.', '#e8eaec', 'tok/s', 'decode_tps');
-  const cp = chart('PREFILL', 'Prompt tokens a second of the prompt passes as they ran (the speed now, sampled every second), the last 15 minutes. Fixed 10-second buckets; hover for the mean and peak.', '#9d8bd0', 'tok/s', 'prefill_tps');
-  const wrap = (name, c) => h('section', { class: 'box plotbox', 'data-box': name }, c.el);
-  // the board: the ENGINE strip across the top, LINES beside DECODE over PREFILL, NODE HEALTH across, the settings box across
+  const lines = linesBox(), health = healthBox(), rate = rateTiles(), cachehits = cacheTile(), kv = sessionsTiles(), tier = tierTiles(), eg = engramTile(), store = storeTiles(), reading = settingsBox(), fans = fansBox();
+  const cd = chart('DECODE tok/s', 'Tokens a second the engine generates, all streams, the last 15 minutes. Fixed 10-second buckets: a bucket keeps its value as the window moves; hover for the bucket\'s average (idle seconds count as 0) and its best 3 s rate. Times are local time.', '#e8eaec', 'tok/s', 'decode_tps');
+  const cp = chart('PREFILL tok/s', 'Prompt tokens a second the engine processes, the last 15 minutes (sampled every second). Fixed 10-second buckets; hover for the bucket\'s average (idle seconds count as 0) and its best 3 s rate. Times are local time.', '#9d8bd0', 'tok/s', 'prefill_tps');
+  const cc = cacheChart();
+  // the board: the ENGINE strip across the top, LINES beside DECODE over PREFILL, NODE HEALTH across, the settings box beside the fans box
   refs.main.append(h('div', { class: 'board' },
-    h('section', { class: 'box', 'data-box': 'engine', 'aria-label': 'ENGINE' }, h('div', { class: 'strip' }, rate.els, kv.els, tier.els, eg.els)),
+    h('section', { class: 'box', 'data-box': 'engine', 'aria-label': 'ENGINE' }, h('div', { class: 'strip' }, rate.els, cachehits.els, kv.by.kv, store.by.ten, kv.by.ctx, kv.by.shared, kv.by.cap, tier.by.ssd, eg.els)),
     lines.el,
-    h('div', { class: 'plots' }, wrap('decode', cd), wrap('prefill', cp)),
+    h('div', { class: 'plots' }, h('section', { class: 'box plotbox', 'data-box': 'plots' }, cd.el, cp.el, cc.el)),
     health.el,
-    reading.el));
+    reading.el,
+    fans.el));
   const seen = new Map(); // request id -> { gen, at, tps, waitS }
   let inflight = [], recent = [], ledger = null, alive = true;
   const track = (body, at) => {
@@ -1184,6 +1287,8 @@ function overview() {
   refs.pull = async (tick) => {
     const names = ROUTE_NAMES();
     if (names.has('requests')) { const r = await api('requests'); if (alive && r.ok) track(r.body, Date.now()); }
+    // the fans every five seconds (the tool asks each Spark); a failed read leaves the box as it was
+    if (names.has('fans') && (tick % 5 === 1 || !S.fans)) { const f = await api('fans'); if (alive && f.ok) S.fans = f.body; }
     if (!names.has('series') || (tick % 5 !== 1 && S.chartsDrawn)) return;
     const [d, p, c] = await Promise.all(['decode_tps', 'prefill_tps', 'cache'].map((n) => api('series', `name=${n}&seconds=${SERIES_S[n]}&step=10`)));
     if (!alive) return;
@@ -1211,7 +1316,8 @@ function overview() {
     refs.main.classList.toggle('stale', stale);
     const st = S.status; if (!st) return;
     lines.update(st, inflight, seen);
-    health.update(st, ledger);
+    health.update(st, ledger, S.fans);
+    fans.update(S.fans);
     kv.update(st, inflight);
     cachehits.update(st);
     tier.update(st);
@@ -1248,9 +1354,9 @@ function showSignIn(msg) {
   signinEl.hidden = false;
   signinEl.input.focus();
 }
-const ROUTE_NAMES = () => new Set(['status', 'requests', 'series', 'ledger']);
+const ROUTE_NAMES = () => new Set(['status', 'requests', 'series', 'ledger', 'fans']);
 const STALE_MS = 5000;
-const S = { tick: 0, status: null, statusAt: 0, fails: 0, chartsDrawn: false };
+const S = { tick: 0, fans: null, status: null, statusAt: 0, fails: 0, chartsDrawn: false };
 let refs = {};
 async function api(name, query, init) {
   const headers = Object.assign({}, (init && init.headers) || {}, KEY ? { Authorization: 'Bearer ' + KEY } : {});

@@ -2,16 +2,7 @@
 """End to end checks of the dashboard and the -ablit name: dsfront against its mock engine, four mock node samplers and a
 fake fan tool, all started here (stdlib only; no engine, no GPU).
 
-    dashboard_smoke.py [--bin target/release/dsfront] [--tokenizer tokenizer.json]
-
-Without --tokenizer a byte-level one is written by make_test_tokenizer.py beside this script. Covers: both served
-names in /v1/models, the `[ablit] ` prefix arriving only on the ablated requests (the -ablit name; never on the plain or
-any other name), the echoed model name, sessions kept apart by weights path, the dashboard's sign-in (the API key on
-every data route; the page loads without it), every dashboard route with the keys the page reads, the page itself, the
-live settings (read, changed through the mock engine, refused out of range), no switch route, a request's states
-through the requests route (queued, prefill with the prompt pass, decode), STATS asked only while the dashboard is
-watched, the series, node health and the memory ledger, and a sanity timing of a stream with and without the page
-polling.
+    dashboard_smoke.py [--bin target/release/dsfront] [--tokenizer tokenizer.json] [--no-timing]
 """
 import http.client
 import json
@@ -72,10 +63,15 @@ def start(argv, log):
 PORT = free_port()
 SOCK = os.path.join(TMP, "engine.sock")
 NODE_PORTS = [free_port() for _ in range(4)]
+FAN_TOOL = os.path.join(HERE, "fake_fan_tool.py")
+FAN_STATE = os.path.join(TMP, "fan-state.json")
+FAN_LOG = os.path.join(TMP, "fan-calls.log")
+os.environ["FAKE_FAN_STATE"] = FAN_STATE  # the tool dsfront runs inherits these
+os.environ["FAKE_FAN_LOG"] = FAN_LOG
 
 
-def http_(method, path, body=None, headers=None, timeout=60):
-    c = http.client.HTTPConnection("127.0.0.1", PORT, timeout=timeout)
+def http_(method, path, body=None, headers=None, timeout=60, port=None):
+    c = http.client.HTTPConnection("127.0.0.1", port or PORT, timeout=timeout)
     h = dict(headers or {})
     h.setdefault("Authorization", "Bearer " + KEY)  # the key every client sends; None leaves it out
     h = {k: v for k, v in h.items() if v is not None}
@@ -98,8 +94,8 @@ def poll_get(path):
         pass
 
 
-def get_json(path):
-    st, raw, _ = http_("GET", path)
+def get_json(path, port=None):
+    st, raw, _ = http_("GET", path, port=port)
     return st, json.loads(raw) if raw else None
 
 
@@ -180,7 +176,7 @@ def main():
     with open(keyfile, "w") as f:
         f.write(KEY + "\n")
     start(["serve", "--engine-socket", SOCK, "--tokenizer", TOK, "--listen", f"127.0.0.1:{PORT}", "--model-name", NAME,
-           "--table-file", table, "--node-stats", nodes, "--api-key-file", keyfile], "serve.log")
+           "--table-file", table, "--node-stats", nodes, "--api-key-file", keyfile, "--fan-tool", FAN_TOOL], "serve.log")
     up = wait_for(lambda: http_("GET", "/health")[0] == 200, 20)
     check(bool(up), "dsfront serves and is connected to the mock engine")
     if not up:
@@ -417,6 +413,8 @@ def main():
     st, d = chat(NAME + "-ablit", "named")
     check(d["model"] == NAME + "-ablit" and text_of(d).startswith("[ablit] "), "the -ablit name always runs ablated")
 
+    fan_checks()
+
     # ---- STATS only while watched: after the watch lapses a finished request does not reach the dashboard's numbers
     time.sleep(11.5)
     before = get_json("/dashboard/api/v1/status")[1]["health"]["prompt_cache"]["spill"][0]["writes_committed"]
@@ -427,6 +425,9 @@ def main():
     check(stale == before, f"STATS were not asked while the dashboard was not watched ({before} then {stale})")
     fresh = wait_for(lambda: (lambda x: x if x > before else None)(get_json("/dashboard/api/v1/status")[1]["health"]["prompt_cache"]["spill"][0]["writes_committed"]), 4)
     check(bool(fresh), "and arrive again once it is watched")
+
+    if "--no-timing" in args:
+        return  # the checks above are all there is without the sanity timing
 
     # ---- sanity timing: a stream with and without the page polling (a check, not a measurement)
     def run_streams(n):
@@ -466,6 +467,103 @@ def main():
     print(f"     token gaps over {len(quiet)} / {len(polled)} chunks (mock delay 5 ms; the page's own polling plus one more client in a tight loop)\n"
           f"     without the page: median {q:.2f} ms, p99 {q99:.2f} ms; with it: median {p:.2f} ms, p99 {p99:.2f} ms")
     check(p < q * 1.5 + 1.0, "polling the dashboard does not slow the stream (sanity only)")
+
+
+def fan_state(**kw):
+    st = {"profiles": ["performance"] * 4, "pinned": None, "down": [], "stale": []}
+    st.update(kw)
+    with open(FAN_STATE, "w") as f:
+        json.dump(st, f)
+
+
+def fan_calls():
+    try:
+        with open(FAN_LOG) as f:
+            return [json.loads(x) for x in f if x.strip()]
+    except OSError:
+        return []
+
+
+def fan_checks():
+    """The FANS box: GET/POST /dashboard/api/v1/fans through the fake tool, and the page's markup."""
+    route = "/dashboard/api/v1/fans"
+    ids = ["stock", "medium", "performance", "max", "hold-4500", "hold-6300", "hold-9000"]
+    fan_state()
+    check(http_("GET", route, headers={"Authorization": None})[0] == 401, "GET fans without the key is 401")
+    check(http_("GET", route, headers={"Authorization": "Bearer wrong-" + KEY})[0] == 401, "GET fans with a wrong key is 401")
+    check(http_("POST", route, {"profile": "max"}, headers={"Authorization": None})[0] == 401, "POST fans without the key is 401")
+    check(http_("POST", route, '{"profile": "max"}', headers={"Content-Type": "text/plain"})[0] == 415,
+          "POST fans as text/plain (what another site's form can send) is 415")
+    check(http_("GET", route, headers={"Host": "rebound.example:%d" % PORT})[0] == 403, "GET fans with a Host the dashboard does not answer is 403")
+    check(fan_calls() == [], "refused requests ran nothing")
+    st, f = get_json(route)
+    check(st == 200 and f["tool"] is True and [p["id"] for p in f["profiles"]] == ids, f"GET fans: the tool is there, seven profiles {[p['id'] for p in f.get('profiles', [])]}")
+    check(all(set(p) == {"id", "label", "group"} for p in f["profiles"]) and {p["group"] for p in f["profiles"]} == {"Curves", "Fixed"}, "each profile has an id, a label and a group")
+    check(f["wanted"] == "performance" and f["mixed"] is False and f["pinned"] is None and len(f["nodes"]) == 4, f"GET fans: wanted performance, not mixed, not pinned, four nodes")
+    n = f["nodes"][1]
+    check({"rank", "ok", "stale", "profile", "requested", "state", "floor_rpm", "hottest_c", "rpm", "age_s", "error", "guard"} <= set(n)
+          and n["rank"] == 1 and n["ok"] and not n["stale"] and n["rpm"] == [3100, 4500] and n["hottest_c"] == 56.0, f"a node's keys and values: {n}")
+    for pid in ids:
+        st, raw, _ = http_("POST", route, {"profile": pid})
+        d = json.loads(raw)
+        check(st == 200 and d["sent"] == {"profile": pid} and [x["ok"] for x in d["nodes"]] == [True] * 4, f"POST fans {pid}: sent on four Sparks")
+        got = get_json(route)[1]
+        check(got["wanted"] == pid and all(x["profile"] == pid for x in got["nodes"]) and got["mixed"] is False, f"and read back: {pid}")
+    sets = [c for c in fan_calls() if c[0] == "set"]
+    check(sets == [["set", "--json", pid] for pid in ids], f"the tool was run only with set --json and the id: {sets}")
+    before = len(fan_calls())
+    for bad in ({}, {"profile": ""}, {"profile": "hold-5000"}, {"profile": "Max"}, {"profile": "quiet"}, {"profile": 3}, {"profile": ["max"]},
+                {"profile": "max", "gpu_clock": "2200"}, {"gpu_clock": "2200"}, ["max"], "max", {"profile": "max; rm -rf /"}):
+        check(http_("POST", route, bad)[0] == 400, f"POST fans {json.dumps(bad)} is refused (400)")
+    st, raw, _ = http_("POST", route, b"not json", headers={"Content-Type": "application/json"})
+    check(st == 400, "POST fans with a body that is not JSON is 400")
+    st, raw, _ = http_("POST", route, {"profile": "quiet"})
+    check("hold-9000" in json.loads(raw)["error"]["message"], "a refusal names the profiles")
+    check(len(fan_calls()) == before, "a refused request never reached the tool")
+    fan_state(pinned="timing window 3")
+    st, raw, _ = http_("POST", route, {"profile": "max"})
+    check(st == 409 and "timing window 3" in json.loads(raw)["error"]["message"], "pinned: POST is 409 with the reason")
+    time.sleep(4.2)  # the status is reused for a few seconds
+    check(get_json(route)[1]["pinned"] == "timing window 3", "pinned: GET carries the reason")
+    fan_state(down=[2])
+    st, raw, _ = http_("POST", route, {"profile": "medium"})
+    d = json.loads(raw)
+    check(st == 200 and [x["ok"] for x in d["nodes"]] == [True, True, False, True] and d["nodes"][2]["error"], "a Spark down: 200, that Spark named with its error")
+    got = get_json(route)[1]
+    check(got["nodes"][2]["ok"] is False and got["nodes"][2]["stale"] is True and got["nodes"][2]["error"], "and read back: the Spark is not ok and stale")
+    fan_state(down=[0, 1, 2, 3])
+    check(http_("POST", route, {"profile": "max"})[0] == 502, "no Spark took it: 502")
+    fan_state(stale=[3])
+    time.sleep(4.2)
+    got = get_json(route)[1]
+    check(got["nodes"][3]["stale"] is True and got["nodes"][0]["stale"] is False, "a reading older than 10 s is stale")
+    fan_state()
+    time.sleep(4.2)
+    # the page
+    st, raw, _ = http_("GET", "/dashboard", headers={"Authorization": None})
+    page = raw.decode()
+    check(st == 200 and "fansBox" in page and "'fans'" in page and "FANS" in page and "api('fans'" in page, "the page has the FANS box and reads the route")
+    check("'fan-1'" in page and "'fan-2'" in page and "'fan-profile'" in page, "and the node card has its FANS rows: fan 1, fan 2, the profile")
+    check("fan-floor" not in page and "fan-temp" not in page and "'Floor'" not in page and "'Hottest'" not in page,
+          "and no floor row and no hottest row (the card's TEMP. group has the temperatures)")
+    # no tool: the box is hidden, the route answers empty and refuses a change; and no engine connected: still answers
+    p2 = free_port()
+    keyfile = os.path.join(TMP, "api-key")
+    start(["serve", "--engine-socket", os.path.join(TMP, "none.sock"), "--tokenizer", TOK, "--listen", f"127.0.0.1:{p2}", "--model-name", NAME,
+           "--api-key-file", keyfile], "serve-notool.log")
+    p3 = free_port()
+    start(["serve", "--engine-socket", os.path.join(TMP, "none.sock"), "--tokenizer", TOK, "--listen", f"127.0.0.1:{p3}", "--model-name", NAME,
+           "--api-key-file", keyfile, "--fan-tool", FAN_TOOL], "serve-noengine.log")
+    up = wait_for(lambda: http_("GET", "/health", port=p2)[0] in (200, 503) and http_("GET", "/health", port=p3)[0] in (200, 503), 20)
+    check(bool(up), "two more dsfront started with no engine behind them")
+    st, f = get_json(route, port=p2)
+    check(st == 200 and f["tool"] is False and f["profiles"] == [] and f["nodes"] == [], f"without --fan-tool: GET fans is empty and says tool false: {f}")
+    check(http_("POST", route, {"profile": "max"}, port=p2)[0] == 503, "without --fan-tool: POST fans is 503")
+    check(http_("GET", route, headers={"Authorization": None}, port=p2)[0] == 401, "without --fan-tool: still 401 without the key")
+    st, f = get_json(route, port=p3)
+    check(st == 200 and f["tool"] is True and len(f["nodes"]) == 4, "with no engine connected GET fans still answers")
+    check(http_("POST", route, {"profile": "performance"}, port=p3)[0] == 200, "and POST fans works with no engine connected")
+
 
 
 try:
