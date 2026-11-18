@@ -22,19 +22,19 @@
 //                apart in the window too), then the same with row r's router logits rotated 48 r
 //                experts (rows that share few experts), and each kind's distinct experts per layer;
 //                --bench-groups G,...: then, for each G dividing k (1 < G < k), steps of k / G runs of
-//                G consecutive rows (B3's verify rows of k / G sessions: docs/batching.md), each run
+//                G consecutive rows (the verify rows of k / G sessions: docs/batching.md), each run
 //                from its own scattered golden position, the runs S apart; natural, then each run's
-//                routing rotated 48 experts further than the run before. A k past 8 (B4: up to 16) runs
+//                routing rotated 48 experts further than the run before. A k past 8 (up to 16) runs
 //                the grouped kinds only, as a batch of k / G sessions (--slots at least that; session g
 //                in slot g, G consecutive positions per step, the sessions S positions apart): one
 //                session's step holds at most model::kMaxSessRows rows
 //     decode     end-to-end decode speed: --ctx golden positions as prefill, then --steps greedy (or
 //                --temp, --top-p, --top-k) tokens through the self-driving decode loop
-//     batch      sessions decoding together (docs/batching.md, B2; --big): --batch 1024,16384c,1024
+//     batch      sessions decoding together (docs/batching.md; --big): --batch 1024,16384c,1024
 //                prefills each of these golden contexts (c: with CED) in a session slot of its own
 //                (--slots; the last slot first), then decodes --steps tokens of each in one batch loop.
 //                Each session's tokens hash is its decode-mode run's at that context. --batch-tf
-//                [--batch-rows G] (B4): instead, each session's golden continuation teacher-forced, G
+//                [--batch-rows G]: instead, each session's golden continuation teacher-forced, G
 //                (1..8) consecutive rows of each per step for --steps steps (a step of at most 16 rows in
 //                all); its samples hash is the same whatever the other sessions and G, and tf mode's
 //                over the same positions (--big --prompt C --k G --limit C + G * steps)
@@ -171,7 +171,7 @@
 //   --ced: --big prefills of at least 128 positions run CED (docs/ced.md): the encoder over every
 //   position, the decoder replaying the last 128. serve runs CED by default (turns of at least 128 new
 //   positions); --exact makes every turn exact (the bit-level checks)
-//   --slots N: N session slots (docs/batching.md, B2): live sessions' states side by side, every step through
+//   --slots N: N session slots (docs/batching.md): live sessions' states side by side, every step through
 //   the attention kernels' slot tables (serve: N requests decode together); --slot S: the golden modes run
 //   in slot S (the same bits in any slot)
 #include <fcntl.h>
@@ -201,18 +201,26 @@
 #include <cuda_runtime.h>
 
 #include "comm/ring.h"
+#include "common/alloc_seal.h"
+#include "common/byte_account.h"
 #include "common/check.h"
 #include "common/heap.h"
 #include "common/keepfile.h"
 #include "dspark/dspark.h"
 #include "engram/display.h"
 #include "engram/engram.h"
+#include "model/copy.h"
+#include "model/img_rows.h"
+#include "model/lend.h"
 #include "model/model.h"
+#include "model/spec.h"
+#include "model/state.h"
 #include "model/pool_rules.h"
 #include "server/bounds.h"
 #include "server/node_stats.h"
 #include "server/cmd.h"
 #include "server/golden.h"
+#include "common/last_words.h"
 #include "server/serve.h"
 #include "vision/vit_device.h"
 #include "weights/loader.h"
@@ -352,6 +360,8 @@ struct Args {
   bool profile = false;  // decode: the decode loop is nsys's capture range (--capture-range=cudaProfilerApi)
   bool loop = false, big = false, ced = false, exact = false, graph_sweep = false;
   int ahead = 1, prefill_rows = 0;  // 0: 8192 for serve with CED, else 4096
+  int loan_low_groups = 2, loan_high_extra = 8;  // serve: the lent set goes back under this many free groups; it is asked for at its own groups plus this many
+  int prefill_rows_max = 0;         // serve: > prefill_rows: chunks of this many rows on a second set of buffers lent by the pool (0: off)
   int wave_probe = 0, wave_probe_at = -1;
   int profile_at = -1;  // --big: the prefill chunk at this position is nsys's capture range
   uint64_t profile_from_req = 0;  // serve: request N's first command opens it on every rank (0: none)
@@ -394,10 +404,11 @@ struct Args {
   double keep_gib = 0, keep_days = 30;  // kept sessions: written at a planned stop, at most; their age
   int snap_every = 1024, small_rows = 8;
   int slots = 1, slot = 0;
+  int copy_mib = 512;  // --copy-mib N: copy drafting's arena a rank (model::Options::copy_mib; used only with DSGB10_COPY / DSGB10_COPY_DUMP)
   int big_slots = 0;  // --big-slots B: slots [0, B) hold --max-ctx, the others --max-ctx / 8 (model::Options::big_slots)  // session slots (model::Options::slots); the golden modes' slot
   int bgraph_bodies = 0;      // DIAGNOSTICS (spec.cu, the batch graph): switch bodies to capture (0: kMaxRows)
   bool bgraph_noif = false;   // DIAGNOSTICS: the entries' accepts without if nodes
-  bool bgraph_check = false;  // DIAGNOSTICS (B3 phase 2a): the one-session draft of every entry after the batch
+  bool bgraph_check = false;  // DIAGNOSTICS: the one-session draft of every entry after the batch
                               // step's pass over them, and the words that differ, printed by --mode batch
   int slice = 64;  // serve: time-slicing's turns, in tokens (0: none)
   int grow_ahead = 131072;  // serve: positions of response a reservation reaches past where it is
@@ -501,6 +512,9 @@ Args parse(int argc, char** argv) {
     else if (s == "--ced") a.ced = true;
     else if (s == "--exact") a.exact = true;
     else if (s == "--prefill-rows") a.prefill_rows = std::atoi(val().c_str());
+    else if (s == "--prefill-rows-max") a.prefill_rows_max = std::atoi(val().c_str());
+    else if (s == "--prefill-loan-low-groups") a.loan_low_groups = std::atoi(val().c_str());
+    else if (s == "--prefill-loan-high-groups") a.loan_high_extra = std::atoi(val().c_str());
     else if (s == "--top-p") a.top_p = std::atof(val().c_str());
     else if (s == "--top-k") a.top_k = std::atoi(val().c_str());
     else if (s == "--socket") a.socket = val();
@@ -531,6 +545,7 @@ Args parse(int argc, char** argv) {
     else if (s == "--snap-every") a.snap_every = std::atoi(val().c_str());
     else if (s == "--slots") a.slots = std::atoi(val().c_str());
     else if (s == "--big-slots") a.big_slots = std::atoi(val().c_str());
+    else if (s == "--copy-mib") a.copy_mib = std::atoi(val().c_str());
     else if (s == "--bgraph-bodies") a.bgraph_bodies = std::atoi(val().c_str());
     else if (s == "--bgraph-noif") a.bgraph_noif = true;
     else if (s == "--bgraph-check") a.bgraph_check = true;
@@ -619,6 +634,10 @@ Args parse(int argc, char** argv) {
     else die("unknown argument %s", s.c_str());
   }
   if (!a.prefill_rows) a.prefill_rows = a.mode == "serve" && !a.exact ? 8192 : 4096;
+  if (a.prefill_rows_max < 0 || (a.prefill_rows_max > 0 && a.prefill_rows_max < a.prefill_rows))
+    die("--prefill-rows-max takes 0 or a number of rows of at least --prefill-rows (%d)", a.prefill_rows);
+  if (a.loan_low_groups < 0 || a.loan_high_extra < 0) die("--prefill-loan-low-groups and --prefill-loan-high-groups take 0 or more");
+  if (a.prefill_rows_max == a.prefill_rows || a.mode != "serve" || a.exact) a.prefill_rows_max = 0;  // no second set: the engine as it is
   if (a.disk_tag.size() > 32 || a.disk_tag.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789_-") != std::string::npos)
     die("--disk-tag: at most 32 of a-z, 0-9, _ and -");
   if (a.keep_gib < 0 || !(a.keep_days > 0)) die("--keep-gib must be >= 0 and --keep-days > 0");
@@ -631,6 +650,8 @@ Args parse(int argc, char** argv) {
   // this box's rank and files: the fleet file's, unless given
   const comm::Fleet& fl = comm::fleet(a.fleet);
   if (a.rank < 0) a.rank = comm::rank_from_hostname(a.fleet);
+  die_set_rank(a.rank);
+  lastwords::install(a.rank);  // the signal, rank, time and call stack of a crash (common/last_words.h)
   if (a.rank < 0)
     die("cannot tell this box's rank: its hostname is no RANK<r>_HOSTNAME in the fleet file %s; pass --rank",
         fl.file.c_str());
@@ -789,6 +810,7 @@ int main(int argc, char** argv) {
   mo.first_layer = a.first;
   mo.graphs = a.graphs;
   mo.prefill_rows = a.prefill_rows;
+  mo.prefill_rows_max = a.prefill_rows_max;
   mo.wave_probe = a.wave_probe, mo.wave_probe_at = a.wave_probe_at;
   mo.draft_fp8 = a.draft_fp8;
   mo.draft_head4 = a.draft_head4, mo.draft_markov8 = a.draft_markov8;
@@ -797,7 +819,15 @@ int main(int argc, char** argv) {
   mo.tree_probe = !a.tree_probe.empty();
   mo.slots = a.slots;
   mo.big_slots = a.big_slots;
+  mo.copy_mib = a.copy_mib;
   mo.pool_one_line = a.mode == "serve";  // it grows to the chosen size before serving (step 6)
+  mo.kv_split = a.mode == "serve" && a.kv_split;
+#ifndef PICO_OLD_RULES
+  mo.imager = a.mode == "serve" && a.disk_gib > 0;  // every write to the disk tier is each Spark's own quarter, in the background (every mode)
+#endif
+  mo.kv_split_mode = a.kv_split_mode;
+  mo.pscan = a.pscan;
+  mo.kv_join_pieces = a.kv_join_pieces;
   mo.bgraph_bodies = a.bgraph_bodies, mo.bgraph_noif = a.bgraph_noif, mo.bgraph_check = a.bgraph_check;
   mo.l2pf = !a.no_l2pf;
   model::Model m(a.rank, mo);
@@ -819,6 +849,18 @@ int main(int argc, char** argv) {
   dsw::WeightFile wf(a.weights, a.rank, comm::kRanks);  // refuses another rank's file
   dsw::LoadOptions lo;
   lo.threads = a.threads;
+  // when the prefill path's gathered weights are made at start (step 5), this rank's own slice of them is loaded
+  // straight into its slot of the gathered buffers and decode reads it there: the arena does not hold it too.
+  // DSGB10_NO_GATHER_ALIAS=1: the arena keeps them (as without the prefill); DSGB10_ALIAS_CHECK=1: each aliased tensor's
+  // CRC is checked at its slot right after the load.
+  const bool prefill_at_start = a.mode == "serve" || (a.big && a.mode != "prefill" && a.mode != "bench");
+  const bool alias_gathered = prefill_at_start && !std::getenv("DSGB10_NO_GATHER_ALIAS");
+  if (alias_gathered) {
+    m.reserve_gathered(!a.no_engram);
+    lo.dest = [&m](const dsw::DeviceTensor& t) { return m.gathered_dest(t.name, t.bytes); };
+    const char* chk = std::getenv("DSGB10_ALIAS_CHECK");
+    lo.verify_dest = chk && *chk && std::strcmp(chk, "0") != 0;
+  }
   lo.select = [&a](const dsw::DeviceTensor& t) {
     if (t.name.rfind("mtp.", 0) == 0) return a.spec && a.draft_weights.empty();
     if (t.name.rfind("layers.", 0) == 0) {
@@ -829,6 +871,12 @@ int main(int argc, char** argv) {
   };
   const dsw::LoadStats ls = wf.load(lo);
   std::printf("rank %d: %.2f GiB of weights in %.1f s (%.2f GB/s)\n", a.rank, ls.bytes / 1073741824.0, ls.seconds, ls.gbps);
+  if (alias_gathered) {
+    size_t n = 0, bytes = 0;
+    m.aliased(&n, &bytes);
+    std::printf("rank %d: %zu weight tensors (%.2f MiB) loaded into this rank's slot of the whole buffers they are gathered into%s\n",
+                a.rank, n, bytes / 1048576.0, lo.verify_dest ? ", CRC checked there" : "");
+  }
   m.bind(wf, ring);
   if (ring2) m.bind_ring2(*ring2);
   // --draft-weights: another drafter's mtp.* (same shapes and formats) from its own rank file; embed and head
@@ -946,10 +994,10 @@ int main(int argc, char** argv) {
   // 5. the prefill path's buffers and gathered weights now, not on the first request (serve, and the
   // modes that prefill through it with --big); every rank's free device memory afterwards goes to
   // rank 0's log
-  if (a.mode == "serve" || (a.big && a.mode != "prefill" && a.mode != "bench")) {
+  if (prefill_at_start) {
     const uint64_t mine = m.prefill_init(ring);
     uint64_t all[4];
-    ring.allgather_host(&mine, all, sizeof mine);
+    ring.allgather_host(&mine, all, sizeof mine, comm::kCallMain0 + 2);
     if (a.rank == 0)
       std::printf("free device memory after the prefill buffers, ranks 0-3: %.2f %.2f %.2f %.2f GiB\n",
                   all[0] / 1073741824.0, all[1] / 1073741824.0, all[2] / 1073741824.0, all[3] / 1073741824.0);
@@ -961,6 +1009,7 @@ int main(int argc, char** argv) {
   const std::string disk_dir = a.disk_dir;  // serve: from the fleet file unless given
   const std::string disk_tag = a.disk_tag.empty() ? "" : "." + a.disk_tag;
   const std::string disk_base = disk_dir + "/rank" + std::to_string(a.rank) + disk_tag;
+  uint64_t store_numbers = 0;  // serve: the store's size, for STATS
   if (a.mode == "serve") {
     if (a.spec) m.spec_graphs();
     const double gib = 1073741824.0;
@@ -985,7 +1034,7 @@ int main(int argc, char** argv) {
       const uint64_t mine[3] = {std::min<uint64_t>((uint64_t)(a.disk_gib * gib), fr > margin ? fr - margin : 0), gen,
                                 kbytes};
       uint64_t all[4][3];
-      ring.allgather_host(mine, all, sizeof mine);
+      ring.allgather_host(mine, all, sizeof mine, comm::kCallMain0 + 3);
       uint64_t bytes = mine[0];
       bool reuse = gen != 0;
       for (const auto& x : all) bytes = std::min(bytes, x[0]), reuse = reuse && x[1] == gen && x[2] == kbytes;
@@ -1146,6 +1195,38 @@ int main(int argc, char** argv) {
                   (unsigned long long)li.groups, li.block_bytes / 1048576.0, (unsigned long long)li.huge_pct,
                   st == model::Model::kLendDone ? "" : li.reason[0] ? (std::string("; the hand-over failed: ") + li.reason).c_str() : "; not made now");
     }
+    // the image encoder's work area (model/vit_area.cu): tenant 3, device memory, two groups of the pool, taken once, here, before any
+    // request and before kept conversations are read back, and kept while the engine runs. A take that fails on any rank fails on all:
+    // the engine serves text and answers a pixel request with an error until the next start
+    if (vision) {
+      int st = m.tenant_lend(model::lend::kTenantWork, model::Model::kLendBegin, (int64_t)model::Model::vision_area_mib());
+      while (st == model::Model::kLendPending) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        st = m.tenant_lend(model::lend::kTenantWork, model::Model::kLendPoll, 0);
+      }
+      std::printf("rank %d: vision work area: %llu MiB asked for, %.0f MiB held on this rank (status %d): %s\n", a.rank,
+                  (unsigned long long)model::Model::vision_area_mib(), m.vision_area_held() / 1048576.0, st,
+                  m.vision_state() == 1 ? "the engine encodes images" : "the engine has no image encoder until the next start");
+    }
+    // the prefill's second set of row buffers (model/rows_lend.cu): tenant 4, device and pinned host memory, whole groups of the pool, taken
+    // here while the pool is empty so that no prompt waits for it; the server gives it back under pressure and asks again when room returns
+    // (serve.cpp loan_policy). A take that fails on any rank fails on all: every chunk is --prefill-rows rows.
+    if (m.prefill_loan_mib() > 0) {
+      int st = m.tenant_lend(model::lend::kTenantPrefill, model::Model::kLendBegin, m.prefill_loan_mib());
+      while (st == model::Model::kLendPending) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        st = m.tenant_lend(model::lend::kTenantPrefill, model::Model::kLendPoll, 0);
+      }
+      std::printf("rank %d: prefill rows: %lld MiB asked for (chunks of up to %d rows), status %d: %s\n", a.rank,
+                  (long long)m.prefill_loan_mib(), a.prefill_rows_max, st,
+                  st == model::Model::kLendDone ? "the second set is made" : "chunks stay at the standing rows for now");
+    }
+    if (a.rank == 0)  // the pool's tenants (lend.h's table), one line each
+      for (const model::Model::TenantRow& t : m.tenant_rows())
+        std::printf("store tenant %d, %s (%s, %s): %d groups of %.0f MiB (%.0f MiB held by its body), %d in flight\n", t.id, model::lend::tenant_name(t.id),
+                    t.kind == model::lend::kKindHost ? "host memory" : "device memory",
+                    t.standing == model::lend::kRequired ? "required" : t.standing == model::lend::kCache ? "cache" : "on demand", t.groups,
+                    m.group_bytes() / 1048576.0, t.size_bytes / 1048576.0, t.pending);
   }
   ring.barrier();
   if (a.mode == "serve" && a.node_stats_port > 0) {  // the dashboard's node sampler (server/node_stats.h)
@@ -1164,6 +1245,33 @@ int main(int argc, char** argv) {
   }
   pin_self(15);
   mem_report(a.rank, ("ready after " + std::to_string((int)(now_s() - t0)) + " s").c_str());
+  {
+    char line[256];
+    alloc_seal::ready_line(line, sizeof line);
+    std::printf("%s\n", line);
+  }
+#ifdef DSGB10_TEST_FAULTS
+  // DSGB10_ALLOC_OUTSIDE=rank:N: on rank N, 30 s after ready, one unscoped 1 MiB cudaMalloc, so that a test sees the seal count a call
+  // that no scope names
+  if (const char* ao = std::getenv("DSGB10_ALLOC_OUTSIDE")) {
+    int fr = -1;
+    if (std::sscanf(ao, "rank:%d", &fr) == 1 && fr == a.rank)
+      std::thread([] {
+        std::this_thread::sleep_for(std::chrono::seconds(30));
+        cudaSetDevice(0);
+        void* p = nullptr;
+        if (cudaMalloc(&p, 1u << 20) == cudaSuccess) cudaFree(p);
+        else cudaGetLastError();
+      }).detach();
+  }
+#endif
+  if (a.mode == "serve") {  // the byte account at ready, by rank (common/byte_account.h): the unexplained remainder is its own row
+    size_t dfree = 0, dtotal = 0;
+    CUDA_CHECK(cudaMemGetInfo(&dfree, &dtotal));
+    byte_account::Sample mine = byte_account::read_system(dtotal - dfree), all[model::rules::kRanks];
+    ring.allgather_host(&mine, all, sizeof mine, comm::kCallMain0 + 5);
+    if (a.rank == 0) std::printf("%s", byte_account::table(all, model::rules::kRanks).c_str());
+  }
 
   Watchdog wd(a.step_timeout_s, ring);
   if (a.rank != 0) {  // follow rank 0
@@ -1177,6 +1285,8 @@ int main(int argc, char** argv) {
     so.socket = a.socket;
     so.max_ctx = a.max_ctx;
     so.prefill_rows = a.prefill_rows;
+    so.prefill_rows_max = a.prefill_rows_max;
+    so.loan_low_groups = a.loan_low_groups, so.loan_high_extra = a.loan_high_extra;
     so.small_rows = a.small_rows;
     so.snap_every = a.snap_every;
     so.slice = a.slice;
@@ -1463,7 +1573,7 @@ int main(int argc, char** argv) {
     const int per = a.batch_tf ? a.steps * a.batch_rows : a.steps;  // positions each session goes on by
     if (a.batch_tf && (int)ss.size() * a.batch_rows > model::kMaxRows)
       die("batch: %zu sessions of %d rows a step: at most %d rows", ss.size(), a.batch_rows, model::kMaxRows);
-    if (a.spec && (int)ss.size() > m.spec_batch_rows() / 2)  // B3: a draft each at least
+    if (a.spec && (int)ss.size() > m.spec_batch_rows() / 2)  // a draft each at least
       die("batch: %zu sessions with drafts (--spec): at most %d", ss.size(), m.spec_batch_rows() / 2);
     for (size_t k = 0; k < ss.size(); ++k) {  // each session's prompt in its slot
       Sess& s = ss[k];
@@ -1481,7 +1591,7 @@ int main(int argc, char** argv) {
                   s.ced ? " (CED)" : "", t_pref, s.first);
     }
     if (a.batch_tf) {
-      // B4's check (docs/batching.md): every session's golden continuation teacher-forced, --batch-rows rows of
+      // The teacher-forced batch check (docs/batching.md): every session's golden continuation teacher-forced, --batch-rows rows of
       // each per step (kCmdBatchTf). Each row computes what it computes alone, so a session's samples hash is
       // the same whatever the other sessions and the rows per step, and tf mode's over the same positions
       // (--big --prompt C --k G --limit C + G * steps: the same (token, logit) folds in the same order).
@@ -1508,7 +1618,7 @@ int main(int argc, char** argv) {
         s.hash = (s.hash ^ bits) * 1099511628211ull;
       });
       bcast(ring, Cmd{});  // stop
-      if (const char* dp = getenv("DSGB10_TF_DUMP")) {  // wide64 test: every session's samples, one line each
+      if (const char* dp = getenv("DSGB10_TF_DUMP")) {  // every session's samples, one line each
         FILE* f = std::fopen(dp, "w");
         for (size_t k = 0; f && k < ss.size(); ++k) {
           std::fprintf(f, "%zu %d", k, ss[k].ctx);
@@ -1542,7 +1652,7 @@ int main(int argc, char** argv) {
       x.sp.temperature = a.temp, x.sp.top_p = a.top_p, x.sp.top_k = a.top_k, x.sp.seed = a.seed;
     }
     Cmd c{};
-    c.op = a.spec ? kCmdSpecBatch : kCmdBatch;  // B3 (--spec): drafts across the sessions, every one to its end
+    c.op = a.spec ? kCmdSpecBatch : kCmdBatch;  // with --spec: drafts across the sessions, every one to its end
     c.n = (int)e.size();
     if (a.spec) {
       c.spec = 1;
@@ -1606,7 +1716,7 @@ int main(int argc, char** argv) {
         std::printf("\n");
       }
     }
-    if (a.spec && a.bgraph_check)  // B3 phase 2a: the passes' drafts against each entry's one-session draft
+    if (a.spec && a.bgraph_check)  // the passes' drafts against each entry's one-session draft
       std::printf("batch: draft check: %u words of the entries' drafts and confidence differ from their one-session "
                   "drafts (0: the pass over the entries is bit for bit each entry's own)\n",
                   m.spec_batch_mismatches());
@@ -1810,14 +1920,14 @@ int main(int argc, char** argv) {
   if (a.mode == "bench") {
     int need = ctxs.back();
     for (int k : a.ks) {
-      const bool multi = k > model::kMaxSessRows;  // runs of several sessions only (B4)
+      const bool multi = k > model::kMaxSessRows;  // runs of several sessions only
       if (!multi) need += k * (a.bench_stride > 0 ? 3 * a.steps + 18 : a.steps);
       for (int G : a.bench_groups)
         if (a.bench_stride > 0 && G > 1 && G < k && k % G == 0 && (!multi || (G <= model::kMaxSessRows && k / G <= a.slots)))
           need += k * (2 * a.steps + 12);
     }
     // the rotated kinds: row r's (or run r's) router logits rotated kRouteShift experts further than the one
-    // before (model.h set_route_shift), kExperts / 8 as measured since 2026-10-12, whatever kMaxRows
+    // before (model.h set_route_shift), kExperts / kMaxSessRows, whatever kMaxRows
     constexpr int kRouteShift = model::kExperts / model::kMaxSessRows;
     if (ctxs[0] < 1 || a.steps < 4 || need > L)
       die("bench: context %d plus %d steps per k do not fit the %d golden tokens", ctxs.back(), a.steps, L);
@@ -1842,7 +1952,7 @@ int main(int argc, char** argv) {
       p = ctx;
       for (size_t j = 0; j < a.ks.size(); ++j) {
         if (a.ks[j] > model::kMaxSessRows) {
-          // B4: a step of 9..16 rows holds runs of several sessions only (one session's at most kMaxSessRows: the
+          // A step of 9..16 rows holds runs of several sessions only (one session's at most kMaxSessRows: the
           // one-session kinds below are skipped), through Model::launch_batch (kCmdBatchTf) with a session slot per
           // run: session g in slot g, G consecutive positions per step from base - (n - 1 - g) * S (S = --bench-stride:
           // the sessions as far apart as a one-session step's runs), its tokens from its own scattered golden
@@ -1919,7 +2029,7 @@ int main(int argc, char** argv) {
               for (int s = 0; s < 6; ++s, ++i, p += k) tf_step(p, i, a.rank == 0 ? &gs[v] : nullptr);
             }
             m.set_route_shift(0);
-            std::printf("  k %d in %d runs of %d rows %d apart (a session a slot, B4), gpu (ms): natural %s, %.1f experts per "
+            std::printf("  k %d in %d runs of %d rows %d apart (a session a slot), gpu (ms): natural %s, %.1f experts per "
                         "layer; rotated %s, %.1f\n",
                         k, n, G, a.bench_stride, stat(gg[0]).c_str(), gs[0].distinct / std::max(1, gs[0].n),
                         stat(gg[1]).c_str(), gs[1].distinct / std::max(1, gs[1].n));
@@ -2137,8 +2247,7 @@ int main(int argc, char** argv) {
     if (a.big && n_dec == 0) {
       // Nothing teacher-forced (--limit = --prompt, as long28k's CED check): the hash covers the prompt's
       // sample from the prefill path instead: its token, logit and logprob, then its top logprobs' ids and
-      // values. (Until 2026-10-13 such a run hashed no row and printed the hash's seed, 14650fb0739d0383,
-      // whatever the engine computed.) A run with steps hashes them alone, as before.
+      // values, so the hash depends on what the engine computed. A run with steps hashes them alone.
       const model::SampleOut& o = prompt_out;
       const int nt = std::min(o.n_top, model::ops::kTopLogprobs);
       const auto fold = [&](uint32_t x) { chosen_hash = (chosen_hash ^ x) * 1099511628211ull; };

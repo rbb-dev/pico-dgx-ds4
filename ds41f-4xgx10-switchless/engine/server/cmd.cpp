@@ -1,6 +1,7 @@
 // Rank 0's commands and what every rank runs alike (cmd.h).
 #include <cstdlib>
 #include "server/cmd.h"
+#include "server/ride_wire.h"
 
 #include <pthread.h>
 #include <sched.h>
@@ -19,7 +20,9 @@
 
 #include "common/check.h"
 #include "common/heap.h"
+#include "model/copy.h"
 #include "model/nvtx.h"
+#include "server/mem_watch.h"
 
 namespace srv {
 
@@ -55,6 +58,109 @@ Watchdog::~Watchdog() {
   th.join();
 }
 
+namespace {
+// The watch's state: every rank has the ring; only rank 0 keeps readings.
+struct MemWatchState {
+  comm::Ring* ring = nullptr;
+  memwatch::Watch w;
+  std::string over;
+  uint64_t seq = 0;  // watches read by rank 0
+};
+MemWatchState g_watch;
+
+// One watch, on every rank at the same point of the command stream: this rank's reading, the host all-gather, rank 0's report.
+void mem_watch_run(int rank) {
+  if (!g_watch.ring || g_watch.w.keep == 0) return;
+  memwatch::Sample mine{memwatch::read_mem_available(), heap::in_use()}, all[comm::kRanks];
+  g_watch.ring->allgather_host(&mine, all, sizeof mine, comm::kCallWatch);
+  if (rank != 0) return;
+  const bool report = g_watch.w.observe(all, comm::kRanks);
+  g_watch.seq++;
+  if (!report) return;
+  std::string over = g_watch.over;
+  for (int r = 0; r < comm::kRanks; ++r)
+    if (all[r].heap > heap::kCap) {
+      char b[128];
+      std::snprintf(b, sizeof b, "%srank %d glibc heap %.2f GiB > %.2f GiB", over.empty() ? "" : "; ", r, all[r].heap / 1073741824.0,
+                    heap::kCap / 1073741824.0);
+      over += b;
+    }
+  std::printf("%s\n", memwatch::low_line(g_watch.w.min_rank, g_watch.w.min_bytes, g_watch.w.keep, over).c_str());
+  std::fflush(stdout);
+}
+}  // namespace
+
+namespace {
+// The imager's ride (cmd.h): rank 0's request and the ride count; the ring is every rank's.
+struct SplitRideState {
+  comm::Ring* ring = nullptr;
+  RideReq req;
+  uint64_t rides = 0, longest_ns = 0;
+};
+SplitRideState g_ride;
+static_assert(ridewire::kLive == model::kMaxSlots && ridewire::kRanks == comm::kRanks, "the ride's wire is as wide as the engine's slot list and ring");
+using RideWire = ridewire::Wire;
+constexpr int kRideRoomProbe = 64;
+}  // namespace
+
+void split_ride_init(comm::Ring* ring) { g_ride.ring = ring; }
+void split_ride_set(const RideReq& r) { g_ride.req = r; }
+uint64_t split_ride_count() { return g_ride.rides; }
+void split_ride_take_longest(uint64_t* ns) {
+  *ns = g_ride.longest_ns;
+  g_ride.longest_ns = 0;
+}
+
+void split_ride_run(model::Model& m, const RideReq& mine_req) {
+  const double t_ride = now_s();
+  RideWire mine{}, all[comm::kRanks];
+  mine.rank = m.rank();
+  mine.done = m.image_done();
+  mine.room = m.image_room_pieces(kRideRoomProbe);
+  uint64_t rd[4];
+  m.ride_readings(rd);  // the replicated readings the ride acts on: every rank must hold the same
+  mine.img_seq = rd[0], mine.jobs = rd[1], mine.ghosts = rd[2], mine.free_numbers = rd[3];
+  if (m.rank() == 0) {
+    mine.h = mine_req.h, mine.budget = mine_req.budget;
+    std::copy(mine_req.live, mine_req.live + model::kMaxSlots, mine.live);
+  }
+  int n = comm::kRanks;
+  if (g_ride.ring) {
+    g_ride.ring->allgather_host(&mine, all, sizeof mine, comm::kCallRide);
+  } else {
+    // no ring is a model that has no host ring (one rank, a tool); on an engine with a ring a ride without it would be one rank deciding alone
+    if (m.has_host_ring()) die("ride: rank %d has no ring for the ride's all-gather", m.rank());
+    all[0] = mine, n = 1;
+  }
+  ridewire::Decision dc;
+  const std::string bad = ridewire::decide(all, n, &dc);
+  if (!bad.empty()) die("ride: rank %d: %s", m.rank(), bad.c_str());
+  std::vector<int> live;
+  for (const int32_t h : dc.live)
+    if (h > 0) live.push_back(h);
+  m.state_ride(dc.settled, dc.h, dc.budget, live);
+  if (const char* e = std::getenv("DSGB10_STORE_CHECK"); e && std::atoi(e) == 1)
+    std::printf("store-check: rank %d ride digest %016llx\n", m.rank(), (unsigned long long)m.store_digest());
+  if (m.rank() == 0) {
+    ++g_ride.rides;
+    g_ride.longest_ns = std::max<uint64_t>(g_ride.longest_ns, (uint64_t)((now_s() - t_ride) * 1e9));
+  }
+}
+
+void mem_watch_init(comm::Ring* ring, uint64_t keep_bytes) {
+  g_watch.ring = ring;
+  g_watch.w.keep = keep_bytes;
+}
+void mem_watch_note(const std::string& over) { g_watch.over = over; }
+bool mem_watch_on() { return g_watch.ring && g_watch.w.keep > 0; }
+MemWatchView mem_watch_view() {
+  MemWatchView v;
+  v.min_bytes = g_watch.w.min_bytes, v.low_count = g_watch.w.low_count;
+  for (int r = 0; r < 4; ++r) v.avail[r] = g_watch.w.last[r];
+  v.seq = g_watch.seq;
+  return v;
+}
+
 void apply_state(model::Model& m, const StateOp& o) {
   switch (o.op) {
     case kStSave: m.state_save(o.h, o.a, o.b); break;
@@ -68,7 +174,7 @@ void apply_state(model::Model& m, const StateOp& o) {
     case kStDropSnap: m.state_drop_snap(o.h, o.a); break;
     case kStSnap: m.state_snap(o.h, o.a); break;
     case kStSpill: m.state_spill(o.h); break;
-    case kStUnspill: m.state_unspill(o.h); break;
+    case kStUnspill: m.state_unspill(o.h, o.a, o.b); break;
     case kStKeep: m.state_keep((uint64_t)(uint32_t)o.a | (uint64_t)(uint32_t)o.b << 32); break;
     case kStReserve: m.slot_reserve(o.a, o.b, o.h); break;
     case kStRelease: m.slot_release(o.a); break;
@@ -111,6 +217,23 @@ bool store_check() {
 }  // namespace
 
 void apply_ops(model::Model& m, const Cmd& c) {
+  // a command of the watch alone runs the watch and touches nothing of the store: no history trim, no pin, no digest line
+  if (c.op == kCmdState && memwatch::watch_only(c.n_ops, [&](int i) { return c.ops[i].op; }, kStMemWatch)) {
+    for (int i = 0; i < c.n_ops; ++i) apply_state(m, c.ops[i]);
+    return;
+  }
+  // the imager's ride with nothing in flight: no trim, no pin of its own (the sessions a request is in flight on are `live`), no digest line
+  if (c.op == kCmdState && c.n_ops == 1 && c.ops[0].op == kStRide) {
+    std::vector<int> live;
+    for (const int32_t h : c.live)
+      if (h > 0) live.push_back(h);
+    m.state_pin({}, live, {});
+    RideReq r;
+    r.h = c.ops[0].h, r.budget = c.ops[0].a;
+    std::copy(c.live, c.live + model::kMaxSlots, r.live);
+    split_ride_run(m, r);
+    return;
+  }
   if (c.slot >= 0) m.use_slot(c.slot);
   m.trim_history();
   std::vector<int> pin, last;
@@ -138,7 +261,7 @@ void apply_ops(model::Model& m, const Cmd& c) {
 
 Cmd bcast(comm::Ring& ring, const Cmd& mine) {
   Cmd all[4];
-  ring.allgather_host(&mine, all, sizeof(Cmd));
+  ring.allgather_host(&mine, all, sizeof(Cmd), comm::kCallFrame);
   return all[0];
 }
 
@@ -148,7 +271,7 @@ void bcast_payload(comm::Ring& ring, void* data, size_t nbytes, int rank) {
   for (size_t off = 0; off < nbytes; off += kPiece) {
     const size_t n = std::min(kPiece, nbytes - off);
     if (rank == 0) std::memcpy(mine.data(), static_cast<uint8_t*>(data) + off, n);
-    ring.allgather_host(mine.data(), all.data(), n);
+    ring.allgather_host(mine.data(), all.data(), n, comm::kCallPayload);
     if (rank != 0) std::memcpy(static_cast<uint8_t*>(data) + off, all.data(), n);
   }
 }
@@ -198,6 +321,7 @@ uint64_t run_prefill(model::Model& m, const Cmd& c) {
       m.prefill(c.pos0, c.rows, (c.flags & kPfSample) ? &c.sp : nullptr, c.handle, snaps, (c.flags & kPfCed) != 0,
                 c.sp.ablit, c.rows_set);
   if (c.next > 0) m.prefill_lookup(c.pos0 + c.rows, c.next, c.rows_set);
+  if (c.flags & kPfWatch) mem_watch_run(m.rank());  // the chunk is queued: the reading and the all-gather go beside the device's work
   return n;
 }
 
@@ -239,9 +363,37 @@ float SpecRate::thresh(const Cmd& c) const {
 
 namespace {
 
+// DSGB10_COPY_DUMP (copy.h; DSGB10_COPY_DUMP_FILE=FILE, on rank 0's server): a line per step and entry with a proposal
+// record: what the step emitted and the proposal made after its kept drafts (source end, match length, drafts kept,
+// proposed tokens); tools/copy/fit.py scores them. Tokens are ';'-separated in a field.
+FILE* copy_dump_file() {
+  static FILE* const f = [] {
+    const char* v = getenv("DSGB10_COPY_DUMP_FILE");
+    if (!(model::copy::mode() & model::copy::kDump) || !v || !*v) return (FILE*)nullptr;
+    FILE* g = std::fopen(v, "a");
+    if (g && std::ftell(g) == 0)
+      std::fprintf(g, "tag,step,entry,pos0,emitted_n,emitted,next_pos0,chain_k,chain,src,match_len,m,copy\n");
+    return g;
+  }();
+  return f;
+}
+void copy_dump_line(FILE* f, int step, int entry, int pos0, int n_emit, const int32_t* emitted, int next_pos0, const int32_t* next_tok,
+                    const int32_t* info, const int32_t* tok) {
+  static const char* const tag = getenv("DSGB10_COPY_TAG") ? getenv("DSGB10_COPY_TAG") : "";
+  std::fprintf(f, "%s,%d,%d,%d,%d,", tag, step, entry, pos0, n_emit);
+  for (int j = 0; j < n_emit; ++j) std::fprintf(f, "%s%d", j ? ";" : "", emitted[j]);
+  std::fprintf(f, ",%d,%d,", next_pos0, info[2]);
+  for (int j = 1; j <= info[2]; ++j) std::fprintf(f, "%s%d", j > 1 ? ";" : "", next_tok[j]);
+  std::fprintf(f, ",%d,%d,%d,", info[0], info[1], info[3]);
+  for (int j = 0; j < info[3]; ++j) std::fprintf(f, "%s%d", j ? ";" : "", tok[j]);
+  std::fprintf(f, "\n");
+}
+
 // decode_loop with DSpark (cmd.h)
-DecodeEnd spec_loop(model::Model& m, const Cmd& c, Watchdog& wd, const OnSample& on) {
+DecodeEnd spec_loop(model::Model& m, const Cmd& c, Watchdog& wd, const OnSample& on, const OnStep& step) {
   constexpr int kD = model::ops::kDrafts;
+  // rows a step can reach past the previous step's last: the chain's drafts, or copy drafting's (copy.h) when copy rows are on
+  static const int kR = model::copy::verify_reach(kD, (model::copy::mode() & model::copy::kRows) != 0);
   DecodeEnd e;
   e.written = c.pos0;
   // verify rows stay below pos_end: the tokens they emit stay within max_new and the context. As in
@@ -260,14 +412,14 @@ DecodeEnd spec_loop(model::Model& m, const Cmd& c, Watchdog& wd, const OnSample&
   cfg.pos_end = pos_end;
   cfg.gate = c.spec_gate;
   std::copy(c.spec_row_ms, c.spec_row_ms + model::ops::kDrafts + 1, cfg.step_ms);
-  // c1fast: DSGB10_RELAX_THRESH=T: a greedy one-session decode verifies drafts while survival >= T (fixed), the gate
+  // DSGB10_RELAX_THRESH=T: a greedy one-session decode verifies drafts while survival >= T (fixed), the gate
   // that pairs with DSGB10_RELAX's relaxed accept (sample.cu); sampled requests and batch steps keep the default gate
   static const float relax_thresh = [] {
     const char* v = getenv("DSGB10_RELAX_THRESH");
     return v ? (float)atof(v) : -1.f;
   }();
   const bool rgate = relax_thresh >= 0.f && !(c.sp.temperature > 0.f);
-  // stack4: DSGB10_CF_ALPHA=A scales the one-session gate's threshold (the confidence MLP's calibration differs from the
+  // DSGB10_CF_ALPHA=A scales the one-session gate's threshold (the confidence MLP's calibration differs from the
   // shipped head's; a threshold only decides which drafts are verified, never a token)
   static const float cf_alpha = getenv("DSGB10_CF_ALPHA") ? (float)atof(getenv("DSGB10_CF_ALPHA")) : 1.f;
   auto gate_of = [&] { return rgate ? relax_thresh : rate.thresh(c) * cf_alpha; };
@@ -284,7 +436,7 @@ DecodeEnd spec_loop(model::Model& m, const Cmd& c, Watchdog& wd, const OnSample&
     const char* v = getenv("DSGB10_STEP_LOG");
     return v && *v ? std::fopen(v, "a") : (FILE*)nullptr;
   }();
-  static FILE* const mhf = [&] {  // stack4 (DSGB10_MH_DUMP=DIR on the rank that holds the pinned ring): DIR/mh.bin
+  static FILE* const mhf = [&] {  // (DSGB10_MH_DUMP=DIR on the rank that holds the pinned ring): DIR/mh.bin
     const char* v = getenv("DSGB10_MH_DUMP");
     if (!v || !*v || !m.mh_dump(0)) return (FILE*)nullptr;
     std::string p = v;
@@ -299,19 +451,27 @@ DecodeEnd spec_loop(model::Model& m, const Cmd& c, Watchdog& wd, const OnSample&
   if (slog) std::fprintf(slog, "{\"req\":1,\"pos0\":%d,\"max_new\":%d,\"temp\":%.3f,\"n_top\":%d}\n", c.pos0, c.max_new, c.sp.temperature, c.sp.n_top);
   const uint64_t first = m.launch_spec(1, c.pos0, c.tokens, c.sp, cfg);
   int launched = 1, prev_rows = 1;
-  if (c.ahead && c.pos0 + 1 <= feed) verify(c.pos0 + 1 + kD), ++launched;
+  if (c.ahead && c.pos0 + 1 <= feed) verify(c.pos0 + 1 + kR), ++launched;
+  // The watch riding the run: the step whose output shows the bit's other value runs the reading on every rank, between two steps.
+  uint32_t watch_seen = 0, split_seen = 0;
+  auto ride = [&](uint32_t ctl) {
+    // a ride is watched as a step is (only when the bit flipped: no cost on a step without one): a rank that stops inside it ends with the watchdog's line
+    if (memwatch::flipped(watch_seen, ctl)) wd.started = now_s(), mem_watch_run(m.rank()), wd.started = 0;
+    if (memwatch::split_flipped(split_seen, ctl)) wd.started = now_s(), split_ride_run(m, g_ride.req), wd.started = 0;
+  };
   for (int i = 0;; ++i) {
     wd.started = now_s();
     const model::SampleOut& o = m.wait(first + i);
+    const uint32_t wctl = o.ctl;
     wd.started = 0;
     g_t_wait.push_back(now_s());
     if (i + 1 < launched) m.engram_late(o.next_pos0, o.next_rows, o.next_tok);  // step i + 1's rows
-    if (mhf) {  // stack4: the step's rows of main_hidden
+    if (mhf) {  // the step's rows of main_hidden
       const int32_t hd[4] = {i, o.pos0, o.step_rows, o.rows};
       std::fwrite(hd, 4, 4, mhf);
       std::fwrite(m.mh_dump(first + i), 2 * 15360, (size_t)std::max(0, std::min(o.step_rows, 8)), mhf);
     }
-    if (slog) {  // stack4 (DSGB10_STEP_LOG, measurement only): every row's sample, the rejected rows' too
+    if (slog) {  // DSGB10_STEP_LOG, measurement only:: every row's sample, the rejected rows' too
       std::fprintf(slog, "{\"i\":%d,\"p\":%d,\"R\":%d,\"n\":%d,\"in\":[", i, o.pos0, o.step_rows, o.rows);
       for (size_t j = 0; j < slog_in.size(); ++j) std::fprintf(slog, "%s%d", j ? "," : "", slog_in[j]);
       std::fprintf(slog, "],\"out\":[");
@@ -350,7 +510,15 @@ DecodeEnd spec_loop(model::Model& m, const Cmd& c, Watchdog& wd, const OnSample&
       slog_in.assign(o.next_tok, o.next_tok + std::max(0, std::min<int>(o.next_rows, model::kMaxRows)));
     }
     g_t_late.push_back(now_s());
-    e.written = std::max(e.written, o.pos0 + std::max(o.step_rows, o.rows + kD));
+    if (on && copy_dump_file()) {
+      int32_t em[model::kMaxRows];
+      const int ne = std::max(0, std::min<int>(o.rows, model::kMaxRows));
+      for (int j = 0; j < ne; ++j) em[j] = o.row[j].token;
+      copy_dump_line(copy_dump_file(), i, 0, o.pos0, ne, em, o.next_pos0, o.next_tok, o.copy_info[0], o.copy_tok[0]);
+      std::fflush(copy_dump_file());
+    }
+    if (model::copy::mode() & model::copy::kAdapt) e.copy_obs(o.copy_obs[0], o.copy_chance);
+    e.written = std::max(e.written, o.pos0 + std::max(o.step_rows, o.rows + kR));
     if (i > 0) {
       ++e.vsteps, e.verified += o.step_rows - 1, e.accepted += o.rows - 1;
       ++e.rows_hist[std::min(o.step_rows - 1, kD)];
@@ -368,7 +536,7 @@ DecodeEnd spec_loop(model::Model& m, const Cmd& c, Watchdog& wd, const OnSample&
       if (on) on(e.sampled, o, j);
       ++e.sampled, ++u;
       toks.push_back(t);
-      if (o.ctl) stop = true, e.why = kEndCancel;
+      if (memwatch::ends_reply(o.ctl)) stop = true, e.why = kEndCancel;
       for (int k = 0; !stop && k < c.n_stop; ++k)
         if (t == c.stop[k]) stop = true, e.why = kEndStop;
       if (!stop && e.sampled >= c.max_new) stop = true, e.why = kEndLength;
@@ -386,13 +554,17 @@ DecodeEnd spec_loop(model::Model& m, const Cmd& c, Watchdog& wd, const OnSample&
       wd.started = now_s();
       const model::SampleOut& q = m.wait(first + i + 1);
       wd.started = 0;
-      e.written = std::max(e.written, q.pos0 + std::max(q.step_rows, q.rows + kD));
+      e.written = std::max(e.written, q.pos0 + std::max(q.step_rows, q.rows + kR));
       next_ran = true;
     }
     const int kv_end = H <= F || next_ran ? H + 1 : F + 1;  // positions [pos0, kv_end) hold the history's KV
     for (; next_snap <= kv_end; next_snap += c.snap_every)  // window snapshots (the ring holds s - 128 .. s - 1)
       if (c.handle >= 0 && next_snap > c.pos0 && next_snap >= 128) m.state_snap(c.handle, next_snap);
     if (stop) {
+      if (model::copy::mode())  // the rank-agreement digest of the rows every step chose (copy.h): equal on all four ranks
+        std::fprintf(stderr, "copy: digest %08x after %d steps (request at %d)\n", o.copy_digest, i + 1, c.pos0);
+      if (model::copy::mode() & model::copy::kAdapt)  // and the fold of every outcome the learner took: equal on all four ranks too
+        std::fprintf(stderr, "copy: learn %08x after %d steps (request at %d)\n", o.copy_learn, i + 1, c.pos0);
       if (slog) std::fflush(slog);
       if (mhf) std::fflush(mhf);
       static const bool cert_log = getenv("DSGB10_CERT_CHECK") || getenv("DSGB10_CERT_LOG");
@@ -405,6 +577,7 @@ DecodeEnd spec_loop(model::Model& m, const Cmd& c, Watchdog& wd, const OnSample&
       }
       e.fed = kv_end - c.pos0;
       e.last = toks[e.fed - 1];
+      ride(wctl);
       return e;
     }
     if (i + 1 == launched) {  // not queued ahead: the rows are known now
@@ -413,16 +586,18 @@ DecodeEnd spec_loop(model::Model& m, const Cmd& c, Watchdog& wd, const OnSample&
     }
     // the step after it starts at most at next_pos0 + next_rows (every draft accepted)
     if (c.ahead && launched == i + 2 && o.next_pos0 + o.next_rows <= feed)
-      verify(o.next_pos0 + o.next_rows + kD), ++launched;
+      verify(o.next_pos0 + o.next_rows + kR), ++launched;
     g_t_launch.push_back(now_s());
+    ride(wctl);
+    if (step) step();
   }
 }
 
 }  // namespace
 
-DecodeEnd decode_loop(model::Model& m, const Cmd& c, Watchdog& wd, const OnSample& on) {
+DecodeEnd decode_loop(model::Model& m, const Cmd& c, Watchdog& wd, const OnSample& on, const OnStep& step) {
   g_t_wait.clear(), g_t_late.clear(), g_t_launch.clear();
-  if (c.spec) return spec_loop(m, c, wd, on);
+  if (c.spec) return spec_loop(m, c, wd, on, step);
   auto may_run = [&](int i) { return i <= c.max_new && c.pos0 + i < c.limit; };
   // a step at position pos; the window snapshot at pos first (the ring then holds pos - 128 .. pos - 1)
   auto launch = [&](int pos, const int32_t* tok) {
@@ -441,23 +616,31 @@ DecodeEnd decode_loop(model::Model& m, const Cmd& c, Watchdog& wd, const OnSampl
   int launched = 1;
   if (c.ahead && may_run(1)) launch(c.pos0 + 1, &from_device), ++launched;
   int32_t fed = c.tokens[0];
+  // The watch riding the run: the step whose output shows the bit's other value runs the reading on every rank, between two steps.
+  uint32_t watch_seen = 0, split_seen = 0;
+  auto ride = [&](uint32_t ctl) {
+    // a ride is watched as a step is (only when the bit flipped: no cost on a step without one): a rank that stops inside it ends with the watchdog's line
+    if (memwatch::flipped(watch_seen, ctl)) wd.started = now_s(), mem_watch_run(m.rank()), wd.started = 0;
+    if (memwatch::split_flipped(split_seen, ctl)) wd.started = now_s(), split_ride_run(m, g_ride.req), wd.started = 0;
+  };
   for (int i = 0;; ++i) {
     wd.started = now_s();
     const model::SampleOut& o = m.wait(first + i);
+    const uint32_t wctl = o.ctl;
     wd.started = 0;
     g_t_wait.push_back(now_s());
     const int32_t t = o.row[0].token;
     if (on) on(i, o, 0);
     e.sampled = i + 1;
     if (!c.ahead && i + 1 <= c.max_new && may_run(i + 1)) {  // diagnostics: launch only now
-      bool stop = o.ctl != 0 || i + 1 >= c.max_new;
+      bool stop = memwatch::ends_reply(o.ctl) != 0 || i + 1 >= c.max_new;
       for (int k = 0; k < c.n_stop; ++k) stop |= t == c.stop[k];
       if (!stop) launch(c.pos0 + i + 1, &t), ++launched;
     }
     if (c.ahead && i + 1 < launched) m.engram_late(c.pos0 + i + 1, 1, &t);  // step i + 1 feeds t
     g_t_late.push_back(now_s());
     bool stop = false;
-    if (o.ctl) stop = true, e.why = kEndCancel;
+    if (memwatch::ends_reply(o.ctl)) stop = true, e.why = kEndCancel;
     for (int k = 0; !stop && k < c.n_stop; ++k)
       if (t == c.stop[k]) stop = true, e.why = kEndStop;
     if (!stop && i + 1 >= c.max_new) stop = true, e.why = kEndLength;
@@ -472,11 +655,14 @@ DecodeEnd decode_loop(model::Model& m, const Cmd& c, Watchdog& wd, const OnSampl
         e.fed = i + 1, e.last = fed;
       }
       e.written = c.pos0 + e.fed;
+      ride(wctl);
       return e;
     }
     fed = t;
     if (c.ahead && may_run(i + 2)) launch(c.pos0 + i + 2, &from_device), ++launched;
     g_t_launch.push_back(now_s());
+    ride(wctl);
+    if (step) step();
   }
 }
 
@@ -541,11 +727,19 @@ std::vector<BatchEnd> batch_loop(model::Model& m, const Cmd& c, const std::vecto
   };
   launch();
   launch();  // queued behind the first, its tokens from the device
+  // The watch riding the run: the step whose output shows the bit's other value runs the reading on every rank, between two steps.
+  uint32_t watch_seen = 0, split_seen = 0;
+  auto ride = [&](uint32_t ctl) {
+    // a ride is watched as a step is (only when the bit flipped: no cost on a step without one): a rank that stops inside it ends with the watchdog's line
+    if (memwatch::flipped(watch_seen, ctl)) wd.started = now_s(), mem_watch_run(m.rank()), wd.started = 0;
+    if (memwatch::split_flipped(split_seen, ctl)) wd.started = now_s(), split_ride_run(m, g_ride.req), wd.started = 0;
+  };
   while (!q.empty()) {
     const Step s = q.front();
     q.pop_front();
     wd.started = now_s();
     const model::SampleOut& o = m.wait(s.id);
+    const uint32_t wctl = o.ctl;
     wd.started = 0;
     g_t_wait.push_back(now_s());
     std::vector<int> row_of(n, -1);  // entry -> its row in this step
@@ -585,6 +779,8 @@ std::vector<BatchEnd> batch_loop(model::Model& m, const Cmd& c, const std::vecto
     }
     launch();
     g_t_launch.push_back(now_s());
+    ride(wctl);
+    if (step) step();
   }
   m.use_slot(slot0);
   return end;
@@ -653,10 +849,11 @@ std::vector<float> batch_tf_loop(model::Model& m, const Cmd& c, const std::vecto
   return ms;
 }
 
-// B3 (cmd.h): spec_loop's accounting per entry, over batch spec steps
+// kCmdSpecBatch (cmd.h): spec_loop's accounting per entry, over batch spec steps
 std::vector<DecodeEnd> spec_batch_loop(model::Model& m, const Cmd& c, const std::vector<BatchEntry>& e, Watchdog& wd,
-                                       const OnBatch& on, SpecBatchStats* st) {
+                                       const OnBatch& on, SpecBatchStats* st, const OnStep& step) {
   constexpr int kD = model::ops::kDrafts;
+  static const int kR = model::copy::verify_reach(kD, (model::copy::mode() & model::copy::kRows) != 0);
   g_t_wait.clear(), g_t_late.clear(), g_t_launch.clear();
   const int n = (int)e.size(), slot0 = m.slot();
   if (n < 1 || n > model::ops::kMaxSess || n > m.spec_batch_entries())
@@ -761,10 +958,10 @@ std::vector<DecodeEnd> spec_batch_loop(model::Model& m, const Cmd& c, const std:
     int S = 0, bound = 0, lim = INT32_MAX;
     for (int k = 0; k < n; ++k)
       if (on_now(k)) ++S;
-    // night T2/T4 (DSGB10_BUDGET=1): every entry may draft up to the rows left after one per entry, and the
+    // DSGB10_BUDGET=1: every entry may draft up to the rows left after one per entry, and the
     // device's gate keeps the step within kMaxRows by survival across the entries (lossless)
     static const bool budget = getenv("DSGB10_BUDGET") && atoi(getenv("DSGB10_BUDGET")) > 0;
-    // wide64: with DSGB10_WIDE (the model's spec_batch_rows() > 16), steps of at least DSGB10_WIDE_S entries (6) may
+    // With DSGB10_WIDE (the model's spec_batch_rows() > 16), steps of at least DSGB10_WIDE_S entries (6) may
     // reach those rows; fewer entries keep the 16-row steps
     static const int wide_s = getenv("DSGB10_WIDE_S") ? atoi(getenv("DSGB10_WIDE_S")) : 6;
     const int rows_cap = S >= wide_s ? m.spec_batch_rows() : model::kDecodeRows;
@@ -783,7 +980,7 @@ std::vector<DecodeEnd> spec_batch_loop(model::Model& m, const Cmd& c, const std:
       if (!b.on[k]) continue;
       b.thresh[k] = rate[k].thresh(c);
       end[k].gate(b.thresh[k]);
-      const int hi = ahead ? nx[k].pos0 + nx[k].rows + kD : nx[k].pos0 + nx[k].rows - 1;  // entry k's rows' last position at most
+      const int hi = ahead ? nx[k].pos0 + nx[k].rows + kR : nx[k].pos0 + nx[k].rows - 1;  // entry k's rows' last position at most
       b.bound[k] = std::min(hi, e[k].limit - 1);  // the memory its slot needs mapped (Model::launch_verify_batch)
       bound = std::max(bound, hi);
       lim = std::min(lim, e[k].limit);
@@ -814,11 +1011,20 @@ std::vector<DecodeEnd> spec_batch_loop(model::Model& m, const Cmd& c, const std:
   }
   uint64_t prev_id = 0;
   int prev_R = 0;
+  uint32_t copy_digest = 0, copy_learn = 0;
+  // The watch riding the run: the step whose output shows the bit's other value runs the reading on every rank, between two steps.
+  uint32_t watch_seen = 0, split_seen = 0;
+  auto ride = [&](uint32_t ctl) {
+    // a ride is watched as a step is (only when the bit flipped: no cost on a step without one): a rank that stops inside it ends with the watchdog's line
+    if (memwatch::flipped(watch_seen, ctl)) wd.started = now_s(), mem_watch_run(m.rank()), wd.started = 0;
+    if (memwatch::split_flipped(split_seen, ctl)) wd.started = now_s(), split_ride_run(m, g_ride.req), wd.started = 0;
+  };
   for (int i = 0; !q.empty(); ++i) {
     const Step s = q.front();
     q.pop_front();
     wd.started = now_s();
     const model::SampleOut& o = m.wait(s.id);
+    const uint32_t wctl = o.ctl;
     wd.started = 0;
     g_t_wait.push_back(now_s());
     for (int k = 0; k < n; ++k) {  // each entry's next rows, the device's choice
@@ -832,6 +1038,17 @@ std::vector<DecodeEnd> spec_batch_loop(model::Model& m, const Cmd& c, const std:
       stats.gpu_ms[std::min(prev_R, model::kMaxRows)] += m.gpu_ms(prev_id), ++stats.gpu_n[std::min(prev_R, model::kMaxRows)];
     prev_id = s.id, prev_R = o.step_rows;
     ++stats.steps, stats.rows += o.step_rows;
+    if (model::copy::mode()) copy_digest = o.copy_digest, copy_learn = o.copy_learn;
+    if (on && copy_dump_file()) {
+      for (int k = 0; k < n; ++k) {
+        if (!s.on[k]) continue;
+        int32_t em[model::kMaxRows];
+        const int ne = std::max(0, std::min<int>(o.sess_rows[k], model::kMaxRows - o.sess_row0[k]));
+        for (int j = 0; j < ne; ++j) em[j] = o.row[o.sess_row0[k] + j].token;
+        copy_dump_line(copy_dump_file(), i, k, o.sess_pos0[k], ne, em, o.next_spos0[k], o.next_stok[k], o.copy_info[k], o.copy_tok[k]);
+      }
+      std::fflush(copy_dump_file());
+    }
     if (gdump) {
       static const char* const tag = getenv("DSGB10_GATE_TAG") ? getenv("DSGB10_GATE_TAG") : "";
       int son = 0;
@@ -860,12 +1077,13 @@ std::vector<DecodeEnd> spec_batch_loop(model::Model& m, const Cmd& c, const std:
       const int p0 = o.sess_pos0[k], sr = o.sess_step_rows[k], er = o.sess_rows[k], r0 = o.sess_row0[k];
       if (sr < 1 || er < 1 || er > sr || r0 < 0 || r0 + sr > o.step_rows)
         die("spec batch: entry %d: rows %d (%d emitted) from row %d of %d", k, sr, er, r0, o.step_rows);
-      d.written = std::max(d.written, p0 + std::max(sr, er + kD));
+      d.written = std::max(d.written, p0 + std::max(sr, er + kR));
       if (ending[k]) {  // its rows behind its end: their KV counts, their tokens do not
         snaps(k, H[k] + 1);
         finish(k, H[k] + 1);
         continue;
       }
+      if (model::copy::mode() & model::copy::kAdapt) d.copy_obs(o.copy_obs[k], o.copy_chance);
       if (i > 0) {
         ++d.vsteps, d.verified += sr - 1, d.accepted += er - 1;
         ++d.rows_hist[std::min(sr - 1, kD)];
@@ -929,8 +1147,14 @@ std::vector<DecodeEnd> spec_batch_loop(model::Model& m, const Cmd& c, const std:
     }
     if (c.ahead && q.size() == 1 && fits()) launch(false, true);
     g_t_launch.push_back(now_s());
+    ride(wctl);
+    if (step) step();
   }
   m.use_slot(slot0);
+  if (model::copy::mode())  // the rank-agreement digest of the rows every step chose (copy.h): equal on all four ranks
+    std::fprintf(stderr, "copy: digest %08x after %d batch steps\n", copy_digest, stats.steps);
+  if (model::copy::mode() & model::copy::kAdapt)
+    std::fprintf(stderr, "copy: learn %08x after %d batch steps\n", copy_learn, stats.steps);
   if (st) *st = stats;
   return end;
 }
@@ -946,7 +1170,9 @@ void follow(model::Model& m, comm::Ring& ring, Watchdog& wd, int rank) {
       CUDA_CHECK(cudaProfilerStart());
       prof = true;
     }
+    wd.started = now_s();     // a state operation is watched as a step is: a rank that waits in one for a partner ends with the watchdog's line
     apply_ops(m, c);         // first, whatever the command
+    wd.started = 0;
     (void)m.state_evicted();  // rank 0's server keeps track of the sessions
     if (c.op == kCmdStep) {
       wd.started = now_s();

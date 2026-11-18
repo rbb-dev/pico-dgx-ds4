@@ -14,6 +14,7 @@
 #include <cmath>
 #include <ctime>
 
+#include "model/copy_dev.h"
 #include "model/nvtx.h"
 #include "model/prefill.h"
 #include "model/spec_batch.h"
@@ -146,8 +147,11 @@ __global__ void k_mh_dump(const uint16_t* mh, const ops::StepIn* in, uint16_t* b
 
 // After the draft pass: the drafts the next step verifies, by the gate (ops.h; at most max_drafts, its
 // rows below pos_end); then the step is published.
+//
+// Copy drafting (copy.h; cp.dev non-null, in->copy set): the step's tokens go into the unit's history first, then the
+// proposal after the chain's k kept drafts is looked up and, in rows mode, the rows the gate keeps follow the chain's.
 __global__ void k_spec_next(const ops::StepIn* in, ops::SpecState* ss, const int* drafts, const float* surv,
-                            ops::SampleOut* outs, const float* cf) {
+                            ops::SampleOut* outs, const float* cf, copy::Args cp) {
   if (threadIdx.x != 0) return;
   ops::SampleOut& o = outs[in->step % ops::kOutSlots];
   const int P = ss->pos0 + ss->count;
@@ -166,16 +170,79 @@ __global__ void k_spec_next(const ops::StepIn* in, ops::SpecState* ss, const int
   } else {
     while (k < maxk && surv[k] >= in->thresh) ++k;
   }
+  int n_copy = 0;
+  int32_t ctok[copy::kMaxDrafts] = {};
+  if (cp.dev && in->copy) {
+    const int uidx = min(max(in->slot[0], 0), copy::kMaxUnitsCopy - 1);
+    copy::Unit& u = cp.dev->unit[uidx];
+    // the learner: every gate run writes the unit's record whole (no proposal: m = 0) and this step's word for the host
+    copy::UnitLearn* ul = (in->copy & copy::kAdapt) ? &cp.dev->ul[uidx] : nullptr;
+    copy::Taken tk;
+    copy::Pend pd{};
+    int m = 0;
+    copy::Match mt;
+    if (u.cap > 0) {
+      copy::append_step(u, ss->pos0, ss->count, in->tokens, ss->bonus);
+      if (ul) {  // what came of the last proposal scores the unit's counts before this step's gate reads them
+        tk = copy::outcome(ul->pend, in->spec == ops::kSpecVerify, in->force, ss->pos0, ss->count, ss->bonus);
+        copy::sess_apply(ul->sess, cp.dev->learn, tk);
+      }
+      const int maxm = min(copy::kMaxDrafts - k, in->pos_end - 1 - (P + k));
+      if (in->max_drafts > 0 && maxm > 0) {
+        int32_t d[ops::kDrafts];
+        for (int j = 0; j < k; ++j) d[j] = drafts[j];
+        m = copy::propose(u, P, d, k, maxm, in->copy_min, ctok, &mt);
+        if (m > 0 && (in->copy & copy::kRows)) {
+          float e_chain = 1.f, cs[copy::kMaxDrafts];
+          for (int j = 0; j < k; ++j) e_chain += surv[j];
+          if (ul) {
+            float lt[1][copy::kMaxDrafts];
+            copy::gate_row(cp.dev->learn, ul->sess, mt.bucket, cp.dev->table.t[mt.bucket], m, lt[0]);
+            n_copy = copy::gate_rows(in->gate, in->thresh, in->step_ms, k > 0 ? surv[k - 1] : 1.f, e_chain, k, m, 0, lt,
+                                     (in->copy & copy::kAll) != 0, cs);
+          } else {
+            n_copy = copy::gate_rows(in->gate, in->thresh, in->step_ms, k > 0 ? surv[k - 1] : 1.f, e_chain, k, m, mt.bucket,
+                                     cp.dev->table.t, (in->copy & copy::kAll) != 0, cs);
+          }
+        }
+      }
+      if (in->copy & copy::kDump) {
+        o.copy_info[0][0] = mt.e, o.copy_info[0][1] = mt.len, o.copy_info[0][2] = k, o.copy_info[0][3] = m;
+        for (int j = 0; j < copy::kMaxDrafts; ++j) o.copy_tok[0][j] = j < m ? ctok[j] : 0;
+      }
+    }
+    if (ul) {  // the record waits for the next verify step's verdict; the shared cells take this step's outcome last, so both gate kernels read the table as the step before left it
+      if (m > 0) {
+        pd.pos = P, pd.k = (int8_t)k, pd.n = (int8_t)n_copy, pd.m = (int8_t)m, pd.bucket = (int8_t)mt.bucket, pd.whole = 1;
+        for (int j = 0; j < m; ++j) pd.tok[j] = ctok[j];
+      }
+      ul->pend = pd;
+      o.copy_obs[0] = copy::pack_obs(tk, n_copy, m > 0, copy::ratio(ul->sess));
+      copy::fold_all(cp.dev->learn, &tk, 1);
+      o.copy_learn = cp.dev->learn.sum;
+      for (int b = 0; b < copy::kBuckets; ++b) o.copy_chance[b] = copy::round_u32(copy::fmul_rn(cp.dev->learn.chance[b][0], 65535.f));
+    } else if (in->copy & copy::kAdapt) {
+      o.copy_obs[0] = 0;
+    }
+  }
+  k += n_copy;  // the chain's kept drafts, then the copy rows: the step's drafts
+  const int kc = k - n_copy;
   ss->next_rows = 1 + k;
   ss->next_pos0 = P;
   ss->next_tok[0] = ss->bonus;
-  for (int j = 1; j < kMaxRows; ++j) ss->next_tok[j] = j <= k ? drafts[j - 1] : 0;
+  for (int j = 1; j < kMaxRows; ++j) ss->next_tok[j] = j <= kc ? drafts[j - 1] : j <= k ? ctok[j - kc - 1] : 0;
   o.next_rows = 1 + k;
   o.next_pos0 = P;
   for (int j = 0; j < kMaxRows; ++j) o.next_tok[j] = ss->next_tok[j];
   for (int j = 0; j < ops::kDrafts; ++j) o.drafts[j] = drafts[j], o.survival[j] = surv[j];
   if (cf)
     for (int j = 0; j < 16; ++j) o.cf[j] = cf[j];
+  if (cp.dev && in->copy) {  // the rank-agreement digest: what this step chose
+    uint32_t dg = cp.dev->digest;
+    dg = copy::digest_fold(dg, ss->next_rows);
+    for (int j = 0; j < ss->next_rows; ++j) dg = copy::digest_fold(dg, ss->next_tok[j]);
+    cp.dev->digest = dg, o.copy_digest = dg;
+  }
   __threadfence_system();
   st_release_sys_u32(&o.seq, in->step + 1);
 }
@@ -237,13 +304,28 @@ __device__ inline float gate_logit(float p) {
   p = fminf(fmaxf(p, 1e-6f), 1.f - 1e-6f);
   return logf(p / (1.f - p));
 }
+//
+// Copy drafting (copy.h; cp.dev non-null, in->copy set): each entry's thread appends its rows to its unit's history, looks
+// up the proposal after its chain's kept drafts and, in rows mode with a row budget (rbudget > 0), lists the copy rows
+// after the chain's: [chain 1..n, copy 1..m], survival non-increasing, so the trims drop copy rows first.
 __global__ void k_spec_gate_batch_all(const ops::StepIn* in, ops::SpecState* ss, const int* tok0, int tok_stride,
-                                      const float* surv0, int surv_stride, ops::SampleOut* outs, GateOpt opt) {
+                                      const float* surv0, int surv_stride, ops::SampleOut* outs, GateOpt opt,
+                                      copy::Args cp) {
   const int k = threadIdx.x;
   __shared__ int sn[ops::kMaxSess];
-  __shared__ float ssv[ops::kMaxSess][ops::kDrafts];
+  __shared__ int snc[ops::kMaxSess];  // the chain's kept drafts of entry k (the copy rows follow them)
+  __shared__ float ssv[ops::kMaxSess][ops::kCopyDrafts];
+  __shared__ int32_t sctok[ops::kMaxSess][ops::kCopyDrafts];  // the copy tokens proposed, all of them (the trims keep a prefix)
+  __shared__ copy::Taken stk[ops::kMaxSess];                   // the outcome each entry took from its last proposal
+  __shared__ int8_t smm[ops::kMaxSess], sbk[ops::kMaxSess];    // the tokens proposed and their match bucket
+  __shared__ float srho[ops::kMaxSess];                        // the entry's ratio
+  const bool adapt = cp.dev && (in->copy & copy::kAdapt);
+  if (k < ops::kMaxSess) {
+    stk[k] = copy::Taken{}, smm[k] = 0, sbk[k] = 0, srho[k] = 1.f;
+    if (adapt) outs[in->step % ops::kOutSlots].copy_obs[k] = 0;
+  }
   const bool on = k < ops::kMaxSess && k < in->nsess && in->sess_on[k];
-  int n = 0;
+  int n = 0, nchain = 0;
   if (on) {
     const float* surv_in = surv0 + k * surv_stride;
     float surv[ops::kDrafts];
@@ -277,6 +359,54 @@ __global__ void k_spec_gate_batch_all(const ops::StepIn* in, ops::SpecState* ss,
       while (n < maxk && surv[n] >= thresh) ++n;
     }
     for (int j = 0; j < ops::kDrafts; ++j) ssv[k][j] = surv[j];
+    nchain = n;
+    if (cp.dev && in->copy) {
+      copy::Unit& u = cp.dev->unit[min(max(in->sess_slot[k], 0), copy::kMaxUnitsCopy - 1)];
+      if (u.cap > 0) {
+        const int32_t* rows = in->tokens + cp.row0[k];
+        copy::append_step(u, s.pos0, s.count, rows, s.bonus);
+        copy::UnitLearn* ul = adapt ? &cp.dev->ul[min(max(in->sess_slot[k], 0), copy::kMaxUnitsCopy - 1)] : nullptr;
+        if (ul) {  // what came of the last proposal scores the conversation's counts before this step's gate reads them
+          stk[k] = copy::outcome(ul->pend, in->spec == ops::kSpecVerify, in->force, s.pos0, s.count, s.bonus);
+          copy::sess_apply(ul->sess, cp.dev->learn, stk[k]);
+          srho[k] = copy::ratio(ul->sess);
+        }
+        int m = 0;
+        copy::Match mt;
+        int32_t ctok[copy::kMaxDrafts] = {};
+        const int maxm = min(copy::kMaxDrafts - n, in->spos_end[k] - 1 - (P + n));
+        if (in->scap[k] > 0 && maxm > 0) {
+          int32_t d[ops::kDrafts];
+          for (int j = 0; j < n; ++j) d[j] = tok0[k * tok_stride + j];
+          m = copy::propose(u, P, d, n, maxm, in->copy_min, ctok, &mt);
+          if (m > 0 && (in->copy & copy::kRows) && in->rbudget > 0 && opt.dump != 2) {
+            float e_chain = 1.f, cs[copy::kMaxDrafts];
+            for (int j = 0; j < n; ++j) e_chain += surv[j];
+            int g;
+            if (ul) {
+              float lt[1][copy::kMaxDrafts];
+              copy::gate_row(cp.dev->learn, ul->sess, mt.bucket, cp.dev->table.t[mt.bucket], m, lt[0]);
+              g = copy::gate_rows(in->gate, thresh, in->step_ms, n > 0 ? surv[n - 1] : 1.f, e_chain, n, m, 0, lt,
+                                  (in->copy & copy::kAll) != 0, cs);
+            } else {
+              g = copy::gate_rows(in->gate, thresh, in->step_ms, n > 0 ? surv[n - 1] : 1.f, e_chain, n, m, mt.bucket,
+                                  cp.dev->table.t, (in->copy & copy::kAll) != 0, cs);
+            }
+            for (int j = 0; j < g; ++j) ssv[k][n + j] = cs[j], sctok[k][j] = ctok[j];
+            n += g;
+          }
+        }
+        if (ul && m > 0) {  // the whole proposal, for the pending record the trims' result completes
+          smm[k] = (int8_t)m, sbk[k] = (int8_t)mt.bucket;
+          for (int j = 0; j < m; ++j) sctok[k][j] = ctok[j];
+        }
+        if (in->copy & copy::kDump) {
+          ops::SampleOut& od = outs[in->step % ops::kOutSlots];
+          od.copy_info[k][0] = mt.e, od.copy_info[k][1] = mt.len, od.copy_info[k][2] = nchain, od.copy_info[k][3] = m;
+          for (int j = 0; j < copy::kMaxDrafts; ++j) od.copy_tok[k][j] = j < m ? ctok[j] : 0;
+        }
+      }
+    }
     if (opt.dump) {
       ops::SampleOut& od = outs[in->step % ops::kOutSlots];
       for (int j = 0; j < ops::kDrafts; ++j) {
@@ -287,7 +417,7 @@ __global__ void k_spec_gate_batch_all(const ops::StepIn* in, ops::SpecState* ss,
       for (int j = 0; j < 16; ++j) od.gate_feat[k][j] = opt.feat0 ? opt.feat0[k * 16 + j] : 0.f;
     }
   }
-  if (k < ops::kMaxSess) sn[k] = on ? n : -1;
+  if (k < ops::kMaxSess) sn[k] = on ? n : -1, snc[k] = nchain;
   __syncthreads();
   // night T2/T4: a row budget across the entries: while the rows exceed it, drop the draft with the least
   // survival among the entries' last kept drafts (survival falls along a session's drafts, so this keeps the
@@ -351,20 +481,51 @@ __global__ void k_spec_gate_batch_all(const ops::StepIn* in, ops::SpecState* ss,
     }
   }
   __syncthreads();
-  if (!on) return;
-  n = sn[k];
-  const int* drafts = tok0 + k * tok_stride;
-  ops::SampleOut& o = outs[in->step % ops::kOutSlots];
-  ops::SpecState& s = ss[k];
-  const int P = s.pos0 + s.count;
-  s.next_rows = 1 + n;
-  s.next_pos0 = P;
-  s.next_tok[0] = s.bonus;
-  for (int j = 1; j < kMaxRows; ++j) s.next_tok[j] = j <= n ? drafts[j - 1] : 0;
-  o.next_srows[k] = 1 + n;
-  if (opt.dump) o.gate_keep[k] = n;
-  o.next_spos0[k] = P;
-  for (int j = 0; j < ops::kSessTok; ++j) o.next_stok[k][j] = s.next_tok[j];
+  if (on) {
+    n = sn[k];
+    const int nc = snc[k];  // the chain's drafts the trims kept stay first; copy rows follow while any is kept
+    const int* drafts = tok0 + k * tok_stride;
+    ops::SampleOut& o = outs[in->step % ops::kOutSlots];
+    ops::SpecState& s = ss[k];
+    const int P = s.pos0 + s.count;
+    s.next_rows = 1 + n;
+    s.next_pos0 = P;
+    s.next_tok[0] = s.bonus;
+    for (int j = 1; j < kMaxRows; ++j) s.next_tok[j] = j <= min(n, nc) ? drafts[j - 1] : j <= n ? sctok[k][j - nc - 1] : 0;
+    if (adapt) {
+      // the proposal with the rows the trims left it, written whole by every run (none: m = 0): it waits for the next verify step's
+      // verdict (a trim into the chain voids it)
+      const int uidx = min(max(in->sess_slot[k], 0), copy::kMaxUnitsCopy - 1);
+      copy::Pend pd{};
+      const int kept = n >= nc ? n - nc : 0;
+      if (smm[k] > 0) {
+        pd.pos = P, pd.k = (int8_t)nc, pd.n = (int8_t)kept, pd.m = smm[k], pd.bucket = sbk[k], pd.whole = n >= nc ? 1 : 0;
+        for (int j = 0; j < smm[k]; ++j) pd.tok[j] = sctok[k][j];
+      }
+      cp.dev->ul[uidx].pend = pd;
+      o.copy_obs[k] = copy::pack_obs(stk[k], kept, smm[k] > 0, srho[k]);
+    }
+    o.next_srows[k] = 1 + n;
+    if (opt.dump) o.gate_keep[k] = n;
+    o.next_spos0[k] = P;
+    for (int j = 0; j < ops::kSessTok; ++j) o.next_stok[k][j] = s.next_tok[j];
+  }
+  __syncthreads();
+  if (k == 0 && cp.dev && in->copy) {  // the rank-agreement digest: what every entry's next rows are, in entry order
+    uint32_t dg = cp.dev->digest;
+    for (int q = 0; q < ops::kMaxSess && q < in->nsess; ++q) {
+      if (!in->sess_on[q]) continue;
+      dg = copy::digest_fold(dg, ss[q].next_rows);
+      for (int j = 0; j < ss[q].next_rows; ++j) dg = copy::digest_fold(dg, ss[q].next_tok[j]);
+    }
+    cp.dev->digest = dg, outs[in->step % ops::kOutSlots].copy_digest = dg;
+    if (adapt) {  // the entries' outcomes into the shared cells in entry order, after every thread has gated on them as they stood
+      ops::SampleOut& od = outs[in->step % ops::kOutSlots];
+      copy::fold_all(cp.dev->learn, stk, min(in->nsess, (int)ops::kMaxSess));
+      od.copy_learn = cp.dev->learn.sum;
+      for (int b = 0; b < copy::kBuckets; ++b) od.copy_chance[b] = copy::round_u32(copy::fmul_rn(cp.dev->learn.chance[b][0], 65535.f));
+    }
+  }
   __threadfence_system();
 }
 
@@ -562,6 +723,12 @@ class RingComm final : public dspark::Comm {
     static_assert(sizeof(dspark::Cand) == sizeof(comm::ArgMax), "Cand");
     comm::argmax_rows(ch_, reinterpret_cast<const comm::ArgMax*>(src), reinterpret_cast<comm::ArgMax*>(dst), 2, s);
   }
+  bool carries_rows() const override { return true; }
+  void argmax_rows_row(const dspark::Cand* src, dspark::Cand* dst, int rows, const uint16_t* table, int base,
+                       uint16_t* rows_out, cudaStream_t s) override {
+    comm::argmax_rows_row(ch_, reinterpret_cast<const comm::ArgMax*>(src), reinterpret_cast<comm::ArgMax*>(dst), rows, table,
+                          base, dspark::kVocabRank, dspark::kMarkov * 2 / 16, dspark::kVocab, rows_out, s);
+  }
   // a batch pass's entries' candidates in one collective (an even count: argmax_rows's 16-byte posts)
   void argmax_rows(const dspark::Cand* src, dspark::Cand* dst, int rows, cudaStream_t s) override {
     if (rows < 1 || rows % 2) die("spec: argmax_rows of %d candidates", rows);
@@ -579,7 +746,6 @@ Spec::~Spec() {
   for (auto& g : graphs) cudaGraphExecDestroy(g.second);
   for (auto& g : bgraphs) cudaGraphExecDestroy(g.second);
   for (void* p : whole) cudaFree(p);
-  cudaFree(rope);
   cudaFree(mh);
   cudaFree(ss);
   cudaFree(row0);
@@ -725,7 +891,7 @@ void Model::Impl::bind_spec(dsw::WeightFile& wf, const dsw::WeightFile* draft) {
   }
   sync();
   cudaFree(hc_tmp);
-  sp.draft = std::make_unique<dspark::Draft>(dw, rank, sp.comm.get(), sp.rope, nunits);
+  sp.draft = std::make_unique<dspark::Draft>(dw, rank, sp.comm.get(), nullptr, nunits);
   sp.draft->use_slot(cur_unit);
   if (opt.tree_probe) sp.draft->enable_probe();
   // stack4: DSGB10_CF_MLP=FILE (dspark::kCfWords fp32 words; the same file on every rank, or the start dies) turns the
@@ -767,6 +933,19 @@ void Model::Impl::bind_spec(dsw::WeightFile& wf, const dsw::WeightFile* draft) {
     sp.draft->enable_cf_batch();
   // the prefill's seed rows, sized for a 4096-row chunk with snapshots every 1024 (768 rows in 96
   // groups, 384 on the last rank), so that a prefill rarely has to grow them (which synchronises)
+  // copy drafting (copy.h): every unit's token history and table, in one arena cut before the chunk pool is sized
+  if (copy::mode() && opt.copy_mib > 0) {
+    if (copy::mode() & copy::kAdapt)  // a relaxed accept takes drafts the sampler's token is not: the outcome the learner reads would run low
+      for (const char* name : {"DSGB10_RELAX", "DSGB10_RELAX_P"})
+        if (const char* e = getenv(name); e && atof(e) > 0.) die("model: DSGB10_COPY_ADAPT cannot run with %s=%s (the relaxed accept makes the learner's outcomes read low)", name, e);
+    int ctx[kMaxUnits] = {};
+    for (int s = 0; s < nslots; ++s) ctx[unit_of[s]] = slot_ctx_[s];
+    sp.copy = std::make_unique<copy::Index>(ctx, nunits, (size_t)opt.copy_mib << 20, st);
+    if (rank == 0)
+      std::printf("copy: drafting %s%s, %.1f MiB of the %d MiB arena a rank (an estimate of one session's lookup: a few "
+                  "us a step, not timed)\n", copy::mode() & copy::kRows ? "rows on" : "probe", copy::mode() & copy::kAll ? ", every proposed row" : "",
+                  (double)sp.copy->bytes() / 1048576.0, opt.copy_mib);
+  }
   sp.pf_rows = kSpecPfRows + 2 * kSnapRows, sp.pf_groups = 128;
   sp.pf_mh = dalloc<uint16_t>((size_t)kRanks * sp.pf_rows * dspark::kMainK);
   sp.pf_acc = dalloc<int>(2 * (size_t)sp.pf_groups);
@@ -802,10 +981,10 @@ void Model::Impl::spec_prefill_hidden(int L, int a, int M, const std::vector<int
     sp.pf_acc = dalloc<int>(2 * (size_t)sp.pf_groups);
     sp.pf_acc_h = halloc<int>(2 * (size_t)sp.pf_groups);
   }
-  // this rank's rows (p.x row 0 is the chunk's row p.r0) into its block
+  // this rank's rows (the set's x row 0 is the chunk's row p.r0) into its block
   for (const PfGroup& g : gs)
     if (g.owner == rank)
-      dspark::main_hidden(U(p.x) + (size_t)(g.pos - a - p.r0) * kHcDim, g.rows, L - kSpecLayer0,
+      dspark::main_hidden(U(p.rs->x) + (size_t)(g.pos - a - p.r0) * kHcDim, g.rows, L - kSpecLayer0,
                           sp.pf_mh + ((size_t)rank * C + g.row) * dspark::kMainK, false, st);
 }
 
@@ -904,7 +1083,8 @@ cudaGraphExec_t Model::Impl::spec_graph(int ctx) {
     sp.draft->probe(in_d->probe, st);
     k_probe_out<<<1, 128, 0, st>>>(in_d, sp.draft->probe_out(), out_h);
   }
-  k_spec_next<<<1, 32, 0, st>>>(in_d, sp.ss, sp.draft->tokens(), sp.draft->survival(), out_h, sp.draft->cf_raw());
+  k_spec_next<<<1, 32, 0, st>>>(in_d, sp.ss, sp.draft->tokens(), sp.draft->survival(), out_h, sp.draft->cf_raw(),
+                                copy::Args{sp.copy ? sp.copy->dev() : nullptr, nullptr});
   CUDA_CHECK(cudaGetLastError());
   CUDA_CHECK(cudaStreamEndCapture(st, &cap));
   cudaGraphExec_t e;
@@ -1115,7 +1295,7 @@ cudaGraphExec_t Model::Impl::spec_batch_graph(int ctx) {
   if (sp.draft->cf_batch()) go.mlp0 = sp.draft->batch_cf_survival(0), go.feat0 = sp.draft->batch_cf_raw(0);
   k_spec_gate_batch_all<<<1, 32, 0, st>>>(in_d, sp.ss, sp.draft->batch_tokens(0), 8,
                                           use_cf ? sp.draft->batch_cf_survival(0) : sp.draft->batch_survival(0), 16, out_h,
-                                          go);
+                                          go, copy::Args{sp.copy ? sp.copy->dev() : nullptr, sp.row0});
   k_spec_publish_batch<<<1, 32, 0, st>>>(in_d, out_h);
   CUDA_CHECK(cudaGetLastError());
   CUDA_CHECK(cudaStreamEndCapture(st, &cap));
@@ -1215,6 +1395,11 @@ void Model::Impl::spec_fill(ops::StepIn& in, int mode, const SpecCfg& c) {
   std::copy(c.probe, c.probe + ops::kDrafts, in.probe);
   in.gate = c.gate;
   std::copy(c.step_ms, c.step_ms + ops::kDrafts + 1, in.step_ms);
+  // copy rows reach past the chain's: the modelled ms of 6 and 7 drafts, by the last difference
+  for (int i = ops::kDrafts + 1; i <= ops::kCopyDrafts; ++i)
+    in.step_ms[i] = in.step_ms[i - 1] + std::max(0.f, in.step_ms[i - 1] - in.step_ms[i - 2]);
+  in.copy = spec && spec->copy ? copy::mode() : 0;
+  in.copy_min = copy::min_match();
 }
 
 uint64_t Model::Impl::launch_spec(int R, int pos0, const int32_t* tokens, const Sampling& sp, const SpecCfg& c) {
@@ -1437,5 +1622,16 @@ uint64_t Model::launch_spec(int R, int pos0, const int32_t* tokens, const Sampli
 uint64_t Model::launch_verify(const Sampling& sp, const SpecCfg& c, int pos_bound) {
   return d_->launch_verify(sp, c, pos_bound);
 }
+
+namespace copy::test {
+void gate_one(const ops::StepIn* in, ops::SpecState* ss, const int* drafts, const float* surv, ops::SampleOut* outs, Args cp, cudaStream_t s) {
+  detail::k_spec_next<<<1, 32, 0, s>>>(in, ss, drafts, surv, outs, nullptr, cp);
+}
+void gate_batch(const ops::StepIn* in, ops::SpecState* ss, const int* tok0, int tok_stride, const float* surv0, int surv_stride,
+                ops::SampleOut* outs, Args cp, cudaStream_t s) {
+  detail::GateOpt opt{};
+  detail::k_spec_gate_batch_all<<<1, 32, 0, s>>>(in, ss, tok0, tok_stride, surv0, surv_stride, outs, opt, cp);
+}
+}  // namespace copy::test
 
 }  // namespace model

@@ -1,7 +1,11 @@
-add_library(dsmodel STATIC model.cu ablit.cu ops.cu fused.cu sample.cu prefill.cu state.cu spec.cu window.cu lend.cu wave_probe.cu spill.cpp vmm.cpp vmm.cu chunks.cpp)
+add_library(dsmodel STATIC model.cu ablit.cu ops.cu fused.cu sample.cu prefill.cu state.cu spec.cu window.cu tenant.cu wave_probe.cu spill.cpp vmm.cpp vmm.cu chunks.cpp copy.cu store_trace.cpp store_core.cpp quarter.cu vit_area.cu vit_cmd.cu rows_lend.cu)
+# an old-rules build (CMAKE_CXX_FLAGS holds -DPICO_OLD_RULES) gives the kernels' sources the same definition, which nvcc does not take from it
+if(CMAKE_CXX_FLAGS MATCHES "-DPICO_OLD_RULES")
+  target_compile_definitions(dsmodel PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:PICO_OLD_RULES>)
+endif()
 target_include_directories(dsmodel PUBLIC ${CMAKE_SOURCE_DIR})
 find_package(CUDAToolkit REQUIRED)
-target_link_libraries(dsmodel PUBLIC dsattn dsk_kernels dsgb10_comm engram dsw_loader dspark CUDA::cuda_driver)
+target_link_libraries(dsmodel PUBLIC dsattn dsk_kernels dsgb10_comm engram dsw_loader dspark vit_kernels CUDA::cuda_driver)
 
 add_executable(coll_tests tests/coll_tests.cu)
 target_include_directories(coll_tests PRIVATE ${CMAKE_SOURCE_DIR}/attn/tests)
@@ -14,6 +18,28 @@ target_link_libraries(ablit_test dsmodel)
 # B3: the batch spec step's layout and verdicts (spec_batch.h) against a host reference; host only, no GPU
 add_executable(spec_batch_test tests/spec_batch_test.cu)
 target_include_directories(spec_batch_test PRIVATE ${CMAKE_SOURCE_DIR})
+
+# Copy drafting's matcher (copy.h) against a plain reference; host only, no GPU
+add_executable(copy_match_test tests/copy_match_test.cpp)
+target_include_directories(copy_match_test PRIVATE ${CMAKE_SOURCE_DIR})
+
+# Copy drafting's learner (copy.h: outcome, the shared cells, a conversation's ratio, the gate's row) against its cases and a
+# simulated stream; host only, no GPU. COPY_ADAPT_TEST_RULES adds the wrong-rule switches its controls use
+add_executable(copy_adapt_test tests/copy_adapt_test.cpp)
+target_include_directories(copy_adapt_test PRIVATE ${CMAKE_SOURCE_DIR})
+
+# Copy drafting on a GB10 (small allocations only, so it can run beside an engine): the device's index and lookups
+# against the host reference, bit for bit, on random and repetitive token streams (tests/copy_kernel_test.cu)
+add_executable(copy_kernel_test tests/copy_kernel_test.cu)
+target_include_directories(copy_kernel_test PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(copy_kernel_test dsmodel)
+
+# Copy drafting's learner inside the two gate kernels, on a GB10 (not run by the build): the kernels' state against the host reference,
+# the kernels' counts against fit.py's on the same run's dump, entries that join and leave a batch step, the attach reset, and the
+# kernels' cost with and without the learner (tests/copy_gate_test.cu)
+add_executable(copy_gate_test tests/copy_gate_test.cu)
+target_include_directories(copy_gate_test PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(copy_gate_test dsmodel)
 
 # The slot memory pool (vmm.h) against a fake backend; host only, no GPU
 add_executable(vmm_test tests/vmm_test.cpp vmm.cpp)

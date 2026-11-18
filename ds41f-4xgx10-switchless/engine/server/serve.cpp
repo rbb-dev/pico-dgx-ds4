@@ -5,12 +5,12 @@
 // blocks on the socket; the engine (the caller's thread) runs the requests, every model call mirrored on
 // the other ranks by a command (cmd.h).
 //
-// Scheduling (docs/batching.md, B1 and B2). A request's first run prefills its prompt into a session slot
+// Scheduling (docs/batching.md). A request's first run prefills its prompt into a session slot
 // and sends its first token; then it decodes with the others, as many as there are slots, a row each
 // per step (batch_loop), or alone through the speculative loop (with drafts). A request that comes while
 // others decode pauses them (prefill first), if it can have a slot: a free one, one whose session no
 // request uses, or, with time-slicing (--slice), the slot of the paused request whose turn comes last.
-// While more requests decode than there are slots, they take turns of --slice tokens. One slot is B1:
+// While more requests decode than there are slots, they take turns of --slice tokens. With one slot,
 // one request decodes at a time, and a new one pauses it.
 //
 // Sessions. Each slot's working state (window rings, compressor carries, compressed caches) belongs to
@@ -65,12 +65,14 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <climits>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -83,10 +85,19 @@
 
 #include "common/check.h"
 #include "common/heap.h"
+#include "model/copy.h"
 #include "model/lend.h"
+#include "server/lend_pace.h"
 #include "model/nvtx.h"
+#include "model/pool_rules.h"
 #include "common/frontend_protocol.h"
 #include "common/keepfile.h"
+#include "server/ids_file.h"
+#include "server/frames.h"
+#include "server/mem_watch.h"
+#include "server/pixels.h"
+#include "vision/vit_rank.h"
+#include "server/prefix.h"
 
 namespace srv {
 namespace {
@@ -132,6 +143,7 @@ double unix_now() { return std::chrono::duration<double>(std::chrono::system_clo
 struct Conn {
   const int fd;
   std::atomic<bool> dead{false};
+  std::atomic<uint32_t> version{fe::kVersion};  // what its HELLO said (fe::kVersionPrefix: the prefix frames); fe::kVersion until it says
   std::mutex mu;
   cancel::Set reqs;  // the requests in flight and the CANCELs received for them (ids are per connection; under mu)
   bounds::OutQueue outq;  // the bytes queued for the writer; past bounds::kOutCap the connection is dropped (Io::send)
@@ -147,10 +159,22 @@ struct Request {
   ConnP conn;
   fe::SubmitHeader h{};
   std::vector<int32_t> stop, prompt;
+  // kFlagPrefix: `prompt` is the suffix until admit builds the whole prompt from the conversation's history (built); the epoch and
+  // the count the frame named are used once
+  uint64_t epoch = 0;
+  uint32_t n_prefix = 0;
+  bool built = true;
+  // positions of the whole prompt, built or not
+  size_t len() const { return prompt.size() + (built ? 0 : n_prefix); }
   double t_recv = 0;
   // vision (fe::kFlagImages): the image spans and their rows, bf16 [sum rows][kImageDim]; empty for text
   std::vector<fe::ImageSpan> spans;
   std::vector<uint16_t> img;
+  // vision (fe::kFlagPixels): the frame's payload, held until the request ends (the images' bytes at px.off); `refuse`: why a
+  // well-formed pixel frame is answered and not run (empty: nothing wrong with the frame)
+  pixels::Parsed px;
+  std::vector<char> pix;
+  std::string refuse;
 };
 
 struct Event {
@@ -181,7 +205,7 @@ struct Frame {
 
 class Io {
  public:
-  Io(const std::string& path, std::vector<char> hello) : path_(path), hello_(std::move(hello)) {
+  Io(const std::string& path, std::vector<char> hello, uint64_t frame_cap) : path_(path), hello_(std::move(hello)), frame_cap_(frame_cap) {
     lfd_ = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
@@ -281,30 +305,72 @@ class Io {
     cv_.notify_one();
   }
 
+  // A frame larger than --frame-stage-mib is not read into memory: a SUBMIT's request id is read, the rest of the frame's bytes are
+  // skipped through a small buffer, and the request ends with DONE kTooLarge naming the limit; any other frame is skipped. The
+  // socket stays up: the next frame is read as usual. false only when the skip cannot be read (the connection went).
+  bool too_large(const ConnP& c, const fe::FrameHeader& h) {
+    uint64_t req = 0;
+    uint64_t left = h.size;
+    const bool submit = h.type == fe::kSubmit && left >= sizeof req;
+    if (submit) {
+      if (!read_all(c->fd, &req, sizeof req)) return false;
+      left -= sizeof req;
+    }
+    std::vector<char> skip(64 << 10);
+    while (left > 0) {
+      const size_t n = (size_t)std::min<uint64_t>(left, skip.size());
+      if (!read_all(c->fd, skip.data(), n)) return false;
+      left -= n;
+    }
+    char why[160];
+    std::snprintf(why, sizeof why, "the request is %llu MiB, over the %llu MiB the engine reads in one frame (--frame-stage-mib)",
+                  (unsigned long long)(h.size >> 20), (unsigned long long)(frame_cap_ >> 20));
+    std::printf("serve: %s frame of %llu bytes not read: %s\n", submit ? "request" : "a", (unsigned long long)h.size, why);
+    if (submit) {
+      fe::DoneHeader d{};
+      d.req_id = req;
+      d.reason = fe::kTooLarge;
+      d.error_len = (uint32_t)std::strlen(why);
+      send(c, Frame(fe::kDone).add(&d).add(why, d.error_len).take());
+    }
+    return true;
+  }
+
   // One frame from c: false when the connection is to be closed.
   bool frame(const ConnP& c) {
     fe::FrameHeader h;
     if (!read_all(c->fd, &h, sizeof h) || h.size > kMaxFrame) return false;
+    if (frame_cap_ && h.size > frame_cap_) return too_large(c, h);
     std::vector<char> p(h.size);
     if (!p.empty() && !read_all(c->fd, p.data(), p.size())) return false;
     if (h.type == fe::kHello) {
       fe::HelloFe hi;
       if (p.size() < sizeof hi) return false;
       std::memcpy(&hi, p.data(), sizeof hi);
-      if (hi.version != fe::kVersion) {
-        std::fprintf(stderr, "serve: front-end speaks version %u, not %u\n", hi.version, fe::kVersion);
+      if (!frames::version_ok(hi.version)) {
+        std::fprintf(stderr, "serve: front-end speaks version %u, not %u or %u\n", hi.version, fe::kVersion, fe::kVersionPrefix);
         return false;
+      }
+      c->version = hi.version;
+      if (hi.version != fe::kVersion) {  // the engine's HELLO went out at the connect in fe::kVersion: this one answers the connection's
+        std::vector<char> h2 = hello_;
+        std::memcpy(h2.data() + sizeof(fe::FrameHeader), &hi.version, sizeof hi.version);
+        send(c, std::move(h2));
       }
     } else if (h.type == fe::kSubmit) {
       Event e;
       Request& r = e.rq;
-      if (p.size() < sizeof r.h) return false;
-      std::memcpy(&r.h, p.data(), sizeof r.h);
-      const size_t base = sizeof r.h + 4 * (size_t(r.h.n_stop_ids) + r.h.n_prompt);
-      if (!(r.h.flags & fe::kFlagImages) ? p.size() != base : p.size() < base + 4) return false;
+      fe::SubmitPrefix px;
+      size_t base = 0;
+      if (!frames::parse_submit_head(p.data(), p.size(), c->version, &r.h, &px, &base)) return false;  // malformed: the connection closes
+      const bool pfx = r.h.flags & fe::kFlagPrefix;
       r.stop.resize(r.h.n_stop_ids);
       r.prompt.resize(r.h.n_prompt);
       const char* a = p.data() + sizeof r.h;
+      if (pfx) {  // the suffix only: the epoch and the count of the history ids the prompt begins with
+        a += sizeof px;
+        r.epoch = px.epoch, r.n_prefix = px.n_prefix, r.built = false;
+      }
       if (!r.stop.empty()) std::memcpy(r.stop.data(), a, r.stop.size() * 4);
       if (!r.prompt.empty()) std::memcpy(r.prompt.data(), a + r.stop.size() * 4, r.prompt.size() * 4);
       if (r.h.flags & fe::kFlagImages) {  // vision: n, the spans, their rows
@@ -322,6 +388,13 @@ class Io {
         if (p.size() != off + rows * fe::kImageDim * 2) return false;
         r.img.resize(rows * fe::kImageDim);
         std::memcpy(r.img.data(), p.data() + off, r.img.size() * 2);
+      }
+      if (r.h.flags & fe::kFlagPixels) {  // vision: the images as pixels (pixels.h)
+        pixels::Result pr = pixels::parse(p.data(), p.size(), base, r.h.flags);
+        if (pr.v == pixels::Verdict::kMalformed) return false;
+        r.spans = std::move(pr.px.spans);
+        if (pr.v == pixels::Verdict::kRefused) r.refuse = std::move(pr.why);
+        else r.px.grids = std::move(pr.px.grids), r.px.off = std::move(pr.px.off), r.pix = std::move(p);
       }
       r.conn = c;
       r.t_recv = now_s();
@@ -405,6 +478,7 @@ class Io {
 
   std::string path_;
   std::vector<char> hello_;
+  uint64_t frame_cap_ = 0;  // bytes; a frame over it is skipped (too_large); 0: none
   int lfd_ = -1;
   std::atomic<bool> stop_{false};
   std::mutex mu_;
@@ -435,7 +509,16 @@ struct Session {
   uint64_t owner = 0;          // 0: the front-end's session id is this entry's key; else the id this one answers to at
                                // `factor` while another entry holds the id (Server::alt_)
   int slot = -1;               // the slot whose working state is this session's (-1: none, the store's only)
-  std::vector<int32_t> hist;   // the tokens whose state the session holds: positions [0, size)
+  std::vector<int32_t> hist;   // the tokens whose state the session holds: positions [0, size); empty while ids_out
+  bool ids_out = false;        // the ids are in the ids file (<ids_dir>/<h>.ids), not in `hist`: Server::need_ids reads them back
+  size_t ids_n = 0;            // their count while ids_out
+  size_t len() const { return ids_out ? ids_n : hist.size(); }  // positions the history holds, wherever the ids are
+  prefix::Epoch ep;            // the epoch of the history and the size the last DONE reported (prefix.h)
+  // The ids file (<ids_dir>/<h>.<seq>.ids, ids_file.h's Keeper): `file` names the newest (seq 0: none); `file_ok` it holds exactly the
+  // history now (ids_out implies it). A run on the session makes the file stale (file_ok false); it stays, as the last kept index may
+  // name it, and the conversation's next idle ids go to a new file.
+  idsfile::Keeper::Ref file;
+  bool file_ok = false;
   uint64_t used = 0;           // LRU clock
   int pe_snap = -1;            // the snapshot at its last prompt's end (when not a multiple of snap_every)
   int lo = 0, clo = 0, w = 0;  // the live state's exact ranges (the comment at the top)
@@ -500,10 +583,21 @@ struct Turn {
   float pf[4] = {};
   int chunks = 0;
   bool pending = false;  // the last chunk's split, read once the first token is out
+  // the join clock (DSGB10_PF_STALL): the chunks' joins summed; jn_on says the switch is on
+  bool jn_on = false;
+  float jn[3] = {};  // attention joins, MoE joins, the pairs' own cost summed over the chunks
+  int jn_pairs = 0, jn_chunks = 0;
   void add_split(const model::Model& m) {
     float f[4];
     m.prefill_split(f);
     for (int i = 0; i < 4; ++i) pf[i] += f[i];
+    float j[3];
+    int np = 0;
+    if (m.prefill_joins(j, &np)) {
+      jn_on = true;
+      for (int i = 0; i < 3; ++i) jn[i] += j[i];
+      jn_pairs += np, ++jn_chunks;
+    }
   }
 };
 
@@ -535,6 +629,10 @@ struct Flight {
 // b's drafts and steps added to a's (a request's decode slices)
 void add(DecodeEnd& a, const DecodeEnd& b) {
   a.vsteps += b.vsteps, a.verified += b.verified, a.accepted += b.accepted;
+  a.copy_proposals += b.copy_proposals, a.copy_scored += b.copy_scored, a.copy_first_right += b.copy_first_right;
+  a.copy_rows_verified += b.copy_rows_verified, a.copy_rows_accepted += b.copy_rows_accepted;
+  if (b.copy_rho256) a.copy_rho256 = b.copy_rho256;
+  if (b.copy_chance[0] | b.copy_chance[1] | b.copy_chance[2] | b.copy_chance[3]) std::copy(b.copy_chance, b.copy_chance + 4, a.copy_chance);
   for (int r = 0; r <= model::ops::kDrafts; ++r) a.rows_hist[r] += b.rows_hist[r];
   for (int r = 0; r <= model::kMaxRows; ++r) a.gpu_ms[r] += b.gpu_ms[r], a.gpu_n[r] += b.gpu_n[r];
   if (b.gate_n) {
@@ -747,7 +845,7 @@ class Server {
     next_h_ = std::max({next_h_, top + 1, kept.empty() ? 0 : hd.next_h});
     for (auto& [id, s] : kept) clock_ = std::max(clock_, s.used);
     size_t positions = 0;
-    for (const auto& [id, s] : kept) positions += s.hist.size();
+    for (const auto& [id, s] : kept) positions += s.len();
     if (!kept.empty()) clock_ = std::max<uint64_t>(clock_, hd.clock);
     sess_.insert(std::make_move_iterator(kept.begin()), std::make_move_iterator(kept.end()));
     for (const auto& [id, x] : sess_)
@@ -758,7 +856,21 @@ class Server {
                   why.empty() ? "" : "; ", why.c_str());
   }
 
+  // After load_kept: the ids files the kept index did not name go (the directory is ours alone).
+  void sweep_ids() {
+    if (o_.ids_dir.empty()) return;
+    std::string why;
+    if (!idsfile::sweep(o_.ids_dir, keeper_.names(), &why)) die("serve: the ids directory: %s", why.c_str());
+  }
+
  private:
+  // A new epoch for a history entry: random, never 0
+  uint64_t new_epoch() {
+    uint64_t e;
+    do e = rng_();
+    while (!e);
+    return e;
+  }
   // Every rank: c's state operations, then c (rank 0's part of c.op is the caller's). c carries the
   // sessions of the slots that a running request uses, which the store keeps (pinned) and whose images it keeps in the
   // disk tier's file; a conversation on an idle or paused line is cache like any other.
@@ -821,6 +933,7 @@ class Server {
     for (auto it = sess_.begin(); it != sess_.end();) {
       if (wall - it->second.t_used > keep_age_s_) {
         v.push_back({kStFree, it->second.h, 0, 0});
+        drop_ids(it->second);
         it = sess_.erase(it);
         ++old;
         continue;
@@ -840,6 +953,7 @@ class Server {
         bytes += b, ++spilled;
       } else {
         v.push_back({kStFree, s.h, 0, 0});
+        drop_ids(sess_.at(id));
         sess_.erase(id);
         ++freed;
       }
@@ -1032,6 +1146,7 @@ class Server {
     c.n_ops = (int)v.size();
     std::copy(v.begin(), v.end(), c.ops);
     issue(c);
+    if (free && x) split_note(x->h);  // it lost its line: its end bookmark was taken whole, its pieces wait for their split
   }
   // The conversation `id` let go: its session at every factor (the primary and the alternates)
   void release(uint64_t id) {
@@ -1072,15 +1187,94 @@ class Server {
         if (it->second.h == h) {
           std::printf("serve: session %016llx evicted to make room\n", (unsigned long long)it->first);
           if (it->second.slot >= 0) v.push_back({kStRelease, 0, it->second.slot, 0}), slot_[it->second.slot] = 0;
+          drop_ids(it->second);
           sess_.erase(it);
           break;
         }
     if (!v.empty()) state(v);  // a live session's slot memory goes back with it
   }
+  // ---- the server's token ids past their cap (ids_file.h; --ids-host-mib, --disk-dir) ----
+  // The ids of every conversation in memory, bytes (the rest are in the ids files).
+  uint64_t ids_bytes() const {
+    uint64_t b = 0;
+    for (const auto& [id, s] : sess_) b += (uint64_t)s.hist.size() * idsfile::kIdBytes;
+    return b;
+  }
+  // When the ids in memory pass the cap, the least recently used idle conversations' ids go to their files and are freed. Only a
+  // conversation on no line and in no flight goes: nothing reads the ids of a conversation a request is not using, and a request's
+  // use starts with unspill, which reads them back.
+  void ids_to_files() {
+    if (o_.ids_dir.empty()) return;
+    std::vector<idsfile::Cand> c;
+    std::map<int, Session*> by_h;
+    for (auto& [id, s] : sess_) {
+      if (s.ids_out || s.slot >= 0 || flying_.count(id) || s.hist.empty()) continue;
+      c.push_back({s.h, s.used, s.hist.size()});
+      by_h[s.h] = &s;
+    }
+    const uint64_t total = ids_bytes();
+    for (const int h : idsfile::pick_out(std::move(c), total, o_.ids_host_bytes)) {
+      Session& s = *by_h.at(h);
+      std::string why;
+      if (!ids_file_now(s, &why)) {
+        std::printf("serve: the ids of session handle %d not written (%s); they stay in memory\n", s.h, why.c_str());
+        return;
+      }
+      s.ids_n = s.hist.size(), s.ids_out = true;
+      std::vector<int32_t>().swap(s.hist);
+      ++ids_files_;
+    }
+  }
+  // The file of `s` holding its history as it is now: written unless it is (a file of an older history is replaced).
+  bool ids_file_now(Session& s, std::string* why) {
+    if (s.file_ok) return true;
+    if (o_.ids_dir.empty()) return *why = "no ids directory", false;
+    idsfile::Keeper::Ref r;
+    if (!keeper_.put(s.h, s.hist, &r, why)) return false;  // a new file: the one the last index names is left as it is
+    s.file = r, s.file_ok = true;
+    return true;
+  }
+  // The ids of `x` back in memory when they are out. A file that is gone or does not check out leaves the history empty: the
+  // conversation is computed again from its prompt, and the line says so.
+  bool need_ids(uint64_t key, Session& x) {
+    if (!x.ids_out) return true;
+    std::vector<int32_t> v;
+    std::string why;
+    const bool ok = idsfile::read(o_.ids_dir, x.h, &v, &why, x.file.seq);
+    if (idsfile::back_verdict(ok, v.size(), x.ids_n) == idsfile::Back::kUse) {
+      std::printf("serve: session %016llx: its ids read back from their file (%zu positions)\n", (unsigned long long)key, v.size());
+      x.hist = std::move(v);
+      x.ids_out = false, x.ids_n = 0;  // the file stays: it holds the history until a run changes it (the kept index may name it)
+      --ids_files_;
+      return true;
+    }
+    std::printf("serve: session %016llx: its ids file %s; the conversation is freed\n", (unsigned long long)key, why.empty() ? "is gone or holds another count" : why.c_str());
+    free_session(key);
+    return false;
+  }
+  // A conversation freed whole by the ordinary path: its state in the store, its line (if any), its ids file, its entry.
+  void free_session(uint64_t key) {
+    const auto it = sess_.find(key);
+    if (it == sess_.end()) return;
+    std::vector<StateOp> v{{kStFree, it->second.h, 0, 0}};
+    if (it->second.slot >= 0) v.push_back({kStRelease, 0, it->second.slot, 0}), slot_[it->second.slot] = 0;
+    state(v);
+    drop_ids(it->second);
+    sess_.erase(it);
+  }
+  // The conversation is freed: its ids files go (at once, or with the next index, which does not name them).
+  void drop_ids(Session& x) {
+    if (x.ids_out) --ids_files_;
+    keeper_.drop(x.h);
+    x.ids_out = false, x.ids_n = 0, x.file = {}, x.file_ok = false;
+  }
+  int64_t ids_files_ = 0;  // conversations whose ids are in a file now
+
   // Least recently used sessions out until the store fits the budget: spilled to the disk tier (one live
   // in a slot saved first, and the slot let go), or freed without one. Sessions in flight stay.
   void evict(uint64_t keep) {
     const bool disk = m_.state_disk_capacity() > 0;
+    if ((o_.kv_split || o_.imager) && disk) return;  // a take evicts as the core does (clean pieces, writing nothing); no spill, which would wait for the image stream, on a request's path
     std::vector<StateOp> v;
     std::vector<uint64_t> out;
     size_t bytes = m_.state_bytes();
@@ -1094,7 +1288,7 @@ class Server {
       if (victim == sess_.end()) break;
       const size_t b = m_.state_info(victim->second.h).bytes;
       std::printf("serve: %s session %016llx (%.1f MiB, %zu positions)\n", disk ? "spill" : "evict",
-                  (unsigned long long)victim->first, b / 1048576.0, victim->second.hist.size());
+                  (unsigned long long)victim->first, b / 1048576.0, victim->second.len());
       bytes -= std::min(bytes, b);
       if (disk) {
         if (victim->second.slot >= 0) persist_slot(victim->second.slot, true);  // what it holds live goes with it
@@ -1104,6 +1298,7 @@ class Server {
       }
       v.push_back({kStFree, victim->second.h, 0, 0});
       if (victim->second.slot >= 0) v.push_back({kStRelease, 0, victim->second.slot, 0}), slot_[victim->second.slot] = 0;
+      drop_ids(victim->second);
       sess_.erase(victim);
     }
     if (!v.empty()) state(v);
@@ -1264,6 +1459,7 @@ class Server {
     Frame f(fe::kTokens);
     f.add(&t).add(&id);
     if (lp) f.add(&o.row[row].logprob);
+    note_token();
     for (int k = 0; k < nt; ++k) {
       const fe::TopLogprob x{(uint32_t)o.top_id[row][k], o.top_lp[row][k]};
       f.add(&x);
@@ -1271,8 +1467,9 @@ class Server {
     io_.send(rq.conn, f.take());
   }
 
+  // `tail`: the history entry's epoch and size (a request that ran); none: no DoneTail in the frame
   void done(const Request& rq, uint32_t reason, uint32_t cached, uint32_t sent, double t_start, double t_first,
-            std::string err = "") {
+            std::string err = "", const fe::DoneTail* tail = nullptr) {
     // cut short by the server's stop, an answer is an error to its client, not a finished one
     if (reason == fe::kCancelled && Io::stopping(rq)) reason = fe::kError, err = "the server is stopping";
     const double t_end = now_s();
@@ -1281,25 +1478,58 @@ class Server {
     fe::DoneHeader d{};
     d.req_id = rq.h.req_id;
     d.reason = reason;
-    d.prompt_tokens = rq.h.n_prompt;
+    d.prompt_tokens = (uint32_t)rq.len();
     d.cached_tokens = cached;
     d.completion_tokens = sent;
     d.queue_us = us(t_start - rq.t_recv);
     d.prefill_us = us(t_first - t_start);
     d.decode_us = us(t_end - t_first);
     d.error_len = (uint32_t)err.size();
-    io_.send(rq.conn, Frame(fe::kDone).add(&d).add(err.data(), err.size()).take());
+    io_.send(rq.conn, frames::done_frame(rq.conn->version, d, tail, err));
     if (!err.empty()) std::printf("serve: request %llu: %s\n", (unsigned long long)rq.h.req_id, err.c_str());
+  }
+
+  // kFlagPrefix: the request's prompt built from the history entry its epoch names (prefix.h), once. False when it cannot be (DONE
+  // kPrefixGone: nothing is done, and the front-end sends the whole prompt).
+  bool build_prompt(Request& rq) {
+    const prefix::Ask a{rq.h.session_id, rq.h.base_session_id, rq.epoch, rq.n_prefix};
+    const int fac = factor_for((int64_t)rq.n_prefix + (int64_t)rq.prompt.size());
+    std::vector<int32_t> whole;
+    const prefix::Gone g = prefix::build<Session>(
+        a, fac, rq.prompt, &whole, [&](uint64_t id, int f, uint64_t* key) { return find_at(id, f, key); },
+        [&](uint64_t key, Session& x) { return need_ids(key, x); });
+    if (g != prefix::Gone::kNone) {
+      done(rq, fe::kPrefixGone, 0, 0, now_s(), 0, prefix::gone_text(g));
+      Io::forget(rq);
+      return false;
+    }
+    std::printf("serve: req %llu: a prompt of %zu ids: %u of the history of %016llx and %zu of its own\n", (unsigned long long)rq.h.req_id,
+                whole.size(), rq.n_prefix, (unsigned long long)(rq.h.base_session_id ? rq.h.base_session_id : rq.h.session_id), rq.prompt.size());
+    rq.prompt = std::move(whole);
+    rq.h.n_prompt = (uint32_t)rq.prompt.size();  // DONE and the log count the whole prompt
+    rq.built = true;
+    return true;
   }
 
   // A submit: held while its session is in flight (a session's requests run one at a time); waiting while
   // no slot can be had (every slot's session in flight, and no time-slicing); else started.
-  void admit(Request&& rq) {
+  uint64_t rescued_req_ = 0;  // the waiting request the idle engine last took off the queue
+  // `front`: the request comes off the head of the waiting queue (nothing waits ahead of it).
+  void admit(Request&& rq, bool front = false) {
     if (Io::cancelled(rq)) {  // its client left (or the server stops) while it queued: nothing is made for it
       done(rq, fe::kCancelled, 0, 0, now_s(), 0);
       return Io::forget(rq);
     }
+    if (rq.h.flags & fe::kFlagPixels) {  // pixels.h: a frame the engine will not run, or a request the encoder cannot take
+      const std::string why = pixel_refusal(rq);
+      if (!why.empty()) {
+        done(rq, fe::kError, 0, 0, now_s(), 0, why);
+        return Io::forget(rq);
+      }
+    }
     if (flying_.count(rq.h.session_id)) return held_.push_back(std::move(rq));
+    if (vit_gated(rq)) return wait_.push_back(std::move(rq));  // an image of another request is between its blocks: it waits for the last block
+    if (!rq.built && !build_prompt(rq)) return;  // kFlagPrefix: the prompt, once, from the history as it is after the session's request in flight
     note_image_ask(rq);
     const Session* cs = find_at(rq.h.session_id, factor_for((int64_t)rq.prompt.size()));  // its session at its factor
     const int need = need_clamped(rq);
@@ -1339,6 +1569,56 @@ class Server {
     start(std::move(rq));
   }
 
+  // A request that cannot be admitted in an idle engine (admit): first its own conversation's window bookmarks other than its
+  // end state go, oldest first, until it fits (restart points for a turn that diverges: the request makes new ones, and a
+  // divergent turn restarts further back or cold, slower and never wrong); then a fork is admitted without its base (read
+  // cold); what still does not fit is answered at once with the numbers. false: answered.
+  template <class Blocked>
+  bool rescue(Request& rq, int need, uint64_t& base, Blocked&& blocked) {
+    const uint64_t sid = rq.h.session_id;
+    const unsigned long long req = (unsigned long long)rq.h.req_id;
+    if (Session* own = find_at(sid, factor_for((int64_t)rq.prompt.size()))) {
+      int dropped = 0;
+      // only bookmarks that hold numbers, oldest first, and only when all of them together would make it fit
+      const std::vector<std::pair<int, int>> sn = m_.state_snap_numbers(own->h);
+      int s0 = own->slot;
+      for (int t = 0; s0 < 0 && t < (int)slot_.size(); ++t)
+        if (fits(t, need)) s0 = t;
+      std::vector<size_t> plan;
+      if (s0 >= 0) {
+        MemCache mc;
+        int64_t have = 0, want = 0;
+        mem_sums(s0, need, {}, sid, base, &mc, &have, &want, &rq.prompt);
+        std::vector<int> held;
+        for (const auto& p : sn) held.push_back(p.second);
+        plan = model::rules::rescue_drops(have, want, held);
+      }
+      for (const size_t i : plan) {
+        const int pos = sn[i].first;
+        if (!blocked()) break;
+        state({{kStDropSnap, own->h, pos, 0}});
+        own->enc_snaps.erase(std::remove(own->enc_snaps.begin(), own->enc_snaps.end(), pos), own->enc_snaps.end());
+        if (own->pe_snap == pos) own->pe_snap = -1;
+        ++dropped;
+      }
+      if (dropped)
+        std::printf("serve: req %llu: %d window bookmarks of its conversation dropped to fit the pool (%d numbers)\n", req, dropped,
+                    m_.slot_chunks_total());
+    }
+    if (blocked() && base) {
+      rq.h.base_session_id = 0, base = 0;
+      std::printf("serve: req %llu: its base does not fit the pool beside it: the request is read cold\n", req);
+    }
+    if (!blocked()) return true;
+    char msg[200];
+    std::snprintf(msg, sizeof msg, "the pool of %d numbers cannot hold this request: %d positions need %d numbers", m_.slot_chunks_total(), need,
+                  m_.slot_chunks_for(0, need));
+    std::printf("serve: req %llu: %s\n", req, msg);
+    done(rq, fe::kError, 0, 0, now_s(), 0, msg);
+    Io::forget(rq);
+    return false;
+  }
+
   // A request checked, then its flight's first run.
   void start(Request&& rq) {
     Flight f;
@@ -1373,9 +1653,9 @@ class Server {
     f.sp.top_p = h.top_p;
     f.sp.top_k = (int32_t)std::min<uint32_t>(h.top_k, 1u << 30);
     f.sp.n_top = (h.flags & fe::kFlagLogprobs) ? (int32_t)std::min<uint32_t>(h.n_top_logprobs, model::ops::kTopLogprobs) : 0;
-    // stack4: a request that wants logprobs keeps the full head (the certified head gives the argmax, not the partition sum)
+    // a request that wants logprobs keeps the full head (the certified head gives the argmax, not the partition sum)
     if ((h.flags & fe::kFlagLogprobs) && f.sp.n_top < 1) f.sp.n_top = 1;
-    {  // stack4 (DSGB10_FORCE_NTOP, measurement only): every request's rows carry their top logprobs in SampleOut (the step log)
+    {  // DSGB10_FORCE_NTOP, measurement only:: every request's rows carry their top logprobs in SampleOut (the step log)
       static const int force_ntop = getenv("DSGB10_FORCE_NTOP") ? atoi(getenv("DSGB10_FORCE_NTOP")) : 0;
       if (force_ntop > 0) f.sp.n_top = std::min(force_ntop, (int)model::ops::kTopLogprobs);
     }
@@ -1394,9 +1674,15 @@ class Server {
       pfq_.push_back(std::move(L));
       return;
     }
-    if (go(f, false)) {  // it decodes in the next run, first
+    const Begin b = go(f, false);
+    if (b == Begin::Began) {  // it decodes in the next run, first
       f.t_paused = now_s();
       rot_.push_front(std::move(f));
+      stalled_ = false;
+    } else if (b == Begin::Waits) {  // back to the front of the queue it came from, asked again after its retry time
+      flying_.erase(f.rq.h.session_id);
+      wait_.push_front(std::move(f.rq));
+      start_wait_.stuck(now_s());
     }
   }
 
@@ -1751,6 +2037,109 @@ class Server {
     const std::vector<int32_t>& prompt() const { return resume ? cont : f->rq.prompt; }
   };
 
+  // ---- vision: images encoded in the engine (vit_sched.h; model/vit_cmd.cu) ----
+  // Why a pixel request cannot run here, or empty: the frame's own refusal (pixels::parse checked every grid), no encoder, no work area.
+  std::string pixel_refusal(const Request& rq) const {
+    if (!rq.refuse.empty()) return rq.refuse;
+    const int vs = m_.vision_state();
+    if (vs == 0) return pixels::kNoEncoder;
+    if (vs == 2) return "the image encoder has no work area";
+    return "";
+  }
+  std::vector<vitsched::Img> vit_imgs(const Flight& f) const {
+    std::vector<vitsched::Img> im(f.rq.spans.size());
+    for (size_t i = 0; i < im.size(); ++i)
+      im[i] = {(int)f.rq.spans[i].start, (int)f.rq.spans[i].rows, (int)f.rq.px.grids[i].n_h * (int)f.rq.px.grids[i].n_w, i < f.enc.size() && f.enc[i] != 0};
+    return im;
+  }
+  // One range of blocks [b0, b1) of image i of the pixel request: the command, its time, the mark. 0: done; <0: the request ended in an
+  // error (r.fail, Flight::err).
+  int vit_encode(Reader& r, int i, int b0, int b1) {
+    Flight& f = *r.f;
+    const uint64_t req = f.rq.h.req_id;
+    const pixels::Grid& pg = f.rq.px.grids[(size_t)i];
+    const vit::Grid g = vit::make_grid(pg.n_h, pg.n_w);
+    if (!enc_mark_.may_run(req, i, b0)) die("serve: BUG: request %llu image %d blocks [%d, %d) while image %d of request %llu is between its blocks (next %d)",
+                                          (unsigned long long)req, i, b0, b1, enc_mark_.image, (unsigned long long)enc_mark_.req, enc_mark_.next);
+    size_t row0 = 0;
+    for (int k = 0; k < i; ++k) row0 += f.rq.spans[(size_t)k].rows;
+    Cmd c{};
+    c.op = kCmdVit;
+    c.vit_key = f.img.key, c.vit_span = i, c.vit_row0 = (int32_t)row0, c.vit_nh = pg.n_h, c.vit_nw = pg.n_w, c.vit_b0 = b0, c.vit_b1 = b1;
+    issue(c);
+    const double t0 = now_s();
+    wd_.started = t0;
+    const int st = run_vit(m_, c, reinterpret_cast<const uint8_t*>(f.rq.pix.data()) + f.rq.px.off[(size_t)i]);
+    wd_.started = 0;
+    const double ms = 1e3 * (now_s() - t0);
+    enc_cost_.observe(ms, g.patches(), b1 - b0);
+    if (st != model::Model::kVitOk) {
+      enc_mark_.clear();
+      f.err = "the image encoder's four ranks disagree on the rows of image " + std::to_string(i + 1) + " of this request";
+      r.fail = true;
+      return -1;
+    }
+    enc_mark_.ran(req, i, b1);
+    if (b1 >= vitsched::kBlocks) {
+      f.enc[(size_t)i] = 1;
+      std::printf("serve: req %llu image %d of %zu encoded: %d patches, %d rows in %.1f ms (blocks [%d, %d) the last)\n", (unsigned long long)req, i + 1,
+                  f.rq.spans.size(), g.patches(), g.rows(), ms, b0, b1);
+    }
+    return 0;
+  }
+  // The encode unit due before the rows piece [r.pos, r.pos + R) of a pixel request, if one is: 0 none (the rows go on), 1 a unit ran, -1
+  // the request ended (cancelled between two commands, or an error). The budget of a unit is the gap less one decode step while sessions
+  // decode, unless the prompt is prefilled in one run (go(): read_whole counted the encode in its time).
+  int vit_step(Reader& r, int R) {
+    Flight& f = *r.f;
+    double budget = std::numeric_limits<double>::max();
+    if (!r.whole && il_.on && !rot_.empty()) budget = std::max(1.0, (double)il_.gap_ms - edge_.value(step_ms()));
+#ifdef DSGB10_TEST_FAULTS
+    if (const char* b = std::getenv("DSGB10_VIT_BUDGET_MS")) budget = std::atof(b);  // tests: the encode cut as finely as asked (0.001: a block at a time)
+#endif
+    const vitsched::Unit u = vitsched::next_unit(vit_imgs(f), r.pos, R, budget, enc_cost_, enc_mark_, f.rq.h.req_id);
+    if (u.kind == vitsched::Unit::Rows) return 0;
+    if (u.kind == vitsched::Unit::Hold)
+      die("serve: BUG: request %llu would encode while image %d of request %llu is between its blocks", (unsigned long long)f.rq.h.req_id,
+          enc_mark_.image, (unsigned long long)enc_mark_.req);
+#ifdef DSGB10_TEST_FAULTS
+    if (std::getenv("DSGB10_VIT_MIDTEST") && u.count >= 2 && !vit_midtest_done_) {  // a second image starts while the first is between its blocks: the engine stops
+      vit_midtest_done_ = true;
+      (void)vit_encode(r, u.first, 0, 1);
+      Cmd c{};
+      c.op = kCmdVit;
+      c.vit_key = f.img.key, c.vit_span = u.first + 1, c.vit_nh = f.rq.px.grids[(size_t)u.first + 1].n_h, c.vit_nw = f.rq.px.grids[(size_t)u.first + 1].n_w;
+      c.vit_b0 = 0, c.vit_b1 = 1;
+      issue(c);
+      (void)run_vit(m_, c, reinterpret_cast<const uint8_t*>(f.rq.pix.data()) + f.rq.px.off[(size_t)u.first + 1]);
+    }
+#endif
+    const double t_unit = now_s();
+    for (int k = 0; k < u.count; ++k) {
+      if (Io::cancelled(f.rq)) {  // a cancel is taken between commands, never inside one
+        r.cancelled = true;
+        return -1;
+      }
+      if (vit_encode(r, u.first + k, u.count == 1 ? u.b0 : 0, u.count == 1 ? u.b1 : vitsched::kBlocks) < 0) return -1;
+    }
+    if (!r.whole) note_unit(f.rq.h.req_id, 0, 1e3 * (now_s() - t_unit));
+    return 1;
+  }
+  // A pixel request that may not start or resume now (vitsched::may_start): an image of another request is between its blocks.
+  bool vit_gated(const Request& rq) const { return !rq.pix.empty() && !vitsched::may_start(enc_mark_, true, rq.h.req_id); }
+  // The waiting queue's front is the next to start: a gated pixel request does not hold the ones behind it (a text request is never held by it).
+  void vit_rotate_wait() {
+    for (size_t i = 0; i < wait_.size() && vit_gated(wait_.front()); ++i) {
+      wait_.push_back(std::move(wait_.front()));
+      wait_.pop_front();
+    }
+  }
+  vitsched::EncCost enc_cost_;
+  vitsched::Mark enc_mark_;  // the one image between its blocks, across requests
+#ifdef DSGB10_TEST_FAULTS
+  bool vit_midtest_done_ = false;
+#endif
+
   // Flight f's prompt run in a slot: the request's first (resume false), or the resume of a request whose
   // session lost its slot, which runs the prompt and the tokens sent so far (the session holds them: it
   // restarts at their last position, exact continuation, one row; `keep`: the sessions whose slots it may
@@ -1892,6 +2281,7 @@ class Server {
       Session ns;
       ns.h = next_h_++;
       ns.factor = fac;
+      ns.ep.value = new_epoch();
       S = &sess_.emplace(h.session_id, std::move(ns)).first->second;
       if (resume)
         std::printf("serve: req %llu factor %d (window %d): a new session for its %d positions, read again (%s)\n",
@@ -1904,7 +2294,7 @@ class Server {
       if (q > 0 && (!src_live || src != S)) v.push_back({kStLoad, src->h, q, 0});
       if (pl.how == kSnap) v.push_back({kStRestore, src->h, pl.snap, 0});
       if (pl.how == kEnd) v.push_back({kStRestoreEnd, src->h, 0, 0});
-      if (src != S) v.push_back({kStCopySnaps, src->h, S->h, q});  // a fork: src's snapshots are S's too
+      if (src != S) v.push_back({kStCopySnaps, src->h, S->h, q}), fork_base_ = src->h;  // a fork: src's snapshots are S's too
       else v.push_back({kStDrop, S->h, q, 0});                     // S forgets what follows q
     }
     // the new live state's exact ranges
@@ -1916,6 +2306,8 @@ class Server {
     S->slot = s;
     S->used = ++clock_;
     S->t_used = unix_now();
+    S->file_ok = false;  // the run changes the history: its ids file is stale (kept until the idle ids replace it)
+    prefix::lose_below(&S->ep, (uint64_t)q, [&] { return new_epoch(); });  // the epoch's first site: the history is cut below what a DONE reported
     S->hist.assign(prompt.begin(), prompt.begin() + q);
     if (S->pe_snap > q) S->pe_snap = -1;  // dropped
     // CED: S's encoder-only snapshots up to q (a fork's are src's), where its decoder rings are valid
@@ -1934,7 +2326,9 @@ class Server {
       Cmd c{};
       c.op = kCmdTokens;
       c.slot = s;
-      c.pos0 = std::max(0, q - 3);
+      // copy drafting (model/copy.h) keeps the whole conversation's tokens, so a unit whose session came from the store or
+      // another slot has the right history before pos0: the whole prompt goes
+      c.pos0 = model::copy::mode() ? 0 : std::max(0, q - 3);
       c.n = n - c.pos0;
       if (v.size() > (size_t)kMaxOps) die("serve: %zu state operations for one command", v.size());
       c.n_ops = (int)v.size();
@@ -1948,6 +2342,7 @@ class Server {
       m_.mark(0);
       issue(c);
       m_.mark(1);
+      if (fork_base_ >= 0) split_note(fork_base_), fork_base_ = -1;  // the fork's setup is done: its base, left alone above the fork point, is split again
       std::vector<int32_t> t(prompt.begin() + c.pos0, prompt.end());
       for (const fe::ImageSpan& sp : f.rq.spans)  // vision: image positions are dead to Engram (-1)
         for (int k = std::max<int>(sp.start, c.pos0); k < (int)(sp.start + sp.rows); ++k) t[k - c.pos0] = -1;
@@ -2127,7 +2522,7 @@ class Server {
       first = m_.wait(k);
       tu.rows_ms += m_.last_gpu_ms();
       first_row = R - 1;
-      S->w = std::max(S->w, pos + R + (m_.spec() ? model::ops::kDrafts : 0));  // its draft's block keys
+      S->w = std::max(S->w, pos + R + (m_.spec() ? model::copy::verify_reach(model::ops::kDrafts, (model::copy::mode() & model::copy::kRows) != 0) : 0));  // its draft's block keys
     } else {
       c.op = kCmdPrefill;
       const bool watch = memwatch::chunk_ride_due(mem_watch_on(), now_s(), watch_at_);  // the memory watch rides this chunk
@@ -2190,9 +2585,9 @@ class Server {
       m_.drain();
       wd_.started = 0;
     };
-    if (cancelled || Io::cancelled(f.rq)) {
+    if (cancelled || r.fail || Io::cancelled(f.rq)) {
       drain();
-      return ended(f, fe::kCancelled);
+      return ended(f, r.fail ? fe::kError : fe::kCancelled);
     }
 
     // ---- the token, the next to feed; then the last chunk's tail drains
@@ -2546,6 +2941,9 @@ class Server {
       if (u < used) best = s, used = u;
     }
     if (best >= 0 || o_.slice <= 0) return best;
+#ifndef PICO_OLD_RULES
+    return best;  // a newcomer never takes the slot of a paused request (turn-slicing among requests in flight is theirs; the extra one waits for an end)
+#endif
     for (auto it = rot_.rbegin(); it != rot_.rend(); ++it) {
       const auto x = sess_.find(it->rq.h.session_id);
       if (x != sess_.end() && x->second.slot >= 0 && !keep.count(x->first) && fits(x->second.slot, need) &&
@@ -2555,7 +2953,11 @@ class Server {
     return -1;
   }
   // whether a submit that waits may pause the requests decoding: it can have a slot
+#ifdef PICO_OLD_RULES
   bool admissible() const { return o_.slice > 0 || pick_slot({}) >= 0; }
+#else
+  bool admissible() const { return pick_slot({}) >= 0; }  // with no slot to be had a waiter takes nothing, so its arrival ends no run
+#endif
 
   static constexpr uint32_t kPaused = ~0u, kTurn = ~0u - 1;  // a run's ends that are not the request's
 
@@ -2654,7 +3056,16 @@ class Server {
         pfq_.push_back(std::move(L));
         continue;
       }
-      if (!live && !go(f, true, keep)) continue;
+      if (!live) {
+        const Begin b = go(f, true, keep);
+        if (b == Begin::Waits) {  // paused for the next pass, as a flight that waits for a slot
+          f.t_paused = now_s();
+          later.push_back(std::move(f));
+          start_waits = true, ++pool_waits;
+          continue;
+        }
+        if (b == Begin::Ended) continue;
+      }
       keep.insert(f.rq.h.session_id);
       fl.push_back(std::move(f));
     }
@@ -2667,6 +3078,38 @@ class Server {
     if (fl.empty() && ext_waits > 0 && (size_t)ext_waits == rot_.size() && ++ext_stall_ == 2)
       std::printf("serve: BUG: every flight waits for an extension (%d flights)\n", ext_waits);
     if (!fl.empty() || ext_waits == 0) ext_stall_ = 0;
+    if (fl.empty() && start_waits && pfq_.empty()) std::this_thread::sleep_for(std::chrono::milliseconds(20));  // nothing else flies: the pool is asked again shortly
+#else
+    (void)start_waits;
+    {  // the standstill is a fact of the pass, not a count of passes; the line is the truth after 2 s; the loop rests whenever a pool wait took the whole pass
+      const bool standstill = reclaim::ext_standstill((int)fl.size(), holders, ext_waits, imager_work(), join_active(), pf_reading());
+      const double tn = now_s();
+      if (!standstill) ext_since_ = 0, ext_noted_ = false;
+      else {
+        if (ext_since_ == 0) ext_since_ = tn;
+        if (!ext_noted_ && tn - ext_since_ >= 2.0) {
+          ext_noted_ = true;
+          std::printf("serve: BUG: every flight waits for an extension (%d flights)\n", ext_waits);
+        }
+        if (reclaim::ext_end_due(tn - ext_since_, tn - ext_end_last_)) {  // the waiter with the longest response ends
+          std::vector<int> outs;
+          std::vector<size_t> at;
+          for (size_t i = 0; i < rot_.size(); ++i)
+            if (ext_ids.count(rot_[i].rq.h.req_id)) outs.push_back((int)rot_[i].out.size()), at.push_back(i);
+          const int pick = reclaim::ext_pick(outs);
+          if (pick >= 0) {
+            Flight victim = std::move(rot_[at[(size_t)pick]]);
+            rot_.erase(rot_.begin() + (long)at[(size_t)pick]);
+            ext_end_last_ = tn;
+            std::printf("serve: req %llu ends at %zu tokens (length): every request that holds memory waits to grow and nothing can be freed (%zu requests, %u numbers in the pool)\n",
+                        (unsigned long long)victim.rq.h.req_id, victim.out.size(), outs.size(), (unsigned)m_.slot_chunks_total());
+            finish(victim, fe::kLength);
+          }
+        }
+      }
+      if (fl.empty() && pool_waits > 0 && pfq_.empty()) std::this_thread::sleep_for(std::chrono::milliseconds(20));  // nothing else flies: the pool is asked again shortly
+    }
+#endif
     if (fl.empty()) return;
     last_fac_ = fl[0].fac;
     const bool turns = o_.slice > 0 && !rot_.empty();  // requests wait for a slot: a turn each
@@ -2681,6 +3124,7 @@ class Server {
       else if (why[k] == kTurn) rot_.push_back(std::move(fl[k]));
       else finish(fl[k], why[k]);
     }
+    run_ended_.clear();  // every flight of the run is finished or back in rot_: the freed slots are assigned from here by the real passes
     for (auto it = paused.rbegin(); it != paused.rend(); ++it) rot_.push_front(std::move(*it));
     dec_end_ = now_s();
   }
@@ -2691,6 +3135,7 @@ class Server {
     if ((int)S.hist.size() < pos)
       die("serve: req %llu: its session holds %zu positions, its next token goes at %d", (unsigned long long)req,
           S.hist.size(), pos);
+    prefix::lose_below(&S.ep, (uint64_t)pos, [&] { return new_epoch(); });  // the epoch's second site
     S.hist.resize(pos);
   }
 
@@ -2727,12 +3172,16 @@ class Server {
     issue(c);
     std::vector<int32_t> samples;
     bool ctl = false, cancel = false, pause = false;
+    uint32_t word = 0;  // rank 0's control word: bit 0 stops the response, kCtlWatch toggles for the watch, kCtlSplit for the imager's ride
+    RideWatch rw;
+    RideSplit rs;
+    pause_why_ = lendpace::Why::None;
     const DecodeEnd e = decode_loop(m_, c, wd_, [&](int, const model::SampleOut& o, int row) {
       samples.push_back(o.row[row].token);
       if (f.tu.dec1_ms < 0) f.tu.dec1_ms = 1e3 * (now_s() - t_dec);
       if (cancel) return;
       if (Io::cancelled(f.rq)) {
-        if (!ctl) m_.set_ctl(1);  // every rank stops after the step that reads it
+        if (!ctl) m_.set_ctl(word |= 1);  // every rank stops after the step that reads it
         ctl = cancel = true;
         return;
       }
@@ -2778,7 +3227,7 @@ class Server {
   }
 
   // The flights' run together, each in its own slot: a row of each per step (batch_loop), or with drafts
-  // (spec_batch_loop, B3) when the server has them and the batch is small enough for a draft each; with
+  // (spec_batch_loop) when the server has them and the batch is small enough for a draft each; with
   // drafts the last one left pauses, to go on alone. Each one's end (fe::k*), or kPaused / kTurn, in why.
   void decode_batch(std::vector<Flight>& fl, bool turns, std::vector<uint32_t>& why) {
     const int n = (int)fl.size();
@@ -2826,7 +3275,10 @@ class Server {
     issue(c);
     bcast_payload(ring_, e.data(), e.size() * sizeof(BatchEntry), 0);
     uint32_t ctl = 0;
+    RideWatch rw;
+    RideSplit rs;
     std::vector<std::vector<int32_t>> samples(n);
+    pause_why_ = lendpace::Why::None;
     // ended: a request that ended in this run. Its DONE goes out at once, while the others go on: the front-end
     // completes a response only on DONE, and the run (whose end finishes the request's session) can last as long
     // as the longest of them. The session's next request waits for that end, as any request of a session in
@@ -2876,12 +3328,14 @@ class Server {
     std::vector<DecodeEnd> dend;
     SpecBatchStats st;
     if (drafts) {
-      dend = spec_batch_loop(m_, c, e, wd_, cb, &st);
+      dend = spec_batch_loop(m_, c, e, wd_, cb, &st, step);
       for (int k = 0; k < n; ++k) end[k].sampled = dend[k].sampled, end[k].fed = dend[k].fed, end[k].why = dend[k].why;
     } else {
-      end = batch_loop(m_, c, e, wd_, cb);
+      end = batch_loop(m_, c, e, wd_, cb, step);
     }
     if (ctl) m_.set_ctl(0);
+    ride_watch_end(rw);
+    ride_split_run_end(rs);
     const double dt = now_s() - t_dec;
     std::string ends;
     for (int k = 0; k < n; ++k) {
@@ -2935,6 +3389,11 @@ class Server {
     }
     std::printf("serve: batch of %d: %zu steps in %.1f ms, %.2f ms a step (median); req, tokens, end: %s%s\n", n,
                 g_t_wait.size(), 1e3 * dt, d.empty() ? 0.0 : d[d.size() / 2], ends.c_str(), dr.c_str());
+    for (int k = 0; k < n; ++k)
+      if (why[k] == kPaused) {
+        pause_note();
+        break;
+      }
   }
 
   // Paused requests that their client cancelled, or that the server's stop ends, end now, not at their
@@ -3111,8 +3570,6 @@ class Server {
     return t;
   }
 
-  // DONE, then the session kept (its snapshots thinned) or freed, and the store held to its budget; the
-  // requests held for the session go on.
   // Every way a request ends (finish): its image rows go back to the pool, and an image it left between two block ranges is no longer
   // mid-way, so the next request's image starts from its block 0.
   void end_images(Flight& f) {
@@ -3160,8 +3617,20 @@ class Server {
         if (reclaim::unreserve_at_finish()) digest("unreserve");
       }
     }
+    if (S) S->t_fin = now_s();  // its idle age counts from here
+    if (S) split_note(S->h);  // its split is a command of its own, between runs (split_tick)
     const model::Model::StateInfo si = S ? m_.state_info(S->h) : model::Model::StateInfo{};
     const DecodeEnd* de = &f.de;
+    if (de->copy_proposals > 0) {  // copy drafting's learner: what the request's proposals came to (rank 0's counts; every rank learns the same)
+      copy_proposals_total_ += (uint64_t)de->copy_proposals, copy_scored_total_ += (uint64_t)de->copy_scored;
+      copy_first_right_total_ += (uint64_t)de->copy_first_right, copy_rows_verified_total_ += (uint64_t)de->copy_rows_verified;
+      copy_rows_accepted_total_ += (uint64_t)de->copy_rows_accepted;
+      if (de->copy_scored >= 16 && 2 * de->copy_first_right < de->copy_scored) ++copy_failing_total_;
+      std::copy(de->copy_chance, de->copy_chance + 4, copy_chance_);
+      std::printf("serve: req %llu copy: %d proposals made, %d scored, first token right %d; %d copy rows verified, %d accepted; this conversation misses %.1f times the average\n",
+                  (unsigned long long)h.req_id, de->copy_proposals, de->copy_scored, de->copy_first_right, de->copy_rows_verified,
+                  de->copy_rows_accepted, de->copy_rho256 / 256.0);
+    }
     if (de->vsteps) {
       std::printf("serve: req %llu drafts: %d verify steps, %.2f drafts verified and %.2f accepted per step, "
                   "steps verifying 0..5: %d %d %d %d %d %d; gate %.3f (%.3f-%.3f); GPU ms by rows:",
@@ -4177,6 +4646,7 @@ class Server {
   double dec_end_ = 0;         // when the last decode run ended: decoders owed for the time since (a long prompt's arrival)
   std::deque<Request> held_, ready_, wait_;  // submits for a session in flight; those let go when it ended;
                                              // those waiting for a slot
+  std::set<uint64_t> run_ended_;  // sessions of flights that ended inside the run in progress (DONE sent): their slots are free for an arrival's question; cleared when the run's flights are finished
   std::set<uint64_t> flying_, later_;  // the sessions in flight; RELEASEs of them, applied at their end
   double win_used_[3] = {};   // when each factor's window was last used (index: win_level)
   int64_t engram_set_mib_ = 0, engram_goal_mib_ = 0;  // the Engram cache's size: the setting, and what the server steers to (lower after it gave way)
@@ -4198,7 +4668,7 @@ class Server {
 }  // namespace
 
 int serve(model::Model& m, comm::Ring& ring, Watchdog& wd, const ServeOptions& o) {
-  if (o.prefill_rows / o.snap_every > kMaxSnaps) die("serve: more than %d snapshots per prefill chunk", kMaxSnaps);
+  if (std::max(o.prefill_rows, o.prefill_rows_max) / o.snap_every > kMaxSnaps) die("serve: more than %d snapshots per prefill chunk", kMaxSnaps);
   signal(SIGPIPE, SIG_IGN);
   signal(SIGINT, on_signal);
   signal(SIGTERM, on_signal);
@@ -4218,11 +4688,16 @@ int serve(model::Model& m, comm::Ring& ring, Watchdog& wd, const ServeOptions& o
     hi.keep_positions = numbers * 16384 / 5;
   }
   hi.name_len = (uint32_t)o.name.size();
-  Io io(o.socket, Frame(fe::kHelloEngine).add(&hi).add(o.name.data(), o.name.size()).take());
+  if (!o.ids_dir.empty()) {  // the token ids' files: the directory made (what an earlier run left is removed after the kept index is read)
+    std::string why;
+    if (!idsfile::ensure_dir(o.ids_dir, &why)) die("serve: the ids directory: %s", why.c_str());
+  }
+  Io io(o.socket, Frame(fe::kHelloEngine).add(&hi).add(o.name.data(), o.name.size()).take(), o.frame_stage_bytes);
   std::printf("serve: listening on %s (context %d, session store %.2f GiB, kept between requests %.2f GiB)\n",
               o.socket.c_str(), o.max_ctx, m.state_capacity() / 1073741824.0, budget / 1073741824.0);
   Server s(m, ring, wd, o, io, budget);
   s.load_kept();
+  s.sweep_ids();
   s.loop();
   if (g_prof) CUDA_CHECK(cudaProfilerStop());
   std::printf("serve: stopped\n");

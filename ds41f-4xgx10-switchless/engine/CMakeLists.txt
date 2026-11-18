@@ -34,6 +34,10 @@ target_compile_definitions(alloc_audit_test PRIVATE ENGINE_SRC_DIR=\"${CMAKE_CUR
 # tools/store_trace_check.py `same` on a real failed-give-back trace (a rank's rolled-back attempt is its own; a real difference fails)
 add_executable(store_trace_check_test tools/store_trace_check_test.cpp)
 target_compile_definitions(store_trace_check_test PRIVATE ENGINE_SRC_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}\")
+# Copy drafting replayed offline on recorded token streams (tools/copy_replay.cpp): the engine's own host matcher and gate
+# functions (model/copy.h) on conversations' ids; host only, no GPU. With no arguments it runs its self-test.
+add_executable(copy_replay tools/copy_replay.cpp)
+target_include_directories(copy_replay PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 add_custom_target(alloc_audit COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/alloc_audit.py --src ${CMAKE_CURRENT_SOURCE_DIR}
                   COMMENT "alloc_audit: allocation call sites against alloc_sites.txt")
 

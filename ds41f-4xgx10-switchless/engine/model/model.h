@@ -15,6 +15,10 @@
 #include "model/ops.h"
 #include "weights/loader.h"
 
+namespace vit {
+struct DevWeights;
+}
+
 namespace model {
 
 // How a step's rows are sampled (ops::StepIn); every rank must pass the same.
@@ -116,13 +120,23 @@ struct Sink {
 // the context: index_dense reads the scan's length from the positions (impl.h, scan_ctx).
 inline constexpr int kCtxBucket = 4096;
 
+// P-scan (attn/indexer.cu index_dense's part, nparts; docs/engine.md "P-scan"): the decode index scan split by positions over the
+// four ranks, each rank's quarter of every session's keys by index_dense, the picks all-gathered and merged by index_merge2
+// (exactly the whole scan's picks). off: every rank scans every key (no extra buffer, the graphs and launches unchanged);
+// ext: the step graphs of factors 32 and 64 (windows past 1,048,576 positions) split; all: factor 16's too.
+enum class PScan { Off, Ext, All };
+
 struct Options {
+  int copy_mib = 512;       // copy drafting (copy.h, DSGB10_COPY / DSGB10_COPY_DUMP): MiB a rank for the units' token
+                            // histories and tables; a unit that does not fit gets a smaller table, then none
   int max_ctx = 65536;      // positions the RoPE tables and compressed caches cover
   int n_layers = kLayers;   // run only blocks [first_layer, n_layers) (tests with golden injection; the
   int first_layer = 0;      // logits are then meaningless)
   bool graphs = true;       // replay steps without golden checks as CUDA graphs (one per row count and
                             // context bucket, captured on first use)
   int prefill_rows = 4096;  // rows per prefill chunk, at most
+  // > prefill_rows: a second set of row buffers for chunks of this many rows is borrowed from the pool (tenant lend::kTenantPrefill)
+  int prefill_rows_max = 0;
   int wave_probe = 0;       // probe: bit L - layer L's FFN beside a second attention side, in the chunk
   int wave_probe_at = -1;  // at this position (wave_probe())
   bool draft_fp8 = false;   // DSpark's head GEMV on an FP8 copy of the vocab head (bind_spec; +165 MB): the
@@ -141,6 +155,10 @@ struct Options {
   // pool_one_line one line's worth (serve: the pool grows to its chosen size before serving, state_reserve).
   double slot_gib = 0;
   bool pool_one_line = false;
+  bool kv_split = false;    // --kv-split tiered | max: a stored conversation is marked (clean pieces become ghosts) once its images are on the SSD
+  bool imager = false;      // the disk tier is written in the background as each Spark's own quarter, on a second stream; every mode
+  int kv_split_mode = 0;    // splitpace::Mode (0 off, 1 tiered, 2 max): the riding of the image commands
+  int kv_join_pieces = 64;  // --kv-join-pieces: the most pieces one join command takes
   int bgraph_bodies = 0;    // DIAGNOSTICS (spec.cu, 2026-10-13): the batch spec graph's switch bodies (0: kMaxRows)
   bool bgraph_noif = false; // DIAGNOSTICS: the entries' accepts at the top level, without if nodes
   bool bgraph_check = false;  // DIAGNOSTICS (B3 phase 2a): after the batch step's draft pass over the entries, every
@@ -256,6 +274,51 @@ class Model {
   EngramLendInfo engram_lend_info() const;
   // The largest size (MiB) whose block takes at most `groups` groups, within what the cache can grow to.
   uint64_t engram_mib_for_groups(int groups) const;
+  // ---- the tenants of the pool (tenant.cu; lend.h's table) ----
+  // Every borrower of the pool's groups is a tenant with an id: 0 the windows, 1 the Engram cache, 2 not assigned, 3 a work area,
+  // 8-15 models loaded while the engine runs. tenant_lend(id, kLendBegin, mib) starts a change of tenant `id` to `mib` MiB and
+  // tenant_lend(id, kLendPoll, 0) finishes it (commands, as engram_lend, which is tenant 1). Only one change is in flight at a
+  // time, and while it is no window command and no settle of owed groups may run (tenant_active: the server waits). Test
+  // builds (DSGB10_TEST_FAULTS) have tenant 15, a dummy device block filled with a pattern; DSGB10_LEND_FAIL's `tenant:N` aims a fault.
+  int tenant_lend(int tenant, int phase, int64_t mib);
+  bool tenant_active() const;     // a change is in flight
+  bool window_may_run() const;    // no window command and no settle of owed groups while a tenant's change is in flight (lend::StoreQueue)
+  int tenant_group_count(int id) const;  // the groups tenant `id` holds (settled)
+  int tenant_change_id() const;   // the tenant it is for (-1: none)
+  int tenant_victim() const;      // the tenant to ask for one group when the reclaim's first tiers are spent (-1: none)
+  bool tenant_table_ok() const;   // sum(groups) + sum(pending) + owed = the groups out of the pool
+  bool tenant_other_enabled() const;  // a tenant besides the windows and the Engram cache is registered
+  uint64_t group_bytes() const;   // one group's bytes on this rank (64 numbers)
+  struct TenantRow {
+    int id = 0, kind = 0, standing = 0;  // lend.h's TenantKind and Standing
+    int groups = 0, pending = 0;
+    uint64_t size_bytes = 0;  // the tenant's own size
+    bool idle = true;
+  };
+  std::vector<TenantRow> tenant_rows() const;
+  // ---- the image encoder in the engine (vit_area.cu, vit_cmd.cu; docs/vision.md) ----
+  // set_vision (every rank, once the vision weights are on the device and before the store is sized): this rank's quarter of the
+  // encoder, the pinned staging buffer for pixels (kVitStageBytes: it is made now, so the sizing read already counts it) and
+  // tenant 3, the work area (device memory, Required). The work area itself is taken by the start's hand-over, tenant_lend(
+  // lend::kTenantWork, kLendBegin, vision_area_mib()), and kept: it is never given back while the engine runs.
+  static constexpr size_t kVitStageBytes = 6u << 20;  // the largest image's pixels (588 B x 9,216 patches) in one piece
+  void set_vision(const vit::DevWeights* w);
+  static uint64_t vision_area_bytes();   // what the work area must hold: the largest image (vit::kMaxPatches, at most 1,024 rows)
+  static uint64_t vision_area_mib() { return (vision_area_bytes() + (1u << 20) - 1) >> 20; }
+  // 0: no encoder (no vision weights); 1: ready (the work area is held on this rank); 2: weights loaded, no work area (the start's take failed)
+  int vision_state() const;
+  uint64_t vision_area_held() const;     // the work area's bytes on this rank
+  // A pixel flight's spans (kCmdImages with the flag): flight `key` has `n` spans whose rows are not written yet. Rows written by
+  // image_fill need no record (they are written when the flight is made).
+  void vision_register(int key, int n);
+  // One range of blocks [b0, b1) of image `span` of flight `key` (nh x nw patches; its span's first row among the flight's rows
+  // is row0), the same call on every rank. Rank 0 passes the image's pixels (588 B a patch, in the request's frame; read when
+  // b0 = 0), the others null. At b1 = the last block the span's rows are written straight into the flight's numbers and the four
+  // ranks vote on them. Returns the same value on every rank. The engine stops (die) when a range is not the next of the one image
+  // that is between its blocks, or an image starts while one is.
+  enum VitStatus { kVitOk = 0, kVitVote, kVitFail };
+  static constexpr int kVitBlocks = 32;
+  int vision_run(int key, int span, int row0, int nh, int nw, int b0, int b1, const uint8_t* pixels);
   int slots() const;
   int slot_ctx(int s) const;  // positions slot s holds (Options::big_slots)
   // Slot memory (Options::vmm; every call is a no-op or zero without it). slot_reserve: commit the chunks a request of
@@ -354,7 +417,19 @@ class Model {
   void image_fill(int key, size_t row0, size_t n, const uint16_t* src);
   void image_free(int key);
   size_t image_numbers() const;
-  void prefill_lookup(int a, int M);
+  // rows_set: the set of row-sized buffers the chunk (and its look-ahead) runs on, 0 the standing set (M <= Options::prefill_rows),
+  // 1 the set lent by the pool (M <= prefill_rows_cap(1)); a set this rank does not hold stops the engine with a message.
+  void prefill_lookup(int a, int M, int rows_set = 0);
+  // The rows a set takes at most (0: this rank holds no such set).
+  int prefill_rows_cap(int rows_set) const;
+  // The lent set (Options::prefill_rows_max): its size in MiB (0: no such set), the groups it takes, and the pool's read-only answers the
+  // policy needs: whether the top `groups` groups of the pool hold no number in use, and the free numbers.
+  int64_t prefill_loan_mib() const;
+  int prefill_loan_groups() const;
+  bool pool_top_free(int groups) const;
+  int64_t pool_free_numbers() const;
+  // The server's mark on an OnDemand tenant (rank 0's table: next_victim reads it): nothing is using it now.
+  void tenant_mark_idle(int id, bool idle);
   // The prefill path's buffers and the weights it gathers, made now instead of by the first prefill:
   // every rank at the same point, after set_engram(). This rank's allocations come before ring's host
   // barrier and the weights' all-gathers after it, so a rank that cannot allocate stops every rank at
@@ -376,6 +451,10 @@ class Model {
   // layer without ced), [1] CED's projection, keep and replay, [2] the head and the sampling, [3] the
   // draft module's windows.
   void prefill_split(float ms[4]) const;
+  // The last prefill chunk's join clock (DSGB10_PF_STALL; waits for the chunk): [0] the ms the main stream stood at the
+  // attention's joins of layers 0-19 (every layer without ced), [1] at the MoE's, [2] one pair's own cost; *pairs the
+  // joins timed. False, and nothing set, when the switch is off.
+  bool prefill_joins(float ms[3], int* pairs) const;
   // Marks on the model's stream (i < 4), and the GPU time from mark i to mark j (waits for j).
   void mark(int i);
   float mark_ms(int i, int j) const;
@@ -478,7 +557,44 @@ class Model {
   size_t state_disk_bytes() const;  // the file's bytes in spilled sessions
   std::string state_disk_path() const;
   void state_spill(int h);    // session h's state to the disk tier (freed without one: state_evicted)
-  void state_unspill(int h);  // and back
+  // and back; `max_numbers` > 0: at most that many numbers are taken (the lists first, then bookmarks): store_core.h unspill
+  // `upto` > 0 makes it one unit of a return: the pieces below `upto` only, at most Options::kv_join_pieces of them, and `max_numbers` < 0
+  // says the budget is spent (it cuts where the count ended); `upto` 0: the whole conversation in one command.
+  void state_unspill(int h, int max_numbers = 0, int upto = 0);
+  int state_unspill_left(int h, int upto) const;  // what a read-back to `upto` still brings (lists on the disk below it, bookmarks at or below it)
+  // The split (--kv-split cache). state_split: at most `budget` pieces of h's whole pieces become quarter slots, never evicting.
+  // state_join: the pieces below position `upto` that are slots become whole numbers again, at most `max_numbers` taken (0: no
+  // limit) and at most Options::kv_join_pieces pieces in this command; every rank cuts at the smallest position whose piece arrived
+  // different. Both are commands (cmd.h kStSplit, kStJoin); the counters below are read by rank 0's STATS and its pacing.
+  void state_split(int h, int budget);
+  void state_join(int h, int upto, int max_numbers);
+  void state_join_plan(int h, int upto, int* back, int* exch) const;  // what a join to `upto` would do: pieces taken back, pieces exchanged
+  struct SplitStats {
+    uint64_t split_pieces = 0, split_deferred = 0, revives = 0, joins = 0, join_bytes = 0, join_ns = 0, join_max_ns = 0;
+    uint64_t join_short = 0, join_bad = 0, exchanged = 0, join_taken = 0, unspill_taken = 0;
+    uint64_t conv_split = 0, quarter_slots = 0, quarter_numbers = 0, ghost_numbers = 0;
+    // the imager
+    uint64_t imaged = 0, image_voids = 0, image_waits = 0, returns_read = 0, rides = 0, clean_numbers = 0, image_pending = 0;
+  };
+  SplitStats split_stats() const;
+  // image: at most `budget` of h's plain pieces get a quarter image queued on the image stream (live: the conversations a request is in flight
+  // on get nothing). settle: the commands at or below `upto` are made true and the idle conversations marked; returns the pieces marked.
+  void ride_readings(uint64_t out[4]) const;  // the replicated readings a ride checks across the ranks: image commands, queued jobs, ghosts, free numbers
+  bool has_host_ring() const;                 // the engine has its ring: a ride without one in the server would be one rank deciding alone
+  void state_ride(uint64_t settled, int h, int budget, const std::vector<int>& live);  // settle up to `settled`, then image (h > 0)
+  int image_room_pieces(int maxn) const;  // the most pieces (up to maxn) staging takes now
+  uint64_t image_pending() const;  // image jobs queued and not settled
+  int image_todo(int h) const;     // pieces of h with no image and none queued
+  uint64_t image_done() const;  // this rank's reading: the highest command whose work on the image stream has ended (no wait)
+  bool image_room(size_t bytes) const;
+  uint64_t image_seq() const;   // image commands queued so far
+  bool imager() const;
+  bool split_can_open() const;  // a split command could open a quarter number now (a replicated count: no command, no collective)
+  // The lend zone (chunks.h): the numbers a window or the Engram lender will take from the top. A collective: every rank calls alike,
+  // at the start and inside a window's open and close; a no-op without Options::kv_split.
+  void split_zone_update();
+  void split_prepare();  // the split's buffers, before the free-memory read the store is sized from (main.cpp)
+
   struct StateInfo {
     int saved = 0;           // compressed caches of positions [0, saved) are kept
     int end_pos = -1;        // the end snapshot's position (-1: none)

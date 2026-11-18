@@ -31,8 +31,11 @@ constexpr int kMaxSess = 16;  // sessions in a step, at most (docs/batching.md, 
 // row_budget): a step of at most 8 rows runs the kernels and launches it ran.
 constexpr int kLowRows = 8;
 constexpr int row_budget(int R) { return R <= kLowRows ? kLowRows : R <= kDecodeRows ? kDecodeRows : kMaxRows; }
-constexpr int kSessTok = 1 + kDrafts;  // a session's rows in a spec step, at most: its bonus token and its drafts
+// Copy drafting (copy.h) appends rows to the chain's drafts: a session's drafts in a step, at most (copy::kMaxDrafts)
+constexpr int kCopyDrafts = 7;
+constexpr int kSessTok = 1 + kCopyDrafts;  // a session's rows in a spec step, at most: its bonus token and its drafts
 static_assert(kSessTok <= kMaxSessRows, "a session's spec rows fit its rows of a step");
+static_assert(kCopyDrafts >= kDrafts, "the chain's drafts are among a session's");
 struct StepSamp {  // one session's sampling (model::Sampling)
   uint64_t seed;
   float temperature;  // 0: greedy
@@ -62,8 +65,8 @@ struct StepIn {
   int32_t force;       // >= 0: draft from this token, not the sampled one (teacher-forced diagnostics)
   int32_t probe[kDrafts];  // EXPERIMENT (Options::tree_probe): the path of the drafter's probe
   int32_t gate;        // kGateThresh, kGateRatio or kGateMarginal
-  float step_ms[kDrafts + 1];  // kGateRatio, kGateMarginal: the modelled ms of a step verifying n drafts
-                               // (n + 1 rows), its draft pass included
+  float step_ms[kCopyDrafts + 1];  // kGateRatio, kGateMarginal: the modelled ms of a step verifying n drafts
+                                   // (n + 1 rows), its draft pass included; past kDrafts only copy drafting reads them
   StepSamp samp[kMaxSess];     // each session's sampling
   // Batch spec steps (spec.cu, docs/batching.md B3: drafts across sessions). Entry k (0 .. nsess - 1) is one
   // session; its rows are consecutive (sess[r] = k), its bonus token then its drafts. Read only when
@@ -83,6 +86,9 @@ struct StepIn {
   // wide64: the gate's step-cost model (ms) by the rows R a step runs: R <= kDecodeRows: wcost[0] + wcost[1] R; a
   // wide bucket of Rb rows: wcost[2] + wcost[3] Rb (DSGB10_WIDE_COST; fit to serve's GPU ms by rows, 2026-11-05: 26, 2.1, 56, 1.6)
   float wcost[4];
+  // copy drafting (copy.h): copy::mode()'s bits and the shortest match a proposal needs; 0: the step is as without it
+  int32_t copy;
+  int32_t copy_min;
 };
 static_assert(sizeof(StepIn) % 4 == 0, "StepIn is copied word by word");
 // slot = *counter % kInSlots of ring -> dev, feedback tokens resolved from fb, ++*counter.
@@ -131,6 +137,20 @@ struct SampleOut {
   float gate_ship[kMaxSess][kDrafts], gate_mlp[kMaxSess][kDrafts], gate_used[kMaxSess][kDrafts];
   float gate_feat[kMaxSess][16];
   int32_t gate_keep[kMaxSess];
+  // copy drafting (StepIn::copy with the dump bit): entry k's proposal after its chain's kept drafts, written by the gate:
+  // copy_info = {the source's end position (-1: none), the match length, the chain drafts kept, the rows proposed},
+  // copy_tok the proposed tokens. A one-session step uses entry 0. copy_digest: the running digest of the rows every
+  // step chose (copy::digest_fold over next_rows and next_tok), the same on every rank.
+  int32_t copy_info[kMaxSess][4];
+  int32_t copy_tok[kMaxSess][kCopyDrafts];
+  uint32_t copy_digest;
+  // copy drafting with the learner (copy::kAdapt), written by the gate every step: copy_obs[k] one packed word for entry k
+  // (copy.h pack_obs: the outcome taken from its last proposal, the rows it verified and kept, the conversation's ratio), a
+  // one-session step uses entry 0; copy_learn the fold of every outcome taken (copy::Learn::sum), the same on every rank;
+  // copy_chance the shared first-token chance by match bucket in 1/65535.
+  uint32_t copy_obs[kMaxSess];
+  uint32_t copy_learn;
+  uint32_t copy_chance[4];
 };
 // The device's side of speculative steps (spec.cu), in device memory: what a spec step's sampling
 // decided, and the rows of the verify step after it.
@@ -163,8 +183,18 @@ void sample(const comm::DevChannel& ch, const float* logits, int vocab0, const S
             SampleOut* outs, int32_t* fb, uint32_t* counter, cudaStream_t s, SpecState* ss = nullptr,
             int max_rows = kDecodeRows);
 
-// x [R][4][5120] = embed[tokens[r]] in every copy; pre_mix [R][4] = (1, 0, 0, 0).
-void embed(const bf16* table, const int* tokens, int R, bf16* x, float* pre_mix, cudaStream_t s);
+// The embedding lookup, by vocabulary rows (common/embed_shard.h). embed_part: slot [R][5120] = this rank's part of each
+// row: the table's row `tokens[r]` where this rank's shard (rank * kVocabPart ..) holds it, bf16 -0.0 elsewhere; an id
+// outside [0, kVocab) stops the kernel. The caller sums the slots over the ranks (all-reduce, in place). embed_fan:
+// x [R][4][5120] = the summed rows in every copy; pre_mix [R][4] = (1, 0, 0, 0).
+void embed_part(const bf16* shard, int rank, const int* tokens, int R, bf16* slot, cudaStream_t s);
+void embed_fan(const bf16* rows, int R, bf16* x, float* pre_mix, cudaStream_t s);
+// Prefill's form: part [4 quarters][rq][5120] for a chunk of M rows whose ids are tokens [0, M): row i = q * rq + t goes
+// to rank q at its row t; embed_send writes row i where this rank's shard holds its token (the rest of part is not read).
+// The all-to-all (rows = rq) then lands rank k's rows for this rank's at recv [k][rq]; embed_pick: x [n][4][5120] from
+// the owner's slot for each of this rank's rows (tokens + r0), pre_mix [n][4] = (1, 0, 0, 0).
+void embed_send(const bf16* shard, int rank, const int* tokens, int M, bf16* part, cudaStream_t s);
+void embed_pick(const bf16* recv, int rq, const int* tokens, int n, bf16* x, float* pre_mix, cudaStream_t s);
 // vision: rows [R][kDim] (bf16, may be pinned host memory) into the 4 hc copies of x's first R rows
 void inject_rows(const bf16* rows, int R, bf16* x, cudaStream_t s);
 

@@ -32,14 +32,25 @@
 #include <string>
 #include <vector>
 
+#include "common/embed_shard.h"
 #include "kernels/prefill_attn.h"
 #include "dspark/dspark.h"
 #include "model/nvtx.h"
+#include "model/spec.h"
 #include "model/state.h"
 
 namespace model {
 
 using namespace detail;
+
+// The standing set's allocator: a failed allocation stops the engine, the buffers are zeroed (dalloc, halloc).
+struct StandingAlloc {
+  bool ok = true;
+  template <class T>
+  T* d(size_t n) { return dalloc<T>(n); }
+  template <class T>
+  T* h(size_t n) { return halloc<T>(n); }
+};
 
 void Model::Impl::prefill_alloc(comm::Ring* ring) {
   if (pf) return;
@@ -68,24 +79,17 @@ void Model::Impl::prefill_alloc(comm::Ring* ring) {
     CUDA_CHECK(cudaStreamCreateWithPriority(&p.cs, cudaStreamNonBlocking, hi));
     for (auto& e : p.ev_grp) CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
     CUDA_CHECK(cudaEventCreateWithFlags(&p.ev_cs, cudaEventDisableTiming));
+    const char* ps = std::getenv("DSGB10_PF_STALL");
+    p.stall = ps && std::atoi(ps) != 0;
+    if (p.stall) {
+      for (auto& pr : p.ev_jn)
+        for (auto& e : pr) CUDA_CHECK(cudaEventCreate(&e));
+      for (auto& e : p.ev_fl) CUDA_CHECK(cudaEventCreate(&e));
+    }
   }
-  p.tok_h = halloc<int32_t>(M);
   p.ced_rows = dalloc<uint8_t>((size_t)kReplay * kCedRow);
   p.ced_gath = dalloc<uint8_t>((size_t)kRanks * kReplay * kCedRow);
   std::fill(p.ced_pos, p.ced_pos + kReplay, -1);
-  const size_t seg = (size_t)M * kEngramCols * kEngramRow;  // one rank may own every cell
-  for (int set = 0; set < 2; ++set)
-    for (int e = 0; e < 2; ++e) {
-      p.e_send[set][e] = halloc<uint8_t>(seg);
-      p.e_off[set][e] = halloc<uint32_t>((size_t)M * kEngramCols);
-    }
-  p.e_done = halloc<uint64_t>(4);
-  p.e_wait = halloc<uint64_t>(4);
-  p.e_gath = dalloc<uint8_t>(kRanks * seg);
-  p.e_xq = dalloc<uint8_t>((size_t)Q * kEngramK);
-  p.e_xs = dalloc<uint8_t>((size_t)Q * kEngramK / 32);
-  p.e_kv = dalloc<bf16>((size_t)kRanks * Q * kEngramN);
-  p.e_part = dalloc<uint8_t>((size_t)kRanks * Q * kEngramPartBytes);
   // bf16 weights the prefill GEMMs read in the GEMV's tiled layout (tile_fp8 with 2 bytes per element),
   // and every rank's slices of the weights this rank's rows need whole (PLayer)
   uint8_t* tmp = dalloc<uint8_t>((size_t)kHead * kDim * 2);  // a gathered compressor matrix before tiling
@@ -97,27 +101,44 @@ void Model::Impl::prefill_alloc(comm::Ring* ring) {
       w.p_wproj = dalloc<uint8_t>((size_t)kIdxHeads * kDim * 2);
       dsk::tile_fp8(reinterpret_cast<const uint8_t*>(w.ix_wproj), w.p_wproj, kIdxHeads, kDim * 2, st);
     }
-    for (int h = 0; h < 2; ++h) {
+    for (int h = 0; h < 2; ++h)
       w.p_hcfn[h] = reinterpret_cast<uint32_t*>(dalloc<uint8_t>(dsk::hc_fn_parts_bytes()));
-      dsk::hc_fn_parts(w.hc_fn[h], w.p_hcfn[h], st);
-    }
-    g.wqa = dalloc<uint8_t>((size_t)kQLora * kDim);
-    g.sqa = dalloc<uint8_t>((size_t)kQLora / 32 * (kDim / 32));
-    g.wkv = dalloc<uint8_t>((size_t)kHead * kDim);
-    g.skv = dalloc<uint8_t>((size_t)kHead / 32 * (kDim / 32));
-    g.wob = dalloc<uint8_t>((size_t)kRanks * kDim * kOPart);
-    g.sob = dalloc<uint8_t>((size_t)kRanks * (kDim / 32) * (kOPart / 32));
+    // made before the weights load (reserve_gathered): this rank's slot already holds its slice, which decode reads
+    const GatheredW pre = pgw.empty() ? GatheredW{} : pgw[L];
+    auto take = [](uint8_t* have, size_t n) { return have ? have : dalloc<uint8_t>(n); };
+    g.wqa = take(pre.wqa, (size_t)kQLora * kDim);
+    g.sqa = take(pre.sqa, (size_t)kQLora / 32 * (kDim / 32));
+    g.wkv = take(pre.wkv, (size_t)kHead * kDim);
+    g.skv = take(pre.skv, (size_t)kHead / 32 * (kDim / 32));
+    g.wob = take(pre.wob, (size_t)kRanks * kDim * kOPart);
+    g.sob = take(pre.sob, (size_t)kRanks * (kDim / 32) * (kOPart / 32));
     if (kv_src(L)) {
       g.ckv = dalloc<uint8_t>((size_t)kHead * kDim * 2);
       if (w.c_wgate) g.cgate = dalloc<uint8_t>((size_t)kHead * kDim * 2);
     }
-    if (engram_layer(L) && store) g.ewkv = dalloc<uint8_t>(kRanks * ewb), g.eskv = dalloc<uint8_t>(kRanks * esb);
+    if (engram_layer(L) && store) g.ewkv = take(pre.ewkv, kRanks * ewb), g.eskv = take(pre.eskv, kRanks * esb);
   }
   if (ring) ring->barrier();
+  float *hc_whole = nullptr, *hc_gath = nullptr;
   for (int L = 0; L < kLayers; ++L) {
     const LayerW& w = lw[L];
     PLayer& g = p.pl[L];
     // L1 tiles of 8 rows and scale rows of 32 concatenate, so the gathered slices are the whole matrices
+    // the parts come from the whole projection: a quarter file's whole is gathered into one transient buffer, reused
+    // by every sublayer and freed below; a file cut by rows holds its whole already
+    for (int h = 0; h < 2; ++h) {
+      const float* fn = w.hc_fn[h];
+      if (w.hc_ld) {
+        if (!hc_whole) hc_whole = dalloc<float>((size_t)kMix * kHcDim), hc_gath = dalloc<float>((size_t)kMix * kHcDim);
+        comm::allgather(ch, w.hc_fn[h], hc_gath, (size_t)kMix * kDim * 4, st);
+        for (int r = 0; r < kRanks; ++r)
+          CUDA_CHECK(cudaMemcpy2DAsync(hc_whole + (size_t)kDim * r, (size_t)kHcDim * 4, hc_gath + (size_t)kMix * kDim * r,
+                                       (size_t)kDim * 4, (size_t)kDim * 4, kMix, cudaMemcpyDeviceToDevice, st));
+        fn = hc_whole;
+      }
+      dsk::hc_fn_parts(fn, w.p_hcfn[h], st);
+    }
+    // (this rank's own slot is already in place, where decode reads it: the gather writes the same bytes back)
     const comm::AgSeg ga[6] = {{w.wqa, g.wqa, (size_t)kQaPart * kDim},
                                {w.sqa, g.sqa, (size_t)kQaPart / 32 * (kDim / 32)},
                                {w.wkv, g.wkv, (size_t)kKvPart * kDim},
@@ -140,9 +161,14 @@ void Model::Impl::prefill_alloc(comm::Ring* ring) {
   }
   sync();
   CUDA_CHECK(cudaFree(tmp));
+  if (hc_whole) {
+    CUDA_CHECK(cudaFree(hc_whole));
+    CUDA_CHECK(cudaFree(hc_gath));
+  }
   CUDA_CHECK(cudaMemGetInfo(&free1, &total));
   std::printf("rank %d: prefill buffers and gathered weights for %d-row chunks: %.2f GiB (%.2f GiB free)\n", rank,
-              M, (double)(free0 - free1) / 1073741824.0, free1 / 1073741824.0);
+              M, (double)(free0 - free1 + pgw_bytes) / 1073741824.0, free1 / 1073741824.0);
+  pgw.clear(), pgw_bytes = 0;
 }
 
 #ifdef DSGB10_NVTX
@@ -156,7 +182,7 @@ static const char* route_dump_dir() {
 static int g_dump_a = -1;  // the pass's first position (the replay's: P - 128)
 static void dump_routes(const Prefill& p, int L, int M, cudaStream_t st) {
   std::vector<int> h((size_t)kRanks * p.rq * kTopK), rows;
-  CUDA_CHECK(cudaMemcpyAsync(h.data(), p.ridx, h.size() * 4, cudaMemcpyDeviceToHost, st));
+  CUDA_CHECK(cudaMemcpyAsync(h.data(), p.rs->ridx, h.size() * 4, cudaMemcpyDeviceToHost, st));
   CUDA_CHECK(cudaStreamSynchronize(st));
   for (int r = 0; r < kRanks; ++r) {
     const int n = std::max(0, std::min(p.rq, M - r * p.rq));
@@ -191,18 +217,18 @@ static uint16_t *g_feat = nullptr, *g_feat_all = nullptr;
 static int g_feat_rows = 0;
 static long g_feat_ctr = 0;
 static void feat_hidden(const Prefill& p, int L, cudaStream_t st) {
-  if (g_feat_rows < p.Q) {
+  if (g_feat_rows < p.rs->Q) {
     CUDA_CHECK(cudaStreamSynchronize(st));
     if (g_feat) CUDA_CHECK(cudaFree(g_feat));
     if (g_feat_all) CUDA_CHECK(cudaFree(g_feat_all));
-    g_feat = dalloc<uint16_t>((size_t)p.Q * kFeatRow);
-    g_feat_all = dalloc<uint16_t>((size_t)kRanks * p.Q * kFeatRow);
-    g_feat_rows = p.Q;
+    g_feat = dalloc<uint16_t>((size_t)p.rs->Q * kFeatRow);
+    g_feat_all = dalloc<uint16_t>((size_t)kRanks * p.rs->Q * kFeatRow);
+    g_feat_rows = p.rs->Q;
   }
   for (int r = 0; r < p.n; r += dspark::kMaxHidden) {
     const int m = std::min(dspark::kMaxHidden, p.n - r);
     // main_hidden writes columns [5120 * slot, +5120) of rows of stride kMainK; here rows of stride kFeatRow
-    dspark::main_hidden(U(p.x) + (size_t)r * kHcDim, m, L - 37, g_feat_all + (size_t)r * dspark::kMainK, false, st);
+    dspark::main_hidden(U(p.rs->x) + (size_t)r * kHcDim, m, L - 37, g_feat_all + (size_t)r * dspark::kMainK, false, st);
     CUDA_CHECK(cudaMemcpy2DAsync(g_feat + (size_t)r * kFeatRow + (L - 37) * kDim, (size_t)kFeatRow * 2,
                                  g_feat_all + (size_t)r * dspark::kMainK + (L - 37) * kDim, (size_t)dspark::kMainK * 2,
                                  (size_t)kDim * 2, m, cudaMemcpyDeviceToDevice, st));
@@ -211,9 +237,9 @@ static void feat_hidden(const Prefill& p, int L, cudaStream_t st) {
 static void feat_write(const Prefill& p, const comm::DevChannel& ch, int a, int M, int rank, const int32_t* toks,
                        cudaStream_t st) {
   if (p.n > 0)
-    CUDA_CHECK(cudaMemcpy2DAsync(g_feat + dspark::kMainK, (size_t)kFeatRow * 2, p.yraw, (size_t)kDim * 2,
+    CUDA_CHECK(cudaMemcpy2DAsync(g_feat + dspark::kMainK, (size_t)kFeatRow * 2, p.rs->yraw, (size_t)kDim * 2,
                                  (size_t)kDim * 2, p.n, cudaMemcpyDeviceToDevice, st));
-  comm::allgather(ch, g_feat, g_feat_all, (size_t)p.Q * kFeatRow * 2, st);  // every rank, the same order
+  comm::allgather(ch, g_feat, g_feat_all, (size_t)p.rs->Q * kFeatRow * 2, st);  // every rank, the same order
   const long c = g_feat_ctr++;
   if (rank != feat_rank()) return;
   CUDA_CHECK(cudaStreamSynchronize(st));
@@ -228,7 +254,7 @@ static void feat_write(const Prefill& p, const comm::DevChannel& ch, int a, int 
   for (int r = 0; r < kRanks; ++r) {
     const int n = std::max(0, std::min(p.rq, M - r * p.rq));
     if (n == 0) continue;
-    CUDA_CHECK(cudaMemcpy(h.data(), g_feat_all + (size_t)r * p.Q * kFeatRow, (size_t)n * kFeatRow * 2,
+    CUDA_CHECK(cudaMemcpy(h.data(), g_feat_all + (size_t)r * p.rs->Q * kFeatRow, (size_t)n * kFeatRow * 2,
                           cudaMemcpyDeviceToHost));
     std::fwrite(h.data(), 2, (size_t)n * kFeatRow, f);
   }
@@ -244,7 +270,7 @@ void Model::Impl::prefill_engram(int a, int M, int set) {
   if (!store) return;
   // a lookup no chunk used (a cancelled request's) may still be writing the set's buffers
   for (int i = 2 * set; i < 2 * set + 2; ++i)
-    while (__atomic_load_n(&p.e_done[i], __ATOMIC_ACQUIRE) < p.e_wait[i]) {
+    while (__atomic_load_n(&p.rs->e_done[i], __ATOMIC_ACQUIRE) < p.rs->e_wait[i]) {
     }
   if (hist.end() < a + M) die("prefill: Engram lookups for [%d, %d) with %d tokens", a, a + M, hist.end());
   if (hist.base > 0 && a < hist.base + 3) die("prefill: Engram lookups from %d, history held from %d", a, hist.base);
@@ -275,25 +301,25 @@ void Model::Impl::engram_apply_p(int L, int M, int set) {
   const int e = engram_index(L);
   const LayerW& w = lw[L];
   const PLayer& g = p.pl[L];
-  ops::wait_seq(&p.e_done[2 * set + e], &p.e_wait[2 * set + e], st);
-  comm::allgather(ch, p.e_send[set][e], p.e_gath, p.e_seg[set][e], st);
+  ops::wait_seq(&p.rs->e_done[2 * set + e], &p.rs->e_wait[2 * set + e], st);
+  comm::allgather(ch, p.rs->e_send[set][e], p.rs->e_gath, p.rs->e_seg[set][e], st);
   const int n = p.n;
   if (n == 0) return;
-  ops::engram_pack(p.e_gath, p.e_off[set][e] + (size_t)p.r0 * kEngramCols, n, p.e_xq, p.e_xs, st);
+  ops::engram_pack(p.rs->e_gath, p.rs->e_off[set][e] + (size_t)p.r0 * kEngramCols, n, p.rs->e_xq, p.rs->e_xs, st);
   const size_t wb = (size_t)kEngramN * kEngramK, sb = (size_t)kEngramN / 32 * (kEngramK / 32);
   dsk::Fp8Seg seg[kRanks];
-  for (int r = 0; r < kRanks; ++r) seg[r] = {g.ewkv + r * wb, g.eskv + r * sb, p.e_kv + (size_t)r * p.Q * kEngramN, kEngramN};
-  dsk::gemm_fp8_p(p.e_xq, p.e_xs, n, seg, kRanks, kEngramK, st);
+  for (int r = 0; r < kRanks; ++r) seg[r] = {g.ewkv + r * wb, g.eskv + r * sb, p.rs->e_kv + (size_t)r * p.rs->Q * kEngramN, kEngramN};
+  dsk::gemm_fp8_p(p.rs->e_xq, p.rs->e_xs, n, seg, kRanks, kEngramK, st);
   for (int r = 0; r < kRanks; ++r)
-    ops::engram_partial(p.x, p.e_kv + (size_t)r * p.Q * kEngramN, w.e_w, r, n, p.e_part + (size_t)r * n * kEngramPartBytes,
+    ops::engram_partial(p.rs->x, p.rs->e_kv + (size_t)r * p.rs->Q * kEngramN, w.e_w, r, n, p.rs->e_part + (size_t)r * n * kEngramPartBytes,
                         st);
   if (!img_span.empty())  // vision: image rows pass through (gate * 0), as model.py's token_mask
     img_runs(p.a_cur + p.r0, n, [&](size_t, int i0, int i1) {
       for (int r = 0; r < kRanks; ++r)
-        CUDA_CHECK(cudaMemset2DAsync(p.e_part + ((size_t)r * n + i0) * kEngramPartBytes + 32, kEngramPartBytes, 0,
+        CUDA_CHECK(cudaMemset2DAsync(p.rs->e_part + ((size_t)r * n + i0) * kEngramPartBytes + 32, kEngramPartBytes, 0,
                                      (size_t)kEngramSeg * 2, i1 - i0, st));
     });
-  ops::engram_combine(p.x, p.e_part, n, p.x, st);
+  ops::engram_combine(p.rs->x, p.rs->e_part, n, p.rs->x, st);
   (void)M;
 }
 
@@ -311,12 +337,12 @@ void Model::Impl::boundary_p(int M, const bf16* sub, const bf16* res, const floa
   Prefill& p = *pf;
   dsk::HcBoundary b;
   b.sub = U(sub), b.res = U(res), b.post = post, b.comb = comb, b.pre = pre, b.y = U(out);
-  b.x_out = U(p.yraw);
+  b.x_out = U(p.rs->yraw);
   if (nL >= 0) {
     const LayerW& w = lw[nL];
     b.fn_parts = w.p_hcfn[nh], b.scale = w.hc_scale[nh], b.base = w.hc_base[nh];
     b.norm_w = U(nh ? w.ffn_norm : w.attn_norm);
-    b.x_out = U(p.y), b.xq = p.yq + (size_t)p.r0 * kDim, b.xs = p.ys + (size_t)p.r0 * (kDim / 32);
+    b.x_out = U(p.rs->y), b.xq = p.rs->yq + (size_t)p.r0 * kDim, b.xs = p.rs->ys + (size_t)p.r0 * (kDim / 32);
     b.pre_out = pre_out, b.post_out = post_out, b.comb_out = comb_out;
   }
   dsk::hc_boundary_p(b, M, st);
@@ -333,10 +359,10 @@ void Model::Impl::index_p(int L, int a, int M) {
   const int Q = p.rq, r0 = p.r0, n = p.n;
   const int ratio = ratio_of(L), slot = idx_slot(L);
   if (n > 0) {
-    const dsk::Fp8Seg qs{w.ix_wqb, w.ix_sqb, p.iq, kIdxQ};
-    dsk::gemm_fp8_p(p.qq + (size_t)r0 * kQLora, p.qs + (size_t)r0 * kQLora / 32, n, &qs, 1, kQLora, st);
-    dsk::gemm_bf16_p(p.y, n, w.p_wproj, kIdxHeads, kDim, p.wpf, st);
-    ops::round_bf16(p.wpf, (size_t)n * kIdxHeads, st);  // a bf16 F.linear, as the decode step's
+    const dsk::Fp8Seg qs{w.ix_wqb, w.ix_sqb, p.rs->iq, kIdxQ};
+    dsk::gemm_fp8_p(p.rs->qq + (size_t)r0 * kQLora, p.rs->qs + (size_t)r0 * kQLora / 32, n, &qs, 1, kQLora, st);
+    dsk::gemm_bf16_p(p.rs->y, n, w.p_wproj, kIdxHeads, kDim, p.rs->wpf, st);
+    ops::round_bf16(p.rs->wpf, (size_t)n * kIdxHeads, st);  // a bf16 F.linear, as the decode step's
     const attn::IndexKeys ik = kvs[kv_slot(kv_source(L))].keys();
     if (reindex(L)) {  // layer 20's pool: a CTA per (2048 positions, row)
       attn::IndexScan sc;
@@ -366,8 +392,8 @@ void Model::Impl::ring_copy(int L, int p0, int p1, int base, bool to_lin) {
     const int slot = q & (attn::kRing - 1), n = std::min(p1 - q, attn::kRing - slot);
     uint8_t* rk = ring_kv[L] + slot * kv;
     uint8_t* rs = ring_sc[L] + slot * sc;
-    uint8_t* lk = p.lin_kv + (size_t)(q - base) * kv;
-    uint8_t* ls = p.lin_sc + (size_t)(q - base) * sc;
+    uint8_t* lk = p.rs->lin_kv + (size_t)(q - base) * kv;
+    uint8_t* ls = p.rs->lin_sc + (size_t)(q - base) * sc;
     CUDA_CHECK(cudaMemcpyAsync(to_lin ? lk : rk, to_lin ? rk : lk, n * kv, cudaMemcpyDeviceToDevice, st));
     CUDA_CHECK(cudaMemcpyAsync(to_lin ? ls : rs, to_lin ? rs : ls, n * sc, cudaMemcpyDeviceToDevice, st));
     q += n;
@@ -385,10 +411,18 @@ static void cs_after(Prefill& p, cudaStream_t st, int c) {
   CUDA_CHECK(cudaStreamWaitEvent(p.cs, p.ev_grp[c], 0));
 }
 
-// The main stream waits for the column groups' reduce-scatters.
-static void rs_join(Prefill& p, cudaStream_t st) {
+// The main stream waits for the column groups' reduce-scatters. `kind` is which join (0 the attention's, 1 the MoE's);
+// with the join clock on, two events on the main stream bracket the wait: their distance is the time the stream stood
+// at the join (0 when the comm stream had finished).
+static void rs_join(Prefill& p, cudaStream_t st, int kind) {
   CUDA_CHECK(cudaEventRecord(p.ev_cs, p.cs));
+  const bool clk = p.jn_on && p.jn_n < Prefill::kJoinMax;
+  if (clk) CUDA_CHECK(cudaEventRecord(p.ev_jn[p.jn_n][0], st));
   CUDA_CHECK(cudaStreamWaitEvent(st, p.ev_cs, 0));
+  if (clk) {
+    CUDA_CHECK(cudaEventRecord(p.ev_jn[p.jn_n][1], st));
+    p.jn_kind[p.jn_n++] = (uint8_t)kind;
+  }
 }
 
 // ---- attention ---------------------------------------------------------------------------------------
@@ -403,26 +437,26 @@ void Model::Impl::attention_p(int L, int a, int M, const std::vector<std::pair<i
   // this rank's rows of wq_a, wkv and the compressor (all of each), then every row by one all-gather
   const int ncomp = kv_src(L) && win_lo < 0 ? (ratio_of(L) > 1 ? 2 : 1) : 0;
   if (n > 0) {
-    const dsk::Fp8Seg seg[2] = {{g.wqa, g.sqa, p.qa + (size_t)r0 * kQLora, kQLora},
-                                {g.wkv, g.skv, p.kvx + (size_t)r0 * kHead, kHead}};
-    dsk::gemm_fp8_p(p.yq + (size_t)r0 * kDim, p.ys + (size_t)r0 * (kDim / 32), n, seg, 2, kDim, st);
+    const dsk::Fp8Seg seg[2] = {{g.wqa, g.sqa, p.rs->qa + (size_t)r0 * kQLora, kQLora},
+                                {g.wkv, g.skv, p.rs->kvx + (size_t)r0 * kHead, kHead}};
+    dsk::gemm_fp8_p(p.rs->yq + (size_t)r0 * kDim, p.rs->ys + (size_t)r0 * (kDim / 32), n, seg, 2, kDim, st);
     if (ncomp) {
-      dsk::gemm_bf16_p(p.y, n, g.ckv, kHead, kDim, p.ckvf + (size_t)r0 * kHead, st);
-      if (ncomp > 1) dsk::gemm_bf16_p(p.y, n, g.cgate, kHead, kDim, p.cscf + (size_t)r0 * kHead, st);
-      else ops::round_bf16(p.ckvf + (size_t)r0 * kHead, (size_t)n * kHead, st);  // ratio 1: model.py projects in bf16
+      dsk::gemm_bf16_p(p.rs->y, n, g.ckv, kHead, kDim, p.rs->ckvf + (size_t)r0 * kHead, st);
+      if (ncomp > 1) dsk::gemm_bf16_p(p.rs->y, n, g.cgate, kHead, kDim, p.rs->cscf + (size_t)r0 * kHead, st);
+      else ops::round_bf16(p.rs->ckvf + (size_t)r0 * kHead, (size_t)n * kHead, st);  // ratio 1: model.py projects in bf16
     }
   }
-  const comm::AgSeg ag[4] = {{p.qa + (size_t)r0 * kQLora, p.qa, (size_t)Q * kQLora * 2},
-                             {p.kvx + (size_t)r0 * kHead, p.kvx, (size_t)Q * kHead * 2},
-                             {p.ckvf + (size_t)r0 * kHead, p.ckvf, (size_t)Q * kHead * 4},
-                             {p.cscf + (size_t)r0 * kHead, p.cscf, (size_t)Q * kHead * 4}};
+  const comm::AgSeg ag[4] = {{p.rs->qa + (size_t)r0 * kQLora, p.rs->qa, (size_t)Q * kQLora * 2},
+                             {p.rs->kvx + (size_t)r0 * kHead, p.rs->kvx, (size_t)Q * kHead * 2},
+                             {p.rs->ckvf + (size_t)r0 * kHead, p.rs->ckvf, (size_t)Q * kHead * 4},
+                             {p.rs->cscf + (size_t)r0 * kHead, p.rs->cscf, (size_t)Q * kHead * 4}};
   comm::allgather_multi(ch, ag, 2 + ncomp, st);
   // the window: the 127 positions before the chunk (none in the replay), then the chunk's own keys
   const int base = win_lo >= 0 ? win_lo : std::max(0, a - 127);
   const attn::Rope tab = L < 2 ? plain() : yarn();
-  const attn::Window win{p.lin_kv, p.lin_sc, -1, base};
+  const attn::Window win{p.rs->lin_kv, p.rs->lin_sc, -1, base};
   ring_copy(L, base, a, base, true);
-  attn::kv_write(U(p.kvx), U(w.kv_norm), p.pos, tab, win, nullptr, M, st);
+  attn::kv_write(U(p.rs->kvx), U(w.kv_norm), p.rs->pos, tab, win, nullptr, M, st);
   if (ncomp) {
     const KvSrc& k = kvs[kv_slot(L)];
     const attn::CompressorWeights cw{ratio_of(L), nullptr, nullptr, U(w.c_norm), U(w.c_wk), U(w.c_knorm)};
@@ -430,16 +464,16 @@ void Model::Impl::attention_p(int L, int a, int M, const std::vector<std::pair<i
                           k.compressed(), k.keys(), nullptr, 0, st);
   }
   // queries: q_norm, act_quant, wq_b; the index layers' top-k
-  attn::q_norm(U(p.qa), U(w.q_norm), U(p.qr), M, st);
-  dsk::act_quant(p.qr, M, kQLora, p.qq, p.qs, st);
-  const dsk::Fp8Seg qseg{w.wqb, w.sqb, p.q, kQ};
-  dsk::gemm_fp8_p(p.qq, p.qs, M, &qseg, 1, kQLora, st);
+  attn::q_norm(U(p.rs->qa), U(w.q_norm), U(p.rs->qr), M, st);
+  dsk::act_quant(p.rs->qr, M, kQLora, p.rs->qq, p.rs->qs, st);
+  const dsk::Fp8Seg qseg{w.wqb, w.sqb, p.rs->q, kQ};
+  dsk::gemm_fp8_p(p.rs->qq, p.rs->qs, M, &qseg, 1, kQLora, st);
   if (idx_src(L)) index_p(L, a, M);
   // attention over the window and the selected compressed entries
   const int kmax = L < 2 ? 0 : kIdxTopk;
-  const int* tk = L < 2 ? nullptr : p.topk[idx_slot(index_source(L))];
+  const int* tk = L < 2 ? nullptr : p.rs->topk[idx_slot(index_source(L))];
   const attn::Compressed ckv = L < 2 ? attn::Compressed{nullptr, nullptr, 0} : kvs[kv_slot(kv_source(L))].compressed();
-  dsk::sparse_attn_p(U(p.q), p.pos, M, tab, win, ckv, tk, kmax, w.sink, U(p.o), st, std::max(win_lo, 0));
+  dsk::sparse_attn_p(U(p.rs->q), p.rs->pos, M, tab, win, ckv, tk, kmax, w.sink, U(p.rs->o), st, std::max(win_lo, 0));
   // the window's last 256 positions back into the ring; snapshots of it inside the chunk
   ring_copy(L, std::max(base, a + M - attn::kRing), a + M, base, false);
   for (const auto& sn : snaps) {
@@ -452,10 +486,10 @@ void Model::Impl::attention_p(int L, int a, int M, const std::vector<std::pair<i
   // the comm stream while this rank's own slice computes. The bf16 partials, added in rank order, are
   // the sums a reduce-scatter of every row's partials gives, for a fifth of its traffic. Then the
   // boundary on this rank's rows: mid and the FFN's input
-  dsk::gemm_woa_p(p.o, M, w.woa, w.soa, kOPart, kWoaK, kOGroupRows, nullptr, p.oq, p.os, st);
+  dsk::gemm_woa_p(p.rs->o, M, w.woa, w.soa, kOPart, kWoaK, kOGroupRows, nullptr, p.rs->oq, p.rs->os, st);
   cs_after(p, st, 0);
-  const comm::A2aSeg oa[2] = {{p.oq, kOPart, p.oqa, kOPart, kOPart},
-                              {p.os, kOPart / 32, p.osa, kOPart / 32, kOPart / 32}};
+  const comm::A2aSeg oa[2] = {{p.rs->oq, kOPart, p.rs->oqa, kOPart, kOPart},
+                              {p.rs->os, kOPart / 32, p.rs->osa, kOPart / 32, kOPart / 32}};
   comm::alltoall_rows(ch, oa, 2, Q, p.cs, kRsBlocks);
   auto wob = [&](int k, const uint8_t* xq, const uint8_t* xs) {
     const dsk::Fp8Seg seg{g.wob + (size_t)k * kDim * kOPart, g.sob + (size_t)k * (kDim / 32) * (kOPart / 32),
@@ -482,20 +516,20 @@ void Model::Impl::ffn_p(int L, int M) {
   const LayerW& w = lw[L];
   const int Q = p.rq, r0 = p.r0, n = p.n;
   if (n > 0) {
-    dsk::gemm_bf16_p(p.y, n, w.gate, kExperts, kDim, p.gl, st);
-    dsk::router_topk(p.gl, w.gate_bias, n, kExperts, p.ridx + (size_t)r0 * kTopK, p.rwts + (size_t)r0 * kTopK,
+    dsk::gemm_bf16_p(p.rs->y, n, w.gate, kExperts, kDim, p.rs->gl, st);
+    dsk::router_topk(p.rs->gl, w.gate_bias, n, kExperts, p.rs->ridx + (size_t)r0 * kTopK, p.rs->rwts + (size_t)r0 * kTopK,
                      kRouteScale, st);
     if (!img_span.empty() && w.gate_bias_vl)  // vision: image-span rows route with the VL bias (model.py Gate)
       img_runs(p.a_cur + r0, n, [&](size_t, int i0, int i1) {
-        dsk::router_topk(p.gl + (size_t)i0 * kExperts, w.gate_bias_vl, i1 - i0, kExperts,
-                         p.ridx + (size_t)(r0 + i0) * kTopK, p.rwts + (size_t)(r0 + i0) * kTopK, kRouteScale, st);
+        dsk::router_topk(p.rs->gl + (size_t)i0 * kExperts, w.gate_bias_vl, i1 - i0, kExperts,
+                         p.rs->ridx + (size_t)(r0 + i0) * kTopK, p.rs->rwts + (size_t)(r0 + i0) * kTopK, kRouteScale, st);
       });
   }
   // every row's act_quant and routes for the MoE
-  const comm::AgSeg ag[4] = {{p.yq + (size_t)r0 * kDim, p.yq, (size_t)Q * kDim},
-                             {p.ys + (size_t)r0 * (kDim / 32), p.ys, (size_t)Q * (kDim / 32)},
-                             {p.ridx + (size_t)r0 * kTopK, p.ridx, (size_t)Q * kTopK * 4},
-                             {p.rwts + (size_t)r0 * kTopK, p.rwts, (size_t)Q * kTopK * 4}};
+  const comm::AgSeg ag[4] = {{p.rs->yq + (size_t)r0 * kDim, p.rs->yq, (size_t)Q * kDim},
+                             {p.rs->ys + (size_t)r0 * (kDim / 32), p.rs->ys, (size_t)Q * (kDim / 32)},
+                             {p.rs->ridx + (size_t)r0 * kTopK, p.rs->ridx, (size_t)Q * kTopK * 4},
+                             {p.rs->rwts + (size_t)r0 * kTopK, p.rs->rwts, (size_t)Q * kTopK * 4}};
   comm::allgather_multi(ch, ag, 4, st);
 #ifdef DSGB10_NVTX
   if (route_dump_dir() && rank == 0) dump_routes(p, L, M, st);
@@ -506,19 +540,19 @@ void Model::Impl::ffn_p(int L, int M) {
   // (moe_prefill_fuses), each group's fp32 outputs are reduce-scattered instead
   dsk::MoePCfg mc;
   mc.phases = 1 | 2 | 4;
-  dsk::moe_prefill(p.yq, p.ys, M, p.ridx, p.rwts, kExperts, w.moe, p.moe_ws, p.ymoe, st, mc);
+  dsk::moe_prefill(p.rs->yq, p.rs->ys, M, p.rs->ridx, p.rs->rwts, kExperts, w.moe, p.rs->moe_ws, p.ymoe, st, mc);
   const bool fuses = dsk::moe_prefill_fuses(M);
   for (int c = 0; c < kColGroups; ++c) {
     mc.phases = fuses ? 8 | 16 : 8, mc.col0 = c * kGroupCols, mc.cols = kGroupCols;
-    dsk::moe_prefill(p.yq, p.ys, M, p.ridx, p.rwts, kExperts, w.moe, p.moe_ws, p.ymoe, st, mc);
+    dsk::moe_prefill(p.rs->yq, p.rs->ys, M, p.rs->ridx, p.rs->rwts, kExperts, w.moe, p.rs->moe_ws, p.ymoe, st, mc);
     cs_after(p, st, c);
     if (fuses)
       comm::reduce_scatter_rows_f32(ch, p.ymoe + mc.col0, kDim, p.ysum + mc.col0, kDim, Q, kGroupCols, p.cs,
                                     kRsBlocks);
     else
-      dsk::moe_combine_rs(ch, p.moe_ws, M, kExperts, Q, mc.col0, kGroupCols, p.sub, kDim, p.cs, kCombRsBlocks);
+      dsk::moe_combine_rs(ch, p.rs->moe_ws, M, kExperts, Q, mc.col0, kGroupCols, p.rs->sub, kDim, p.cs, kCombRsBlocks);
   }
-  rs_join(p, st);
+  rs_join(p, st, 1);
   // the abliteration's shared-expert share: every rank's dot products of every row (each rank holds its 576 of the
   // intermediate units), gathered on every rank (a collective: a rank without rows of its own takes part)
   const bool ab_sh = pf_ablit != 0.f && ab.s[L][1] != 0.f;
@@ -534,8 +568,8 @@ void Model::Impl::ffn_p(int L, int M) {
   // the boundary: x and the next layer's attention input, unless Engram changes x first; after the last
   // layer only the head's collapse
   const int nL = L + 1 < kLayers && !(engram_layer(L + 1) && store) ? L + 1 : -1;
-  boundary_p(n, p.sub, p.mid, p.f_post, p.f_comb, p.pm, L + 1 < kLayers ? p.x : nullptr, nL, 0, p.a_pre, p.a_post,
-             p.a_comb);
+  boundary_p(n, p.rs->sub, p.rs->mid, p.rs->f_post, p.rs->f_comb, p.rs->pm, L + 1 < kLayers ? p.rs->x : nullptr, nL, 0, p.rs->a_pre, p.rs->a_post,
+             p.rs->a_comb);
 }
 
 // ---- CED -------------------------------------------------------------------------------------------
@@ -545,13 +579,13 @@ static void ced_copy(Prefill& p, uint8_t* rec, int i, int cnt, bool to_rec, cuda
   const struct {
     uint8_t* buf;
     size_t off, row;
-  } f[7] = {{reinterpret_cast<uint8_t*>(p.x + (size_t)i * kHcDim), kCedX, (size_t)kHcDim * 2},
-            {reinterpret_cast<uint8_t*>(p.y + (size_t)i * kDim), kCedY, (size_t)kDim * 2},
-            {p.yq + (size_t)(p.r0 + i) * kDim, kCedYq, (size_t)kDim},
-            {p.ys + (size_t)(p.r0 + i) * (kDim / 32), kCedYs, (size_t)kDim / 32},
-            {reinterpret_cast<uint8_t*>(p.a_pre + (size_t)i * kHc), kCedPre, (size_t)kHc * 4},
-            {reinterpret_cast<uint8_t*>(p.a_post + (size_t)i * kHc), kCedPost, (size_t)kHc * 4},
-            {reinterpret_cast<uint8_t*>(p.a_comb + (size_t)i * kHc * kHc), kCedComb, (size_t)kHc * kHc * 4}};
+  } f[7] = {{reinterpret_cast<uint8_t*>(p.rs->x + (size_t)i * kHcDim), kCedX, (size_t)kHcDim * 2},
+            {reinterpret_cast<uint8_t*>(p.rs->y + (size_t)i * kDim), kCedY, (size_t)kDim * 2},
+            {p.rs->yq + (size_t)(p.r0 + i) * kDim, kCedYq, (size_t)kDim},
+            {p.rs->ys + (size_t)(p.r0 + i) * (kDim / 32), kCedYs, (size_t)kDim / 32},
+            {reinterpret_cast<uint8_t*>(p.rs->a_pre + (size_t)i * kHc), kCedPre, (size_t)kHc * 4},
+            {reinterpret_cast<uint8_t*>(p.rs->a_post + (size_t)i * kHc), kCedPost, (size_t)kHc * 4},
+            {reinterpret_cast<uint8_t*>(p.rs->a_comb + (size_t)i * kHc * kHc), kCedComb, (size_t)kHc * kHc * 4}};
   for (const auto& e : f) {
     if (to_rec)
       CUDA_CHECK(cudaMemcpy2DAsync(rec + e.off, kCedRow, e.buf, e.row, e.row, cnt, cudaMemcpyDeviceToDevice, st));
@@ -568,10 +602,10 @@ void Model::Impl::ced_project(int M) {
   constexpr int L = 20;
   const LayerW& w = lw[L];
   if (p.n > 0) {
-    dsk::gemm_bf16_p(p.y, p.n, p.pl[L].ckv, kHead, kDim, p.ckvf + (size_t)p.r0 * kHead, st);
-    ops::round_bf16(p.ckvf + (size_t)p.r0 * kHead, (size_t)p.n * kHead, st);  // ratio 1: model.py projects in bf16
+    dsk::gemm_bf16_p(p.rs->y, p.n, p.pl[L].ckv, kHead, kDim, p.rs->ckvf + (size_t)p.r0 * kHead, st);
+    ops::round_bf16(p.rs->ckvf + (size_t)p.r0 * kHead, (size_t)p.n * kHead, st);  // ratio 1: model.py projects in bf16
   }
-  const comm::AgSeg ag{p.ckvf + (size_t)p.r0 * kHead, p.ckvf, (size_t)p.rq * kHead * 4};
+  const comm::AgSeg ag{p.rs->ckvf + (size_t)p.r0 * kHead, p.rs->ckvf, (size_t)p.rq * kHead * 4};
   comm::allgather_multi(ch, &ag, 1, st);
   const KvSrc& k = kvs[kv_slot(L)];
   const attn::CompressorWeights cw{ratio_of(L), nullptr, nullptr, U(w.c_norm), U(w.c_wk), U(w.c_knorm)};
@@ -614,7 +648,7 @@ void Model::Impl::ced_replay(int P, const std::vector<std::pair<int, const std::
     ced_copy(p, p.ced_gath + ((size_t)src * kReplay + slot) * kCedRow, i, cnt, false, st);
     i += cnt;
   }
-  ops::iota(p.pos, s, M, st);
+  ops::iota(p.rs->pos, s, M, st);
   for (int L = 20; L < kLayers; ++L) {
     NVTX_RANGE("rep L%02d", L);
     // here x holds this rank's replay rows' layer-L input (DSpark's hidden-state hook, a = s, M = 128)
@@ -645,8 +679,9 @@ uint64_t Model::Impl::prefill(int a, int M, const Sampling* sp, int handle, cons
   pf_ablit = ab.on ? ablit : 0.f;  // every rank gets the same command, so every rank takes the same branches
   if (pf_ablit != 0.f) ablit::reserve(ab, M);
   prefill_alloc();
+  prefill_use(rows_set);
   Prefill& p = *pf;
-  if (M < 1 || M > p.cap || a < 0 || a + M > slot_ctx_[cur_slot]) die("model: bad prefill [%d, +%d) in slot %d", a, M, cur_slot);
+  if (M < 1 || M > p.rs->cap || a < 0 || a + M > slot_ctx_[cur_slot]) die("model: bad prefill [%d, +%d) in slot %d", a, M, cur_slot);
   ensure_mapped(cur_slot, a + M - 1);  // the chunk's entries and the Reindex layers' over-read, before any work is queued
   if (hist.end() < a + M) die("model: prefill [%d, %d) with %d tokens", a, a + M, hist.end());
   if (a < hist.base) die("model: prefill [%d, %d), history held from %d", a, a + M, hist.base);
@@ -684,12 +719,22 @@ uint64_t Model::Impl::prefill(int a, int M, const Sampling* sp, int handle, cons
   p.a_cur = a;
   if (!img_span.empty())  // vision: the spans' ids are -1 in the history (Engram); embed a real id, then the rows
     for (int i = 0; i < M; ++i)
-      if (p.tok_h[i] < 0) p.tok_h[i] = 129264;
-  CUDA_CHECK(cudaMemcpyAsync(p.tok, p.tok_h, (size_t)M * 4, cudaMemcpyHostToDevice, st));
-  ops::iota(p.pos, a, M, st);
-  if (p.n > 0) ops::embed(embed, p.tok + p.r0, p.n, p.x, p.pm, st);
+      if (p.rs->tok_h[i] < 0) p.rs->tok_h[i] = 129264;
+  CUDA_CHECK(cudaMemcpyAsync(p.rs->tok, p.rs->tok_h, (size_t)M * 4, cudaMemcpyHostToDevice, st));
+  ops::iota(p.rs->pos, a, M, st);
+  {  // the embedding: every rank sends the rows its shard holds to the rank whose rows they are, and each rank takes its own
+    const int bad = embed_shard::first_bad_id(p.rs->tok_h, M);
+    if (bad >= 0) die("model: prefill [%d, +%d): token id %d at row %d is outside the vocabulary", a, M, p.rs->tok_h[bad], bad);
+    ops::embed_send(embed, rank, p.rs->tok, M, p.rs->part, st);
+    const comm::A2aSeg es{p.rs->part, (size_t)kDim * 2, p.rs->mid, (size_t)kDim * 2, (size_t)kDim * 2};
+    comm::alltoall_rows(ch, &es, 1, p.rq, st);
+    ops::embed_pick(p.rs->mid, p.rq, p.rs->tok + p.r0, p.n, p.rs->x, p.rs->pm, st);
+  }
   if (!img_span.empty() && p.n > 0)
     img_runs(a + p.r0, p.n, [&](size_t k, int i0, int i1) {
+      // an image encoded in the engine is encoded before the first chunk that reaches its span (serve.cpp): a span reached with its rows
+      // unwritten is a bug in that rule, and the engine stops
+      if (!vit_span_written(img_key, k)) die("model: the prefill at position %d reached image %zu of flight %d before its rows were written", a, k, img_key);
       const size_t row = img_row0[k] + (size_t)(a + p.r0 + i0 - img_span[k].first);
       imgrows::runs(row, row + (size_t)(i1 - i0), [&](size_t r, size_t cnt) {  // the rows sit 204 to a number
         ops::inject_rows(reinterpret_cast<const bf16*>(img_row(img_key, r)), (int)cnt, p.rs->x + (size_t)(i0 + (r - row)) * kHcDim, st);
@@ -708,14 +753,15 @@ uint64_t Model::Impl::prefill(int a, int M, const Sampling* sp, int handle, cons
       fresh = true;
     }
     if (fresh && p.n > 0)
-      boundary_p(p.n, nullptr, p.x, nullptr, nullptr, p.pm, nullptr, L, 0, p.a_pre, p.a_post, p.a_comb);
+      boundary_p(p.n, nullptr, p.rs->x, nullptr, nullptr, p.rs->pm, nullptr, L, 0, p.rs->a_pre, p.rs->a_post, p.rs->a_comb);
     if (spec) spec_prefill_hidden(L, a, M, snap_pos);  // DSpark: main_hidden of the rows its windows take
     if (!ced && L >= 37 && !feat_dir().empty()) feat_hidden(p, L, st);  // drafter2: feature dump
     attention_p(L, a, M, snaps);
     if ((opt.wave_probe >> L & 1) && a == opt.wave_probe_at) wave_probe(L, a, M);
     ffn_p(L, M);
   }
-  p.e_pos0[set] = -1;  // used
+  p.rs->e_pos0[set] = -1;  // used
+  p.jn_on = false;     // the replay's layers are not the join clock's
   CUDA_CHECK(cudaEventRecord(ev_pf[1], st));
   if (!ced && !feat_dir().empty()) feat_write(p, ch, a, M, rank, hist.data() + (a - hist.base), st);  // drafter2: feature dump
   if (ced) {
@@ -734,7 +780,7 @@ uint64_t Model::Impl::prefill(int a, int M, const Sampling* sp, int handle, cons
   if (sp) {  // the last row through the head and the sampling, as a step of one row
     NVTX_RANGE("head");
     // the last row's collapsed stream, from the rank that owns it
-    comm::allgather(ch, p.yraw + (size_t)std::max(p.n - 1, 0) * kDim, p.gath, (size_t)kDim * 2, st);
+    comm::allgather(ch, p.rs->yraw + (size_t)std::max(p.n - 1, 0) * kDim, p.gath, (size_t)kDim * 2, st);
     const bf16* last = reinterpret_cast<const bf16*>(p.gath) + (size_t)((Mh - 1) / p.rq) * kDim;
     n = n_steps;
     if (n >= (uint64_t)ops::kInSlots) wait_done(n - ops::kInSlots);
@@ -761,6 +807,7 @@ void Model::set_tokens(int pos0, int n, const int32_t* tokens) {
   if (pos0 < 0 || n < 0) die("model: set_tokens(%d, %d)", pos0, n);
   d_->hist_ep[d_->cur_unit] = ++d_->tok_epoch;  // lookups hashed from the unit's earlier tokens are stale
   h.assign(pos0, n, tokens);
+  if (d_->spec && d_->spec->copy) d_->spec->copy->set_tokens(d_->cur_unit, pos0, n, tokens, d_->st);  // copy drafting's mirror
 }
 
 size_t Model::prefill_init(comm::Ring& ring) {
@@ -770,11 +817,18 @@ size_t Model::prefill_init(comm::Ring& ring) {
   return free;
 }
 
-void Model::prefill_lookup(int a, int M) {
+int Model::prefill_rows_cap(int rows_set) const {
+  if (!d_->pf) return rows_set == 0 ? std::max(d_->opt.prefill_rows, detail::kReplay) : 0;
+  if (rows_set == 1) return d_->pf_big_ready() ? d_->pf->big.cap : 0;
+  return rows_set == 0 ? d_->pf->rows.cap : 0;
+}
+
+void Model::prefill_lookup(int a, int M, int rows_set) {
   d_->prefill_alloc();
+  d_->prefill_use(rows_set);
   Prefill& p = *d_->pf;
   // not the set of the chunk in flight; the other one's chunk has finished (prefill() drains first)
-  d_->prefill_engram(a, M, 1 - p.e_last);
+  d_->prefill_engram(a, M, 1 - p.rs->e_last);
 }
 
 uint64_t Model::prefill(int a, int M, const Sampling* sp, int handle, const std::vector<int>& snaps, bool ced,
