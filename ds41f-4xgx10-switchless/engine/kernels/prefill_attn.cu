@@ -61,7 +61,7 @@ struct PArgs {
   const uint16_t* q;
   const int* pos;
   int rows;
-  const float2* table;
+  attn::Rope table;
   attn::Window win;
   attn::Compressed ckv;
   const int* topk;
@@ -114,9 +114,13 @@ __device__ __forceinline__ void issue_q(const PArgs& a, uint8_t* sm, int r, int 
   const uint8_t* src = reinterpret_cast<const uint8_t*>(a.q + (size_t)r * kHeads * kHead);
   for (int i = threadIdx.x; i < kHeads * 64; i += kThreads)
     pa::cp16(sm + kOffQ + (i >> 6) * 1024 + qswz(i >> 6, i & 63) * 16, src + i * 16, true);
-  if (threadIdx.x < kRope / 4)
-    pa::cp16(sm + kOffTab + slot * kRope * 4 + threadIdx.x * 16,
-             reinterpret_cast<const uint8_t*>(a.table + (size_t)p * 32) + threadIdx.x * 16, true);
+  if (a.table.table) {
+    if (threadIdx.x < kRope / 4)
+      pa::cp16(sm + kOffTab + slot * kRope * 4 + threadIdx.x * 16,
+               reinterpret_cast<const uint8_t*>(a.table.table + (size_t)p * 32) + threadIdx.x * 16, true);
+  } else if (threadIdx.x < kRope / 2) {  // computed: the same 32 entries, stored directly (visible at the next sync)
+    reinterpret_cast<float2*>(sm + kOffTab + slot * kRope * 4)[threadIdx.x] = attn::rope_cs(a.table.p, p, threadIdx.x);
+  }
 }
 __device__ __forceinline__ void issue_tk(const PArgs& a, uint8_t* sm, int r) {
   const int* src = a.topk + (size_t)r * a.kmax;
@@ -437,7 +441,7 @@ __global__ void __launch_bounds__(kThreads, 1) attn_p_kernel(PArgs a) {
 
 }  // namespace
 
-void sparse_attn_p(const uint16_t* q_pre, const int* pos, int rows, const float2* table, attn::Window win,
+void sparse_attn_p(const uint16_t* q_pre, const int* pos, int rows, attn::Rope table, attn::Window win,
                    attn::Compressed ckv, const int* topk, int kmax, const float* sink, uint16_t* out, cudaStream_t s,
                    int win_lo) {
   static const int nsm = [] {

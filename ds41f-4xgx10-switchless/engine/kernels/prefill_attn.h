@@ -17,7 +17,7 @@ namespace dsk {
 // window-only layers 0-1). q_pre [rows][16][512] bf16 (RoPE at pos applied on load), sink [16], out
 // [rows][16][512] bf16 with the inverse RoPE applied. Online softmax over blocks of 64 keys with P rounded
 // to bf16 for PV and the sink in the denominator, as the reference; not bit-exact (summation order).
-void sparse_attn_p(const uint16_t* q_pre, const int* pos, int rows, const float2* table, attn::Window win,
+void sparse_attn_p(const uint16_t* q_pre, const int* pos, int rows, attn::Rope table, attn::Window win,
                    attn::Compressed ckv, const int* topk, int kmax, const float* sink, uint16_t* out, cudaStream_t s,
                    int win_lo = 0);
 
@@ -46,7 +46,7 @@ void compressor_project_p(const uint16_t* x, const attn::CompressorWeights& w, f
 // last 16 rows). Rows: consecutive positions, or pairs of them for ratio 2. KV entries bit-identical; wk
 // runs on tensor cores in another summation order (rare one-step differences in index-key elements).
 void compressor_emit_p(const float* kv, const float* score, const int* pos, int rows, const attn::CompressorWeights& w,
-                       attn::CompressorCarry carry, const float2* table, attn::Compressed ckv, attn::IndexKeys ik,
+                       attn::CompressorCarry carry, attn::Rope table, attn::Compressed ckv, attn::IndexKeys ik,
                        cudaStream_t s);
 
 // ---- mHC (prefill_mhc.cu) ---------------------------------------------------------------------------

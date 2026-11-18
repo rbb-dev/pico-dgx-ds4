@@ -43,7 +43,7 @@ __global__ void q_norm_kernel(const uint16_t* qa, const uint16_t* w, uint16_t* q
 // One row's window KV by one warp; lane l owns elements [16l, 16l+16): half an fp8 block, and lanes 28..31
 // the RoPE dims. nw: the lane's 16 kv_norm weights.
 __device__ __forceinline__ void kv_write_warp(const uint16_t* src_row, const float (&nw)[16], int p,
-                                              const float2* table, const Window& win, uint16_t* kv_out_row,
+                                              Rope table, const Window& win, uint16_t* kv_out_row,
                                               int lane) {
   float v[16];
   const uint4* src = reinterpret_cast<const uint4*>(src_row + lane * 16);
@@ -66,7 +66,7 @@ __device__ __forceinline__ void kv_write_warp(const uint16_t* src_row, const flo
   if (lane >= 28) {
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
-      float2 cs = table[(size_t)p * 32 + (lane - 28) * 8 + j];
+      float2 cs = rope_at(table, p, (lane - 28) * 8 + j);
       rope_pair(v[2 * j], v[2 * j + 1], cs.x, cs.y, false);
       v[2 * j] = bfround(v[2 * j]);
       v[2 * j + 1] = bfround(v[2 * j + 1]);
@@ -99,7 +99,7 @@ __device__ __forceinline__ void kv_write_warp(const uint16_t* src_row, const flo
 }
 
 // one warp per row
-__global__ void kv_write_kernel(const uint16_t* kv_pre, const uint16_t* norm_w, const int* pos, const float2* table,
+__global__ void kv_write_kernel(const uint16_t* kv_pre, const uint16_t* norm_w, const int* pos, Rope table,
                                 Window win, uint16_t* kv_out, int rows, const int* nrows) {
   int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x & 31;
   if (row >= rows || (nrows && row >= *nrows)) return;
@@ -112,7 +112,7 @@ __global__ void kv_write_kernel(const uint16_t* kv_pre, const uint16_t* norm_w, 
 
 // DSpark's window writes: set blockIdx.x, warp r: row r < *count at position pos[r] (pos null: *pos0 + r;
 // negative: none), into its slot's window (norm weights load before the PDL wait)
-__global__ void kv_write_sets_kernel(KvSets a, const int* count, const int* pos0, const int* pos, const float2* table) {
+__global__ void kv_write_sets_kernel(KvSets a, const int* count, const int* pos0, const int* pos, Rope table) {
   pdl_trigger();
   const KvSet& k = a.s[blockIdx.x];
   int r = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -213,14 +213,14 @@ void q_norm(const uint16_t* qa, const uint16_t* w, uint16_t* qr, int rows, cudaS
   CUDA_CHECK(cudaGetLastError());
 }
 
-void kv_write(const uint16_t* kv_pre, const uint16_t* norm_w, const int* pos, const float2* table, Window win,
+void kv_write(const uint16_t* kv_pre, const uint16_t* norm_w, const int* pos, Rope table, Window win,
               uint16_t* kv_out, int rows, cudaStream_t s, const int* nrows) {
   check_slots(win, "kv_write");
   kv_write_kernel<<<(rows + 3) / 4, 128, 0, s>>>(kv_pre, norm_w, pos, table, win, kv_out, rows, nrows);
   CUDA_CHECK(cudaGetLastError());
 }
 
-void kv_write_sets(const KvSets& sets, int max_rows, const int* count, const int* pos0, const float2* table, bool pdl,
+void kv_write_sets(const KvSets& sets, int max_rows, const int* count, const int* pos0, Rope table, bool pdl,
                    cudaStream_t s, const int* pos) {
   if (sets.n < 1 || sets.n > kMaxKvSets || max_rows < 1 || max_rows > 32 || !(pos0 || pos))
     die("kv_write_sets: %d x %d", sets.n, max_rows);

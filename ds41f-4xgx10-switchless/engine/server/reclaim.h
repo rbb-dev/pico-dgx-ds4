@@ -1,7 +1,7 @@
-// Which memory of the pool gives way: the decisions of the server's reclaim, its live set and a finished request's
-// reservation, with no engine state (tested by tests/reclaim_test.cpp and tests/resv_test.cpp). The rule: everything in
-// the pool that no running request uses is cache and gives way, to the disk tier or dropped; a request never waits on,
-// fails on or is degraded by cache; memory is given back only when a consumer asks.
+// Which memory of the pool gives way: the decisions of the server's reclaim, window plan, window close and live set, with
+// no engine state (tested by tests/reclaim_test.cpp and tests/resv_test.cpp). The rule (docs/engine.md, "Memory given back
+// on demand"): everything in the pool that no running request uses is cache and gives way, to the disk tier or dropped; a
+// request never waits on, fails on or is degraded by cache; memory is given back only when a consumer asks.
 //
 // A request is running when it is in flight and not paused between turns. A paused request (time-slicing) holds nothing a
 // step is using: its line can be detached, and it resumes through go() when its line did not survive.
@@ -30,7 +30,7 @@ inline bool counts_as_live(bool in_flight, bool paused) {
 
 // Whether finish() zeroes a kept session's reservation on its line. The reservation is a reservation for a running request;
 // a finished one has none, and a leftover one (up to --grow-ahead positions) is counted as reserved by every sum that
-// refuses a consumer (Model::slot_uncommitted, take_extra, the dashboard's reserved).
+// refuses a consumer (Model::slot_uncommitted, take_extra, the window's unheld sum, the dashboard's reserved).
 inline bool unreserve_at_finish() {
 #ifdef PICO_OLD_RULES
   return false;  // without the rule: finish() issues kStSave only, and the reservation stays until the line is released
@@ -39,7 +39,8 @@ inline bool unreserve_at_finish() {
 #endif
 }
 
-// The numbers the lines are reserved but do not hold, summed over the slots. Zero whenever no request is in flight.
+// The numbers the lines are reserved but do not hold, summed over the slots. Zero whenever no request is in flight (the
+// server's tripwire reads it).
 struct SlotNums {
   int64_t committed = 0, mapped = 0;
 };
@@ -86,6 +87,78 @@ int detach_until(std::vector<Line> lines, int skip_slot, Short short_by, Detach 
     ++n;
   }
   return n;
+}
+
+// A session that holds a number at or above a window's top (Model::window_plan); slot < 0: it is on no line, so the model
+// evicts it.
+struct Holder {
+  uint64_t id = 0;
+  int slot = -1;
+};
+struct WindowActions {
+  std::vector<int> detach;        // slots of idle holders: each detached before the window command
+  std::vector<uint64_t> running;  // holders a running request uses: the window waits for them, with no command
+};
+// What a window plan asks of the server: the holders on lines that no running request uses are detached, the others are
+// named. `idle(id)` is the server's test, with no own or base exemption: the request's own conversation and its base give
+// way to the window like any other (the model evicts them last).
+template <class Idle>
+WindowActions window_actions(const std::vector<Holder>& holders, Idle idle) {
+  WindowActions a;
+  for (const Holder& h : holders) {
+    if (h.slot < 0) continue;
+#ifdef PICO_OLD_RULES
+    (void)idle;
+    a.running.push_back(h.id);  // without the rule: a holder on a line is busy; the request's own and its base are pinned
+#else
+    if (idle(h.id)) a.detach.push_back(h.slot);
+    else a.running.push_back(h.id);
+#endif
+  }
+  return a;
+}
+
+// The windows (factors 32 and 64) as the close sees them.
+struct Win {
+  int factor = 0;
+  bool open = false;
+  bool in_use = false;  // a request of this factor exists anywhere: queued, waiting, held, in a run, in turns, or being read
+  double used_at = 0;
+};
+// The window to close when a consumer is short: the least recently used open one no request needs; 0: none.
+inline int window_to_close(const std::vector<Win>& w) {
+  int best = 0;
+  double at = 0;
+  for (const Win& x : w) {
+    if (!x.open || x.in_use) continue;
+    if (!best || x.used_at < at) best = x.factor, at = x.used_at;
+  }
+  return best;
+}
+
+// --window-idle-s: a window unused this long is freed by time when an operator turned it on. Never by default.
+#ifdef PICO_OLD_RULES
+constexpr int kWindowIdleS = 300;  // without the rule: freed after 300 s whatever a request wants next
+#else
+constexpr int kWindowIdleS = 0;
+#endif
+inline bool timer_may_close(int idle_s, double now, double used_at, bool in_use) {
+#ifdef PICO_OLD_RULES
+  (void)in_use;
+  return idle_s > 0 && now - used_at >= idle_s;
+#else
+  return idle_s > 0 && !in_use && now - used_at >= idle_s;
+#endif
+}
+
+// Window bookmarks a decode run takes: one at each multiple of `every` in (pos0, pos0 + max_new + slack], an upper bound
+// (the run may stop early, and keep_snap thins some). slack covers the positions a queued or drafted step writes past
+// max_new.
+inline int run_snaps(int pos0, int max_new, int every, int slack) {
+  if (every <= 0 || max_new <= 0) return 0;
+  const int64_t end = (int64_t)pos0 + max_new + slack;
+  const int64_t n = end / every - (int64_t)pos0 / every;
+  return n > 0 ? (int)n : 0;
 }
 
 }  // namespace reclaim

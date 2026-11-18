@@ -212,6 +212,38 @@ void nothing_is_created_or_destroyed_after_the_start() {
   check(r.pool->free_chunks() == 12 && r.fb->mapped_chunks() == 0, "and every chunk is free at the end");
 }
 
+// A window's memory leaves the pool and comes back (Model::window_open / window_close): shrink() unmaps a slot's tail
+// of every array, trim() gives free chunks to the driver, add_chunks() makes them again and ensure() maps them. What
+// stays mapped keeps its addresses and stays touchable; what left is not touchable; the driver's live handles follow.
+void a_window_leaves_the_pool_and_comes_back() {
+  Rig r(12);
+  two_slots(r);
+  const size_t all[2] = {4 * kChunk, 4 * kChunk};
+  check(r.pool->ensure(0, all) && r.pool->free_chunks() == 4 && r.fb->mapped_chunks() == 8, "eight chunks mapped, four free");
+  const uint64_t a0 = r.pool->base(0), a1 = r.pool->base(1);
+  const size_t part[2] = {2 * kChunk, 3 * kChunk};
+  r.pool->shrink(0, part);
+  check(r.pool->mapped(0, 0) == 2 && r.pool->mapped(0, 1) == 3 && r.pool->mapped(0) == 5, "shrink: the tail of each array unmapped");
+  check(r.fb->touch(a0, 2 * kChunk) && r.fb->touch(a1, 3 * kChunk), "what stays mapped is touchable at the same addresses");
+  check(!r.fb->touch(a0 + 2 * kChunk, 1) && !r.fb->touch(a1 + 3 * kChunk, 1), "RED: what left is not touchable");
+  check(r.fb->mapped_chunks() == 5 && r.pool->free_chunks() == 7, "its chunks are free again, none destroyed");
+  check(r.fb->live_handles() == 12, "shrink gives nothing to the driver");
+  r.pool->shrink(0, all);
+  check(r.pool->mapped(0) == 5, "shrink to more than is mapped changes nothing");
+  check(r.pool->trim(100) == 7 && r.pool->total() == 5 && r.pool->free_chunks() == 0, "trim: only free chunks go, all seven");
+  check(r.fb->live_handles() == 5 && r.pool->ok(), "the driver holds five handles; the pool is whole at five");
+  check(r.pool->used_chunks() == 5, "used_chunks counts the live ones");
+  check(!r.pool->ensure(0, all), "RED: growing past the chunks left fails cleanly");
+  check(r.pool->mapped(0) == 5, "and changes nothing");
+  check(r.pool->add_chunks(7) == 7 && r.pool->total() == 12 && r.fb->live_handles() == 12, "add_chunks: seven again");
+  check(r.pool->ensure(0, all) && r.pool->mapped(0) == 8, "the slot maps its tail again");
+  check(r.fb->touch(a0, 4 * kChunk) && r.fb->touch(a1, 4 * kChunk), "all touchable at the same addresses");
+  check(r.pool->free_chunks() == 4, "four free");
+  check(r.pool->trim(0) == 0, "trim of none");
+  r.pool->release(0);
+  check(r.pool->trim(12) == 12 && r.pool->total() == 0 && r.fb->live_handles() == 0, "everything given back");
+}
+
 }  // namespace
 
 int main() {
@@ -226,6 +258,7 @@ int main() {
   regions_do_not_overlap();
   many_slots_share_one_pool();
   nothing_is_created_or_destroyed_after_the_start();
+  a_window_leaves_the_pool_and_comes_back();
   std::printf("%s: %d checks, %d failed\n", g_fail ? "FAIL" : "PASS", g_checks, g_fail);
   return g_fail ? 1 : 0;
 }

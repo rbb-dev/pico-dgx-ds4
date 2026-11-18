@@ -30,6 +30,44 @@ inline constexpr float kHcEps = 1e-6f;
 // compressed=true: theta 1.6e5 with YaRN (factor 16, original 65536, beta 32/1), every ratio>0 layer.
 void rope_table_build(float2* table, int max_pos, bool compressed, cudaStream_t s);
 
+// The same recipe at a YaRN factor (16, 32 or 64: windows 1M, 2M, 4M over the original 65536); the factor enters only
+// as 1/factor, exact for a power of two. Factor 16 equals the call above bit for bit. compressed=false ignores the
+// factor. A table costs max_pos * 256 B.
+void rope_table_build(float2* table, int max_pos, bool compressed, int factor, cudaStream_t s);
+
+// Rows of the table a factor-16 session reads: its 1M window plus a margin (kRopeTableCap), whatever max_ctx is;
+// `extra` more positions (the drafter passes 8). Other factors compute their rotation and own no rows.
+inline constexpr int kRopeTableCap = (1 << 20) + 4096;
+inline int rope_table_rows(int max_ctx, int extra = 0) { return max_ctx + extra < kRopeTableCap ? max_ctx + extra : kRopeTableCap; }
+
+// What the recipe needs per table: computed on the host once, passed by value to kernels. A kernel that
+// includes attn/rope_calc.cuh derives (cos, sin) of any position from it with the table builder's own code,
+// so it needs no table: the values equal the table's entry bit for bit.
+struct RopeParams {
+  float base;        // theta: 1e4, or 1.6e5 with YaRN
+  int yarn;          // 0: plain rotary
+  float low;         // YaRN ramp start (pair index)
+  float inv_span;    // fp32(1 / (high - low))
+  float inv_factor;  // 1 / YaRN factor
+};
+RopeParams rope_params(bool compressed, int factor);
+
+// How a kernel gets its rotation: from a table (table non-null: entry [position][pair], the table builder's
+// output) or computed from (position, pair) by rope_calc.cuh with `p` (table null). A launch has one Rope, so
+// all its rows share the YaRN factor; the two forms give the same bits (rope_calc.cuh).
+struct Rope {
+  const float2* table = nullptr;
+  RopeParams p{};
+  Rope() = default;
+  Rope(const float2* t) : table(t) {}
+  Rope(const RopeParams& q) : p(q) {}
+};
+// The computed YaRN rotation (theta 1.6e5) at factor 16, 32 or 64: no table memory at any window.
+Rope rope_yarn_calc(int factor);
+// The computed plain rotation (theta 1e4, no YaRN: the factor does not enter): no table memory at any window; the
+// same bits as the table rope_table_build(.., compressed = false) writes.
+Rope rope_plain_calc();
+
 // ---- state --------------------------------------------------------------------------------------
 // Session slots (batching, docs/batching.md): a state struct can stand for an array of sessions' states,
 // slot s at its pointers + s * stride (bytes, multiples of 16; CompressorCarry: floats, multiples of 4;
@@ -71,12 +109,12 @@ struct IndexKeys {       // the indexer keys of the same entries, through the sa
 void q_norm(const uint16_t* qa, const uint16_t* w, uint16_t* qr, int rows, cudaStream_t s);
 // RoPE on the last 64 dims of each of `heads` heads of width `dim`, in place (bf16), at pos[row].
 // The attention kernels fuse this; it is exposed for tests and for the DSpark path.
-void rope_rows(uint16_t* x, int rows, int heads, int dim, const int* pos, const float2* table,
+void rope_rows(uint16_t* x, int rows, int heads, int dim, const int* pos, Rope table,
                bool inverse, cudaStream_t s);
 // The window KV of `rows` new tokens: kv_norm(wkv output) -> RoPE at pos -> fp8 per 32 with a
 // power-of-two scale -> ring slot pos & (kRing-1). Optionally also returns the dequantised bf16.
 // nrows (device, optional): rows r >= *nrows write nothing (wide64: a bucket's pad rows).
-void kv_write(const uint16_t* kv_pre, const uint16_t* norm_w, const int* pos, const float2* table,
+void kv_write(const uint16_t* kv_pre, const uint16_t* norm_w, const int* pos, Rope table,
               Window win, uint16_t* kv_out_or_null, int rows, cudaStream_t s, const int* nrows = nullptr);
 
 // y[r][n] = x[r] . W[n] for bf16 x [rows][K] and bf16 W [N][K] (rows n < N0 from W0 into y0 [rows][N0],
@@ -110,7 +148,7 @@ void compressor_project(const uint16_t* x, const CompressorWeights& w, float* kv
 // nrows (device, optional): rows r >= *nrows - row_base emit and carry nothing (wide64: a bucket's pad rows; row_base:
 // this call's first row in the step).
 void compressor_emit(const float* kv, const float* score, const int* pos, int rows, const CompressorWeights& w,
-                     CompressorCarry carry, const float2* table, Compressed ckv, IndexKeys ik,
+                     CompressorCarry carry, Rope table, Compressed ckv, IndexKeys ik,
                      uint16_t* debug_latent, int debug_base, cudaStream_t s, const int* nrows = nullptr,
                      int row_base = 0);
 
@@ -132,7 +170,7 @@ struct IndexQ {              // one call's prepared queries
 // RoPE (dims 64..127 at pos) -> fp4 with e8m0 per 32 of the indexer queries iq_pre [rows][32][128]
 // (bf16, from the indexer's wq_b), and the head weights from wproj = gemv_bf16(x, weights_proj)
 // [rows][32]. debug_q (optional) gets the dequantised queries.
-void index_q_prep(const uint16_t* iq_pre, const float* wproj, const int* pos, const float2* table, IndexQ q,
+void index_q_prep(const uint16_t* iq_pre, const float* wproj, const int* pos, Rope table, IndexQ q,
                   uint16_t* debug_q, int rows, cudaStream_t s);
 
 struct IndexScan {           // which compressed positions a call scores ("scan index" i -> position)
@@ -181,7 +219,7 @@ struct WinBounds {
 // the inverse RoPE applied, ready for wo_a. `splits` CTAs share a row's 64-key blocks (decode: 2 window
 // blocks + kmax/64), merged by a second kernel; prefill uses 1. pdl: both are PDL launches (see the decode
 // path). (Merging in the main launch, by each row's last CTA, measured slower: one CTA reads every split.)
-void sparse_attn(const uint16_t* q_pre, const int* pos, WinBounds wb, int rows, const float2* table, Window win,
+void sparse_attn(const uint16_t* q_pre, const int* pos, WinBounds wb, int rows, Rope table, Window win,
                  Compressed ckv, const int* topk, int kmax, const float* sink, uint16_t* out, int splits,
                  AttnScratch scratch, cudaStream_t s, bool pdl = false);
 
@@ -250,7 +288,7 @@ void compressor_project_rows(const uint16_t* x, const CompressorWeights& w, int 
 // decode_prep dies past kDecodeGroup rows; with one, the step's builder (the runner's StepIn) must check it.
 struct DecodePrep {
   const int* pos = nullptr;
-  const float2* table = nullptr;
+  Rope table;
   const uint16_t* qa = nullptr;  // [rows][1280]
   const uint16_t* q_norm = nullptr;
   uint8_t* qq = nullptr;  // [rows][1280] e4m3
@@ -285,7 +323,7 @@ struct KvSets {
   KvSet s[kMaxKvSets];
   int n = 0;
 };
-void kv_write_sets(const KvSets& sets, int max_rows, const int* count, const int* pos0, const float2* table, bool pdl,
+void kv_write_sets(const KvSets& sets, int max_rows, const int* count, const int* pos0, Rope table, bool pdl,
                    cudaStream_t s, const int* pos = nullptr);
 // One selection's output: the top kmax (positions, or pool blocks) and their keys, rows `stride` apart.
 struct IndexSel {
@@ -297,7 +335,7 @@ struct IndexSel {
 // index_q_prep, index_score and index_topk in one launch (the last CTA of each row selects): top from the
 // scan's keys; pool (pos non-null; dense scans with bkeys) from the block maxima. counters: [rows] ints,
 // zero before and left zero.
-void index_fused(const uint16_t* iq_pre, const float* wproj, const int* pos, const float2* table, int rows, int ratio,
+void index_fused(const uint16_t* iq_pre, const float* wproj, const int* pos, Rope table, int rows, int ratio,
                  IndexKeys ik, const IndexScan& scan, int max_scan, uint16_t* keys, int keys_stride, uint16_t* bkeys,
                  int bkeys_stride, IndexSel top, IndexSel pool, int* counters, bool pdl, cudaStream_t s);
 // index_fused of a whole dense scan (IndexScan{}) for all rows at once, sized for long contexts: the same
@@ -308,12 +346,12 @@ void index_fused(const uint16_t* iq_pre, const float* wproj, const int* pos, con
 // zero before and left zero. cand: the most candidates a selection gathers in shared memory (-1: all it has
 // room for).
 size_t index_dense_scratch();
-void index_dense(const uint16_t* iq_pre, const float* wproj, const int* pos, const float2* table, int rows, int ratio,
+void index_dense(const uint16_t* iq_pre, const float* wproj, const int* pos, Rope table, int rows, int ratio,
                  IndexKeys ik, int max_scan, uint16_t* keys, int keys_stride, uint16_t* bkeys, int bkeys_stride,
                  IndexSel top, IndexSel pool, uint32_t* scratch, bool pdl, cudaStream_t s, int cand = -1);
 // index_fused of a block-list scan (layer 20's pool: each row's nblocks blocks of 8, nblocks * 8 <= 32768)
 // on index_dense's grid, the same outputs bit for bit: a row's blocks are its own, so a row group is one row.
-void index_dense_blocks(const uint16_t* iq_pre, const float* wproj, const int* pos, const float2* table, int rows,
+void index_dense_blocks(const uint16_t* iq_pre, const float* wproj, const int* pos, Rope table, int rows,
                         int ratio, IndexKeys ik, const int* blocks, int nblocks, uint16_t* keys, int keys_stride,
                         IndexSel top, uint32_t* scratch, bool pdl, cudaStream_t s, int cand = -1);
 // index_merge of the gathered candidates, and of the gathered pool candidates when pool.pos is given, in

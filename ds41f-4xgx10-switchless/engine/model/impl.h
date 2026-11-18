@@ -3,6 +3,7 @@
 // (DSpark: the draft module and the speculative steps).
 #pragma once
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstring>
 #include <functional>
@@ -10,6 +11,7 @@
 #include <memory>
 #include <set>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -186,8 +188,61 @@ struct Model::Impl {
   int held(int s) const;                 // chunk numbers slot s's session's lists hold
   int numbers_for(int s, int upto) const;  // chunk numbers slot s needs to hold positions [0, upto]
   uint8_t* ent_addr(int k, int a, int j) const;  // the current unit's entry j of kv source k's array a
-  float2 *rope_plain, *rope_yarn;
-  int kstride;
+  // The rotation tables cover what a factor-16 session can reach (attn::rope_table_rows: its 1M window and a margin) at any
+  // max_ctx, read by the kernels; factors 32 and 64 compute theirs (attn.h Rope: the same bits either way).
+  // rope_plain: layers 0-1 (theta 1e4); rope_y16: the YaRN layers.
+  float2* rope_plain = nullptr;
+  int rope_plain_rows = 0;
+  float2* rope_y16 = nullptr;
+  int rope_y16_rows = 0;
+  // The YaRN factor (16, 32 or 64) of every slot (Model::set_slot_factor) and the one the step being built or
+  // captured rotates with (sf: set from the rows' slots before any work is queued; a step's rows share it).
+  // Captured graphs are keyed by it (graphs, Spec::graphs, Spec::bgraphs): their kernel parameters bake it.
+  std::array<int, kMaxSlots> slot_fac = [] {
+    std::array<int, kMaxSlots> a;
+    a.fill(16);
+    return a;
+  }();
+  int sf = 16;
+  attn::Rope plain() const { return attn::rope_plain_calc(); }
+  attn::Rope yarn() const { return sf == 16 ? attn::Rope(rope_y16) : attn::rope_yarn_calc(sf); }
+  void use_factor(int f) { sf = f; }
+  int factor_of_slots(const int32_t* slots, int n) const;  // the rows' slots' factor; dies if they differ
+  // The dense index scans' score buffers by window level (factor 16, 32, 64): decode's rows (keys, block maxima) and the
+  // prefill's batch (pkeys, pbkeys). Factor 16's cover the 1,048,576 positions of its window; with lazy_win, 32 and 64
+  // are made when their window opens and freed when it closes. Without lazy_win every factor reads level 0, which covers max_ctx.
+  struct Scan {
+    int stride = 0;  // keys per row, a multiple of attn::kScoreAlign: the scan's longest context
+    uint16_t *keys = nullptr, *bkeys = nullptr, *pkeys = nullptr, *pbkeys = nullptr;
+    bool open = false;
+    int groups = 0;  // of the pool's memory this level's graphs and buffers took (window_open)
+    size_t bytes = 0;  // what its buffers took
+  };
+  bool lazy_win = false;
+  Scan scan_[3];
+  static int level_of(int f) { return f == 16 ? 0 : f == 32 ? 1 : 2; }
+  const Scan& scan() const { return lazy_win ? scan_[level_of(sf)] : scan_[0]; }
+  // window.cu: the pool's memory a window takes while it is open (docs/engine.md, "Context past 1M")
+  size_t win_n0 = 0;                // the pool's numbers before the first window took any (0: none taken)
+  int win_groups = 0;               // groups of window.cu's kGroupNums (64) numbers out of the pool
+  int win_owed = 0;                 // of them, owed back by a window that closed (its memory not yet checked free)
+  size_t win_gcost = 0;             // device bytes factor 16's step and batch step graphs took at the start
+  size_t win_free_end = 0;          // free device memory when the last window opened
+  size_t scan_bytes(int f, bool prefill) const;
+  int scan_stride_of(int f) const;
+  bool win_alloc(int f);
+  void win_free(int f);
+  void win_graphs_drop(int f);
+  size_t win_numbers_for(int g) const;
+  int window_make_room(int f, int groups);
+  // The top number of the pool with `g` more groups of factor f's window out of it, and false when the pool could not
+  // hold one conversation of the window even whole (kWindowNoRoom). Reads the allocator only.
+  bool window_top(int f, int g, uint32_t* top) const;
+  size_t win_need(int f) const;  // the bytes factor f's window takes by this rank's own estimate
+  int win_busy_g[3] = {0, 0, 0};  // by window level: the exact groups of the last open that found it busy (0: none)
+  void window_regrow(int groups);
+  int window_open(int f);
+  int window_close(int f);
 
   // step buffers
   bf16 *x, *mid, *y, *yraw, *sub, *part, *qa, *kvx, *q, *iqpre, *o, *hfin;
@@ -195,7 +250,7 @@ struct Model::Impl {
   float *ckvf, *cscf, *wproj, *gl, *rwts, *ymoe, *logits, *lgath, *po, *pml;
   uint8_t *yq, *ys, *oq, *os, *pack;
   uint32_t* dense_scratch;  // index_dense's counters and histograms (zero between launches)
-  uint16_t *keys, *bkeys, *topkey[kIdxSlots], *poolkey;
+  uint16_t *topkey[kIdxSlots], *poolkey;
   int *topk[kIdxSlots], *pool, *ridx;
   void* moe_ws;
   void* moe_pws = nullptr;  // wide64: moe_prefill's workspace (kMaxRows rows)
@@ -221,7 +276,7 @@ struct Model::Impl {
 
   // captured steps: one graph per (rows, context bucket), captured on first use (up to kMaxRows rows: a row
   // count never used costs nothing); a row count runs eagerly once first
-  std::map<std::pair<int, int>, cudaGraphExec_t> graphs;
+  std::map<std::tuple<int, int, int>, cudaGraphExec_t> graphs;  // (rows, context bucket, YaRN factor)
   bool warm[kMaxRows + 1] = {};
   // side streams: the mHC mixes (sa); the window/compressed KV writes and the indexer's head weights (sb)
   cudaStream_t sa = nullptr, sb = nullptr;
@@ -357,7 +412,7 @@ struct Model::Impl {
   // The positions the dense index scans are checked against: the whole cache. index_dense takes the scan's
   // length from the step's positions, so its launch, and the graph of a row count, is the same for every
   // context (the graph maps keep this key).
-  int scan_ctx(int) const { return kstride; }
+  int scan_ctx(int) const { return scan().stride; }
   // side-stream work: fork(s) makes s wait for the main stream so far; join(s) the main stream for s
   void fork(cudaStream_t s) {
     CUDA_CHECK(cudaEventRecord(ev_fork, st));
@@ -383,7 +438,7 @@ struct Model::Impl {
   void forward(int R, int ctx, uint32_t flags, Sink* sink, int pos0);
   // its rows through the model: the embedding to this rank's logits (and kFlagLogits' gather)
   void forward_rows(int R, int ctx, uint32_t flags, Sink* sink, int pos0);
-  cudaGraphExec_t graph(int R, int ctx);  // captured on first use
+  cudaGraphExec_t graph(int R, int ctx);  // of the current factor sf; captured on first use
   uint64_t launch(int R, int pos0, const int32_t* tokens, const Sampling& sp, uint32_t flags, Sink* sink);
   uint64_t launch_batch(const Batch& b);
   void engram_late_batch(const int32_t* tokens);

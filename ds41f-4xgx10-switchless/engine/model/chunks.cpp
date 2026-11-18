@@ -3,6 +3,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
 
 namespace model::chunks {
 
@@ -60,6 +61,22 @@ void Alloc::grow(uint32_t n) {
   free_ += n - n_;
   if (lo_ > n_) lo_ = n_;
   n_ = n;
+}
+
+uint32_t Alloc::first_taken_from(uint32_t c) const {
+  for (uint32_t x = std::max<uint32_t>(c, 1); x < n_; ++x)
+    if (taken(x)) return x;
+  return 0;
+}
+
+bool Alloc::shrink(uint32_t n) {
+  if (n < 2 || n > n_ || first_taken_from(n)) return false;
+  free_ -= n_ - n;
+  n_ = n;
+  bits_.resize((n + 63) / 64);
+  if (n % 64) bits_.back() &= (1ull << (n % 64)) - 1;  // no numbers past n
+  if (lo_ > n) lo_ = n;
+  return true;
 }
 
 void Alloc::give(uint32_t c) {

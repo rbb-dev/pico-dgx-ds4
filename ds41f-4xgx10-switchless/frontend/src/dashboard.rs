@@ -308,6 +308,11 @@ impl Telemetry {
         self.stats.lock().unwrap().map(|(_, s)| s)
     }
 
+    /// How long ago the last STATS arrived (None: none yet).
+    pub fn stats_age(&self) -> Option<Duration> {
+        self.stats.lock().unwrap().as_ref().map(|(t, _)| t.elapsed())
+    }
+
     /// A dashboard request came in: the dashboard counts as watched for the next `WATCH_S` seconds.
     pub fn watch(&self) {
         self.watched_ms.store(unix_ms(), Ordering::Relaxed);
@@ -384,12 +389,12 @@ pub fn requests_json(t: &Telemetry) -> Value {
     json!({"in_flight": in_flight, "recent": recent})
 }
 
-/// The engine's sessions as the page's card reads them (STATS version 2): the chunk pool every conversation's caches
-/// live in (its numbers, free, held, shared by more than one conversation, reserved for the running replies' horizons;
-/// one number's bytes and the positions the whole pool holds), the conversations (on lines, idle in memory, on the SSD,
-/// sharing a beginning) and the lines.
+/// The engine's sessions as the page's card reads them: the chunk pool (numbers, free, held, shared, reserved, number bytes,
+/// positions), the conversations (on lines, in memory, on the SSD, sharing a beginning) and the lines. The window is
+/// STATS ctx_limit, else HELLO's max_context; ranks are the Sparks the engine runs on.
 pub fn sessions_json(s: &EngineStats, usable_window: u32) -> Value {
-    json!({"lines": s.lines, "usable_window": usable_window,
+    let window = if s.ctx_limit > 0 { s.ctx_limit } else { usable_window as u64 };
+    json!({"lines": s.lines, "usable_window": window, "ranks": s.ranks,
            "pool": {"numbers": s.pool_numbers, "free": s.pool_free, "held": s.pool_held, "shared": s.pool_shared,
                     "reserved": s.pool_reserved, "number_bytes": s.number_bytes, "positions": s.pool_positions},
            "conversations": {"on_lines": s.conv_on_lines, "in_memory": s.conv_in_memory, "on_disk": s.conv_on_disk,
@@ -499,7 +504,8 @@ pub fn settings_json(s: Option<&EngineStats>) -> Value {
         Some(s) if s.il_share > 0 => json!({"on": s.il_on == 1, "whole_rows": s.il_whole_rows, "push_rows": s.il_push_rows,
                                             "gap_ms": s.il_gap_ms, "share": s.il_share, "burst_max_ms": s.il_burst_max_ms,
                                             "reading": s.il_reading, "queued": s.il_queued,
-                                            "ssd_gib": s.disk_cap_bytes >> 30, "keep_days": s.keep_days}),
+                                            "ssd_gib": s.disk_cap_bytes >> 30, "keep_days": s.keep_days,
+                                            "extend": s.extend == 1}),
         _ => Value::Null,
     }
 }
@@ -523,7 +529,8 @@ pub fn parse_settings(v: &Value, max_ctx: i64) -> Result<ConfigFrame, String> {
             "push_rows" => c.push_rows = int(0, max_ctx)?,
             "ssd_gib" => c.ssd_gib = int(1, 131071)?,
             "keep_days" => c.keep_days = int(1, 3650)?,
-            _ => return Err(format!("{k}: not a setting (on, share, gap_ms, burst_max_ms, whole_rows, push_rows, ssd_gib, keep_days)")),
+            "extend" => c.extend = x.as_bool().ok_or("extend: true or false")? as i64,
+            _ => return Err(format!("{k}: not a setting (on, share, gap_ms, burst_max_ms, whole_rows, push_rows, ssd_gib, keep_days, extend)")),
         }
     }
     if c == ConfigFrame::default() {
@@ -797,7 +804,10 @@ mod settings_tests {
         assert_eq!(parse_settings(&json!({"push_rows": 131072, "whole_rows": 32768}), 1 << 20).unwrap().push_rows, 131072);
         let c = parse_settings(&json!({"ssd_gib": 128, "keep_days": 14}), 1 << 20).unwrap();
         assert_eq!((c.ssd_gib, c.keep_days, c.share), (128, 14, -1), "the SSD tier's size and expiry");
-        for bad in [json!({"ssd_gib": 0}), json!({"keep_days": 0}), json!({"keep_days": 4000}), json!({"ssd_gib": "big"}),
+        let c = parse_settings(&json!({"extend": true}), 1 << 20).unwrap();
+        assert_eq!((c.extend, c.share), (1, -1), "extending past 1M on");
+        assert_eq!(parse_settings(&json!({"extend": false}), 1 << 20).unwrap().extend, 0);
+        for bad in [json!({"extend": "on"}), json!({"extend": 1}), json!({"ssd_gib": 0}), json!({"keep_days": 0}), json!({"keep_days": 4000}), json!({"ssd_gib": "big"}),
                     json!({"share": 95}), json!({"share": 5}), json!({"gap_ms": 50}), json!({"whole_rows": 4096}),
                     json!({"whole_rows": 2_000_000}), json!({"share": "40"}), json!({"on": 1}), json!({"speed": 1}),
                     json!({}), json!([1])] {
@@ -814,6 +824,9 @@ mod settings_tests {
         let v = settings_json(Some(&s));
         assert_eq!((v["on"].as_bool(), v["share"].as_u64(), v["queued"].as_u64()), (Some(true), Some(40), Some(2)));
         assert_eq!((v["ssd_gib"].as_u64(), v["keep_days"].as_u64()), (Some(128), Some(30)));
+        assert_eq!(v["extend"], false, "off in these stats");
+        let v = settings_json(Some(&EngineStats { il_share: 40, extend: 1, ..Default::default() }));
+        assert_eq!(v["extend"], true);
     }
 }
 
@@ -917,6 +930,10 @@ mod tests {
                               conv_sharing: 2, ..stats() };
         let ss = sessions_json(&s, 1_048_576);
         assert_eq!((ss["lines"].as_u64(), ss["usable_window"].as_u64()), (Some(32), Some(1_048_576)));
+        // the window is the engine's live limit when it sends one (it follows extend), HELLO's otherwise; the ranks are its
+        let live = sessions_json(&EngineStats { ctx_limit: 1_048_576, ranks: 4, ..s }, 4_194_304);
+        assert_eq!((live["usable_window"].as_u64(), live["ranks"].as_u64()), (Some(1_048_576), Some(4)));
+        assert_eq!(sessions_json(&EngineStats { ctx_limit: 0, ..s }, 4_194_304)["usable_window"].as_u64(), Some(4_194_304));
         let p = &ss["pool"];
         assert_eq!((p["numbers"].as_u64(), p["free"].as_u64(), p["held"].as_u64()), (Some(8913), Some(8000), Some(913)));
         assert_eq!((p["shared"].as_u64(), p["reserved"].as_u64(), p["number_bytes"].as_u64()), (Some(40), Some(120), Some(2_916_352)));

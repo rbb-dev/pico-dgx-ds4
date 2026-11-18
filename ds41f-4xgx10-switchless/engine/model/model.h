@@ -181,6 +181,47 @@ class Model {
   // same calls. Slot 0 at the start.
   void use_slot(int s);
   int slot() const;
+  // The YaRN factor (16, 32 or 64: windows of 1M, 2M, 4M over the original 65536) slot s rotates with, from its next
+  // step or chunk on; 16 until set. A decode step's rows must share one factor (the model dies otherwise); graphs are
+  // kept per factor. Every rank makes the same calls. A slot's cache is not rewritten: move a session to another
+  // factor only with an empty or re-prefilled slot.
+  void set_slot_factor(int s, int factor);
+  int slot_factor(int s) const;
+  // Serving past 1M (Options::pool_one_line, max_ctx over 1,048,576; window_lazy): window_open(factor) takes a factor 32
+  // or 64 window's memory out of the chunk pool (whole groups of numbers, evicting the conversations holding them first),
+  // makes its buffers and graphs and gives back the groups the build did not use; window_close(factor) frees them and the
+  // pool makes the numbers again (factor 0: only numbers an earlier close could not take back). set_slot_factor refuses a
+  // factor whose window is not open. Every rank calls alike, one command at a time (srv::run_window).
+  // kWindowBusy: sessions on lines, pinned ones or a unit's own hold too much of the pool, try later (the server detaches idle and paused lines first, so these are running requests); kWindowNoRoom: the pool cannot hold one
+  // conversation of that window; kWindowFailed: a rank had too little device memory (nothing changed).
+  enum WindowStatus { kWindowOk = 0, kWindowBusy, kWindowNoRoom, kWindowFailed };
+  bool window_lazy() const;
+  bool window_is_open(int factor) const;  // always true for 16, and for every factor when not lazy
+  int window_open(int factor);
+  int window_close(int factor);
+  int window_owed() const;     // groups of the pool's numbers a closed window has not yet given back
+  int window_groups() const;   // groups out of the pool
+  // What opening factor f's window with `g` groups would need out of the pool, without evicting anything (rank 0's server
+  // plans with it; it reads only the store's records, so it changes nothing on any rank): `top` is the first number that
+  // leaves the pool, `removed` the numbers cut off, `holders` every session holding a number >= top (handle, the unit that
+  // holds it or -1, and whether it is a unit's own session of a tool or test, which can never be evicted). A pool that
+  // could not hold one conversation of the window gives removed 0 and no holders (the open answers kWindowNoRoom).
+  struct WindowHolder {
+    int handle;
+    int line;
+    bool unit_own;
+  };
+  struct WindowPlan {
+    uint32_t top = 0;
+    int64_t removed = 0;
+    std::vector<WindowHolder> holders;
+  };
+  WindowPlan window_plan(int f, int g) const;
+  // The groups factor f's window needs by this rank's own estimate (window_open takes the largest of every rank's, so the
+  // exact value is only known to the command), and the exact groups of the last open of factor f that found the pool busy
+  // (0: none), the same on every rank: a plan made with the first is made again with the second.
+  int window_groups_estimate(int f) const;
+  int window_busy_groups(int f) const;
   int slots() const;
   int slot_ctx(int s) const;  // positions slot s holds (Options::big_slots)
   // Slot memory (Options::vmm; every call is a no-op or zero without it). slot_reserve: commit the chunks a request of
@@ -312,9 +353,12 @@ class Model {
   StoreChunks state_chunks() const;  // the pool's chunks; the slots' commitments; the store's mapped and idle; the
                                      // bytes of its blocks; the chunks it handed back since the start; how many times
   // h: the sessions the command uses (never evicted); live: the sessions running in the slots (never evicted; a session on
-  // an idle or paused line is not named, so it is cache).
-  void state_pin(const std::vector<int>& h, const std::vector<int>& live = {});
-  // Numbers a copy on write at pos would take (see state.cu): the server makes room for them before the command.
+  // an idle or paused line is not named, so it is cache); last: the command's own conversation and its fork base, evicted
+  // after every other session but not protected.
+  void state_pin(const std::vector<int>& h, const std::vector<int>& live = {}, const std::vector<int>& last = {});
+  // Numbers `snaps` window bookmarks would take; numbers a copy on write at pos would take (see state.cu): the server makes
+  // room for them before the command.
+  int state_bookmark_numbers(int snaps) const;
   int state_cow_numbers(int h_src, int h_own, int pos) const;
   // A hash of the replicated store state, printed by the server under DSGB10_STORE_CHECK=1 and compared across the ranks.
   uint64_t store_digest() const;
@@ -377,6 +421,10 @@ class Model {
     int restart = -1;        // the latest position it can restart from with what it holds (state.cu restart_of); -1: none
   };
   StateInfo state_info(int h) const;
+  // The YaRN factor session h's stored state is rotated with (16, 32, 64; 16 when unknown). Set once, when a slot takes the
+  // session (server kStFactor); a session that holds state under another factor is a fatal mismatch.
+  void state_set_factor(int h, int factor);
+  int state_factor(int h) const;
   size_t state_bytes() const;                  // device memory the store holds
   // The store and its disk tier for rank 0's dashboard (serve.cpp STATS), with their counters since the start: sessions
   // written to the disk tier and read back, the positions restored, the time requests waited for them.

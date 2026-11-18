@@ -1,4 +1,4 @@
-add_library(dsmodel STATIC model.cu ablit.cu ops.cu fused.cu sample.cu prefill.cu state.cu spec.cu wave_probe.cu spill.cpp vmm.cpp vmm.cu chunks.cpp)
+add_library(dsmodel STATIC model.cu ablit.cu ops.cu fused.cu sample.cu prefill.cu state.cu spec.cu window.cu wave_probe.cu spill.cpp vmm.cpp vmm.cu chunks.cpp)
 target_include_directories(dsmodel PUBLIC ${CMAKE_SOURCE_DIR})
 find_package(CUDAToolkit REQUIRED)
 target_link_libraries(dsmodel PUBLIC dsattn dsk_kernels dsgb10_comm engram dsw_loader dspark CUDA::cuda_driver)
@@ -25,6 +25,12 @@ target_include_directories(chunks_test PRIVATE ${CMAKE_SOURCE_DIR})
 # maps and unmaps beside a replaying graph (tests/vmm_probe.cu)
 add_executable(vmm_probe tests/vmm_probe.cu)
 target_link_libraries(vmm_probe CUDA::cuda_driver CUDA::cudart)
+
+# A window's memory leaving the chunk pool and coming back (vmm.h shrink / trim / add_chunks) on a GB10: free device
+# memory follows, a graph over the arrays replays after the give-back (tests/vmm_giveback.cu)
+add_executable(vmm_giveback tests/vmm_giveback.cu)
+target_include_directories(vmm_giveback PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(vmm_giveback dsmodel)
 
 # Profiling builds (-DDSGB10_NVTX=ON): NVTX ranges per turn, chunk, layer and part for nsys (model/nvtx.h),
 # and DSGB10_ROUTE_DUMP (model/prefill.cu). The ranges cost nothing without a profiler attached.

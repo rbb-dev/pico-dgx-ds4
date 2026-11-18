@@ -7,6 +7,7 @@
 #include <cuda_fp8.h>
 
 #include "attn/attn.h"
+#include "attn/rope_calc.cuh"
 #include "common/check.h"
 
 namespace attn {

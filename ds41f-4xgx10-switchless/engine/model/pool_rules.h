@@ -1,6 +1,6 @@
-// The chunk pool's rules as pure functions (no engine state; tested by server/tests/pool_rules_test.cpp): what a
-// reservation is worth once its request has finished, what a restore or a bookmark may take beside the reservations of
-// running requests, and which conversation gives up its images when the disk tier's file is full. Everything in the
+// The chunk pool's rules as pure functions (no engine state; tested by server/tests/pool_rules_test.cpp): which holder
+// of a number blocks a window, in what order the store gives pieces up, what a reservation is worth once its request
+// has finished, and what a restore or a bookmark may take beside the reservations of running requests. Everything in the
 // pool that no running request uses is cache and gives way; these functions are where the model decides that. The pool's
 // size (pool_offer) and the per-rank memory ledger with the start check are here too.
 // A session is "running" when a command lists it in `live` (the server passes the running requests' sessions only).
@@ -23,6 +23,36 @@ struct Holder {
   uint64_t used = 0;
 };
 
+// Whether a holder blocks vacating numbers: a unit's own session, a session on a line, a pinned one or a running one.
+// `last` is the evict-last list (the command's own conversation and its fork base): those give way too, after the rest.
+inline bool holder_busy(const Holder& x, const std::vector<int>& pinned, const std::vector<int>& live, const std::vector<int>& last) {
+#ifdef PICO_OLD_RULES
+  // without the rule: a unit's own session, a session on a line, a pinned or a live one blocks, and the window command pins
+  // its own conversation and its base (kStPin), so those in `last` count as pinned.
+  return x.handle <= 0 || x.line >= 0 || listed(pinned, x.handle) || listed(live, x.handle) || listed(last, x.handle);
+#else
+  return x.handle <= 0 || x.line >= 0 || listed(pinned, x.handle) || listed(live, x.handle);
+#endif
+}
+
+// The session that gives up a piece first. Offer the eligible sessions in ascending handle order (the order of
+// Store::sess); `victim` is then the evict-last sessions after all others, the least recently used among them, the
+// lowest handle on a tie (the same on every rank). -1: none offered.
+struct VictimPick {
+  int victim = -1;
+  bool victim_last = false;
+  uint64_t oldest = UINT64_MAX;
+  void offer(int handle, uint64_t used, bool is_last) {
+#ifdef PICO_OLD_RULES
+    // without the rule: the smallest `used`, the lowest handle on a tie; no evict-last
+    (void)is_last;
+    if (used < oldest) victim = handle, oldest = used;
+#else
+    if (victim < 0 || (is_last != victim_last ? !is_last : used < oldest)) victim = handle, victim_last = is_last, oldest = used;
+#endif
+  }
+};
+
 // A slot's reservation once its request has finished (kStUnreserve): a finished request reserves nothing for anyone.
 inline int resv_after_finish(int resv) {
 #ifdef PICO_OLD_RULES
@@ -34,7 +64,7 @@ inline int resv_after_finish(int resv) {
 }
 
 // Numbers the slots' reservations still reserve (a reservation past what the slot's session holds), over n slots.
-// state.cu take_extra's `reserved`.
+// state.cu take_extra's `reserved` and window.cu window_make_room's `unheld`: one sum.
 template <class Resv, class Held>
 int64_t unheld_sum(int n, Resv resv, Held held) {
   int64_t sum = 0;
@@ -61,6 +91,10 @@ bool restore_may_take(int64_t free, int64_t reserved, int64_t n, Giveable giveab
   return covers(free, reserved, n, giveable);
 #endif
 }
+
+// Whether the window can be made once the holders are vacated: the numbers cut off the pool (`removed`) are free and
+// the reservations still to be taken (`unheld`) stay covered. window.cu window_make_room.
+inline bool window_room(int64_t free_after, int64_t removed, int64_t unheld) { return free_after >= removed + unheld; }
 
 // The disk tier's file is full: whether session k may give up its images. A running or pinned session never does; the
 // session making room (h) neither.

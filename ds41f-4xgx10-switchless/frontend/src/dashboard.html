@@ -68,7 +68,7 @@ main#view:focus { outline: none; }
 .stale .card { opacity: .6; }
 [hidden] { display: none !important; }
 /* ---- the Overview: a status board's front page (its colours, type and density) ---- */
-/* the board: the ENGINE box across the top; LINES beside DECODE over PREFILL (the charts take the LINES height); NODE HEALTH
+/* the board: the ENGINE strip across the top; LINES beside DECODE over PREFILL (the charts take the LINES height); NODE HEALTH
    across; the settings box across */
 .board { display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(0, 1fr); grid-template-areas: "engine engine" "lines plots" "health health" "reading reading"; gap: 12px; align-items: stretch; }
 .board > [data-box="reading"] { grid-area: reading; }
@@ -134,19 +134,24 @@ nav.sections button[aria-current="page"] { background: transparent; color: var(-
 .stg i { display: block; width: 0; }
 .stg .pre { background: #7d6bb0; } .stg .dec { background: #e8eaec; }
 
-/* ENGINE: the Rate, Sessions and SSD tier cards (the node cards' build), three in a row */
-/* the cards follow the ENGINE box's own width: three in a row from about 640 px, one in a row below (never two and one) */
-[data-box="engine"] { container-type: inline-size; }
-.vrow { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; }
-@container (min-width: 640px) { .vrow { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
-.vcard { align-content: start; }
+/* ENGINE: one strip of tiles, a value and a short qualifier each (hover a tile for its detail); seven in a row, four in a
+   narrower box, two on a phone */
+[data-box="engine"] { container-type: inline-size; padding: 0; gap: 0; overflow: hidden; }
+.strip { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); margin: 0 -1px -1px 0; }
+@container (max-width: 1300px) { .strip { grid-template-columns: repeat(4, minmax(0, 1fr)); } .etile:last-child { grid-column: span 2; } }
+@container (max-width: 640px) { .strip { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.etile { padding: 7px 12px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); display: flex; flex-direction: column; gap: 2px; min-width: 0; cursor: help; }
+.etile .k { font-family: var(--mono); font-size: 9px; letter-spacing: .14em; color: var(--t4); white-space: nowrap; }
+.etile .v { font-family: var(--mono); font-size: 17px; font-weight: 500; color: var(--t1); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.etile .u { font-size: 12px; font-weight: 400; color: var(--t4); margin-left: 5px; }
+.etile .q { font-family: var(--mono); font-size: 10px; color: var(--t5); overflow-wrap: anywhere; }
+.etile .q.warn { color: var(--warn); }
 .role.warn { color: #e0a33e; }
 .srows > .sfbody { padding: 12px 18px; margin-top: 0; }
 
 /* NODE HEALTH */
 /* one table row a Spark, the columns in groups with the units in their heads; a narrow screen scrolls it sideways */
 .tscroll { overflow-x: auto; }
-.ncard { background: var(--well); border: 1px solid var(--line); padding: 10px 12px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; min-width: 0; }
 .ntab { width: max-content; --npad: 0px; border-collapse: collapse; font-family: var(--mono); font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .ntab th, .ntab td { padding: 4px calc(4px + var(--npad)); text-align: right; border-bottom: 1px solid #14181a; }
 .ntab th:first-child, .ntab td:first-child { text-align: left; }
@@ -213,6 +218,17 @@ nav.sections button[aria-current="page"] { background: transparent; color: var(-
 
 /* the served names in the header */
 .htile[data-tile="served"] .v { color: var(--t2); }
+/* the engine's rates, centre stage in the header, in the charts' colours */
+.rates { display: flex; justify-content: center; align-items: flex-end; gap: 12px 40px; flex: 1 1 auto; }
+.rtile { display: flex; flex-direction: column; align-items: center; gap: 1px; min-width: 150px; }
+.rtile .k { font-family: var(--mono); font-size: 10px; letter-spacing: .18em; }
+.rtile.dec .k { color: #e8eaec; }
+.rtile.pre .k { color: #9d8bd0; }
+.rtile .rn { font-family: var(--mono); line-height: 1.05; white-space: nowrap; }
+.rtile .rv { font-variant-numeric: tabular-nums; font-size: 30px; font-weight: 600; color: var(--t1); }
+.rtile .ru { font-size: 13px; color: var(--t4); margin-left: 6px; }
+.rates.stale { opacity: .45; }
+@media (min-width: 960px) { .top > div { display: grid; grid-template-columns: 1fr auto 1fr; } .top .tiles { justify-self: end; } }
 
 /* sign-in (the API key, kept in this browser until Sign out) and the engine settings */
 .signin { position: fixed; inset: 0; background: rgba(5, 7, 8, .94); display: flex; align-items: center; justify-content: center; z-index: 50; }
@@ -226,6 +242,7 @@ button.signout { font-family: var(--mono); font-size: 11px; letter-spacing: .08e
 .settings .field { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
 .settings .k { color: var(--t4); font-family: var(--mono); font-size: 11px; letter-spacing: .08em; text-transform: uppercase; }
 .settings .note { grid-column: 1 / -1; color: var(--t5); font-size: 12px; }
+.settings .field.check input { width: 18px; height: 18px; margin: 4px 0; accent-color: #9d8bd0; }
 .settings .note.bad { color: var(--bad); }
 </style>
 </head>
@@ -312,7 +329,6 @@ function smoothPath(pts) {
 }
 const plotY = (frac) => 100 - PLOT_PAD - Math.min(1, Math.max(0, frac)) * (100 - 2 * PLOT_PAD);
 function plotShell(label, tip, aria) {
-  const now = h('span', { class: 'pn num', text: '0' });
   const g = [h('span', { class: 'g top' }), h('span', { class: 'g mid' }), h('span', { class: 'g zero', text: '0' })];
   g[0].style.top = (PLOT_PAD) + '%'; g[1].style.top = '50%'; g[2].style.top = (100 - PLOT_PAD) + '%';
   const gutter = h('div', { class: 'gutter', title: tip || null }, ...g);
@@ -322,8 +338,8 @@ function plotShell(label, tip, aria) {
   const tipBox = h('div', { class: 'tip', 'aria-hidden': 'true', hidden: true });
   const plot = h('div', { class: 'plot', role: 'img', 'aria-label': aria }, plotSvg, hair, tipBox);
   const xlab = h('div', { class: 'xlab', 'aria-hidden': 'true' });
-  const el = h('div', { class: 'pbox' }, h('div', { class: 'phead' }, h('span', { class: 'pl', text: label, title: tip || null }), now), h('div', { class: 'pbody' }, gutter, plot), h('div', { class: 'pfoot' }, h('span'), xlab));
-  return { el, now, g, plotSvg, hair, tipBox, plot, xlab };
+  const el = h('div', { class: 'pbox' }, h('div', { class: 'phead' }, h('span', { class: 'pl', text: label, title: tip || null })), h('div', { class: 'pbody' }, gutter, plot), h('div', { class: 'pfoot' }, h('span'), xlab));
+  return { el, g, plotSvg, hair, tipBox, plot, xlab };
 }
 function hoverIndex(plot, n, e) {
   const r = plot.getBoundingClientRect();
@@ -359,7 +375,6 @@ function chart(label, tip, color, unit, name) {
   s.plot.addEventListener('pointerleave', () => { s.hair.hidden = dot.hidden = s.tipBox.hidden = true; });
   return {
     el: s.el, name,
-    setNow(v) { setText(s.now, `${fmt(v)} ${unit}`); },
     draw(body, atMs, goal) {
       const pts = body.points.map((p) => (p == null ? null : Number(p)));
       const peaks = (body.peaks || []).map((p) => (p == null ? null : Number(p)));
@@ -643,122 +658,77 @@ function healthBox() {
   };
 }
 
-// ---- the ENGINE box's cards: the node cards' build (a head, then groups of label / value rows, each row with its tip)
-// The TP=4 engine: the four Sparks hold the same chunk pool and the same disk tier, so the cluster's memory is four
-// times one Spark's.
-const SPARKS = 4;
-function vcard(name, title, groups) {
-  const v = {};
-  const sub = h('span', { class: 'role' });
-  const el = h('div', { class: 'ncard vcard', 'data-card': name },
-    h('div', { class: 'nhead' }, h('span', { class: 'nn', text: title }), h('span', { class: 'nr' }, sub)),
-    ...groups.map(([gt, rows, extra]) => h('div', { class: 'ngroup' }, h('span', { class: 'gt', text: gt }),
-      ...rows.map(([key, label, tip]) => { const c = h('span', { class: 'num', text: '0' }); v[key] = c; return h('div', { class: 'nrow', 'data-row': key, title: tip }, h('span', { class: 'nl', text: label }), h('span', { class: 'nv' }, c)); }),
-      ...(extra ? [extra] : []))));
-  return { el, sub, set(key, text, tip) { setText(v[key], text); if (tip) setTip(v[key].closest('.nrow'), tip); } };
+// ---- the ENGINE strip: one tile a figure, its value and unit and a short qualifier; the tile's tip carries the detail
+function etile(name, label, tip) {
+  const val = h('span', { class: 'num', text: '-' }), unit = h('span', { class: 'u' }), qual = h('span', { class: 'q' });
+  const el = h('div', { class: 'etile', 'data-tile': name, title: tip }, h('span', { class: 'k', text: label }), h('span', { class: 'v' }, val, unit), qual);
+  return { el, qual, set(v, u, q, t) { setText(val, v); setText(unit, u || ''); setText(qual, q || ''); if (t) setTip(el, t); } };
 }
-function rateCard() {
-  const c = vcard('rate', 'RATE', [
-    ['DECODE', [['decode', 'Total', 'Tokens a second the engine generates for all streams together (token ids received over the last 3 s).'],
-      ['streams', 'Users generating', 'The users whose replies are being written now.'],
-      ['user', 'Per user', 'The decode rate divided by the streams generating: what one user gets on average.'],
-      ['gap', 'Time per token', 'The mean time between two tokens of one stream: 1000 over the per-stream rate.']]],
-    ['PREFILL', [['prefill', 'Speed now', 'Prompt tokens a second NOW: the tokens the prefill chunks finished over the last 3 s (the engine\'s progress reports).'],
-      ['pass', 'This prompt', 'While a prompt is processed: that prompt\'s average since it began, which stays higher than the speed now as a long prompt slows.']]],
-    ['TTFT', [['p50', 'Median', 'Time to first token: the median over the last finished requests the front-end remembers (a prompt of any length).'],
-      ['p99', 'Slowest 1 %', 'Time to first token: the 99th percentile over the last finished requests the front-end remembers.']]],
-  ]);
+function rateTiles() {
+  const TIP = 'Time to first token (waiting in the queue, then processing the prompt): the median and the slowest of the finished requests the front-end remembers, any prompt length.';
+  const t = etile('first-token', 'FIRST TOKEN', TIP);
   return {
-    el: c.el,
+    els: [t.el],
     update(st, recent) {
-      const live = (st.health || {}).live || {};
-      const running = none(live.connections) ? 0 : live.connections - (live.waiting || 0);
-      const dec = live.decode_tokens_per_second, per = running > 0 && !none(dec) ? dec / running : null;
       const ttfts = (recent || []).map((x) => x.ttft_s).filter((x) => !none(x));
-      const pp = live.prompt_pass, ppAvg = pp && pp.seconds > 0 && pp.computed > 0 ? pp.computed / pp.seconds : null;
-      c.set('decode', fmt(dec) + ' t/s');
-      c.set('streams', String(running));
-      c.set('user', one.format(none(per) ? 0 : per) + ' t/s');
-      c.set('gap', whole.format(none(per) || per <= 0 ? 0 : 1000 / per) + ' ms');
-      c.set('prefill', fmt(live.prefill_tokens_per_second) + ' t/s');
-      c.set('pass', pp ? (none(ppAvg) ? 'running' : `avg ${whole.format(ppAvg)} t/s`) : 'none now');
-      c.set('p50', ttfts.length ? secFmt(quantile(ttfts, 0.5)) + ' s' : '0', `Time to first token: the median over the last ${ttfts.length} finished requests (a prompt of any length).`);
-      c.set('p99', ttfts.length ? secFmt(quantile(ttfts, 0.99)) + ' s' : '0', `Time to first token: the 99th percentile over the last ${ttfts.length} finished requests.`);
+      const n = ttfts.length;
+      if (!n) { t.set('-', '', 'no finished request yet', TIP); return; }
+      const slow = secFmt(Math.max(...ttfts));
+      t.set(secFmt(quantile(ttfts, 0.5)), 's', `median · slowest ${slow} s`,
+        `Time to first token (waiting in the queue, then processing the prompt): the median of the last ${n} finished ${n === 1 ? 'request' : 'requests'}, any prompt length; the slowest ${slow} s. The list starts over when the front-end restarts.`);
     },
   };
 }
 const tokFmt = (v) => posFmt(v).replace(' ', '') + ' tokens';
-function sessionsCard() {
-  const fill = h('div', { class: 'fill' }), meter = h('div', { class: 'meter vmeter', role: 'img' }, fill);
-  const c = vcard('kv', 'CONVERSATION MEMORY', [
-    ['POOL', [['chunks', 'Pool memory', 'The memory every conversation\'s caches live in, on the four Sparks together: chunks of one size, taken as a conversation grows and given back when it ends.'],
-      ['holds', 'KV pool', 'The tokens of conversation the pool holds, every conversation together.'],
-      ['free', 'Free', 'The pool memory no conversation holds, on the four Sparks together.'],
-      ['window', 'Max context', 'The longest context one request may use.']]],
-    ['IN USE', [['held', 'In use', 'The pool memory the conversations hold (their caches and their bookmarks), on the four Sparks together.'],
-      ['shared', 'Shared starts', 'The pool memory more than one conversation holds: a beginning they share, kept once.'],
-      ['reserved', 'For replies', 'The pool memory kept for the running replies to grow into.'],
-      ['pct', 'Used', 'The share of the pool\'s chunks the conversations hold.']], meter],
-    ['CONVERSATIONS', [['lines', 'Running', 'The conversations a line holds now (decoding, or reading their prompt), of the lines.'],
-      ['memory', 'Paused in memory', 'Idle conversations whose chunks are in the pool: their next turn starts at once.'],
-      ['disk', 'Paused on SSD', 'Conversations kept on the SSD tier: their next turn reads them back first.'],
-      ['sharing', 'Sharing a start', 'Conversations that share their beginning with another.']]],
-  ]);
+function sessionsTiles() {
+  const used = etile('kv', 'CONTEXT CACHE', 'The pool memory the kept conversations hold (their caches and bookmarks), of the memory every conversation\'s caches live in.');
+  const cap = etile('capacity', 'CAPACITY', 'The tokens of conversation the pool holds, on all the engine\'s Sparks together, and the longest context one request may use now (it follows Extend context).');
+  const ctx = etile('contexts', 'CONTEXTS', 'Conversations whose cache is in the pool (running, or waiting for their next turn, which then starts at once), and those kept only on the SSD cache (their next turn reads them back first).');
+  const shared = etile('shared', 'SHARED PREFIXES', 'The memory the beginnings that conversations share take, kept once, and how many conversations share one.');
+  const els = [used.el, cap.el, ctx.el, shared.el];
   return {
-    el: c.el,
+    els,
     update(st) {
       const ss = st.sessions;
-      c.el.hidden = !ss;
+      for (const e of els) e.hidden = !ss;
       if (!ss) return;
       const p = ss.pool || {}, cv = ss.conversations || {};
+      const SPARKS = Number(ss.ranks) || 1;  // the engine's ranks: each holds the same pool, so the cluster's is that many times one
       const n = Number(p.numbers), nb = Number(p.number_bytes), held = Number(p.held), pct = 100 * held / Math.max(1, n);
-      setText(c.sub, 'one pool');
-      c.set('chunks', gib(SPARKS * n * nb) + ' GiB', `${whole.format(n)} chunks of ${one.format(nb / 2 ** 20)} MiB on each of the ${SPARKS} Sparks: ${gib(n * nb)} GiB a Spark, ${gib(SPARKS * n * nb)} GiB in all.`);
-      c.set('holds', tokFmt(Number(p.positions)), `The pool holds ${whole.format(Number(p.positions))} tokens of conversation: a chunk holds 16,384 positions of the half-rate layers or 8,192 of the others.`);
-      c.set('free', gib(SPARKS * Number(p.free) * nb) + ' GiB', `${whole.format(Number(p.free))} of ${whole.format(n)} chunks a Spark are free.`);
-      c.set('window', tokFmt(ss.usable_window), `The longest context one request may use: ${whole.format(ss.usable_window)} tokens.`);
-      c.set('held', gib(SPARKS * held * nb) + ' GiB', `The conversations hold ${whole.format(held)} chunks a Spark: ${gib(SPARKS * held * nb)} GiB in all.`);
-      c.set('shared', gib(SPARKS * Number(p.shared) * nb) + ' GiB', `${whole.format(Number(p.shared))} chunks a Spark are held by more than one conversation, kept once.`);
-      c.set('reserved', gib(SPARKS * Number(p.reserved) * nb) + ' GiB', `${whole.format(Number(p.reserved))} chunks a Spark are kept for the running replies to grow into.`);
-      c.set('pct', one.format(pct) + ' %');
-      c.set('lines', `${whole.format(Number(cv.on_lines))} of ${whole.format(Number(ss.lines))}`);
-      c.set('memory', whole.format(Number(cv.in_memory)));
-      c.set('disk', whole.format(Number(cv.on_disk)));
-      c.set('sharing', whole.format(Number(cv.sharing)));
-      setWidth(fill, pct);
-      meter.setAttribute('aria-label', `${one.format(pct)} % of the pool's chunks held`);
+      const kept = Number(cv.on_lines) + Number(cv.in_memory), sharing = Number(cv.sharing);
+      used.set(gib(SPARKS * held * nb), 'GiB', `${one.format(pct)} % of ${gib(SPARKS * n * nb)} GiB`,
+        `The kept conversations hold ${whole.format(held)} of ${whole.format(n)} chunks a Spark (${one.format(nb / 2 ** 20)} MiB each): ${gib(SPARKS * held * nb)} of ${gib(SPARKS * n * nb)} GiB on the ${SPARKS} Sparks together.`);
+      cap.set(posFmt(Number(p.positions)).replace(' ', ''), 'tokens', `max context ${tokFmt(ss.usable_window)}`,
+        `${whole.format(n)} chunks of ${one.format(nb / 2 ** 20)} MiB on each of the ${SPARKS} Sparks (${gib(n * nb)} GiB a Spark, ${gib(SPARKS * n * nb)} GiB in all) hold ${whole.format(Number(p.positions))} tokens of conversation. The longest context one request may use now (it follows Extend context): ${whole.format(ss.usable_window)} tokens.`);
+      ctx.set(whole.format(kept), 'in memory', `${whole.format(Number(cv.on_disk))} on SSD only`,
+        `${whole.format(kept)} conversations have their cache in the pool: running, or waiting for their next turn (a finished one stays on its line until the line is needed; ${whole.format(Number(cv.on_lines))} are on a line now). ${whole.format(Number(cv.on_disk))} are kept only on the SSD cache: their next turn reads them back first.`);
+      shared.set(gib(SPARKS * Number(p.shared) * nb), 'GiB', `${whole.format(sharing)} sharing a prefix`,
+        `The beginnings that ${whole.format(sharing)} ${sharing === 1 ? 'conversation shares' : 'conversations share'} with another, kept once: ${whole.format(Number(p.shared))} chunks a Spark, ${gib(SPARKS * Number(p.shared) * nb)} GiB in all.`);
     },
   };
 }
-function tierCard() {
-  const c = vcard('tier', 'SSD CACHE', [
-    ['DISK', [['stored', 'Used', 'The bytes the saved prompt states take on the four Sparks\' SSDs together (each Spark keeps the same copy), of the space the cache may use there.'],
-      ['records', 'Save points', 'The published prompt states (points) in the tier\'s index.'],
-      ['writes', 'Saved', 'Prompt states written and published since the engine started.'],
-      ['pending', 'Waiting to save', 'Prompt states queued for writing, not yet published.']]],
-    ['RESTORES', [['restores', 'Read-backs', 'Disk restores begun since the engine started.'],
-      ['hits', 'Found on SSD', 'Lookups that found a state on disk longer than memory had.'],
-      ['restored', 'Tokens not recomputed', 'Prompt tokens restored from disk instead of computed, since the engine started.'],
-      ['wait', 'Average wait', 'The average time a request waited for a restore.']]],
-  ]);
+function tierTiles() {
+  const ssd = etile('ssd', 'SSD CACHE', 'The bytes the saved conversations take on the SSDs of all the engine\'s Sparks together (every Spark writes the same copy), of the space the cache may use there, and the bytes written since the engine started: what wears them.');
+  const rs = etile('restores', 'RESTORES', 'Conversations read back from the SSD since the engine started, the prompt tokens read back instead of computed, and the average time a request waited for a read-back.');
+  const els = [ssd.el, rs.el];
   return {
-    el: c.el,
+    els,
     update(st) {
       const hh = st.health || {}, pc = hh.prompt_cache, sp = hh.spill, t = pc && pc.spill && pc.spill[0];
-      c.el.hidden = !sp;
+      const ss = st.sessions || {}, SPARKS = Number(ss.ranks) || 1;  // the engine's ranks: each keeps the same disk tier
+      const nb = Number((ss.pool || {}).number_bytes);
+      for (const e of els) e.hidden = !sp;
       if (!sp) return;
-      setText(c.sub, sp.state === 'on' ? 'Enabled' : sp.state === 'off' ? 'Disabled' : sp.state);
-      c.sub.classList.toggle('warn', sp.state !== 'on');
-      if (!t || !pc) { for (const k of ['stored', 'records', 'writes', 'pending', 'restores', 'hits', 'restored', 'wait']) c.set(k, '0'); return; }
-      const avgMs = pc.restore_waits > 0 ? pc.restore_wait_ns / pc.restore_waits / 1e6 : 0;
-      c.set('stored', `${gib(SPARKS * Number(t.stored_bytes))} of ${whole.format(SPARKS * Number(t.cap_bytes) / 2 ** 30)} GiB`);
-      c.set('records', whole.format(t.points));
-      c.set('writes', whole.format(t.writes_committed), `Prompt states written and published since the engine started: ${gib(t.written_bytes)} GiB written.`);
-      c.set('pending', whole.format(t.writes_pending));
-      c.set('restores', whole.format(pc.restores_begun));
-      c.set('hits', whole.format(pc.disk_hits));
-      c.set('restored', posFmt(pc.restored_tokens) + ' tok');
-      c.set('wait', whole.format(avgMs) + ' ms', `The average time a request waited for a restore (${whole.format(pc.restore_waits)} waits, the longest ${whole.format((pc.restore_wait_max_ns || 0) / 1e6)} ms).`);
+      const state = sp.state === 'on' ? 'Enabled' : sp.state === 'off' ? 'Disabled' : String(sp.state);
+      ssd.qual.classList.toggle('warn', sp.state !== 'on');
+      if (!t || !pc) { ssd.set('-', '', state); rs.set('-', '', ''); return; }
+      const avgMs = pc.restore_waits > 0 ? pc.restore_wait_ns / pc.restore_waits / 1e6 : null;
+      const wb = SPARKS * Number(t.written_bytes);  // TiB from 1,000 GiB
+      const written = wb >= 1000 * 2 ** 30 ? `${one.format(wb / 2 ** 40)} TiB` : `${gib(wb)} GiB`;
+      ssd.set(gib(SPARKS * Number(t.stored_bytes)), `of ${whole.format(SPARKS * Number(t.cap_bytes) / 2 ** 30)} GiB`, `${state} · written ${written}`,
+        `The saved conversations take ${gib(SPARKS * Number(t.stored_bytes))} GiB on the SSDs of the ${SPARKS} Sparks together (every Spark writes the same copy). Written since the engine started: ${written}, ${whole.format(t.writes_committed)} pieces on each Spark (a cache piece of ${one.format(nb / 2 ** 20)} MiB or a bookmark each).`);
+      rs.set(whole.format(pc.restores_begun), '', `${tokFmt(pc.restored_tokens)} saved · avg wait ${avgMs == null ? '-' : whole.format(avgMs) + ' ms'}`,
+        `${whole.format(pc.restores_begun)} conversations read back from the SSD since the engine started, ${whole.format(pc.restored_tokens)} prompt tokens read back instead of computed; ${whole.format(pc.restore_waits)} read-backs waited on, the longest ${whole.format((pc.restore_wait_max_ns || 0) / 1e6)} ms.`);
     },
   };
 }
@@ -776,28 +746,31 @@ function settingsBox() {
     ['whole_rows', 'NO SPLIT UP TO', 'A prompt with at most this many tokens to compute (after what is cached) is read whole: the decoding users wait for it.', [8192, 16384, 32768, 65536, 131072].map((v) => [v, (v / 1024) + 'K tokens'])],
     ['ssd_gib', 'SSD CACHE SIZE', 'How much of each Spark\'s SSD the conversations kept on disk may use: at most the file made when the engine started (a larger one takes a restart). Smaller drops the least recently used conversations\' copies to fit.', [16, 32, 64, 128, 256].map((v) => [v, v + ' GiB'])],
     ['keep_days', 'FORGET UNUSED AFTER', 'A conversation unused this long is dropped (from memory and the SSD).', [1, 3, 7, 14, 30, 60, 90].map((v) => [v, v + (v === 1 ? ' day' : ' days')])],
+    ['extend', 'EXTEND CONTEXT', 'Lets a conversation grow past 1,048,576 tokens, up to the window the engine was started with. At 1M and again at 2M the whole conversation is read again, once each. Off: a 1M window; a longer prompt is refused and an output that reaches it ends.', 'check'],
   ];
   const note = h('span', { class: 'note' });
   const copyLine = h('span', { class: 'note', hidden: true });
   const sels = {};
   const grid = h('div', { class: 'settings' }, ROWS.map(([key, label, tip, opts]) => {
-    const sel = h('select', { 'aria-label': label, disabled: true, onchange: async () => {
-      const v = key === 'on' ? sel.value === 'true' : Number(sel.value);
+    const check = opts === 'check';
+    const sel = h(check ? 'input' : 'select', { type: check ? 'checkbox' : null, 'aria-label': label, disabled: true, onchange: async () => {
+      const v = check ? sel.checked : key === 'on' ? sel.value === 'true' : Number(sel.value);
       sel.disabled = true;
       const r = await api('settings', null, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ [key]: v }) });
       sel.disabled = false;
       note.classList.toggle('bad', !r.ok);
       setText(note, r.ok ? label.toLowerCase() + ' set; the engine shows it within a second' : ((r.body && r.body.error && r.body.error.message) || 'not set: HTTP ' + r.status));
-    } }, opts.map(([v, text]) => h('option', { value: String(v), text })));
+    } }, check ? [] : opts.map(([v, text]) => h('option', { value: String(v), text })));
     sels[key] = sel;
-    return h('label', { class: 'field', title: tip }, h('span', { class: 'k', text: label }), sel);
+    return h('label', { class: check ? 'field check' : 'field', title: tip }, h('span', { class: 'k', text: label }), sel);
   }), note, copyLine);
-  const b = box('reading', 'LONG PROMPTS AND SSD', 'How the engine reads long prompts while others decode (interleaved prefill), and how much SSD its kept conversations may use and for how long. Changes apply at once and last until the engine restarts; its start flags set them again.', grid);
+  const b = box('reading', 'LONG PROMPTS AND SSD', 'How the engine reads long prompts while others decode (interleaved prefill), how much SSD its kept conversations may use and for how long, and whether a conversation may extend past 1M tokens. Changes apply at once and last until the engine restarts; its start flags set them again.', grid);
   function update(st) {
     const il = st && st.interleave;
     for (const [key, sel] of Object.entries(sels)) {
       sel.disabled = !il;
       if (!il || document.activeElement === sel) continue;
+      if (sel.type === 'checkbox') { sel.checked = il[key] === true; continue; }
       const v = String(il[key]);
       if (![...sel.options].some((o) => o.value === v)) sel.append(h('option', { value: v, text: v }));
       if (sel.value !== v) sel.value = v;
@@ -817,13 +790,13 @@ function settingsBox() {
 }
 
 function overview() {
-  const lines = linesBox(), health = healthBox(), rate = rateCard(), kv = sessionsCard(), tier = tierCard(), reading = settingsBox();
+  const lines = linesBox(), health = healthBox(), rate = rateTiles(), kv = sessionsTiles(), tier = tierTiles(), reading = settingsBox();
   const cd = chart('DECODE', 'Tokens a second the engine generates, all streams, the last 15 minutes. Fixed 10-second buckets: a bucket keeps its value as the window moves; hover for the bucket\'s mean and peak.', '#e8eaec', 'tok/s', 'decode_tps');
   const cp = chart('PREFILL', 'Prompt tokens a second of the prompt passes as they ran (the speed now, sampled every second), the last 15 minutes. Fixed 10-second buckets; hover for the mean and peak.', '#9d8bd0', 'tok/s', 'prefill_tps');
   const wrap = (name, c) => h('section', { class: 'box plotbox', 'data-box': name }, c.el);
-  // the board: the ENGINE box across the top, LINES beside DECODE over PREFILL, NODE HEALTH across, the settings box across
+  // the board: the ENGINE strip across the top, LINES beside DECODE over PREFILL, NODE HEALTH across, the settings box across
   refs.main.append(h('div', { class: 'board' },
-    box('engine', 'ENGINE', 'The rates, the sessions and the SSD tier, as the engine reports them. Hover a row for its detail.', h('div', { class: 'vrow' }, rate.el, kv.el, tier.el)).el,
+    h('section', { class: 'box', 'data-box': 'engine', 'aria-label': 'ENGINE' }, h('div', { class: 'strip' }, rate.els, kv.els, tier.els)),
     lines.el,
     h('div', { class: 'plots' }, wrap('decode', cd), wrap('prefill', cp)),
     health.el,
@@ -890,9 +863,6 @@ function overview() {
     tier.update(st);
     rate.update(st, recent);
     reading.update(st);
-    const live = (st.health || {}).live || {};
-    cd.setNow(live.decode_tokens_per_second);
-    cp.setNow(live.prefill_tokens_per_second);
   };
   S.chartsDrawn = false;
   refs.update(false);
@@ -942,8 +912,20 @@ function headerTiles() {
   const eng = strip('ENGINE', 'Whether the front-end is connected to rank 0 and for how long the front-end has been up.');
   const names = strip('SERVED AS', 'The model names the API serves. A request naming the second one runs on the ablated weights path; any other name runs on the plain path.');
   const el = h('div', { class: 'tiles' }, eng.el, names.el);
+  // the engine's two rates, centre stage: token generation (decode) and prompt processing (prefill), tokens a second over the last 3 s
+  const rate = (cls, label, tip) => {
+    const v = h('span', { class: 'rv num', text: '0' });
+    return { el: h('div', { class: 'rtile ' + cls, title: tip }, h('span', { class: 'k', text: label }), h('span', { class: 'rn' }, v, h('span', { class: 'ru', text: 'tok/s' }))), v };
+  };
+  const dec = rate('dec', 'DECODE', 'Tokens a second the engine generates for every request together: the token ids the front-end received over the last 3 s.');
+  const pre = rate('pre', 'PREFILL', 'Prompt tokens a second the engine processes now: its progress reports over the last 3 s; 0 when no prompt is being processed.');
+  const rates = h('div', { class: 'rates' }, dec.el, pre.el);
   function update(st, stale) {
     if (!st) return;
+    const live = (st.health || {}).live || {};
+    setText(dec.v, fmt(live.decode_tokens_per_second));
+    setText(pre.v, fmt(live.prefill_tokens_per_second));
+    rates.classList.toggle('stale', stale);
     const en = st.engine || {};
     const down = S.fails > 0 || en.connected === false;
     eng.el.classList.toggle('bad', down);
@@ -954,7 +936,7 @@ function headerTiles() {
     setText(names.q, alias || 'no ablit name');
     el.classList.toggle('stale', stale);
   }
-  return { el, update };
+  return { el, rates, update };
 }
 function onStatus() {
   const st = S.status;
@@ -990,7 +972,7 @@ refs.main = h('main', { id: 'view', tabindex: '-1' });
 const head = headerTiles();
 refs.head = head.update;
 const signout = h('button', { class: 'signout', text: 'SIGN OUT', title: 'Forget the API key in this browser', onclick: () => { keepKey(''); showSignIn('Signed out.'); } });
-app.append(h('header', { class: 'top' }, h('div', {}, h('div', { class: 'brand' }, h('span', { class: 'word', text: 'DSFRONT' }), refs.sub, signout), head.el)), refs.blind, refs.main);
+app.append(h('header', { class: 'top' }, h('div', {}, h('div', { class: 'brand' }, h('span', { class: 'word', text: 'DSFRONT' }), signout), head.rates, head.el)), refs.blind, refs.main);
 overview();
 poll();
 

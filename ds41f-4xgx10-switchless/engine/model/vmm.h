@@ -1,27 +1,8 @@
-// The memory behind the chunk pool's arrays, made once and mapped before serving (docs/engine.md, "The chunk pool").
-//
-// A Pool owns B physical chunks of kChunk bytes, all created when it is built and never released while it
-// lives, and any number of virtual address ranges ("arrays"), one per per-session array, each reserved
-// whole (virtual addresses cost nothing). A slot's part of an array grows from its front, one chunk at a
-// time: ensure() takes a chunk from the free list and maps it, release() unmaps every chunk of a slot and
-// returns it to the free list. Mapping and unmapping never create or free physical memory, so a request
-// never waits for an allocation and the addresses a captured graph holds never change.
-//
-// Contracts:
-//  - Pool code is host only (no CUDA headers): the driver calls are behind Backend, which the engine
-//    implements with the CUDA driver's virtual memory calls (vmm.cu, make_cuda_backend) and the unit test
-//    with FakeBackend.
-//  - A slot's mapped chunks are a prefix of its region of each array: bytes [0, n * kChunk).
-//  - ensure() is all or nothing across the arrays: it maps nothing when the free list cannot cover every
-//    array's growth, so a failure leaves the slot as it was.
-//  - A chunk holds whatever its last user left (a new chunk's content is not defined either): the readers
-//    must read only what was written (model.cu ensure_mapped lists why none reads more). poison() fills
-//    every chunk it maps with 0xFF, to prove that.
-//  - Commitments (reserve) are a host-side account: the sum of every slot's max(reserved, mapped) chunks
-//    never exceeds the pool, so a slot that stays within its reservation can always be mapped.
-//  - Chunks are made at the start only: the constructor, and add_chunks() before serving. Nothing is created or
-//    destroyed after that.
-//  - Not thread safe: one caller (the model's host thread).
+// The memory behind the chunk pool's arrays, made once and mapped before serving (docs/engine.md, "The chunk pool"). A
+// Pool owns physical chunks of kChunk bytes, created at construction (or add_chunks) and given to the driver only by
+// trim(), and virtual ranges ("arrays") reserved whole; a slot's part of an array is a prefix of chunks, grown by ensure()
+// and released by release(). Mapping never allocates, so the addresses a captured graph holds never change. Host only,
+// not thread safe; ensure() is all or nothing across the arrays.
 #pragma once
 #include <algorithm>
 #include <cstddef>
@@ -93,10 +74,10 @@ class Pool {
   Pool& operator=(const Pool&) = delete;
 
   bool ok() const { return created() == want_; }
-  size_t created() const { return handles_.size(); }
-  size_t total() const { return handles_.size(); }
+  size_t created() const { return live_; }
+  size_t total() const { return live_; }
   size_t free_chunks() const { return free_.size(); }
-  size_t used_chunks() const { return handles_.size() - free_.size(); }
+  size_t used_chunks() const { return live_ - free_.size(); }
   size_t peak_used() const { return peak_; }
   const std::string& error() const { return err_; }
   void set_poison(bool on) { poison_ = on; }
@@ -136,8 +117,17 @@ class Pool {
     return total() > c ? total() - c : 0;
   }
 
-  // Makes `n` more chunks now, for the start-up (the pool's ok() then covers them); returns how many were made.
+  // Makes `n` more chunks now (the pool's ok() then covers them); returns how many were made. A chunk id given
+  // back by trim() is used again first.
   size_t add_chunks(size_t n);
+
+  // Unmaps the tail of the slot's part of every array down to bytes[a] bytes (rounded up to chunks), highest chunk
+  // first; the chunks go to the free list. Bytes past what is mapped change nothing. Nothing else of the slot moves:
+  // what stays mapped keeps its addresses, so graphs that hold them stay valid.
+  void shrink(int slot, const size_t* bytes);
+  // Gives up to n free chunks back to the driver (the physical memory returns to the system); returns how many.
+  // Chunks that are mapped are never taken.
+  size_t trim(size_t n);
 
  private:
   struct Array {
@@ -156,6 +146,9 @@ class Pool {
   std::unique_ptr<Backend> be_;
   size_t want_;
   std::vector<uint64_t> handles_;  // chunk id -> handle
+  std::vector<uint8_t> alive_;     // chunk id -> its handle is live (trim() clears it; add_chunks() sets it again)
+  std::vector<uint32_t> dead_;     // chunk ids whose handle trim() gave back
+  size_t live_ = 0;                // live handles
   std::vector<uint32_t> free_;     // chunk ids not mapped, the next to map last
   std::vector<Array> arrays_;
   std::vector<Slot> slots_;

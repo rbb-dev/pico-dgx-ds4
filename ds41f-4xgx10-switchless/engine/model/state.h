@@ -51,6 +51,8 @@ struct Store {
                             // the disk tier (dl), read back before use
     std::vector<size_t> dl[kKvSlots];  // each entry's image in the disk tier's file (Pool::kNone: none), beside lists
     int saved = 0;          // positions [0, saved) are in them
+    int factor = 16;        // the YaRN factor every cache entry and bookmark was rotated with (16, 32, 64): for life, set when
+                            // a slot takes the session (Model::state_set_factor); kept sessions record it
     std::map<int, Nums> snaps;  // window bookmarks by position: their chunk numbers (empty: only on the disk tier)
     Nums end;               // every layer's ring and the carries (and the draft module's windows); empty: none in the pool
     int end_pos = -1;       // its position (-1: no end bookmark, in the pool or on the disk tier)
@@ -70,7 +72,7 @@ struct Store {
   };
   // A session in a kept file's index: its pieces' images and their checksums as they went out.
   struct Kept {
-    int h = 0, saved = 0, end_pos = -1;
+    int h = 0, saved = 0, end_pos = -1, factor = 16;
     uint64_t used = 0;
     std::vector<std::pair<size_t, uint64_t>> ents[kKvSlots];
     std::map<int, std::pair<size_t, uint64_t>> snaps;
@@ -101,6 +103,8 @@ struct Store {
   std::vector<int> pinned;   // the sessions the current command uses: never evicted during it
   std::vector<int> live;     // the sessions running in the slots (a running request's): never evicted either; a session on an
                              // idle or paused line is not named here, so its conversation is cache like a stored one
+  std::vector<int> last;     // the sessions the current command evicts after every other (its own conversation and its fork
+                             // base): not pinned, so a window or a restore can still take their pieces
   std::vector<int> evicted;  // sessions evicted to make room, since rank 0's server last asked
   Sess& use(int h) {         // session h (made if new), used now
     Sess& s = sess[h];

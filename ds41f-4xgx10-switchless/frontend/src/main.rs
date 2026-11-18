@@ -38,6 +38,15 @@ fn usage() -> ! {
                                 (30; 0 = only at the stop); written whole or not at all, off the
                                 request path
       --table-days N            sessions unused for longer are not kept: 7
+      --front-table-mib N       the most memory the session table may hold, counted by what its buffers allocate:
+                                0 = no limit (the default); the oldest idle sessions go first, beside the
+                                engine's position limit
+      --front-mib N             the most memory this process may hold as the kernel counts it, read every 10 s:
+                                0 = not watched (the default); over it, idle sessions go, oldest first (not
+                                below half of what the table held when it went over, and not at all while the
+                                memory does not fall as they go), and image requests are answered 429 with
+                                Retry-After: 5 until it is under
+      --front-image-mib N       the most the image requests in flight count for against --front-table-mib: 400
       --node-stats HOST:PORT,... each rank's sampler, in rank order (docs/dashboard.md): the dashboard at
                                 /dashboard polls them while it is open; without them its NODE HEALTH is empty
       --dashboard-host NAME     a host name the dashboard also answers (repeat it), e.g. a proxy's; it always
@@ -153,12 +162,16 @@ fn serve(args: &[String]) {
         max_image_rows: max_image_rows(args),
         max_body_bytes: max_body_bytes(args),
         max_image_rows_in_flight: max_image_rows_in_flight(args),
+        front_table_mib: parse_opt(args, "--front-table-mib", dsfront::server::DEFAULT_FRONT_TABLE_MIB),
+        front_mib: parse_opt(args, "--front-mib", dsfront::server::DEFAULT_FRONT_MIB),
+        front_image_mib: parse_opt(args, "--front-image-mib", dsfront::server::DEFAULT_FRONT_IMAGE_MIB),
     };
     let node_stats: Vec<String> = opt(args, "--node-stats").map_or(Vec::new(), |v| v.split(',').map(|a| a.trim().to_string()).filter(|a| !a.is_empty()).collect());
     let admin = opt(args, "--admin-socket");
     let table = opt(args, "--table-file").map(std::path::PathBuf::from);
     let table_age_s = (parse_opt(args, "--table-days", 7f64) * 86400.0) as u64;
     let table_save_s = parse_opt(args, "--table-save-s", 30u64);
+    dsfront::session::cap_heap_arenas(2);
     let tok = std::sync::Arc::new(load_tokenizer(args));
     let socket = opt(args, "--engine-socket").unwrap_or_else(|| dsfront::protocol::DEFAULT_SOCKET.into());
     runtime().block_on(async move {
@@ -172,6 +185,8 @@ fn serve(args: &[String]) {
         if let Some(t) = &table {
             app.spawn_table_saver(t.clone(), table_age_s, std::time::Duration::from_secs(table_save_s));
         }
+        app.spawn_front_governor(dsfront::server::FRONT_WATCH_EVERY);
+        app.spawn_front_status(std::time::Duration::from_secs(60));
         if let Some(path) = admin {
             let (gate, engine) = (app.gate.clone(), app.engine.clone());
             tokio::spawn(async move {

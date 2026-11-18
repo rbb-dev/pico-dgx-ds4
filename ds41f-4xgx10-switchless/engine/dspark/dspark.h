@@ -204,7 +204,9 @@ struct Inject {
 class Draft {
  public:
   // table: the RoPE table without YaRN (attn::rope_table_build(.., compressed = false)), positions up to the
-  // last one drafted (anchor + 5). slots: the windows of that many sessions side by side (model::Options::slots).
+  // last one drafted (anchor + 5) of a factor-16 session. Sessions at the other YaRN factors (32, 64) reach past
+  // it: use_factor(f) switches the launches that follow to the computed rotation (attn::rope_plain_calc, the same
+  // bits), and back to the table at 16; captured graphs bake the choice, so it is set before a capture. slots: the windows of that many sessions side by side (model::Options::slots).
   Draft(const Weights& w, int rank, Comm* comm, const float2* table, int slots = 1);
   ~Draft();
   Draft(const Draft&) = delete;
@@ -225,6 +227,7 @@ class Draft {
   // `slot` as accept()'s (kDraft entries, all the anchor's session's).
   void draft(const int* token, cudaStream_t s, const int* slot = nullptr);
   void use_slot(int s);
+  void use_factor(int f);
 
   // B3 phase 2a (docs/batching.md): one pass over the drafts of several entries (sessions), their rows side by
   // side, the weights read once. Rows [kDraft q, kDraft q + kDraft) are entry ent[q]'s, q < n <= kBatchEnts: its
@@ -295,7 +298,8 @@ class Draft {
   Weights w_;
   int rank_;
   Comm* comm_;
-  const float2* table_;
+  const float2* table16_;  // the factor-16 table
+  attn::Rope table_;       // what the launches rotate with (use_factor)
   int slots_ = 1, cur_ = 0;
   // EXPERIMENT, bench only (the draft pass study): DSPARK_VROWS, the vocabulary rows the FP8 head GEMV and the
   // Markov chain cover (a multiple of 64; the pass's time with a vocabulary subset of 4x that, not its drafts)

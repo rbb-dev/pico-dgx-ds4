@@ -94,8 +94,9 @@ void Model::Impl::prefill_alloc(comm::Ring* ring) {
   p.topk_mine = dalloc<int>((size_t)Q * kIdxTopk);
   for (auto& t : p.topk) t = dalloc<int>((size_t)M4 * kIdxTopk);
   p.pool = dalloc<int>((size_t)Q * kPoolBlocks);
-  p.keys = dalloc<uint16_t>(std::max((size_t)kIdxBatch * kstride, (size_t)Q * kPoolBlocks * 8));
-  p.bkeys = dalloc<uint16_t>((size_t)kIdxBatch * kstride / 8);
+  p.keys = dalloc<uint16_t>(std::max((size_t)kIdxBatch * scan_[0].stride, (size_t)Q * kPoolBlocks * 8));
+  p.bkeys = dalloc<uint16_t>((size_t)kIdxBatch * scan_[0].stride / 8);
+  scan_[0].pkeys = p.keys, scan_[0].pbkeys = p.bkeys;
   p.iqf = dalloc<uint8_t>((size_t)Q * kIdxHeads * 64);
   p.iqsc = dalloc<uint32_t>((size_t)Q * kIdxHeads);
   p.iqw = dalloc<float>((size_t)Q * kIdxHeads);
@@ -380,21 +381,21 @@ void Model::Impl::index_p(int L, int a, int M) {
     const attn::IndexKeys ik = kvs[kv_slot(kv_source(L))].keys();
     if (reindex(L)) {  // layer 20's pool: a CTA per (2048 positions, row)
       attn::IndexScan sc;
-      sc.blocks = p.pool;
+      sc.blocks = p.rs->pool;
       sc.nblocks = kPoolBlocks;
-      const attn::IndexSel top{kIdxTopk, p.topk_mine, p.topkey, kIdxTopk};
-      attn::index_fused(U(p.iq), p.wpf, p.pos + r0, rope_yarn, n, ratio, ik, sc, kPoolBlocks * 8, p.keys,
-                        kPoolBlocks * 8, nullptr, 0, top, attn::IndexSel{}, p.counters, false, st);
+      const attn::IndexSel top{kIdxTopk, p.rs->topk_mine, p.rs->topkey, kIdxTopk};
+      attn::index_fused(U(p.rs->iq), p.rs->wpf, p.rs->pos + r0, yarn(), n, ratio, ik, sc, kPoolBlocks * 8, scan().pkeys,
+                        kPoolBlocks * 8, nullptr, 0, top, attn::IndexSel{}, p.rs->counters, false, st);
     } else {  // every position so far: the prefill scan, a CTA per 256 positions and rows, in batches of rows
       const int max_scan =
-          std::min(kstride, ((a + M) / ratio + attn::kScoreAlign) / attn::kScoreAlign * attn::kScoreAlign);
-      const attn::IndexQ q{p.iqf, p.iqsc, p.iqw};
-      attn::index_q_prep(U(p.iq), p.wpf, p.pos + r0, rope_yarn, q, nullptr, n, st);
-      dsk::index_topk_p(q, p.pos + r0, n, ratio, ik, max_scan, kIdxBatch, p.keys, kstride, kIdxTopk, p.topk_mine,
-                        p.topkey, L == 20 ? p.bkeys : nullptr, kPoolBlocks, p.pool, p.poolkey, st);
+          std::min(scan().stride, ((a + M) / ratio + attn::kScoreAlign) / attn::kScoreAlign * attn::kScoreAlign);
+      const attn::IndexQ q{p.rs->iqf, p.rs->iqsc, p.rs->iqw};
+      attn::index_q_prep(U(p.rs->iq), p.rs->wpf, p.rs->pos + r0, yarn(), q, nullptr, n, st);
+      dsk::index_topk_p(q, p.rs->pos + r0, n, ratio, ik, max_scan, kIdxBatch, scan().pkeys, scan().stride, kIdxTopk, p.rs->topk_mine,
+                        p.rs->topkey, L == 20 ? scan().pbkeys : nullptr, kPoolBlocks, p.rs->pool, p.rs->poolkey, st);
     }
   }
-  comm::allgather(ch, p.topk_mine, p.topk[slot], (size_t)Q * kIdxTopk * 4, st);
+  comm::allgather(ch, p.rs->topk_mine, p.rs->topk[slot], (size_t)Q * kIdxTopk * 4, st);
 }
 
 // ---- the window ------------------------------------------------------------------------------------
@@ -459,14 +460,14 @@ void Model::Impl::attention_p(int L, int a, int M, const std::vector<std::pair<i
   comm::allgather_multi(ch, ag, 2 + ncomp, st);
   // the window: the 127 positions before the chunk (none in the replay), then the chunk's own keys
   const int base = win_lo >= 0 ? win_lo : std::max(0, a - 127);
-  const float2* tab = L < 2 ? rope_plain : rope_yarn;
+  const attn::Rope tab = L < 2 ? plain() : yarn();
   const attn::Window win{p.lin_kv, p.lin_sc, -1, base};
   ring_copy(L, base, a, base, true);
   attn::kv_write(U(p.kvx), U(w.kv_norm), p.pos, tab, win, nullptr, M, st);
   if (ncomp) {
     const KvSrc& k = kvs[kv_slot(L)];
     const attn::CompressorWeights cw{ratio_of(L), nullptr, nullptr, U(w.c_norm), U(w.c_wk), U(w.c_knorm)};
-    attn::compressor_emit(p.ckvf, p.cscf, p.pos, M, cw, attn::CompressorCarry{k.carry_kv, k.carry_sc}, rope_yarn,
+    attn::compressor_emit(p.rs->ckvf, p.rs->cscf, p.rs->pos, M, cw, attn::CompressorCarry{k.carry_kv, k.carry_sc}, yarn(),
                           k.compressed(), k.keys(), nullptr, 0, st);
   }
   // queries: q_norm, act_quant, wq_b; the index layers' top-k
@@ -615,7 +616,7 @@ void Model::Impl::ced_project(int M) {
   comm::allgather_multi(ch, &ag, 1, st);
   const KvSrc& k = kvs[kv_slot(L)];
   const attn::CompressorWeights cw{ratio_of(L), nullptr, nullptr, U(w.c_norm), U(w.c_wk), U(w.c_knorm)};
-  attn::compressor_emit(p.ckvf, p.cscf, p.pos, M, cw, attn::CompressorCarry{k.carry_kv, k.carry_sc}, rope_yarn,
+  attn::compressor_emit(p.rs->ckvf, p.rs->cscf, p.rs->pos, M, cw, attn::CompressorCarry{k.carry_kv, k.carry_sc}, yarn(),
                         k.compressed(), k.keys(), nullptr, 0, st);
 }
 
@@ -681,6 +682,7 @@ uint64_t Model::Impl::prefill(int a, int M, const Sampling* sp, int handle, cons
                               bool ced, float ablit, int rows_set) {
   NVTX_RANGE("chunk a=%d M=%d%s%s", a, M, ced ? " ced" : "", sp ? " sample" : "");
   if (!bound) die("model: prefill before bind");
+  sf = slot_fac[cur_slot];  // a batch step before it may have left another factor
   pf_ablit = ab.on ? ablit : 0.f;  // every rank gets the same command, so every rank takes the same branches
   if (pf_ablit != 0.f) ablit::reserve(ab, M);
   prefill_alloc();

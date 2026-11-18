@@ -13,7 +13,9 @@
 // host top-k of each one's keys, with the case's fill seed (its data), in DIR/bench_index_<context>_<rows>_<sessions>_
 // <kind>_seed<N>/ (.npy, meta.txt). --dump DIR (default .); --keep-all: every case's (a test of the dump);
 // --seed0 N: the fills from seed N (one case alone on another run's data: its seed and the same arguments).
-//   bench_index [--iters N] [--iqm] [--rows 1,6] [--sessions 1,4] [--table] [--dump DIR] [--seed0 N] ctx...
+// --equal: every position of a row scores the same, so the whole scan falls in one histogram bin and the
+// selection is the first positions (ties to the lowest): the case that fills a CTA's packed counters.
+//   bench_index [--iters N] [--iqm] [--rows 1,6] [--sessions 1,4] [--table] [--equal] [--dump DIR] [--seed0 N] ctx...
 #include <algorithm>
 #include <filesystem>
 #include <random>
@@ -36,6 +38,7 @@ cudaStream_t g_s;
 int g_iters = 30, g_bad = 0;
 bool g_iqm = false;  // --iqm: report the interquartile mean (the timer ticks every ~2 us)
 bool g_table = false;  // --table: a slot table for one session too
+bool g_equal = false;  // --equal: every key of a row scores the same (one bin holds the whole scan: the counters' limit)
 std::string g_dump = ".";  // --dump: where a case that differs keeps its outputs
 bool g_keep_all = false;   // --keep-all: every case keeps them
 Dev<uint8_t> g_flush;
@@ -90,6 +93,10 @@ struct Case {
     fill::u8(ik_sc, 7, 120);
     fill::bf16(iq, 2.f);
     fill::f32(wp, 1.f);
+    if (g_equal) {  // one key value, one scale: every position of a row scores the same
+      fill::u8(ik_k, 0, 0x22);
+      fill::u8(ik_sc, 0, 127);
+    }
     keys = Dev<uint16_t>((size_t)rows * kstride);
     bkeys = Dev<uint16_t>((size_t)rows * kstride / 8);
     top = Dev<int>((size_t)rows * kTopk);
@@ -338,6 +345,7 @@ int main(int argc, char** argv) {
     if (a == "--iters" && i + 1 < argc) g_iters = std::atoi(argv[++i]);
     else if (a == "--iqm") g_iqm = true;
     else if (a == "--table") g_table = true;
+    else if (a == "--equal") g_equal = true;
     else if (a == "--dump" && i + 1 < argc) g_dump = argv[++i];
     else if (a == "--keep-all") g_keep_all = true;
     else if (a == "--seed0" && i + 1 < argc) fill::g_seed = (uint32_t)std::atoll(argv[++i]);

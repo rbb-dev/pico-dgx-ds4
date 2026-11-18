@@ -899,7 +899,7 @@ struct Draft::Buf {
 };
 
 Draft::Draft(const Weights& w, int rank, Comm* comm, const float2* table, int slots)
-    : w_(w), rank_(rank), comm_(comm), table_(table), slots_(slots), b_(new Buf) {
+    : w_(w), rank_(rank), comm_(comm), table16_(table), table_(table), slots_(slots), b_(new Buf) {
   if (rank < 0 || rank >= kRanks || !comm || !table || slots < 1) die("dspark::Draft: rank %d, %d slots", rank, slots);
   Buf& b = *b_;
   // one arena, carved in two passes: sizes, then pointers
@@ -954,6 +954,11 @@ Draft::~Draft() {
 
 const float* Draft::logits() const { return b_->dl; }
 attn::Window Draft::window(int b) const { return win(b, nullptr); }
+
+void Draft::use_factor(int f) {
+  if (f != 16 && f != 32 && f != 64) die("dspark::Draft::use_factor: YaRN factor %d (16, 32 or 64)", f);
+  table_ = f == 16 && table16_ ? attn::Rope(table16_) : attn::rope_plain_calc();
+}
 
 void Draft::use_slot(int s) {
   if (s < 0 || s >= slots_) die("dspark::Draft: slot %d of %d", s, slots_);

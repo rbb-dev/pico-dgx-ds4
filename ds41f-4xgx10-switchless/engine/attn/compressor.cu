@@ -10,7 +10,7 @@ namespace {
 
 // One 128-thread CTA per row (compressor.cuh emit_row), into the row's session's state.
 __global__ void __launch_bounds__(128) emit_kernel(const float* kv, const float* score, const int* pos, int rows,
-                                                   CompressorWeights w, CompressorCarry carry, const float2* table,
+                                                   CompressorWeights w, CompressorCarry carry, Rope table,
                                                    Compressed ckv, IndexKeys ik, uint16_t* dbg_latent, int dbg_base,
                                                    const int* nrows, int row_base) {
   const int r = blockIdx.x;
@@ -36,7 +36,7 @@ void compressor_project(const uint16_t* x, const CompressorWeights& w, float* kv
 }
 
 void compressor_emit(const float* kv, const float* score, const int* pos, int rows, const CompressorWeights& w,
-                     CompressorCarry carry, const float2* table, Compressed ckv, IndexKeys ik,
+                     CompressorCarry carry, Rope table, Compressed ckv, IndexKeys ik,
                      uint16_t* debug_latent, int debug_base, cudaStream_t s, const int* nrows, int row_base) {
   // the carry keeps a call's last 16 rows, so with session slots every row (no two rows of a session on one slot)
   if (carry.slot && rows > 16) die("compressor_emit: %d rows with session slots", rows);

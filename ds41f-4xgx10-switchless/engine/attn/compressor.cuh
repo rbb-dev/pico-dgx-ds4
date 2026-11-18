@@ -19,7 +19,7 @@ __device__ __forceinline__ float block_sum128(float v, float* red) {
 // group's first position is that row's projection, else the carry's).
 __device__ __forceinline__ void emit_row(int r, bool prev, const float* kv, const float* score, const int* pos,
                                          const CompressorWeights& w, const CompressorCarry& carry,
-                                         const float2* table, const Compressed& ckv, const IndexKeys& ik,
+                                         Rope table, const Compressed& ckv, const IndexKeys& ik,
                                          uint16_t* dbg_latent, int dbg_base) {
   __shared__ float lat[kHead];
   __shared__ float ikv[kIdxDim];
@@ -96,7 +96,7 @@ __device__ __forceinline__ void emit_row(int r, bool prev, const float* kv, cons
   int rpos = j * ratio;
   if (t < 32) {
     float x0 = ikv[64 + 2 * t], x1 = ikv[65 + 2 * t];
-    float2 cs = table[(size_t)rpos * 32 + t];
+    float2 cs = rope_at(table, rpos, t);
     rope_pair(x0, x1, cs.x, cs.y, false);
     ikv[64 + 2 * t] = bfround(x0);
     ikv[65 + 2 * t] = bfround(x1);
@@ -120,7 +120,7 @@ __device__ __forceinline__ void emit_row(int r, bool prev, const float* kv, cons
 #pragma unroll
     for (int h = 0; h < 2; ++h) {
       int pi = (4 * t + 2 * h - 448) / 2;
-      float2 cs = table[(size_t)rpos * 32 + pi];
+      float2 cs = rope_at(table, rpos, pi);
       rope_pair(e[2 * h], e[2 * h + 1], cs.x, cs.y, false);
       e[2 * h] = bfround(e[2 * h]);
       e[2 * h + 1] = bfround(e[2 * h + 1]);

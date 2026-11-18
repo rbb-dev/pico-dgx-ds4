@@ -179,7 +179,7 @@ Store& Model::Impl::store_of() {
 
 namespace {
 
-constexpr char kKeptMagic[8] = {'D', 'S', 'G', 'B', '1', '0', 'K', '2'};  // 2: images per piece
+constexpr char kKeptMagic[8] = {'D', 'S', 'G', 'B', '1', '0', 'K', '3'};  // the last byte is the index layout's version; another version is "not a kept index"
 
 struct KeptHeader {
   char magic[8];
@@ -234,7 +234,8 @@ uint64_t Model::Impl::state_kept_check(const std::string& base, uint64_t run_id,
     k.h = r.get<int32_t>(), k.saved = r.get<int32_t>(), k.end_pos = r.get<int32_t>();
     const int ns = r.get<int32_t>(), he = r.get<int32_t>();
     k.used = r.get<uint64_t>();
-    if (!r.ok || k.h <= 0 || !hs.insert(k.h).second || ns < 0 || ns > 4096 || (he != 0 && he != 1) || k.saved < 0 ||
+    k.factor = r.get<int32_t>();
+    if (!r.ok || (k.factor != 16 && k.factor != 32 && k.factor != 64) || k.h <= 0 || !hs.insert(k.h).second || ns < 0 || ns > 4096 || (he != 0 && he != 1) || k.saved < 0 ||
         k.saved > opt.max_ctx || k.end_pos < -1 || k.end_pos > opt.max_ctx)
       return bad("a bad session record");
     for (int kk = 0; kk < kKvSlots; ++kk) {
@@ -304,7 +305,7 @@ void Model::Impl::state_disk(const std::string& base, size_t bytes, size_t stagi
     for (const Store::Kept& k : s.kept) {
       Store::Sess& ss = s.sess[k.h];
       ss.kept = true;
-      ss.saved = k.saved, ss.end_pos = k.end_pos, ss.used = k.used;
+      ss.saved = k.saved, ss.end_pos = k.end_pos, ss.used = k.used, ss.factor = k.factor;
       for (int kk = 0; kk < kKvSlots; ++kk)
         for (const auto& [off, sum] : k.ents[kk]) take(off, chunk_image(), sum), ss.lists[kk].push_back(0), ss.dl[kk].push_back(off);
       for (const auto& [pos, os] : k.snaps) take(os.first, snap_bytes(sp), os.second), ss.dsnaps.emplace(pos, os.first), ss.snaps[pos];
@@ -355,7 +356,7 @@ std::vector<uint8_t> Model::Impl::kept_index(uint64_t gen, bool all, std::vector
     ++n;
     hs->push_back(h);
     put<int32_t>(f, h), put<int32_t>(f, saved), put<int32_t>(f, end ? ss.end_pos : -1);
-    put<int32_t>(f, (int32_t)bks.size()), put<int32_t>(f, end), put<uint64_t>(f, ss.used);
+    put<int32_t>(f, (int32_t)bks.size()), put<int32_t>(f, end), put<uint64_t>(f, ss.used), put<int32_t>(f, ss.factor);
     for (int k = 0; k < kKvSlots; ++k) {
       int ne = 0;  // a checkpoint lists the entries below its saved length; a planned stop every one
       while (ne < (int)ss.lists[k].size() && (!all || ent_pos(k, ne) < saved)) ++ne;
@@ -536,16 +537,16 @@ void Model::Impl::share_nums(const Nums& from, size_t n, Nums* out) {
   }
 }
 
-// One step of making room for session h: the least recently used session that the current command does not use and
-// no line holds gives up its last piece in the pool (evict_piece; every rank does the same): to the disk tier, or
-// dropped without one. False when none is left.
+// One step of making room for session h: the session that the current command does not use and no line holds gives up
+// its last piece in the pool (evict_piece; every rank does the same): to the disk tier, or dropped without one. The
+// command's evict-last sessions (Store::last) go after every other, then the least recently used (rules::VictimPick).
+// False when none is left.
 bool Model::Impl::store_evict_step(int h) {
   Store& s = store_of();
-  int victim = -1;
-  uint64_t oldest = UINT64_MAX;
+  rules::VictimPick pick;
   for (const auto& [k, ss] : s.sess)
-    if (k != h && k > 0 && ss.line < 0 && ss.numbers() && ss.used < oldest && !in(s.pinned, k) && !in(s.live, k))
-      victim = k, oldest = ss.used;
+    if (k != h && k > 0 && ss.line < 0 && ss.numbers() && !in(s.pinned, k) && !in(s.live, k)) pick.offer(k, ss.used, in(s.last, k));
+  const int victim = pick.victim;
   if (victim < 0) return false;
   if (!s.disk) {  // nowhere to put a piece: the session goes whole
     state_free(victim);
@@ -1609,12 +1610,19 @@ Model::StoreChunks Model::state_chunks() const {  // the chunk pool: numbers in 
   c.live_bytes = c.mapped * d_->chunk_image();
   return c;
 }
-void Model::state_pin(const std::vector<int>& h, const std::vector<int>& live) {
+void Model::state_pin(const std::vector<int>& h, const std::vector<int>& live, const std::vector<int>& last) {
   auto& s = d_->store_of();
   s.pinned = h;
   s.live = live;
+  s.last = last;
 }
 void Model::slot_unreserve(int s) { d_->slot_unreserve(s); }
+
+// Numbers `snaps` window bookmarks take (a bookmark is snap_bytes in 2 MiB numbers).
+int Model::state_bookmark_numbers(int snaps) const {
+  if (snaps <= 0) return 0;
+  return (int)((size_t)snaps * bk_nums(snap_bytes(d_->spec != nullptr)));
+}
 
 // Numbers a copy on write at position `pos` takes: with h_own == h_src, own_tail's count (every list's numbers from the
 // cut's chunk on that another list or bookmark also names, one fresh number each); with h_own another session (a fork of
@@ -1664,6 +1672,7 @@ uint64_t Model::store_digest() const {
       mix(x.dend);
     }
     for (const size_t o : s.ndisk) mix(o);
+    for (const int k : s.last) mix((uint64_t)(uint32_t)k);
   }
   for (const uint32_t r : m.refs) mix(r);
   for (int t = 0; t < m.nslots; ++t) mix((uint64_t)(uint32_t)m.resv[t]);
@@ -1710,6 +1719,21 @@ size_t Model::state_disk_bytes() const { return d_->store_s ? d_->store_s->dbyte
 std::string Model::state_disk_path() const { return d_->store_s && d_->store_s->disk ? d_->store_s->disk->path() : ""; }
 void Model::state_spill(int h) { d_->state_spill(h); }
 void Model::state_unspill(int h) { d_->state_unspill(h); }
+void Model::state_set_factor(int h, int factor) {
+  if (factor != 16 && factor != 32 && factor != 64) die("state: session %d tagged with factor %d", h, factor);
+  if (!d_->store_s) return;
+  const auto it = d_->store_s->sess.find(h);
+  if (it == d_->store_s->sess.end()) return;
+  if (it->second.factor != factor && (it->second.saved > 0 || it->second.end_pos >= 0 || !it->second.snaps.empty()))
+    die("state: session %d holds state of factor %d and is tagged %d (a session keeps its factor for life)", h,
+        it->second.factor, factor);
+  it->second.factor = factor;
+}
+int Model::state_factor(int h) const {
+  if (!d_->store_s) return 16;
+  const auto it = d_->store_s->sess.find(h);
+  return it == d_->store_s->sess.end() ? 16 : it->second.factor;
+}
 Model::StateInfo Model::state_info(int h) const {
   StateInfo r;
   if (!d_->store_s) return r;

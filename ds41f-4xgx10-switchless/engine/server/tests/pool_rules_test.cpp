@@ -1,7 +1,7 @@
-// model/pool_rules.h against a pool with seven finished lines and their leftover reservations (157 numbers reserved for
-// nobody), a restore beside a running request's reservation, the disk tier's file full. Built twice: with -DPICO_OLD_RULES
-// (each rule built without its change) the cases marked "red" fail; without it every case passes. Host only: no
-// engine, no GPU.
+// model/pool_rules.h against a pool with seven finished lines holding its top numbers and their leftover reservations (157
+// numbers reserved for nobody), the request's own conversation holding a tail number, a 543-number cut for a window and a
+// running request with a reservation. Built twice: with -DPICO_OLD_RULES (each rule built without its change) the cases marked
+// "red" fail; without it every case passes. Host only: no engine, no GPU.
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -49,6 +49,43 @@ int main() {
     check(reserved_of(s) == 157, "fixture: the seven finished lines reserve 157 numbers before they are unreserved");
     for (Slot& x : s) x.resv = rules::resv_after_finish(x.resv);
     check(reserved_of(s) == 0, "red: a finished request's reservation reserves nothing for anyone");
+  }
+
+  // the window: 543 numbers cut, 650 free once the holders are vacated; the lines' reservations decide
+  {
+    auto s = finished_lines();
+    for (Slot& x : s) x.resv = rules::resv_after_finish(x.resv);
+    check(rules::window_room(650, 543, reserved_of(s)), "red: the window opens when the finished lines reserve nothing");
+    check(!rules::window_room(600, 543, 157), "a window short of numbers by the reservations of running requests stays busy");
+    check(rules::window_room(700, 543, 157), "free covering the cut and a running request's reservation opens it");
+  }
+
+  // the holders of the cut: the request's own conversation (a tail number), a stored one, a finished line's one (detached)
+  {
+    const std::vector<int> pinned = none, live = none, last = {100};
+    const Holder own{100, -1, 1}, stored{5, -1, 9}, detached{6, -1, 3};
+    check(!rules::holder_busy(own, pinned, live, last), "red: the command's own conversation (evict-last) does not block the window");
+    check(!rules::holder_busy(stored, pinned, live, last), "a stored conversation never blocks");
+    check(!rules::holder_busy(detached, pinned, live, last), "a detached line's conversation never blocks");
+    const Holder running{7, 2, 4}, unit_own{-1, 0, 2}, idle_line{8, 3, 5};
+    check(rules::holder_busy(running, pinned, {7}, last), "a running request's conversation blocks");
+    check(rules::holder_busy(unit_own, pinned, live, last), "a unit's own session (a tool or test) blocks");
+    check(rules::holder_busy(idle_line, pinned, live, last), "a session still on a line blocks the model (the server detaches idle lines first)");
+    check(rules::holder_busy(stored, {5}, live, last), "a pinned session blocks");
+  }
+
+  // the order pieces go in: evict-last after every other, least recently used first, the lowest handle on a tie
+  {
+    const std::vector<int> last = {100};
+    rules::VictimPick p;
+    p.offer(5, 9, false), p.offer(6, 3, false), p.offer(7, 3, false), p.offer(100, 1, true);
+    check(p.victim == 6, "red: the own conversation (used longest ago) goes after the others; a tie goes to the lowest handle");
+    rules::VictimPick q;
+    q.offer(100, 1, true);
+    check(q.victim == 100, "the evict-last session goes when nothing else is left");
+    rules::VictimPick e;
+    check(e.victim == -1, "no session offered: none");
+    (void)last;
   }
 
   // a restore beside a running request's reservation: 157 reserved, 100 free, nothing stored to give

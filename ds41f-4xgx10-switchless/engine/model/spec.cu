@@ -547,10 +547,9 @@ void Model::Impl::bind_spec(dsw::WeightFile& wf, const dsw::WeightFile* draft) {
   if (head_coded) die("model: bind_spec after code_head (the FP8 head is made from the raw head)");
   if (opt.first_layer != 0 || opt.n_layers != kLayers) die("model: DSpark needs the whole model");
   spec = std::make_unique<Spec>();
+  store_notes();
   Spec& sp = *spec;
   sp.comm = std::make_unique<RingComm>(ch);
-  sp.rope = dalloc<float2>((size_t)(opt.max_ctx + 8) * 32);
-  attn::rope_table_build(sp.rope, opt.max_ctx + 8, false, st);
   // the drafter's mHC projections and router rows whole on every rank (dspark.h BlockW): 9 collectives fewer
   // in each draft, the same bits
   dspark::Weights dw = draft ? dspark::weights_from({draft, &wf}) : dspark::weights_from({&wf});
@@ -771,6 +770,7 @@ void Model::Impl::spec_prefill_accept(int a, int M, int handle, const std::vecto
   CUDA_CHECK(cudaMemcpyAsync(sp.pf_acc, sp.pf_acc_h, gs.size() * 8, cudaMemcpyHostToDevice, st));
   for (size_t i = 0; i < gs.size(); ++i) {
     const PfGroup& g = gs[i];
+    sp.draft->use_factor(sf);
     sp.draft->accept(sp.pf_mh + ((size_t)g.owner * C + g.row) * dspark::kMainK, sp.pf_acc + 2 * i,
                      sp.pf_acc + 2 * i + 1, st);
     if (g.snap >= 0) state_snap_spec(handle, g.snap);  // a snapshot's windows
@@ -781,7 +781,7 @@ void Model::Impl::spec_prefill_accept(int a, int M, int handle, const std::vecto
 
 cudaGraphExec_t Model::Impl::spec_graph(int ctx) {
   Spec& sp = *spec;
-  const auto it = sp.graphs.find(ctx);
+  const auto it = sp.graphs.find({ctx, sf});
   if (it != sp.graphs.end()) return it->second;
   const clock_t t0 = clock();
   size_t free0 = 0, free1 = 0, total = 0;
@@ -838,6 +838,7 @@ cudaGraphExec_t Model::Impl::spec_graph(int ctx) {
   if (sp.mhd) k_mh_dump<<<kMaxSessRows, 256, 0, st>>>(sp.mh, in_d, sp.mhd);  // stack4: data collection
   // the step's session's windows (every entry of its slot table holds its slot)
   const int* slot = nunits > 1 ? in_d->slot : nullptr;
+  sp.draft->use_factor(sf);
   sp.draft->accept(sp.mh, &sp.ss->count, &sp.ss->pos0, st, slot);
   sp.draft->draft(&sp.ss->bonus, st, slot);
   if (opt.tree_probe) {  // EXPERIMENT (docs/engine.md, "Draft trees")
@@ -850,7 +851,7 @@ cudaGraphExec_t Model::Impl::spec_graph(int ctx) {
   cudaGraphExec_t e;
   CUDA_CHECK(cudaGraphInstantiate(&e, g, cudaGraphInstantiateFlagUseNodePriority));
   CUDA_CHECK(cudaGraphDestroy(g));
-  sp.graphs.emplace(ctx, e);
+  sp.graphs.emplace(std::make_pair(ctx, sf), e);
   CUDA_CHECK(cudaMemGetInfo(&free1, &total));
   if (rank == 0 && !sp.quiet)
     std::printf("spec: the step graph of context %d (%zu nodes in its bodies) in %.2f s (CPU), %.1f MiB of device "
@@ -869,7 +870,7 @@ cudaGraphExec_t Model::Impl::spec_graph(int ctx) {
 // > 1; the one-session graph above is not touched.
 cudaGraphExec_t Model::Impl::spec_batch_graph(int ctx) {
   Spec& sp = *spec;
-  const auto it = sp.bgraphs.find(ctx);
+  const auto it = sp.bgraphs.find({ctx, sf});
   if (it != sp.bgraphs.end()) return it->second;
   if (sp.bents < 2) die("model: a batch spec step needs Options::slots > 1");
   const clock_t t0 = clock();
@@ -954,6 +955,7 @@ cudaGraphExec_t Model::Impl::spec_batch_graph(int ctx) {
       CUDA_CHECK(cudaStreamBeginCaptureToGraph(st, g, tail.data(), nullptr, tail.size(), mode));
     }
     const int* slot = sp.stab + (size_t)k * dspark::kMaxAcc;
+    sp.draft->use_factor(sf);
     sp.draft->accept(sp.mh, &sp.ss[k].count, &sp.ss[k].pos0, st, slot, sp.row0 + k, sp.draft->batch_start() + k);
     if (!noif) {
       CUDA_CHECK(cudaStreamEndCapture(st, &cap));
@@ -1014,6 +1016,7 @@ cudaGraphExec_t Model::Impl::spec_batch_graph(int ctx) {
     cudaGraph_t body = ip.conditional.phGraph_out[0];
     CUDA_CHECK(cudaStreamBeginCaptureToGraph(st, body, nullptr, nullptr, 0, mode));
     const int* slot = sp.stab + (size_t)k * dspark::kMaxAcc;
+    sp.draft->use_factor(sf);
     sp.draft->accept(sp.mh, &sp.ss[k].count, &sp.ss[k].pos0, st, slot, sp.row0 + k);
     sp.draft->draft(&sp.ss[k].bonus, st, slot);
     k_spec_draft_check<<<1, 32, 0, st>>>(sp.draft->ids(), sp.draft->confidence(), sp.draft->batch_ids(k),
@@ -1061,7 +1064,7 @@ cudaGraphExec_t Model::Impl::spec_batch_graph(int ctx) {
     CUDA_CHECK(ie);
   }
   CUDA_CHECK(cudaGraphDestroy(g));
-  sp.bgraphs.emplace(ctx, e);
+  sp.bgraphs.emplace(std::make_pair(ctx, sf), e);
   CUDA_CHECK(cudaMemGetInfo(&free1, &total));
   if (rank == 0 && !sp.quiet)
     std::printf("spec: the batch step graph of context %d (%d entries, %zu nodes in its bodies) in %.2f s (CPU), %.1f "
@@ -1072,29 +1075,46 @@ cudaGraphExec_t Model::Impl::spec_batch_graph(int ctx) {
 
 // The step graphs of every context now (serve's startup): the device memory a graph takes (its conditional
 // bodies live on the device) would otherwise have to be free in the middle of a session. One graph serves
-// every context (scan_ctx), so the sweep captures one. With session slots, the batch step's graphs too.
+// every context (scan_ctx), so the sweep captures one per YaRN factor a context can reach (16 always; 32 when the
+// context window exceeds 1M, 64 when it exceeds 2M: a graph's kernels bake the factor). With session slots, the batch
+// step's graphs too. Counted before the chunk pool is sized, so no capture happens while serving. Serving past 1M
+// (lazy_win) captures factor 16's only: the graphs of 32 and 64 are captured when their window opens, out of the
+// pool's memory (window.cu).
 void Model::Impl::spec_graphs() {
   if (!spec) die("model: spec_graphs without bind_spec");
   const clock_t t0 = clock();
   size_t free0 = 0, free1 = 0, total = 0;
   CUDA_CHECK(cudaMemGetInfo(&free0, &total));
+  const int sf0 = sf;
+  std::vector<int> facs{16};
+  for (int f = 32; !lazy_win && f <= 64 && 65536 * (f / 2) < opt.max_ctx; f *= 2) facs.push_back(f);
   spec->quiet = true;
-  for (int p = 0; p < opt.max_ctx; p += kCtxBucket) spec_graph(scan_ctx(p));
-  spec_graph(scan_ctx(opt.max_ctx - 1));
+  for (const int f : facs) {
+    sf = f;
+    spec_graph(scan_ctx(0));
+  }
   spec->quiet = false;
   CUDA_CHECK(cudaMemGetInfo(&free1, &total));
   if (rank == 0)
-    std::printf("spec: %zu step graph%s for contexts up to %d (%zu nodes in its bodies) in %.1f s (CPU), %.2f GiB of "
-                "device memory\n", spec->graphs.size(), spec->graphs.size() == 1 ? "" : "s", opt.max_ctx, spec->nodes,
+    std::printf("spec: %zu step graph%s (factors up to %d, contexts up to %d; %zu nodes in its bodies) in %.1f s (CPU), %.2f GiB of "
+                "device memory\n", spec->graphs.size(), spec->graphs.size() == 1 ? "" : "s", facs.back(), opt.max_ctx, spec->nodes,
                 (double)(clock() - t0) / CLOCKS_PER_SEC, ((double)free0 - (double)free1) / 1073741824.0);
-  if (spec->bents < 2) return;
+  win_gcost = free0 > free1 ? free0 - free1 : 0;
+  if (spec->bents < 2) {
+    sf = sf0;
+    return;
+  }
   const clock_t t1 = clock();
   size_t free2 = 0;
   spec->quiet = true;
-  for (int p = 0; p < opt.max_ctx; p += kCtxBucket) spec_batch_graph(scan_ctx(p));
-  spec_batch_graph(scan_ctx(opt.max_ctx - 1));
+  for (const int f : facs) {
+    sf = f;
+    spec_batch_graph(scan_ctx(0));
+  }
   spec->quiet = false;
+  sf = sf0;
   CUDA_CHECK(cudaMemGetInfo(&free2, &total));
+  win_gcost += free1 > free2 ? free1 - free2 : 0;
   if (rank == 0)
     std::printf("spec: %zu batch step graph%s of up to %d entries (%zu nodes in its bodies) in %.1f s (CPU), %.2f GiB "
                 "of device memory\n", spec->bgraphs.size(), spec->bgraphs.size() == 1 ? "" : "s", spec->bents,
@@ -1124,6 +1144,7 @@ uint64_t Model::Impl::launch_spec(int R, int pos0, const int32_t* tokens, const 
   for (int r = 0; r < R; ++r)
     if (tokens[r] < 0) die("model: launch_spec takes the step's tokens");
   ensure_mapped(cur_slot, pos_last);
+  sf = slot_fac[cur_slot];
   const uint64_t n = n_steps;
   if (n >= (uint64_t)ops::kInSlots) wait_done(n - ops::kInSlots);
   ops::StepIn& in = next_in(n, R, pos0, tokens, sp);
@@ -1149,6 +1170,7 @@ uint64_t Model::Impl::launch_spec(int R, int pos0, const int32_t* tokens, const 
 uint64_t Model::Impl::launch_verify(const Sampling& sp, const SpecCfg& c, int pos_bound) {
   if (!spec) die("model: launch_verify without bind_spec");
   if (pos_bound < 0) die("model: launch_verify(%d)", pos_bound);
+  sf = slot_fac[cur_slot];
   ensure_mapped(cur_slot, pos_bound);  // the rows are the device's: pos_bound is the highest position they can reach
   const uint64_t n = n_steps;
   if (n >= (uint64_t)ops::kInSlots) wait_done(n - ops::kInSlots);
@@ -1216,6 +1238,10 @@ int Model::Impl::spec_batch_check(const SpecBatch& b, bool given) {
       die("model: batch spec entry %d: token %d at %d", k, b.token[k], b.pos0[k]);
   }
   if (S < 1) die("model: a batch spec step with no entry on");
+  int sl[ops::kMaxSess], ns = 0;  // the entries on share one YaRN factor (the server never batches different ones)
+  for (int k = 0; k < b.n; ++k)
+    if (b.on[k]) sl[ns++] = b.slot[k];
+  sf = factor_of_slots(sl, ns);
   if (b.budget > 0 ? S > std::min(b.budget, spec_row_cap()) : rows > spec_row_cap())
     die("model: a batch spec step of %d entries whose next rows could reach %d (cap %d, budget %d)", S, rows, spec_row_cap(),
         b.budget);

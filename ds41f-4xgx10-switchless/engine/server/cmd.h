@@ -48,7 +48,10 @@ enum : int32_t {
   kStFlush,        // state_flush(h): an idle session's pieces in the pool that have no image get one
   kStDiskSize,     // state_disk_resize(a * 64 KiB): the disk tier's file made that long (the dashboard's SSD size)
   kStCheckpoint,   // state_checkpoint(gen): the index a crash comes back to (gen = a | b << 32)
+  kStFactor,       // set_slot_factor(a, b): slot a rotates with YaRN factor b (16, 32, 64) from its next step; the store's
+                   // session h (when > 0) is tagged with b (state_set_factor)
   kStUnreserve,    // slot_unreserve(a): slot a's reservation to 0 (its request has finished: no reservation to anyone)
+  kStLast,         // nothing: names session h, which the command's operations evict after every other session (not pinned)
 };
 struct StateOp {
   int32_t op = 0, h = -1, a = 0, b = 0;
@@ -76,6 +79,9 @@ enum : int32_t {
   // vision (docs/vision.md): n image spans for the prefill chunks that follow (Model::set_images; n = 0 clears
   // them); their bounds (int32 lo[n], hi[n]) and rows (bf16 [rows][5120]) follow as payloads
   kCmdImages = 21,
+  // a factor's window (Model::window_open / window_close): rows = the YaRN factor (0: only settle what a closed window
+  // owes the pool), pos0 = 0 to open it, 1 to close it. Every rank runs run_window and gets the same status
+  kCmdWindow = 22,
 };
 enum : uint32_t { kPfSample = 1, kPfCed = 2 };  // kPfCed: a CED chunk (Model::prefill's ced, docs/ced.md)
 struct Cmd {
@@ -126,6 +132,10 @@ void apply_ops(model::Model& m, const Cmd& c);
 // rank 0's payload of nbytes, to every rank (in pieces of 64 KiB, the bootstrap sockets' limit)
 void bcast_payload(comm::Ring& ring, void* data, size_t nbytes, int rank);
 model::Ctl to_ctl(const Cmd& c);
+
+// kCmdWindow on this rank: Model::window_open / window_close's status (the same on every rank), once the command's state
+// operations were applied. The sessions it evicts are the store's evicted list, as for any command.
+int run_window(model::Model& m, const Cmd& c);
 
 // A prefill chunk on this rank (every rank alike): positions [pos0, pos0 + rows) of the tokens set
 // before; with kPfSample the last row is sampled (the step's number), else ~0.

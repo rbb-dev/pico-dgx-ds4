@@ -80,13 +80,16 @@ Pool::Pool(std::unique_ptr<Backend> be, size_t chunks) : be_(std::move(be)), wan
       break;
     }
     handles_.push_back(h);
+    alive_.push_back(1);
+    ++live_;
   }
   for (size_t i = handles_.size(); i-- > 0;) free_.push_back((uint32_t)i);  // chunk 0 is the first to map
 }
 
 Pool::~Pool() {
   for (int s = 0; s < (int)slots_.size(); ++s) release(s);
-  for (const uint64_t h : handles_) be_->destroy(h);
+  for (size_t i = 0; i < handles_.size(); ++i)
+    if (alive_[i]) be_->destroy(handles_[i]);
   for (const Array& a : arrays_) be_->release_va(a.base, a.stride * (size_t)a.nunits);
 }
 
@@ -208,7 +211,7 @@ bool Pool::reserve(int slot, size_t chunks) {
   return true;
 }
 
-// ---- more chunks at the start --------------------------------------------------------------------------
+// ---- more chunks, fewer chunks --------------------------------------------------------------------------
 
 size_t Pool::add_chunks(size_t n) {
   want_ += n;
@@ -218,15 +221,55 @@ size_t Pool::add_chunks(size_t n) {
   for (size_t i = 0; i < n; ++i) {
     uint64_t h = 0;
     if (!be_->create(&h)) {
-      err_ = "chunk " + std::to_string(handles_.size()) + " of " + std::to_string(want_) + ": " + be_->error();
+      err_ = "chunk " + std::to_string(live_) + " of " + std::to_string(want_) + ": " + be_->error();
       break;
     }
-    handles_.push_back(h);
-    made.push_back((uint32_t)handles_.size() - 1);
+    uint32_t id;
+    if (!dead_.empty()) {
+      id = dead_.back();
+      dead_.pop_back();
+      handles_[id] = h;
+      alive_[id] = 1;
+    } else {
+      id = (uint32_t)handles_.size();
+      handles_.push_back(h);
+      alive_.push_back(1);
+    }
+    ++live_;
+    made.push_back(id);
   }
   // the new chunks map after the ones there are: the lowest of them first
   free_.insert(free_.begin(), made.rbegin(), made.rend());
   return made.size();
+}
+
+void Pool::shrink(int slot, const size_t* bytes) {
+  Slot& s = slots_[slot];
+  for (int a = 0; a < (int)arrays_.size(); ++a) {
+    const size_t want = (bytes[a] + kChunk - 1) / kChunk;
+    std::vector<uint32_t>& held = s.held[a];
+    while (held.size() > want) {
+      be_->unmap(va_of(s, a, held.size() - 1));
+      free_.push_back(held.back());
+      held.pop_back();
+      --s.mapped;
+    }
+  }
+}
+
+size_t Pool::trim(size_t n) {
+  n = std::min(n, free_.size());
+  for (size_t i = 0; i < n; ++i) {
+    const uint32_t id = free_[i];  // the front: the chunks the pool would map last
+    be_->destroy(handles_[id]);
+    alive_[id] = 0;
+    handles_[id] = 0;
+    dead_.push_back(id);
+  }
+  free_.erase(free_.begin(), free_.begin() + (std::ptrdiff_t)n);
+  live_ -= n;
+  want_ -= n;
+  return n;
 }
 
 }  // namespace model::vmm

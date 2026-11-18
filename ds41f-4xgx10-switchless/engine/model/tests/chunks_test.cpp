@@ -43,6 +43,25 @@ int main() {
     a.give(3);
     check(a.take() == 3 && a.take() == 11, "after grow, a given number and then the next new one");
   }
+  {  // shrink: a window's numbers leave the pool when they are all free, and come back as free numbers
+    Alloc a(200);
+    std::vector<uint32_t> v;
+    check(a.take(120, &v), "120 taken");  // 1..120
+    const uint64_t d0 = a.digest();
+    check(a.first_taken_from(100) == 100 && a.first_taken_from(121) == 0, "first_taken_from");
+    check(!a.shrink(110) && a.numbers() == 200 && a.free() == 79, "RED: a shrink below a taken number changes nothing");
+    check(a.shrink(121) && a.numbers() == 121 && a.total() == 120 && a.free() == 0 && a.digest() == d0,
+          "shrink to the end of the taken: the free numbers leave, the digest stays");
+    check(!a.shrink(1) && !a.shrink(300), "no shrink to the guard alone or to more");
+    a.give(7);
+    check(a.take() == 7 && a.free() == 0, "the numbers left are the old ones");
+    for (uint32_t c = 100; c <= 120; ++c) a.give(c);
+    check(a.shrink(100) && a.numbers() == 100 && a.free() == 0 && a.total() == 99, "shrink again, across a word edge");
+    a.grow(260);
+    check(a.numbers() == 260 && a.free() == 160, "grow after a shrink: every new number free");
+    check(a.take() == 100 && a.take() == 101, "lowest first from the old end");
+    check(!a.taken(259) && a.first_taken_from(102) == 0, "nothing taken past it");
+  }
   {  // model-based: random operations against a reference
     const uint32_t n = 5000;
     Alloc a(n);

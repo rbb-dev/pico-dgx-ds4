@@ -35,6 +35,13 @@ struct ServeOptions {
   std::string keep_index;
   size_t keep_bytes = 0;
   double keep_age_s = 30 * 86400.0;  // also while serving: an idle conversation unused this long is dropped
+  // Extend context: on serves up to max_ctx, a YaRN factor per request, a conversation that outgrows its window read again
+  // at the next factor; off serves the 1,048,576-token window only (as --max-ctx 1048576 does). Live: CONFIG extend.
+  bool extend = true;
+  // The graphs and score buffers of factors 32 and 64 are made when a request first needs them, out of the chunk pool
+  // (Model::window_open). They are freed when a consumer of the pool is short and no request needs the window (reclaim.h),
+  // and, when this is not 0, after this many seconds that no request of the factor existed (0: not by time)
+  int window_idle_s = reclaim::kWindowIdleS;
   std::string name = "deepseek-v4.1-flash";
   // DSpark drafts in decode (the model bound them): Cmd's spec_drafts, spec_thresh, spec_cost, spec_gate,
   // spec_row_ms

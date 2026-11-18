@@ -33,6 +33,9 @@ pub const MAX_TOTAL_IMAGE_ROWS: usize = MAX_IMAGES * MAX_IMAGE_ROWS;
 /// The default for --max-image-rows-in-flight: two requests at the default request cap.
 pub const DEFAULT_MAX_IMAGE_ROWS_IN_FLIGHT: usize = 2 * DEFAULT_MAX_IMAGE_ROWS;
 
+/// The bytes of one image row held in memory (bf16 x IMAGE_DIM).
+pub const IMAGE_ROW_BYTES: usize = IMAGE_DIM * 2;
+
 /// The most rows `n_images` images can take, before the encoder has said what they do take:
 /// MAX_IMAGE_ROWS each, and no more than the request cap (over it the request is refused anyway).
 pub fn rows_estimate(n_images: usize, max_rows: usize) -> usize {
@@ -44,6 +47,8 @@ pub fn rows_estimate(n_images: usize, max_rows: usize) -> usize {
 pub struct RowsInFlight {
     max: usize,
     held: std::sync::Mutex<usize>,
+    /// The process is over its memory limit: no request with images is taken until it is not.
+    refusing: std::sync::atomic::AtomicBool,
 }
 
 /// One request's share of the rows in flight; dropping it gives the rows back.
@@ -55,7 +60,16 @@ pub struct RowsHeld {
 
 impl RowsInFlight {
     pub fn new(max: usize) -> std::sync::Arc<RowsInFlight> {
-        std::sync::Arc::new(RowsInFlight { max, held: std::sync::Mutex::new(0) })
+        std::sync::Arc::new(RowsInFlight { max, held: std::sync::Mutex::new(0), refusing: std::sync::atomic::AtomicBool::new(false) })
+    }
+
+    /// Refuse new image requests (true) or take them again (false), as the process is over its memory limit or not.
+    pub fn set_refusing(&self, refusing: bool) {
+        self.refusing.store(refusing, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn refusing(&self) -> bool {
+        self.refusing.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn max(&self) -> usize {

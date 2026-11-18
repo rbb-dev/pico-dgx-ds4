@@ -45,7 +45,7 @@ struct AttnArgs {
   const uint16_t* q;
   const int* pos;
   WinBounds wb;
-  const float2* table;
+  Rope table;
   Window win;
   Compressed ckv;
   const int* topk;
@@ -65,7 +65,7 @@ __device__ __forceinline__ uint32_t finish_pair(float x0, float x1, bool rope, f
   if (rope) rope_pair(x0, x1, cs.x, cs.y, true);
   return pack_bf16(x0, x1);
 }
-__device__ __forceinline__ uint32_t finish_pair(float x0, float x1, int d, const float2* tb) {
+__device__ __forceinline__ uint32_t finish_pair(float x0, float x1, int d, const RopeRow& tb) {
   bool rope = d >= kHead - kRope;
   return finish_pair(x0, x1, rope, rope ? tb[(d - (kHead - kRope)) >> 1] : make_float2(0.f, 0.f));
 }
@@ -90,7 +90,7 @@ __global__ void __launch_bounds__(128) attn_kernel(AttnArgs a) {
   const Window win = win_at(a.win, r);  // the row's session's
   const Compressed ckv = ckv_at(a.ckv, r);
   int whi = a.wb.hi ? a.wb.hi[r] : p, wlo = max(0, a.wb.lo ? a.wb.lo[r] : whi - (kWindow - 1));
-  const float2* tb = a.table + (size_t)p * 32;
+  const RopeRow tb{a.table, p};
   const uint16_t* qrow = a.q + (size_t)r * kHeads * kHead;
 #pragma unroll
   for (int it = 0; it < kHeads * kHead / 8 / 128; ++it) {  // every load in flight at once
@@ -318,13 +318,13 @@ __global__ void __launch_bounds__(128) attn_kernel(AttnArgs a) {
 // one CTA per (row, head): merge the splits' (m, l, O), add the sink, normalise, inverse RoPE (the sink loads
 // before the PDL wait)
 __global__ void __launch_bounds__(128) attn_combine_kernel(const float* po, const float* pml, const float* sink,
-                                                           const int* pos, const float2* table, int splits,
+                                                           const int* pos, Rope table, int splits,
                                                            uint16_t* out) {
   int r = blockIdx.x, h = blockIdx.y, d = threadIdx.x * 4;
   pdl_trigger();
   float sk = sink[h];
   pdl_wait();
-  const float2* tb = table + (size_t)pos[r] * 32;
+  const RopeRow tb{table, pos[r]};
   bool rope = d >= kHead - kRope;
   float2 cs0 = make_float2(0.f, 0.f), cs1 = cs0;
   if (rope) {
@@ -353,7 +353,7 @@ __global__ void __launch_bounds__(128) attn_combine_kernel(const float* po, cons
 
 }  // namespace
 
-void sparse_attn(const uint16_t* q_pre, const int* pos, WinBounds wb, int rows, const float2* table, Window win,
+void sparse_attn(const uint16_t* q_pre, const int* pos, WinBounds wb, int rows, Rope table, Window win,
                  Compressed ckv, const int* topk, int kmax, const float* sink, uint16_t* out, int splits,
                  AttnScratch scratch, cudaStream_t s, bool pdl) {
   static bool once = [] {

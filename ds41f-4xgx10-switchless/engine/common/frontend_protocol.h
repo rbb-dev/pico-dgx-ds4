@@ -152,8 +152,8 @@ struct StatsReq {
 // Interleaved prefill's settings (the engine's --interleave-* flags), changed while it serves: version, the number of
 // i64 fields that follow, then the fields in this order; a field < 0, or one not sent, keeps its value. The engine checks
 // each against its flag's range and ignores one out of range; the next Stats frame shows what it runs.
-constexpr uint32_t kConfigVersion = 2;
-constexpr uint32_t kConfigFields = 8;
+constexpr uint32_t kConfigVersion = 3;
+constexpr uint32_t kConfigFields = 9;
 struct Config {
   uint32_t version;  // kConfigVersion
   uint32_t n_fields;
@@ -165,13 +165,14 @@ struct Config {
   int64_t burst_max_ms;  // one decode window, at most
   int64_t ssd_gib;       // the disk tier's size in GiB (at most its file's size at the start; smaller evicts to fit)
   int64_t keep_days;     // a conversation unused this many days is dropped (1-3650)
+  int64_t extend;        // the context past 1,048,576 tokens: 0 off (the 1,048,576-token window only), 1 on (a factor per request)
 };
 
 // The engine's own counters for the dashboard: version, the number of u64 fields that follow, then the fields in this
 // order. A front-end reads min(n_fields, kStatsFields) of them; a field it does not get is 0. The pool's counts are
 // rank 0's (every rank's are equal); counters count from the engine's start.
 constexpr uint32_t kStatsVersion = 2;
-constexpr uint32_t kStatsFields = 31;
+constexpr uint32_t kStatsFields = 34;
 struct StatsFrame {
   uint32_t version;   // kStatsVersion
   uint32_t n_fields;  // kStatsFields
@@ -210,6 +211,9 @@ struct StatsFrame {
   uint64_t il_reading;
   uint64_t il_queued;
   uint64_t keep_days;               // a conversation unused this many days is dropped (CONFIG keep_days)
+  uint64_t extend;                  // the context past 1,048,576 tokens (CONFIG extend): 0 off, 1 on
+  uint64_t ctx_limit;               // the longest context a request may use: the start window, 1,048,576 with extend 0
+  uint64_t ranks;                   // the Sparks the engine runs on: each holds the same pool and the same disk tier
 };
 
 static_assert(sizeof(FrameHeader) == 8);
@@ -229,7 +233,10 @@ static_assert(sizeof(StatsReq) == 8);
 static_assert(sizeof(StatsFrame) == 8 + 8 * kStatsFields);
 static_assert(offsetof(StatsFrame, pool_numbers) == 8);
 static_assert(offsetof(StatsFrame, lines) == 8 + 8 * 11);
-static_assert(offsetof(StatsFrame, keep_days) == 8 + 8 * (kStatsFields - 1));
+static_assert(offsetof(StatsFrame, keep_days) == 8 + 8 * (kStatsFields - 4));
+static_assert(offsetof(StatsFrame, extend) == 8 + 8 * (kStatsFields - 3));
+static_assert(offsetof(StatsFrame, ctx_limit) == 8 + 8 * (kStatsFields - 2));
+static_assert(offsetof(StatsFrame, ranks) == 8 + 8 * (kStatsFields - 1));
 static_assert(sizeof(Config) == 8 + 8 * kConfigFields);
 
 }  // namespace fe

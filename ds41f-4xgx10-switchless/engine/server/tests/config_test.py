@@ -13,11 +13,19 @@ from serve_test import DONE, PROGRESS, TOKENS, CANCEL, Engine, load_npy_i32
 
 CONFIG, STATS_REQ, STATS = 0x06, 0x05, 0x85
 IL = ['on', 'whole_rows', 'push_rows', 'gap_ms', 'share', 'burst_max_ms', 'reading', 'queued']
+EXTEND = 31  # STATS field index of `extend` (field 32 of 34; docs/protocol.md)
+CTX_LIMIT, RANKS = 32, 33  # the window a request may use now, and the ranks (fields 33 and 34)
 
 
 def config(e, **kw):
-    order = ['on', 'whole_rows', 'push_rows', 'gap_ms', 'share', 'burst_max_ms']
-    e.send(CONFIG, struct.pack('<II', 1, 6) + struct.pack('<6q', *[kw.get(k, -1) for k in order]))
+    order = ['on', 'whole_rows', 'push_rows', 'gap_ms', 'share', 'burst_max_ms', 'ssd_gib', 'keep_days', 'extend']
+    e.send(CONFIG, struct.pack('<II', 3, 9) + struct.pack('<9q', *[kw.get(k, -1) for k in order]))
+
+
+def config_v2(e, **kw):
+    """A version 2 frame (8 fields, no extend): the engine keeps the extend setting it has."""
+    order = ['on', 'whole_rows', 'push_rows', 'gap_ms', 'share', 'burst_max_ms', 'ssd_gib', 'keep_days']
+    e.send(CONFIG, struct.pack('<II', 2, 8) + struct.pack('<8q', *[kw.get(k, -1) for k in order]))
 
 
 def stats(e):
@@ -29,7 +37,14 @@ def stats(e):
             version, n = struct.unpack('<II', p[:8])
             v = struct.unpack('<%dQ' % n, p[8:8 + 8 * n])
             lo = 22 if version >= 2 else 19  # interleave's fields: after the pool's in version 2 (docs/protocol.md)
-            return dict(zip(IL, v[lo:lo + 8])) if n >= lo + 8 else {}
+            if n < lo + 8:
+                return {}
+            d = dict(zip(IL, v[lo:lo + 8]))
+            if n > EXTEND:
+                d['extend'] = v[EXTEND]
+            if n > RANKS:
+                d['ctx_limit'], d['ranks'] = v[CTX_LIMIT], v[RANKS]
+            return d
 
 
 def decoder_rate(e, S, T, share):
@@ -80,6 +95,21 @@ def main():
     s2 = stats(e)
     print('after out-of-range share 95, gap 10, whole 100: %s' % s2)
     res['values out of range are ignored'] = (s2.get('share'), s2.get('gap_ms'), s2.get('whole_rows')) == (70, 450, s0.get('whole_rows'))
+    res['Extend context is on at the start (STATS field 32: 0 off, 1 on; the start flags here leave it at its default)'] = s0.get('extend') == 1
+    res['at the start a request may use the start window (STATS ctx_limit = HELLO max_context), on 4 ranks'] = s0.get('ctx_limit') == e.max_ctx and s0.get('ranks') == 4
+    config(e, extend=0)
+    sx = stats(e)
+    res['a CONFIG frame turns it off, the other settings stay'] = (
+        sx.get('extend') == 0 and sx.get('share') == s1.get('share') and sx.get('gap_ms') == s1.get('gap_ms'))
+    res['with it off a request may use at most 1,048,576 tokens (STATS ctx_limit)'] = sx.get('ctx_limit') == min(e.max_ctx, 1048576)
+    config(e, extend=2)
+    config(e, share=-1)
+    res['an extend value out of range, or not sent, is ignored'] = stats(e).get('extend') == 0
+    config_v2(e, share=70)
+    res['a version 2 frame keeps it'] = stats(e).get('extend') == 0
+    config(e, extend=1)
+    sb = stats(e)
+    res['and it goes back on, the window with it'] = sb.get('extend') == 1 and sb.get('ctx_limit') == e.max_ctx
     S = 0x636f6e6600000000 | (int(time.time() * 1000) & 0xffffffff) << 8
     r20, w20 = decoder_rate(e, S + 10, T, 20)
     r80, w80 = decoder_rate(e, S + 20, T, 80)

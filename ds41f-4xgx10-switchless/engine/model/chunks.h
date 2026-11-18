@@ -19,6 +19,11 @@ class Alloc {
   void give(uint32_t c);
   // numbers [numbers(), n) join the free set (the store's share of the pool, or a closed window's numbers coming back)
   void grow(uint32_t n);
+  // numbers [n, numbers()) leave the pool (a window's memory taken out of it, Model::window_open): false, nothing
+  // changed, when one of them is taken or n would leave no number to take; the taken set and its digest stay as they were
+  bool shrink(uint32_t n);
+  // the first taken number at or above c (the numbers a shrink to c would have to wait for), 0 when none
+  uint32_t first_taken_from(uint32_t c) const;
   uint32_t numbers() const { return n_; }         // the arrays' slices, the guard's included
   uint32_t total() const { return n_ - 1; }       // takeable numbers
   uint32_t free() const { return free_; }

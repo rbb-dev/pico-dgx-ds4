@@ -64,8 +64,17 @@
 //                request that would need the slot of another in flight waits for one to free).
 //                --ssd-flush-s S: a conversation idle for S seconds gets its pieces written to the disk tier (its tail
 //                chunk and bookmarks; full chunks are written at their turn's save; default 30, 0: never).
-//                --grow-ahead N: a request reserves its prompt and N positions of reply (default 131072,
-//                at most its max_new); a reply reaches past them a horizon at a time, when the pool can hold it.
+//                --window-idle-s S: with --max-ctx past 1,048,576 the graphs and score buffers of factors 32 and 64 are made when a
+//                request first needs them, out of the chunk pool. A window is freed when a consumer of the pool is short and no
+//                request needs it; with S > 0 also after S seconds in which no request of its factor existed (default 0:
+//                not by time).
+//                --extend on|off: Extend context (default on). On: a request runs at the smallest YaRN factor whose window
+//                holds its prompt, up to --max-ctx, and a response that reaches its window goes on at the next factor with its
+//                conversation read again there (exact). Off: only the 1,048,576-token window is served: a longer prompt is
+//                refused and a response that reaches the window ends with reason context, as with --max-ctx 1048576. The
+//                dashboard's SETTINGS card changes it live.
+//                --grow-ahead N: a request reserves its prompt and N positions of response (default 131072,
+//                at most its max_new); a response reaches past them a horizon at a time, when the pool can hold it.
 //                Interleaved prefill (docs/interleave.md): a prompt with more than --interleave-whole-rows
 //                rows to compute (default 32768; the rows after its restart point, not the whole prompt)
 //                is read in pieces while others decode: after each piece the decoders get a window, so
@@ -331,6 +340,7 @@ struct Args {
   double disk_gib = 32;  // serve: the store's disk tier (0: none)
   std::string disk_dir;  // its directory (default: the fleet's RANK<r>_SPILL)
   std::string disk_tag;  // its files' tag: rank<r>.<tag>.spill (none: rank<r>.spill)
+  bool extend = true;  // serve: --extend on|off (Extend context)
   double keep_gib = 0, keep_days = 30;  // kept sessions: written at a planned stop, at most; their age
   int snap_every = 1024, small_rows = 8;
   int slots = 1, slot = 0;
@@ -342,6 +352,7 @@ struct Args {
   int slice = 64;  // serve: time-slicing's turns, in tokens (0: none)
   int grow_ahead = 131072;  // serve: positions of response a reservation reaches past where it is
   int ssd_flush_s = 30;     // serve: seconds between checkpoints while idle; without the imager also the idle age for writing a conversation's pieces
+  int window_idle_s = reclaim::kWindowIdleS;  // serve past 1M: a factor's window freed after this many seconds with no request of it (0: not by time)
   il::Settings il;  // serve: interleaved prefill's settings (--interleave-*)
   bool snap_all = false;
   size_t ring_cap = 4u << 20;  // the ring's per-rank collective size (prefill's bulk collectives post cap / 4)
@@ -437,6 +448,11 @@ Args parse(int argc, char** argv) {
     else if (s == "--disk-tag") a.disk_tag = val();
     else if (s == "--keep-gib") a.keep_gib = std::atof(val().c_str());
     else if (s == "--keep-days") a.keep_days = std::atof(val().c_str());
+    else if (s == "--extend") {
+      const std::string v = val();
+      if (v != "on" && v != "off") die("--extend is on or off");
+      a.extend = v == "on";
+    }
     else if (s == "--snap-every") a.snap_every = std::atoi(val().c_str());
     else if (s == "--slots") a.slots = std::atoi(val().c_str());
     else if (s == "--big-slots") a.big_slots = std::atoi(val().c_str());
@@ -450,6 +466,7 @@ Args parse(int argc, char** argv) {
     else if (s == "--slice") a.slice = std::atoi(val().c_str());
     else if (s == "--grow-ahead") a.grow_ahead = std::atoi(val().c_str());
     else if (s == "--ssd-flush-s") a.ssd_flush_s = std::atoi(val().c_str());
+    else if (s == "--window-idle-s") a.window_idle_s = std::atoi(val().c_str());
     else if (s == "--interleave") a.il.on = true;
     else if (s == "--no-interleave") a.il.on = false;
     else if (s == "--interleave-whole-rows") a.il.whole_rows = std::atoi(val().c_str());
@@ -894,6 +911,7 @@ int main(int argc, char** argv) {
     so.slice = a.slice;
     so.grow_ahead = a.grow_ahead;
     so.ssd_flush_s = a.ssd_flush_s;
+    so.window_idle_s = a.window_idle_s;
     so.interleave = a.il;
     so.interleave.prefill_rows = a.prefill_rows;
     if (a.exact) so.interleave.on = false;  // --exact reads every prompt whole
@@ -902,6 +920,7 @@ int main(int argc, char** argv) {
     so.keep_index = disk_dir + "/server" + disk_tag + ".index";
     so.keep_bytes = std::min(m.state_disk_capacity(), (size_t)(a.keep_gib * 1073741824.0));  // none without a file
     so.keep_age_s = a.keep_days * 86400;
+    so.extend = a.extend;
     so.ced = !a.exact;
     so.spec = a.spec;
     so.spec_drafts = a.spec_drafts;

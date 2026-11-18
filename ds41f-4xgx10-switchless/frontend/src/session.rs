@@ -5,16 +5,10 @@
 //! sent as that session's own token ids, which is what is in the engine's KV state; the rest is
 //! tokenised on its own from a cut next to an added token, where tokenisation restarts anyway.
 //!
-//! A session belongs to the weights path it was created on (`ablit`, protocol flag ABLIT): a request is
-//! matched only against sessions of its own path, so a continuation or a fork never crosses the two.
-//!
-//! An image is a run of placeholder tokens (docs/vision.md): the prompt's text carries each image as its
-//! placeholder written once per row, so the text and its ids still spell each other, and a session records
-//! each image's place and content hash (`ImageKey`). The engine matches a session's history to a prompt by
-//! token id alone, and every image row has the same id, so ids cannot tell one image from another: a
-//! session is a candidate only when the images inside the text it shares with the prompt are the same
-//! images (same place, rows and content hash) on both sides. An image that differs inside the shared text
-//! rules the session out; it is never named as a base, so the engine cannot carry its rows over.
+//! A session belongs to the weights path (`ablit`) and the YaRN factor (`factor_for` its ids) it was created at; a request
+//! is matched only against sessions of its own path and factor. An image is a run of placeholder tokens: a session also
+//! records each image's place, rows and content hash (`ImageKey`) and is a candidate only when the images inside the shared
+//! text are the same on both sides.
 //!
 //! The table outlives a stop (`save`, `load`; docs/engine.md, "Kept sessions"): the engine keeps its
 //! sessions across a planned stop, and the table is what finds them again. It holds the conversations'
@@ -33,6 +27,20 @@ const MIN_SHARED: usize = 64;
 /// the session's prompt; the encoding may rewrite the tail of the prompt (`<think>` → `</think>`).
 const PROMPT_SLACK: usize = 16;
 
+/// The window (in tokens) one YaRN factor covers per step: factor 16 holds 1M, 32 holds 2M, 64 holds 4M.
+const FACTOR_STEP: usize = 1 << 20;
+/// The factor a prompt of `n_tokens` ids is served at: the smallest of 16 / 32 / 64 whose window holds it with room
+/// for the next token (the engine's `factor_for`: below 2^20 ids is 16, below 2^21 is 32, else 64).
+pub fn factor_for(n_tokens: usize) -> u32 {
+    if n_tokens < FACTOR_STEP {
+        16
+    } else if n_tokens < 2 * FACTOR_STEP {
+        32
+    } else {
+        64
+    }
+}
+
 /// One image of a prompt: where its run of placeholders starts in the prompt's text (a byte offset), how
 /// many rows it spans, and a hash of the image's bytes (the encoder's).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,8 +58,10 @@ fn images_agree(a: &[ImageKey], b: &[ImageKey], n: usize) -> bool {
 struct Session {
     text: String,
     ids: Vec<u32>,
-    /// ends[i] = byte length of the text of ids[..=i]
-    ends: Vec<usize>,
+    /// marks[j] = byte length of the text of ids[..32 * (j + 1)]: where every 32nd token ends, so that the end of
+    /// any token is found by a search of the marks and at most 31 token lengths (`token_end`). Empty when the text
+    /// is longer than u32::MAX bytes.
+    marks: Vec<u32>,
     prompt_len: usize,
     busy: bool,
     last_used: u64,
@@ -59,10 +69,31 @@ struct Session {
     t_used: u64,
     /// The ablated weights path: its state was computed with the ablation direction applied.
     ablit: bool,
+    /// The YaRN factor its state was computed at (`factor_for` its prompt's ids when it was created).
+    factor: u32,
     /// The images of its prompt, in order.
     images: Vec<ImageKey>,
     /// Its text's prefix keys (`prefix_keys`), as the index holds them.
     keys: Vec<u64>,
+}
+
+impl Session {
+    /// The memory the session holds: its buffers by capacity, not length, and its place in the table and the index.
+    fn bytes(&self) -> usize {
+        std::mem::size_of::<Session>()
+            + SESSION_FIXED
+            + self.text.capacity()
+            + 4 * self.ids.capacity()
+            + 4 * self.marks.capacity()
+            + std::mem::size_of::<ImageKey>() * self.images.capacity()
+            + 8 * self.keys.capacity()
+            + INDEX_ENTRY * self.keys.len()
+    }
+
+    /// How many leading ids hold exactly the first `p` bytes of the text, when `p` is where a token ends.
+    fn token_end(&self, p: usize, tok: &Tokenizer) -> Option<usize> {
+        token_end_in(&self.marks, &self.ids, self.text.len(), p, |id| tok.token_bytes(id).len())
+    }
 }
 
 pub struct Plan {
@@ -83,7 +114,7 @@ impl Plan {
     /// Where the request starts, for the log (no text, no ids): a continuation of a session, a
     /// fork of one (the engine starts from it if it holds it), or a new session that names none.
     pub fn describe(&self, prompt_bytes: usize) -> String {
-        let of = format!("{} of {prompt_bytes} bytes, {} ids in common", self.shared, self.common);
+        let of = format!("{} of {prompt_bytes} bytes", self.shared);
         if self.base_session_id != 0 {
             format!("session {}, a fork of {}: it shares {of}", self.session_id, self.base_session_id)
         } else if self.matched == self.session_id {
@@ -108,6 +139,12 @@ pub struct SessionTable {
     changes: u64,
     max_sessions: usize,
     max_tokens: usize,
+    /// The most memory the sessions may hold (`Session::bytes`, with `image_bytes`).
+    max_bytes: usize,
+    /// The most memory the image rows in flight count for against `max_bytes`.
+    image_cap: usize,
+    /// What the image rows in flight count for now (at most `image_cap`).
+    image_bytes: usize,
 }
 
 /// The prefix lengths a text is indexed at: MIN_SHARED bytes, then four times longer each (64, 256, 1 KiB, ... 4 MiB at
@@ -145,17 +182,94 @@ fn unix_now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-/// The table's layout with each session's flags word. The first layout (`DSFT0001`) has none: its sessions
-/// are all of the plain path.
-const TABLE_MAGIC: &[u8; 8] = b"DSFT0002";
+/// Layout `DSFT0003`: each session has a flags word and then a factor word (u64 each).
+const TABLE_MAGIC: &[u8; 8] = b"DSFT0003";
+/// `DSFT0002`: a flags word, no factor word; read as factor 16.
+const TABLE_MAGIC_V2: &[u8; 8] = b"DSFT0002";
+/// `DSFT0001`: no flags and no factor word; read as the plain path at factor 16.
 const TABLE_MAGIC_V1: &[u8; 8] = b"DSFT0001";
 const TABLE_FLAG_ABLIT: u64 = 1;
 /// The session's ids are followed by its images: u64 count, then (at, rows, hash) as three u64 each.
 const TABLE_FLAG_IMAGES: u64 = 2;
 
-fn fnv(b: &[u8]) -> u64 {
-    b.iter().fold(1469598103934665603u64, |h, &x| (h ^ x as u64).wrapping_mul(1099511628211))
+const FNV_START: u64 = 1469598103934665603;
+
+fn fnv_update(h: u64, b: &[u8]) -> u64 {
+    b.iter().fold(h, |h, &x| (h ^ x as u64).wrapping_mul(1099511628211))
 }
+
+fn fnv(b: &[u8]) -> u64 {
+    fnv_update(FNV_START, b)
+}
+
+/// Tokens between two marks (`Session::marks`).
+const MARK_EVERY: usize = 32;
+
+/// The marks of `ids` (`len_of` is a token's byte length) and the byte length of the whole text. A text longer than
+/// u32::MAX bytes has no marks.
+fn mark_ids(ids: &[u32], len_of: impl Fn(u32) -> usize) -> (Vec<u32>, usize) {
+    let mut marks = Vec::with_capacity(ids.len() / MARK_EVERY);
+    let (mut at, mut fits) = (0usize, true);
+    for (i, &id) in ids.iter().enumerate() {
+        at += len_of(id);
+        if i % MARK_EVERY == MARK_EVERY - 1 {
+            match u32::try_from(at) {
+                Ok(m) => marks.push(m),
+                Err(_) => fits = false,
+            }
+        }
+    }
+    if !fits {
+        marks = Vec::new();
+    }
+    (marks, at)
+}
+
+/// The number of leading ids whose text is exactly `p` bytes long, when `p` is the end of a token; None otherwise (and
+/// always None for a text of more than u32::MAX bytes, which has no marks).
+fn token_end_in(marks: &[u32], ids: &[u32], text_len: usize, p: usize, len_of: impl Fn(u32) -> usize) -> Option<usize> {
+    if text_len > u32::MAX as usize {
+        return None;
+    }
+    let c = marks.partition_point(|&m| m as usize <= p);
+    if c > 0 && marks[c - 1] as usize == p {
+        return Some(c * MARK_EVERY);
+    }
+    let mut at = if c > 0 { marks[c - 1] as usize } else { 0 };
+    for (i, &id) in ids.iter().enumerate().take((c + 1) * MARK_EVERY).skip(c * MARK_EVERY) {
+        at += len_of(id);
+        if at == p {
+            return Some(i + 1);
+        }
+        if at > p {
+            return None;
+        }
+    }
+    None
+}
+
+/// Capacity a vector may keep over its length before it is given back: a quarter and a page.
+fn slack_over(len: usize, cap: usize) -> bool {
+    cap > len + len / 4 + 4096
+}
+
+fn shrink_slack<T>(v: &mut Vec<T>) {
+    if slack_over(v.len(), v.capacity()) {
+        v.shrink_to_fit();
+    }
+}
+
+fn shrink_text(s: &mut String) {
+    if slack_over(s.len(), s.capacity()) {
+        s.shrink_to_fit();
+    }
+}
+
+/// What a session costs besides its buffers: its struct, its slot in the table, the allocator's header on each of its
+/// five buffers.
+const SESSION_FIXED: usize = 64 + 16 * 5;
+/// What each of a session's index keys costs: the index slot and the bucket's list.
+const INDEX_ENTRY: usize = 96;
 
 /// The directory is ours and nobody else's (made 0700 if it was ours but open to others).
 fn private_dir(dir: &Path) -> Result<(), String> {
@@ -218,22 +332,248 @@ pub fn write_table(path: &Path, bytes: &[u8]) -> Result<(), String> {
     })
 }
 
-/// One periodic save: if `table` changed since the count in `saved`, snapshot it under the lock, write it after the
-/// lock is let go and set `saved` to that count. None when nothing changed; a failed write leaves `saved`, so the next
-/// call tries again.
-pub fn save_if_changed(table: &std::sync::Mutex<SessionTable>, saved: &mut u64, path: &Path, max_age_s: u64) -> Option<Result<usize, String>> {
-    let (bytes, n, at) = {
-        let t = table.lock().unwrap();
-        if t.changes() == *saved {
-            return None;
+/// Whether a session is in a saved table: a session in a request is saved as its last finished turn left it (its text and
+/// ids change only at `finish`); one with no finished turn, or unused for longer than `max_age_s`, is left out.
+fn saved_in(s: &Session, now: u64, max_age_s: u64) -> bool {
+    !s.text.is_empty() && now.saturating_sub(s.t_used) <= max_age_s
+}
+
+/// One session's record in a saved table.
+fn write_session(body: &mut Vec<u8>, id: u64, s: &Session) {
+    let flags = (if s.ablit { TABLE_FLAG_ABLIT } else { 0 }) | (if s.images.is_empty() { 0 } else { TABLE_FLAG_IMAGES });
+    for v in [id, s.last_used, s.t_used, s.prompt_len as u64, s.text.len() as u64, flags, s.factor as u64] {
+        body.extend(v.to_le_bytes());
+    }
+    body.extend(s.text.as_bytes());
+    body.extend((s.ids.len() as u64).to_le_bytes());
+    for &x in &s.ids {
+        body.extend(x.to_le_bytes());
+    }
+    if !s.images.is_empty() {
+        body.extend((s.images.len() as u64).to_le_bytes());
+        for k in &s.images {
+            for v in [k.at as u64, k.rows as u64, k.hash] {
+                body.extend(v.to_le_bytes());
+            }
         }
-        let (b, n) = t.snapshot(max_age_s);
-        (b, n, t.changes())
+    }
+}
+
+/// The 56 bytes that open a saved table.
+fn table_header(written: u64, next_id: u64, clock: u64, n: u64, body_len: u64, hash: u64) -> [u8; 56] {
+    let mut f = [0u8; 56];
+    f[..8].copy_from_slice(TABLE_MAGIC);
+    for (i, v) in [written, next_id, clock, n, body_len, hash].into_iter().enumerate() {
+        f[8 + 8 * i..16 + 8 * i].copy_from_slice(&v.to_le_bytes());
+    }
+    f
+}
+
+/// Sessions are copied out of the table until their records reach this many bytes, which are then written with the lock
+/// let go.
+const SAVE_BATCH: usize = 2 << 20;
+
+/// The sessions of `table` used within `max_age_s`, saved to `path` like `write_table` (same bytes as `snapshot`, same crash behaviour)
+/// without the lock held across a disk write or the file in memory: the lock is taken for one batch of records at a time (`SAVE_BATCH`,
+/// or one session when it is larger), which are written after it is let go, the header (its length and hash) last. A session changed
+/// between batches is written as it is when its batch is taken, a session removed meanwhile is left out, and the table's change count then
+/// differs from the one returned, so the next save follows. Returns the sessions written and the change count the save started from.
+pub fn save_table(table: &std::sync::Mutex<SessionTable>, path: &Path, max_age_s: u64) -> Result<(usize, u64), String> {
+    save_table_with(table, path, max_age_s, &mut || {})
+}
+
+fn save_table_with(table: &std::sync::Mutex<SessionTable>, path: &Path, max_age_s: u64, before_write: &mut dyn FnMut()) -> Result<(usize, u64), String> {
+    use std::os::unix::fs::FileExt;
+    static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    private_dir(path.parent().unwrap_or(Path::new(".")))?;
+    let tmp = PathBuf::from(format!("{}.new", path.display()));
+    let _ = std::fs::remove_file(&tmp);
+    let now = unix_now();
+    let (ids, at) = {
+        let t = table.lock().unwrap();
+        (t.sessions.keys().copied().collect::<Vec<u64>>(), t.changes)
     };
-    Some(write_table(path, &bytes).map(|()| {
+    let mut write = || -> std::io::Result<usize> {
+        let mut o = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
+        o.write_all(&[0u8; 56])?;
+        let (mut hash, mut body_len, mut n) = (FNV_START, 0u64, 0usize);
+        let mut buf: Vec<u8> = Vec::new();
+        let mut next = 0;
+        while next < ids.len() {
+            buf.clear();
+            {
+                let t = table.lock().unwrap();
+                while next < ids.len() && buf.len() < SAVE_BATCH {
+                    if let Some(s) = t.sessions.get(&ids[next]).filter(|s| saved_in(s, now, max_age_s)) {
+                        write_session(&mut buf, ids[next], s);
+                        n += 1;
+                    }
+                    next += 1;
+                }
+            }
+            before_write();
+            o.write_all(&buf)?;
+            hash = fnv_update(hash, &buf);
+            body_len += buf.len() as u64;
+        }
+        drop(buf);
+        let (next_id, clock) = {
+            let t = table.lock().unwrap();
+            (t.next_id, t.clock)
+        };
+        o.write_all_at(&table_header(now, next_id, clock, n as u64, body_len, hash), 0)?;
+        o.sync_all()?;
+        drop(o);
+        std::fs::rename(&tmp, path)?;
+        if let Some(d) = path.parent() {
+            std::fs::File::open(d)?.sync_all()?;
+        }
+        Ok(n)
+    };
+    match write() {
+        Ok(n) => Ok((n, at)),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(format!("{}: {e}", path.display()))
+        }
+    }
+}
+
+/// One periodic save: if `table` changed since the count in `saved`, save it (`save_table`) and set `saved` to the count
+/// the save started from, then give the allocator's free memory back. None when nothing changed; a failed write leaves
+/// `saved`, so the next call tries again.
+pub fn save_if_changed(table: &std::sync::Mutex<SessionTable>, saved: &mut u64, path: &Path, max_age_s: u64) -> Option<Result<usize, String>> {
+    if table.lock().unwrap().changes() == *saved {
+        return None;
+    }
+    let r = save_table(table, path, max_age_s).map(|(n, at)| {
         *saved = at;
         n
-    }))
+    });
+    trim_heap();
+    Some(r)
+}
+
+/// Memory the process holds, as the kernel counts it (VmRSS), in bytes; None where /proc has no such line.
+pub fn vm_rss_bytes() -> Option<usize> {
+    parse_vm_rss(&std::fs::read_to_string("/proc/self/status").ok()?)
+}
+
+/// The most memory the process has held (VmHWM), in bytes.
+pub fn vm_hwm_bytes() -> Option<usize> {
+    parse_status_kb(&std::fs::read_to_string("/proc/self/status").ok()?, "VmHWM:")
+}
+
+fn parse_vm_rss(status: &str) -> Option<usize> {
+    parse_status_kb(status, "VmRSS:")
+}
+
+fn parse_status_kb(status: &str, key: &str) -> Option<usize> {
+    let line = status.lines().find_map(|l| l.strip_prefix(key))?;
+    let kb: usize = line.trim().strip_suffix("kB")?.trim().parse().ok()?;
+    kb.checked_mul(1024)
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+mod heap {
+    extern "C" {
+        fn mallopt(param: i32, value: i32) -> i32;
+        fn malloc_trim(pad: usize) -> i32;
+    }
+    const M_ARENA_MAX: i32 = -8;
+    pub fn cap_arenas(n: i32) {
+        unsafe {
+            mallopt(M_ARENA_MAX, n);
+        }
+    }
+    pub fn trim() {
+        unsafe {
+            malloc_trim(0);
+        }
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+mod heap {
+    pub fn cap_arenas(_n: i32) {}
+    pub fn trim() {}
+}
+
+/// At most `n` malloc arenas for the process (call before threads allocate): each thread's own arena keeps what it
+/// freed, and a table of long texts built and dropped on many threads would hold many times its size.
+pub fn cap_heap_arenas(n: i32) {
+    heap::cap_arenas(n);
+}
+
+/// Gives the allocator's free memory back to the kernel.
+pub fn trim_heap() {
+    heap::trim();
+}
+
+/// What one reading of the process's memory led to (`Governor::step`).
+#[derive(Debug, Default, PartialEq)]
+pub struct Governed {
+    /// The process is over its limit: no image request is taken.
+    pub over: bool,
+    /// Sessions dropped, to release on the engine.
+    pub released: Vec<u64>,
+    /// A line for the log, once per episode: the memory is held by something other than the table.
+    pub held_elsewhere: Option<String>,
+}
+
+/// Keeps the process under a memory limit by dropping idle sessions, without emptying the table when the memory is not
+/// the table's. A round that freed bytes is judged by the next reading, taken after the allocator gave memory back:
+/// if the reading has not fallen by at least a quarter of what was freed, nothing more is dropped until the process has
+/// been under the limit once. Within one stretch over the limit the table never goes below half of what it held when the
+/// stretch began.
+#[derive(Debug, Default)]
+pub struct Governor {
+    over: bool,
+    stalled: bool,
+    floor: usize,
+    /// What the last round freed and the reading it was made at.
+    last: Option<(usize, usize)>,
+}
+
+impl Governor {
+    pub fn step(&mut self, table: &mut SessionTable, rss: usize, limit: usize) -> Governed {
+        if rss <= limit {
+            *self = Governor::default();
+            return Governed::default();
+        }
+        if !self.over {
+            self.over = true;
+            self.floor = table.bytes() / 2;
+        }
+        let mut held_elsewhere = None;
+        if let Some((freed, at)) = self.last.take() {
+            if at.saturating_sub(rss) < freed / 4 && !self.stalled {
+                self.stalled = true;
+                held_elsewhere = Some(format!(
+                    "front-end memory is held by something other than the session table: RSS {} MiB, the table counts {} MiB, the limit is {} MiB; no more sessions are dropped until RSS has been under the limit",
+                    rss >> 20,
+                    table.bytes() >> 20,
+                    limit >> 20
+                ));
+            }
+        }
+        if self.stalled {
+            return Governed { over: true, released: Vec::new(), held_elsewhere };
+        }
+        let (freed, released) = table.shed(rss - limit, self.floor);
+        if freed > 0 {
+            self.last = Some((freed, rss));
+        }
+        Governed { over: true, released, held_elsewhere }
+    }
+}
+
+/// The line that says what the table and the process hold, to choose the limits from.
+pub fn front_status(bytes: usize, sessions: usize, tokens: usize, rss: Option<usize>, hwm: Option<usize>) -> String {
+    let mib = |b: Option<usize>| b.map_or("?".to_string(), |b| (b >> 20).to_string());
+    let per = if tokens == 0 { 0.0 } else { bytes as f64 / tokens as f64 };
+    format!("session table: {} MiB counted, {sessions} sessions, {tokens} tokens, {per:.1} B/token; RSS {} MiB, high-water {} MiB", bytes >> 20, mib(rss), mib(hwm))
 }
 
 impl SessionTable {
@@ -241,7 +581,19 @@ impl SessionTable {
     /// so that a table begun afresh never reuses an earlier one's ids, whose sessions the engine may
     /// still keep.
     pub fn new(max_sessions: usize, max_tokens: usize) -> Self {
-        SessionTable { sessions: HashMap::new(), index: HashMap::new(), next_id: (unix_now() << 20).max(1), clock: 0, changes: 0, max_sessions, max_tokens }
+        SessionTable {
+            sessions: HashMap::new(),
+            index: HashMap::new(),
+            next_id: (unix_now() << 20).max(1),
+            clock: 0,
+            changes: 0,
+            max_sessions,
+            limits_known: true,
+            max_tokens,
+            max_bytes: usize::MAX,
+            image_cap: 0,
+            image_bytes: 0,
+        }
     }
 
     /// How many changes the sessions held have seen (see `changes`); equal counts mean equal tables.
@@ -258,40 +610,19 @@ impl SessionTable {
     }
 
     /// The saved form of the sessions used within `max_age_s` (one in a request as its last finished turn left it;
-    /// one with no finished turn is left out), and how many
-    /// they are. Memory only: the file is written from it after the table's lock is let go.
+    /// one with no finished turn is left out), and how many they are, whole in memory. A caller that writes it to a
+    /// file while requests are served uses `save_table`, which holds a few megabytes at a time and no lock across
+    /// a disk write.
     pub fn snapshot(&self, max_age_s: u64) -> (Vec<u8>, usize) {
         let now = unix_now();
         let (mut body, mut n) = (Vec::new(), 0u64);
         for (&id, s) in &self.sessions {
-            // a session in a request is saved as its last finished turn left it (its text and ids change only
-            // at `finish`); one with no finished turn has nothing to save
-            if s.text.is_empty() || now.saturating_sub(s.t_used) > max_age_s {
-                continue;
-            }
-            n += 1;
-            let flags = (if s.ablit { TABLE_FLAG_ABLIT } else { 0 }) | (if s.images.is_empty() { 0 } else { TABLE_FLAG_IMAGES });
-            for v in [id, s.last_used, s.t_used, s.prompt_len as u64, s.text.len() as u64, flags] {
-                body.extend(v.to_le_bytes());
-            }
-            body.extend(s.text.as_bytes());
-            body.extend((s.ids.len() as u64).to_le_bytes());
-            for &x in &s.ids {
-                body.extend(x.to_le_bytes());
-            }
-            if !s.images.is_empty() {
-                body.extend((s.images.len() as u64).to_le_bytes());
-                for k in &s.images {
-                    for v in [k.at as u64, k.rows as u64, k.hash] {
-                        body.extend(v.to_le_bytes());
-                    }
-                }
+            if saved_in(s, now, max_age_s) {
+                n += 1;
+                write_session(&mut body, id, s);
             }
         }
-        let mut f = TABLE_MAGIC.to_vec();
-        for v in [now, self.next_id, self.clock, n, body.len() as u64, fnv(&body)] {
-            f.extend(v.to_le_bytes());
-        }
+        let mut f = table_header(now, self.next_id, self.clock, n, body.len() as u64, fnv(&body)).to_vec();
         f.extend(body);
         (f, n as usize)
     }
@@ -319,10 +650,11 @@ impl SessionTable {
         }
         let mut f = Vec::new();
         file.read_to_end(&mut f).map_err(|e| e.to_string())?;
-        if f.len() < 56 || (&f[..8] != TABLE_MAGIC && &f[..8] != TABLE_MAGIC_V1) {
+        if f.len() < 56 || (&f[..8] != TABLE_MAGIC && &f[..8] != TABLE_MAGIC_V2 && &f[..8] != TABLE_MAGIC_V1) {
             return Err("not a saved table".into());
         }
-        let with_flags = &f[..8] == TABLE_MAGIC;
+        let with_flags = &f[..8] != TABLE_MAGIC_V1;
+        let with_factor = &f[..8] == TABLE_MAGIC;
         let mut h = Bytes { b: &f[8..56], at: 0 };
         let (written, next_id, clock, n, body_len, hash) = (h.u64()?, h.u64()?, h.u64()?, h.u64()?, h.u64()?, h.u64()?);
         let now = unix_now();
@@ -338,6 +670,10 @@ impl SessionTable {
         for _ in 0..n {
             let (id, last_used, t_used, prompt_len, text_len) = (r.u64()?, r.u64()?, r.u64()?, r.u64()? as usize, r.u64()? as usize);
             let flags = if with_flags { r.u64()? } else { 0 };
+            let factor = if with_factor { r.u64()? } else { 16 };
+            if !matches!(factor, 16 | 32 | 64) {
+                return Err("a bad factor".into());
+            }
             let text = r.take(text_len)?;
             let n_ids = r.u64()? as usize;
             let raw = r.take(n_ids.checked_mul(4).ok_or("a bad count")?)?;
@@ -354,12 +690,7 @@ impl SessionTable {
             if id == 0 || now.saturating_sub(t_used) > max_age_s || prompt_len > text.len() || ids.iter().any(|&x| x >= vocab) {
                 continue;
             }
-            let mut ends = Vec::with_capacity(ids.len());
-            let mut at = 0;
-            for &x in &ids {
-                at += tok.token_bytes(x).len();
-                ends.push(at);
-            }
+            let (marks, at) = mark_ids(&ids, |x| tok.token_bytes(x).len());
             if at != text.len() || tok.decode_bytes(&ids) != text.as_bytes() {
                 continue; // another tokenizer's ids
             }
@@ -367,7 +698,7 @@ impl SessionTable {
                 continue;
             }
             let ablit = flags & TABLE_FLAG_ABLIT != 0;
-            got.insert(id, Session { text: text.to_string(), ids, ends, prompt_len, busy: false, last_used, t_used, ablit, images, keys: Vec::new() });
+            got.insert(id, Session { text: text.to_string(), ids, marks, prompt_len, busy: false, last_used, t_used, ablit, factor: factor as u32, images, keys: Vec::new() });
         }
         if r.at != body.len() {
             return Err("a bad body".into());
@@ -405,7 +736,45 @@ impl SessionTable {
     pub fn plan_images(&mut self, text: &str, tok: &Tokenizer, threads: usize, ablit: bool, images: &[ImageKey]) -> (Plan, Vec<u64>) {
         self.clock += 1;
         self.changes += 1;
-        let top = self.best(text, ablit, images);
+        // The request's factor follows from its ids, which follow from the session it continues: try the best
+        // match at any factor, then the best of the factor the ids came to; if that moves the factor again,
+        // start fresh (a prompt tokenised whole has one length and so one factor).
+        let mut only = None;
+        let mut tries = 0;
+        let (plan, factor) = loop {
+            let (plan, used) = self.build(text, tok, threads, ablit, only, images);
+            let f = factor_for(plan.ids.len());
+            if used.map_or(true, |u| u == f) || only == Some(0) {
+                break (plan, f);
+            }
+            tries += 1;
+            only = Some(if tries >= 2 { 0 } else { f });
+        };
+        let clock = self.clock;
+        let s = self.sessions.entry(plan.session_id).or_insert_with(|| Session {
+            text: String::new(),
+            ids: Vec::new(),
+            marks: Vec::new(),
+            prompt_len: 0,
+            busy: false,
+            last_used: clock,
+            t_used: 0,
+            ablit,
+            factor,
+            images: Vec::new(),
+            keys: Vec::new(),
+        });
+        s.busy = true;
+        s.last_used = clock;
+        s.t_used = unix_now();
+        let released = self.evict(plan.session_id);
+        (plan, released)
+    }
+
+    /// The plan for a prompt against the sessions of factor `only` (None: of any factor; Some(0): none), and the
+    /// factor of the session it continues or forks (None when it starts fresh).
+    fn build(&mut self, text: &str, tok: &Tokenizer, threads: usize, ablit: bool, only: Option<u32>, images: &[ImageKey]) -> (Plan, Option<u32>) {
+        let top = self.best(text, ablit, only, images);
         let best = top.filter(|&(_, n)| n >= MIN_SHARED);
         let (mut plan, cut) = match best {
             None => (Plan { session_id: self.new_id(), base_session_id: 0, reused: 0, ids: Vec::new(), matched: 0, shared: 0, common: 0 }, 0),
@@ -423,8 +792,8 @@ impl SessionTable {
                     }
                     for p in [a, e] {
                         if p <= shared && p > cut.0 {
-                            if let Ok(k) = s.ends.binary_search(&p) {
-                                cut = (p, k + 1);
+                            if let Some(n) = s.token_end(p, tok) {
+                                cut = (p, n);
                             }
                         }
                     }
@@ -446,24 +815,7 @@ impl SessionTable {
             let s = &self.sessions[&sid].ids;
             plan.common = s.iter().zip(&plan.ids).take_while(|(a, b)| a == b).count();
         }
-        let clock = self.clock;
-        let s = self.sessions.entry(plan.session_id).or_insert_with(|| Session {
-            text: String::new(),
-            ids: Vec::new(),
-            ends: Vec::new(),
-            prompt_len: 0,
-            busy: false,
-            last_used: clock,
-            t_used: 0,
-            ablit,
-            images: Vec::new(),
-            keys: Vec::new(),
-        });
-        s.busy = true;
-        s.last_used = clock;
-        s.t_used = unix_now();
-        let released = self.evict(plan.session_id);
-        (plan, released)
+        (plan, best.map(|(sid, _)| self.sessions[&sid].factor))
     }
 
     /// Record what the session holds after a request: the prompt and the generated ids.
@@ -483,16 +835,16 @@ impl SessionTable {
             text.push_str(g);
             ids.extend_from_slice(generated);
         }
-        let mut ends = Vec::with_capacity(ids.len());
-        let mut at = 0;
-        for &id in &ids {
-            at += tok.token_bytes(id).len();
-            ends.push(at);
-        }
+        let (marks, at) = mark_ids(&ids, |id| tok.token_bytes(id).len());
         debug_assert_eq!(at, text.len());
+        // the buffers grew by doubling while the reply was appended: what the session keeps is what it holds
+        shrink_text(&mut text);
+        shrink_slack(&mut ids);
         s.text = text;
         s.ids = ids;
-        s.ends = ends;
+        s.marks = marks;
+        // The session's factor is the larger of its own and the one its whole text needs, so the next turn matches it at the factor the engine used.
+        s.factor = s.factor.max(factor_for(s.ids.len()));
         s.prompt_len = prompt_text.len();
         s.images = images.to_vec();
         s.busy = false;
@@ -500,17 +852,16 @@ impl SessionTable {
         self.enter(session_id);
     }
 
-    /// The session of the weights path `ablit` whose text shares the longest prefix with `text` (at least MIN_SHARED
-    /// bytes), with the images inside it the same, and how many bytes it shares. The deepest level the prompt shares
-    /// with some session holds it: every session sharing at least that level's length is in that bucket (a hash that
-    /// only collides shares less, and the next level down is tried).
-    fn best(&self, text: &str, ablit: bool, images: &[ImageKey]) -> Option<(u64, usize)> {
+    /// The session of path `ablit` (and factor `only`, when given) sharing the longest prefix with `text` (at least MIN_SHARED
+    /// bytes) with the same images inside it, and how many bytes it shares: found from the deepest index level the prompt
+    /// shares with some session.
+    fn best(&self, text: &str, ablit: bool, only: Option<u32>, images: &[ImageKey]) -> Option<(u64, usize)> {
         let pk = prefix_keys(text.as_bytes());
         let mut top: Option<(u64, usize)> = None;
         for level in (0..pk.len()).rev() {
             for &id in self.index.get(&pk[level]).map_or(&[][..], |v| &v[..]) {
                 let s = &self.sessions[&id];
-                if s.ablit != ablit {
+                if s.ablit != ablit || only.map_or(false, |f| s.factor != f) {
                     continue;
                 }
                 let n = common_prefix(text.as_bytes(), s.text.as_bytes());
@@ -563,33 +914,95 @@ impl SessionTable {
         self.remove(session_id);
     }
 
-    /// Drop least recently used idle sessions over the limits; returns their ids.
+    /// Drop least recently used idle sessions (never `keep`, never one in a request) while the table holds more than
+    /// `max_sessions` sessions, `max_tokens` ids or `max_bytes` bytes; returns their ids.
     fn evict(&mut self, keep: u64) -> Vec<u64> {
         let mut out = Vec::new();
+        let mut tokens: usize = self.sessions.values().map(|s| s.ids.len()).sum();
+        let mut bytes: usize = self.bytes();
         loop {
-            let total: usize = self.sessions.values().map(|s| s.ids.len()).sum();
-            if self.sessions.len() <= self.max_sessions && total <= self.max_tokens {
+            let counts_ok = !self.limits_known || (self.sessions.len() <= self.max_sessions && tokens <= self.max_tokens);
+            if counts_ok && bytes <= self.max_bytes {
                 return out;
             }
-            let victim = self.sessions.iter().filter(|(&id, s)| id != keep && !s.busy).min_by_key(|(_, s)| s.last_used).map(|(&id, _)| id);
-            match victim {
-                Some(id) => {
-                    self.remove(id);
-                    out.push(id);
-                }
-                None => return out,
-            }
+            let Some(id) = self.lru_idle(keep) else { return out };
+            let s = &self.sessions[&id];
+            tokens -= s.ids.len();
+            bytes -= s.bytes();
+            self.remove(id);
+            out.push(id);
         }
+    }
+
+    /// The least recently used session that is in no request and is not `keep`.
+    fn lru_idle(&self, keep: u64) -> Option<u64> {
+        self.sessions.iter().filter(|(&id, s)| id != keep && !s.busy).min_by_key(|(_, s)| s.last_used).map(|(&id, _)| id)
+    }
+
+    /// The memory the table holds: every session's buffers by capacity (`Session::bytes`) and the image rows in flight
+    /// (`set_image_bytes`).
+    pub fn bytes(&self) -> usize {
+        self.sessions.values().map(|s| s.bytes()).sum::<usize>() + self.image_bytes
+    }
+
+    /// The most memory the sessions may hold (0: no limit), and the most the image rows in flight count for against it.
+    pub fn set_byte_limits(&mut self, max_bytes: usize, image_cap: usize) {
+        self.max_bytes = if max_bytes == 0 { usize::MAX } else { max_bytes };
+        self.image_cap = image_cap;
+    }
+
+    /// The image rows in flight take `bytes` of the process (counted up to the image limit): the table gives that room up.
+    pub fn set_image_bytes(&mut self, bytes: usize) {
+        self.image_bytes = bytes.min(self.image_cap);
+    }
+
+    /// Drop idle sessions, least recently used first (never one in a request), until their memory is at least `need`
+    /// bytes, but not past the point where the table would hold less than `floor` bytes. Returns the memory freed and
+    /// the ids dropped, which the caller releases on the engine.
+    pub fn shed(&mut self, need: usize, floor: usize) -> (usize, Vec<u64>) {
+        let (mut freed, mut out) = (0usize, Vec::new());
+        let mut held = self.bytes();
+        while freed < need {
+            let Some(id) = self.lru_idle(0) else { break };
+            let b = self.sessions[&id].bytes();
+            if held.saturating_sub(b) < floor {
+                break;
+            }
+            held -= b;
+            freed += b;
+            self.remove(id);
+            out.push(id);
+        }
+        (freed, out)
+    }
+
+    /// (memory held by the sessions and image rows by `bytes`, sessions, ids).
+    pub fn stats(&self) -> (usize, usize, usize) {
+        (self.bytes(), self.sessions.len(), self.sessions.values().map(|s| s.ids.len()).sum())
     }
 
     pub fn len(&self) -> usize {
         self.sessions.len()
     }
 
-    /// The table's limits from what the engine can keep (HELLO keep_positions: its pool and disk tier), so that a
-    /// conversation is matched for as long as the engine holds its state; never under 256 sessions and 16M ids.
-    pub fn keep_for(&mut self, keep_positions: u64) {
-        self.max_tokens = (keep_positions as usize).max(16 << 20);
+    /// Until `keep_for` runs, the session and id counts bound nothing (the memory limit still does): the engine's limits are not
+    /// known yet, and the table must not trim below them.
+    pub fn defer_limits(&mut self) {
+        self.limits_known = false;
+    }
+
+    /// Drops idle sessions beyond the limits now set; returns their ids, which the caller releases on the engine.
+    pub fn trim_to_limits(&mut self) -> Vec<u64> {
+        self.evict(0)
+    }
+
+    /// The table's limits from what the engine can keep (HELLO keep_positions), never under 256 sessions and 16M ids; the id
+    /// limit also holds four conversations of the whole window plus a sibling of at most 1M ids beside each (the session
+    /// left behind at a factor boundary).
+    pub fn keep_for(&mut self, keep_positions: u64, max_context: u32) {
+        self.limits_known = true;
+        let conversations = 4 * (max_context as usize + max_context.min(FACTOR_STEP as u32) as usize);
+        self.max_tokens = (keep_positions as usize).max(16 << 20).max(conversations);
         self.max_sessions = (keep_positions as usize / 4096).max(256);
     }
 }
@@ -602,8 +1015,8 @@ mod tests {
 
     /// A session of `text` straight into the table and its index (no tokenizer: the index reads only the text).
     fn put(t: &mut SessionTable, id: u64, text: &str, ablit: bool) {
-        t.sessions.insert(id, Session { text: text.into(), ids: Vec::new(), ends: Vec::new(), prompt_len: text.len(), busy: false,
-                                        last_used: 0, t_used: 0, ablit, images: Vec::new(), keys: Vec::new() });
+        t.sessions.insert(id, Session { text: text.into(), ids: Vec::new(), marks: Vec::new(), prompt_len: text.len(), busy: false,
+                                        last_used: 0, t_used: 0, ablit, factor: 16, images: Vec::new(), keys: Vec::new() });
         t.enter(id);
     }
 
@@ -618,6 +1031,145 @@ mod tests {
     fn put_fresh(t: &mut SessionTable, id: u64, text: &str, ablit: bool) {
         put(t, id, text, ablit);
         t.sessions.get_mut(&id).unwrap().t_used = unix_now();
+    }
+
+    /// A saved table of an older layout holding one session of `text` (`DSFT0002` has the flags word, `DSFT0001` not).
+    fn old_table(magic: &[u8; 8], id: u64, text: &str, ids: &[u32]) -> Vec<u8> {
+        let now = unix_now();
+        let mut body = Vec::new();
+        let mut head = vec![id, 5, now, text.len() as u64, text.len() as u64];
+        if magic == TABLE_MAGIC_V2 {
+            head.push(0);
+        }
+        for v in head {
+            body.extend(v.to_le_bytes());
+        }
+        body.extend(text.as_bytes());
+        body.extend((ids.len() as u64).to_le_bytes());
+        for x in ids {
+            body.extend(x.to_le_bytes());
+        }
+        let mut f = magic.to_vec();
+        for v in [now, id + 1, 9, 1, body.len() as u64, fnv(&body)] {
+            f.extend(v.to_le_bytes());
+        }
+        f.extend(body);
+        f
+    }
+
+    #[test]
+    fn the_factor_follows_the_prompts_token_count() {
+        assert_eq!([0, 1, (1 << 20) - 1].map(factor_for), [16, 16, 16]);
+        assert_eq!([1 << 20, (2 << 20) - 1].map(factor_for), [32, 32]);
+        assert_eq!([2 << 20, 4 << 20, 9 << 20].map(factor_for), [64, 64, 64]);
+    }
+
+    #[test]
+    fn a_match_never_crosses_factors() {
+        let text = "<｜begin▁of▁sentence｜>a conversation long enough to be matched, with its system prompt and a few turns";
+        let mut t = SessionTable::new(8, 1 << 20);
+        put(&mut t, 1, text, false);
+        t.sessions.get_mut(&1).unwrap().factor = 32;
+        assert_eq!(best_of(&t, &tok, text, false, None, &[]), Some(1), "any factor: found");
+        assert_eq!(best_of(&t, &tok, text, false, Some(32), &[]), Some(1));
+        assert_eq!(best_of(&t, &tok, text, false, Some(16), &[]), None, "a factor-16 request never matches a factor-32 session");
+        assert_eq!(best_of(&t, &tok, text, false, Some(64), &[]), None);
+    }
+
+    #[test]
+    fn a_reply_that_crosses_a_boundary_labels_its_session_with_the_new_factor() {
+        let tok = crate::tokenizer::synthetic::tokenizer();
+        let mut t = SessionTable::new(8, 64 << 20);
+        let p1 = "<｜begin▁of▁sentence｜><｜System｜>You are a careful assistant who answers briefly and well.<｜User｜>hello<｜Assistant｜></think>";
+        let (a, _) = t.plan(p1, &tok, 1, false);
+        assert_eq!(t.sessions[&a.session_id].factor, 16);
+        let reply = vec![tok.encode("x")[0]; (1 << 20) + 8];
+        t.finish(a.session_id, p1, &a.ids, &reply, &tok);
+        assert_eq!(t.sessions[&a.session_id].factor, 32, "prompt and reply together hold over 2^20 ids");
+    }
+
+    #[test]
+    fn a_conversation_past_a_boundary_gets_a_new_session_and_the_old_one_stays() {
+        let tok = crate::tokenizer::synthetic::tokenizer();
+        let mut t = SessionTable::new(8, 64 << 20);
+        let p1 = "<｜begin▁of▁sentence｜><｜System｜>You are a careful assistant who answers briefly and well.<｜User｜>hello<｜Assistant｜></think>";
+        let (a, _) = t.plan(p1, &tok, 1, false);
+        t.finish(a.session_id, p1, &a.ids, &tok.encode("Hi."), &tok);
+        assert_eq!(t.sessions[&a.session_id].factor, 16);
+        // the next turn is over 1M ids (one id a byte here): factor 32, so session `a` is not offered
+        let big = format!("{p1}Hi.<｜User｜>{}<｜Assistant｜></think>", "x".repeat((1 << 20) + 100));
+        let (b, _) = t.plan(&big, &tok, 1, false);
+        assert!(b.ids.len() > 1 << 20);
+        assert_ne!(b.session_id, a.session_id, "a new session, not the factor-16 one in place");
+        assert_eq!((b.base_session_id, b.reused), (0, 0), "no fork of it and no id of its history");
+        assert_eq!(t.sessions[&b.session_id].factor, 32);
+        t.finish(b.session_id, &big, &b.ids, &tok.encode("ok"), &tok);
+        // the old record is kept: a sibling still under the boundary continues it in place
+        let sib = format!("{p1}Hi.<｜User｜>next<｜Assistant｜></think>");
+        let (c, _) = t.plan(&sib, &tok, 1, false);
+        assert_eq!((c.session_id, c.base_session_id), (a.session_id, 0));
+        assert!(c.reused > 0);
+        // and the big conversation's next turn continues the new session
+        t.finish(c.session_id, &sib, &c.ids, &tok.encode("ok"), &tok);
+        let big2 = format!("{big}ok<｜User｜>more<｜Assistant｜></think>");
+        let (d, _) = t.plan(&big2, &tok, 1, false);
+        assert_eq!(d.session_id, b.session_id);
+    }
+
+    #[test]
+    fn the_saved_table_carries_each_sessions_factor() {
+        let dir = table_dir("factor");
+        let path = dir.join("front.table");
+        let tok = crate::tokenizer::synthetic::tokenizer();
+        let mut t = SessionTable::new(8, 1 << 20);
+        let text = "<｜begin▁of▁sentence｜>one conversation at factor thirty-two";
+        put_fresh(&mut t, 3, text, false);
+        let ids = tok.encode(text);
+        {
+            let s = t.sessions.get_mut(&3).unwrap();
+            s.marks = Vec::new();
+            s.ids = ids;
+            s.factor = 32;
+        }
+        assert_eq!(&t.snapshot(3600).0[..8], TABLE_MAGIC);
+        assert_eq!(t.save(&path, 3600), Ok(1));
+        let mut u = SessionTable::new(8, 1 << 20);
+        assert_eq!(u.load(&path, &tok, 3600), Ok(1));
+        assert_eq!(u.sessions[&3].factor, 32);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_old_format_table_loads_at_factor_16() {
+        let tok = crate::tokenizer::synthetic::tokenizer();
+        let text = "<｜begin▁of▁sentence｜>an older table's conversation, long enough to be matched by a prompt";
+        let ids = tok.encode(text);
+        for (name, magic) in [("v2", TABLE_MAGIC_V2), ("v1", TABLE_MAGIC_V1)] {
+            let dir = table_dir(name);
+            let path = dir.join("front.table");
+            write_table(&path, &old_table(magic, 7, text, &ids)).unwrap();
+            let mut t = SessionTable::new(8, 1 << 20);
+            assert_eq!(t.load(&path, &tok, 3600), Ok(1), "{name}");
+            assert_eq!(t.sessions[&7].factor, 16, "{name}: every old record is factor 16");
+            assert_eq!(best_of(&t, &tok, text, false, Some(16), &[]), Some(7));
+            assert_eq!(best_of(&t, &tok, text, false, Some(32), &[]), None);
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn the_id_limit_holds_four_whole_window_conversations_with_their_siblings() {
+        let mut t = SessionTable::new(256, 16 << 20);
+        let four_4m = 4 * (4 << 20);
+        // what a 4M engine reports it keeps (HELLO keep_positions) alone would not do for four 4M conversations
+        // plus the 1M session each left behind at its boundary
+        t.keep_for(8 << 20, 4 << 20);
+        assert_eq!(t.max_tokens, four_4m + 4 * (1 << 20));
+        // a larger keep_positions wins; a 1M engine keeps the 16M-id floor
+        t.keep_for(40 << 20, 4 << 20);
+        assert_eq!(t.max_tokens, 40 << 20);
+        t.keep_for(8 << 20, 1 << 20);
+        assert_eq!(t.max_tokens, 16 << 20);
     }
 
     #[test]
@@ -799,7 +1351,7 @@ mod tests {
             let p = b[..rnd(b.len() as u64 + 1) as usize].to_string() + &(0..rnd(800)).map(|_| alpha(rnd(3))).collect::<String>();
             let ablit = q % 7 == 0;
             let brute = texts.iter().filter(|x| x.2 == ablit).map(|x| common_prefix(p.as_bytes(), x.1.as_bytes())).max().unwrap_or(0);
-            let got = t.best(&p, ablit, &[]).map_or(0, |(_, n)| n);
+            let got = t.best(&p, ablit, None, &[]).map_or(0, |(_, n)| n);
             if brute >= MIN_SHARED {
                 assert_eq!(got, brute, "prompt {q} of {} bytes", p.len());
             } else {
@@ -816,9 +1368,9 @@ mod tests {
     #[test]
     fn the_table_keeps_what_the_engine_keeps() {
         let mut t = SessionTable::new(256, 16 << 20);
-        t.keep_for(0);  // an engine that keeps nothing (or an echo engine): the table's own limits, never less
+        t.keep_for(0, 1 << 20); // an engine that keeps nothing (or an echo engine): the table's own limits, never less
         assert_eq!((t.max_sessions, t.max_tokens), (256, 16 << 20));
-        t.keep_for(300_000_000);  // a pool and a 256 GiB disk tier: about 300M positions
+        t.keep_for(300_000_000, 1 << 20); // an engine that reports about 300M positions
         assert_eq!((t.max_sessions, t.max_tokens), (300_000_000 / 4096, 300_000_000));
     }
 
@@ -853,7 +1405,7 @@ mod tests {
 
     #[test]
     fn the_plan_says_where_it_starts() {
-        let Ok(tok) = Tokenizer::from_file(TOKENIZER) else { return };
+        let tok = syn();
         let mut t = SessionTable::new(8, 1 << 20);
         // pi-like: a long system text that ends with the time, then the tools and the first message
         let body = "You are an expert coding assistant. Read files, run commands and edit code.\n".repeat(40);
@@ -893,7 +1445,7 @@ mod tests {
 
     #[test]
     fn a_saved_table_finds_its_sessions_again() {
-        let Ok(tok) = Tokenizer::from_file(TOKENIZER) else { return };
+        let tok = syn();
         let dir = std::env::temp_dir().join(format!("dsfront-table-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir(&dir).unwrap();
@@ -1164,6 +1716,398 @@ mod tests {
         let (x3, k3) = with_images(&turn(&hist, "and its colour?"), 3, &[12]);
         let (p3, _) = u.plan_images(&x3, &tok, 1, false, &k3);
         assert_eq!((p3.base_session_id, p3.reused), (0, 0));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // ---------------------------------------------------------------- memory
+
+    /// Heap use of the calling thread only, for the tests that bound memory.
+    mod probe {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+
+        thread_local! {
+            static ON: Cell<bool> = const { Cell::new(false) };
+            static CUR: Cell<isize> = const { Cell::new(0) };
+            static PEAK: Cell<isize> = const { Cell::new(0) };
+        }
+
+        pub struct Counting;
+
+        fn note(d: isize) {
+            let _ = ON.try_with(|on| {
+                if on.get() {
+                    CUR.with(|c| {
+                        c.set(c.get() + d);
+                        PEAK.with(|p| p.set(p.get().max(c.get())));
+                    });
+                }
+            });
+        }
+
+        unsafe impl GlobalAlloc for Counting {
+            unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+                note(l.size() as isize);
+                System.alloc(l)
+            }
+            unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
+                note(l.size() as isize);
+                System.alloc_zeroed(l)
+            }
+            unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+                note(-(l.size() as isize));
+                System.dealloc(p, l)
+            }
+            unsafe fn realloc(&self, p: *mut u8, l: Layout, n: usize) -> *mut u8 {
+                note(n as isize - l.size() as isize);
+                System.realloc(p, l, n)
+            }
+        }
+
+        /// `f`'s result, the bytes it left allocated and the most it had allocated at once (this thread).
+        pub fn measure<R>(f: impl FnOnce() -> R) -> (R, usize, usize) {
+            CUR.with(|c| c.set(0));
+            PEAK.with(|p| p.set(0));
+            ON.with(|o| o.set(true));
+            let r = f();
+            ON.with(|o| o.set(false));
+            (r, CUR.with(|c| c.get()).max(0) as usize, PEAK.with(|p| p.get()).max(0) as usize)
+        }
+    }
+
+    #[global_allocator]
+    static COUNTING: probe::Counting = probe::Counting;
+
+    /// Token lengths as a real vocabulary has them: mostly short, some of an added token's size.
+    fn len_of_id(id: u32) -> usize {
+        [1, 1, 2, 3, 4, 5, 9, 13, 23, 29][id as usize % 10]
+    }
+
+    #[test]
+    fn a_token_end_found_by_marks_is_the_one_a_search_of_every_end_finds() {
+        let mut st = 7u64;
+        for n in [0usize, 1, 2, 31, 32, 33, 63, 64, 65, 95, 96, 97, 300, 1000] {
+            for _ in 0..6 {
+                let ids: Vec<u32> = (0..n).map(|_| lcg(&mut st) as u32 % 1000).collect();
+                let (marks, total) = mark_ids(&ids, len_of_id);
+                assert_eq!(marks.len(), n / 32);
+                let mut ends = Vec::new();
+                let mut at = 0;
+                for &id in &ids {
+                    at += len_of_id(id);
+                    ends.push(at);
+                }
+                assert_eq!(total, at);
+                for p in 0..=total + 3 {
+                    let want = ends.binary_search(&p).ok().map(|k| k + 1);
+                    assert_eq!(token_end_in(&marks, &ids, total, p, len_of_id), want, "n {n} p {p}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_text_over_four_gigabytes_has_no_marks_and_never_matches_an_edge() {
+        let ids = vec![0u32; 64];
+        let (marks, total) = mark_ids(&ids, |_| 1 << 26);
+        assert_eq!(total, 1 << 32);
+        assert!(marks.is_empty());
+        assert_eq!(token_end_in(&marks, &ids, total, 1 << 26, |_| 1 << 26), None);
+        let (marks, total) = mark_ids(&ids, |_| 1 << 25);
+        assert_eq!((marks.len(), marks[1]), (2, 1 << 31));
+        assert_eq!(token_end_in(&marks, &ids, total, 33 << 25, |_| 1 << 25), Some(33));
+    }
+
+    /// A finished session of `text` (a prompt of its own, no reply), through the table's own steps.
+    fn add(t: &mut SessionTable, tok: &Tokenizer, i: usize, bytes: usize) -> u64 {
+        let text = format!("<｜begin▁of▁sentence｜>session number {i:05} {}", char::from(b'a' + (i % 26) as u8).to_string().repeat(bytes));
+        let (p, _) = t.plan(&text, tok, 1, false);
+        t.finish(p.session_id, &text, &p.ids, &[], tok);
+        p.session_id
+    }
+
+    #[test]
+    fn the_byte_limit_drops_the_oldest_idle_sessions_and_spares_a_busy_one() {
+        let tok = crate::tokenizer::synthetic::tokenizer();
+        let mut t = SessionTable::new(1000, 1 << 40);
+        t.set_byte_limits(400_000, 0);
+        let busy_text = format!("<｜begin▁of▁sentence｜>the busy conversation {}", "z".repeat(10_000));
+        let (busy, _) = t.plan(&busy_text, &tok, 1, false);
+        let mut made = Vec::new();
+        for i in 0..12 {
+            // a session is taken in by the plan that starts it, which is where the limit is kept; its record grows at its finish
+            let text = format!("<｜begin▁of▁sentence｜>session number {i:05} {}", "a".repeat(20_000));
+            let (p, _) = t.plan(&text, &tok, 1, false);
+            assert!(t.bytes() <= 400_000, "after session {i}: {} bytes", t.bytes());
+            t.finish(p.session_id, &text, &p.ids, &[], &tok);
+            made.push(p.session_id);
+        }
+        assert!(t.len() < 13, "only the byte limit can have dropped any: sessions, ids and positions are far from theirs");
+        assert!(t.sessions.contains_key(&busy.session_id), "a session in a request stays");
+        assert!(!t.sessions.contains_key(&made[0]) && t.sessions.contains_key(made.last().unwrap()), "the oldest goes first");
+    }
+
+    #[test]
+    fn a_session_counts_its_capacity_not_its_length() {
+        let mut t = SessionTable::new(8, 1 << 20);
+        put(&mut t, 1, "x", false);
+        let lean = t.sessions[&1].bytes();
+        let s = t.sessions.get_mut(&1).unwrap();
+        s.ids = Vec::with_capacity(100_000);
+        s.ids.push(1);
+        s.marks = Vec::with_capacity(5_000);
+        s.text = String::with_capacity(70_000);
+        assert!(t.sessions[&1].bytes() >= lean + 4 * 100_000 + 4 * 5_000 + 70_000 - 1);
+    }
+
+    #[test]
+    fn the_counted_bytes_follow_what_the_table_allocates() {
+        let tok = syn();
+        let ((t, ids), held, _) = probe::measure(|| {
+            let mut t = SessionTable::new(1000, 1 << 40);
+            let ids: Vec<u64> = (0..24).map(|i| add(&mut t, &tok, i, 4000 + 90 * i)).collect();
+            (t, ids)
+        });
+        assert_eq!(ids.len(), 24);
+        let counted = t.bytes();
+        let diff = counted.abs_diff(held) as f64 / held as f64;
+        assert!(diff < 0.10, "counted {counted}, allocated {held}: {:.1} % apart", diff * 100.0);
+        assert!(counted >= held * 9 / 10, "never well under what is held");
+    }
+
+    #[test]
+    fn a_finished_session_gives_back_the_slack_its_buffers_grew() {
+        let tok = crate::tokenizer::synthetic::tokenizer();
+        let mut t = SessionTable::new(8, 1 << 24);
+        let prompt = format!("<｜begin▁of▁sentence｜>{}", "p".repeat(100_000));
+        let (a, _) = t.plan(&prompt, &tok, 1, false);
+        t.finish(a.session_id, &prompt, &a.ids, &tok.encode(&"r".repeat(30_000)), &tok);
+        let s = &t.sessions[&a.session_id];
+        assert!(s.text.capacity() <= s.text.len() + s.text.len() / 4 + 4096, "text {} of {}", s.text.len(), s.text.capacity());
+        assert!(s.ids.capacity() <= s.ids.len() + s.ids.len() / 4 + 4096, "ids {} of {}", s.ids.len(), s.ids.capacity());
+        assert_eq!(s.marks.capacity(), s.ids.len() / MARK_EVERY);
+    }
+
+    #[test]
+    fn over_the_process_limit_idle_sessions_go_oldest_first_until_the_excess_is_gone() {
+        let tok = crate::tokenizer::synthetic::tokenizer();
+        let mut t = SessionTable::new(1000, 1 << 40);
+        let ids: Vec<u64> = (0..8).map(|i| add(&mut t, &tok, i, 30_000)).collect();
+        let (busy, _) = t.plan(&format!("<｜begin▁of▁sentence｜>busy and old {}", "b".repeat(30_000)), &tok, 1, false);
+        t.sessions.get_mut(&busy.session_id).unwrap().last_used = 0;
+        let one = t.sessions[&ids[0]].bytes();
+        let mut g = Governor::default();
+        assert_eq!(g.step(&mut t, 1000, 1000), Governed::default(), "at the limit nothing goes");
+        let r = g.step(&mut t, 1000 + 2 * one + 1, 1000);
+        assert!(r.over);
+        assert_eq!(r.released, ids[..3].to_vec(), "three sessions cover two and a bit of them, the oldest first");
+        assert!(t.sessions.contains_key(&busy.session_id), "a session in a request stays however old");
+    }
+
+    /// A table of `n` idle sessions of one size and the size.
+    fn idle_table(n: usize) -> (SessionTable, Vec<u64>, usize) {
+        let tok = syn();
+        let mut t = SessionTable::new(1000, 1 << 40);
+        let ids: Vec<u64> = (0..n).map(|i| add(&mut t, &tok, i, 500)).collect();
+        let one = t.sessions[&ids[0]].bytes();
+        (t, ids, one)
+    }
+
+    #[test]
+    fn memory_that_does_not_fall_after_a_round_stops_the_dropping_until_it_has_been_under_the_limit() {
+        let (mut t, ids, one) = idle_table(20);
+        let limit = 1_000_000;
+        let mut g = Governor::default();
+        let first = g.step(&mut t, limit + 2 * one, limit);
+        assert_eq!(first.released.len(), 2);
+        let left = t.len();
+        // the reading has not moved: one more look says so, once, and drops nothing
+        let second = g.step(&mut t, limit + 2 * one, limit);
+        assert!(second.over && second.released.is_empty());
+        let line = second.held_elsewhere.expect("the log line");
+        assert!(line.contains("RSS") && line.contains("counts") && line.contains("limit"), "{line}");
+        for _ in 0..5 {
+            let r = g.step(&mut t, limit + 2 * one, limit);
+            assert!(r.over && r.released.is_empty() && r.held_elsewhere.is_none(), "quiet and still");
+        }
+        assert_eq!(t.len(), left);
+        // under the limit once: dropping works again
+        assert_eq!(g.step(&mut t, limit - 1, limit), Governed::default());
+        assert_eq!(g.step(&mut t, limit + 2 * one, limit).released.len(), 2);
+        assert!(ids.len() > t.len());
+    }
+
+    #[test]
+    fn memory_that_falls_by_a_quarter_of_what_was_freed_lets_the_next_round_go_on() {
+        let (mut t, _, one) = idle_table(20);
+        let limit = 1_000_000;
+        let mut g = Governor::default();
+        assert_eq!(g.step(&mut t, limit + 4 * one, limit).released.len(), 4);
+        let r = g.step(&mut t, limit + 4 * one - one, limit); // fell by exactly a quarter of the 4 freed
+        assert!(r.held_elsewhere.is_none() && !r.released.is_empty());
+    }
+
+    #[test]
+    fn a_stretch_over_the_limit_never_takes_the_table_below_half_of_what_it_held_at_its_start() {
+        let (mut t, _, one) = idle_table(20);
+        let start = t.bytes();
+        let mut g = Governor::default();
+        let mut rss = 1_000_000 + 1000 * one;
+        for _ in 0..40 {
+            g.step(&mut t, rss, 1_000_000);
+            rss -= 5 * one; // falling fast enough: never stalled
+        }
+        assert!(t.bytes() >= start / 2 && t.bytes() < start / 2 + one, "{} of {start}", t.bytes());
+    }
+
+    #[test]
+    fn the_status_line_names_what_the_table_and_the_process_hold() {
+        assert_eq!(
+            front_status(3 << 30, 120, 200_000_000, Some(2 << 30), Some(3 << 30)),
+            "session table: 3072 MiB counted, 120 sessions, 200000000 tokens, 16.1 B/token; RSS 2048 MiB, high-water 3072 MiB"
+        );
+        assert!(front_status(0, 0, 0, None, None).contains("0.0 B/token; RSS ? MiB"));
+        assert_eq!(parse_status_kb("VmHWM:\t 5 kB\n", "VmHWM:"), Some(5120));
+    }
+
+    #[test]
+    fn image_rows_in_flight_take_room_from_the_table_up_to_their_limit() {
+        let tok = syn();
+        let mut t = SessionTable::new(1000, 1 << 40);
+        t.set_byte_limits(150_000, 60_000);
+        for i in 0..9 {
+            add(&mut t, &tok, i, 450);
+        }
+        let held = t.len();
+        assert!(held >= 6, "{held} sessions of about 20 KB under 150 KB");
+        t.set_image_bytes(10_000_000);
+        assert_eq!(t.bytes() - t.sessions.values().map(|s| s.bytes()).sum::<usize>(), 60_000, "counted up to the limit");
+        let text = format!("<｜begin▁of▁sentence｜>session number 99999 {}", "k".repeat(4_000));
+        t.plan(&text, &tok, 1, false);
+        assert!(t.len() < held && t.bytes() <= 150_000, "the rows' share pushed sessions out: {} of {held}", t.len());
+    }
+
+    #[test]
+    fn the_process_memory_is_read_from_the_kernels_line() {
+        assert_eq!(parse_vm_rss("Name:\tx\nVmRSS:\t  1234 kB\nThreads:\t3\n"), Some(1234 * 1024));
+        assert_eq!(parse_vm_rss("Name:\tx\n"), None);
+        assert!(vm_rss_bytes().unwrap() > 1 << 20);
+    }
+
+    /// The table as the periodic save found it before records were copied out in batches: one buffer.
+    fn old_snapshot(t: &SessionTable, max_age_s: u64) -> Vec<u8> {
+        let now = unix_now();
+        let (mut body, mut n) = (Vec::new(), 0u64);
+        for (&id, s) in &t.sessions {
+            if s.text.is_empty() || now.saturating_sub(s.t_used) > max_age_s {
+                continue;
+            }
+            n += 1;
+            let flags = (if s.ablit { TABLE_FLAG_ABLIT } else { 0 }) | (if s.images.is_empty() { 0 } else { TABLE_FLAG_IMAGES });
+            for v in [id, s.last_used, s.t_used, s.prompt_len as u64, s.text.len() as u64, flags, s.factor as u64] {
+                body.extend(v.to_le_bytes());
+            }
+            body.extend(s.text.as_bytes());
+            body.extend((s.ids.len() as u64).to_le_bytes());
+            for &x in &s.ids {
+                body.extend(x.to_le_bytes());
+            }
+            if !s.images.is_empty() {
+                body.extend((s.images.len() as u64).to_le_bytes());
+                for k in &s.images {
+                    for v in [k.at as u64, k.rows as u64, k.hash] {
+                        body.extend(v.to_le_bytes());
+                    }
+                }
+            }
+        }
+        let mut f = TABLE_MAGIC.to_vec();
+        for v in [unix_now(), t.next_id, t.clock, n, body.len() as u64, fnv(&body)] {
+            f.extend(v.to_le_bytes());
+        }
+        f.extend(body);
+        f
+    }
+
+    /// `n` sessions of about `bytes` of text (a token a byte), straight into the table.
+    fn bulk(t: &mut SessionTable, tok: &Tokenizer, n: usize, bytes: usize) {
+        for i in 0..n {
+            let text = format!("<｜begin▁of▁sentence｜>bulk {i:05} {}", "q".repeat(bytes));
+            put_fresh(t, 100 + i as u64, &text, i % 3 == 0);
+            let s = t.sessions.get_mut(&(100 + i as u64)).unwrap();
+            s.ids = tok.encode(&text);
+            s.factor = [16, 32, 64][i % 3];
+            s.t_used = unix_now() - (i as u64 % 5);
+            if i % 4 == 1 {
+                s.images = vec![ImageKey { at: 30, rows: 5, hash: 77 + i as u64 }];
+            }
+        }
+    }
+
+    #[test]
+    fn the_saved_file_is_the_one_the_whole_table_snapshot_makes() {
+        let tok = syn();
+        let dir = table_dir("bytes");
+        let path = dir.join("front.table");
+        let table = std::sync::Mutex::new(SessionTable::new(1000, 1 << 40));
+        {
+            let mut t = table.lock().unwrap();
+            bulk(&mut t, &tok, 23, 150_000);
+            put(&mut t, 5, "", false); // no finished turn: left out
+            put_fresh(&mut t, 6, "<｜begin▁of▁sentence｜>an old one", false);
+            t.sessions.get_mut(&6).unwrap().t_used = 1;
+        }
+        let (n, _) = save_table(&table, &path, 3600).unwrap();
+        assert_eq!(n, 23);
+        let file = std::fs::read(&path).unwrap();
+        let want = old_snapshot(&table.lock().unwrap(), 3600);
+        assert_eq!(file.len(), want.len());
+        assert!(file[..8] == want[..8] && file[16..] == want[16..], "everything but the time written is the same");
+        assert!(!dir.join("front.table.new").exists());
+        assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+        // the reader takes it
+        let mut u = SessionTable::new(1000, 1 << 40);
+        assert_eq!(u.load(&path, &tok, 3600), Ok(23));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_save_holds_a_few_megabytes_and_never_the_lock_across_a_write() {
+        let dir = table_dir("peak");
+        let path = dir.join("front.table");
+        let table = std::sync::Mutex::new(SessionTable::new(1000, 1 << 40));
+        bulk(&mut table.lock().unwrap(), 50, 100_000);
+        let mut free_at_writes = Vec::new();
+        let (r, _, peak) = probe::measure(|| save_table_with(&table, &path, 3600, &mut || free_at_writes.push(table.try_lock().is_ok())));
+        assert_eq!(r.unwrap().0, 50);
+        assert!(std::fs::metadata(&path).unwrap().len() > 40 << 20, "a file far over the bound");
+        assert!(peak < 16 << 20, "peak {} MiB", peak >> 20);
+        assert!(free_at_writes.len() >= 5, "written in batches: {}", free_at_writes.len());
+        assert!(free_at_writes.iter().all(|&free| free), "the table's lock was held across a write");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_session_changed_between_batches_is_saved_as_it_is_then_and_a_dropped_one_is_left_out() {
+        let tok = syn();
+        let dir = table_dir("between");
+        let path = dir.join("front.table");
+        let table = std::sync::Mutex::new(SessionTable::new(1000, 1 << 40));
+        bulk(&mut table.lock().unwrap(), 20, 200_000);
+        let mut calls = 0;
+        let (n, at) = save_table_with(&table, &path, 3600, &mut || {
+            calls += 1;
+            if calls == 2 {
+                let mut t = table.lock().unwrap();
+                let victim = *t.sessions.keys().last().unwrap(); // saved in the last batch, which is not yet taken
+                t.remove(victim);
+            }
+        })
+        .unwrap();
+        assert_eq!(n, 19);
+        assert_ne!(table.lock().unwrap().changes(), at, "the change is seen by the next periodic save");
+        let mut u = SessionTable::new(1000, 1 << 40);
+        assert_eq!(u.load(&path, &tok, 3600), Ok(n), "a whole file that loads");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

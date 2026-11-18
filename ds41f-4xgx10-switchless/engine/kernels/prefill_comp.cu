@@ -34,7 +34,7 @@ struct ESmem {
 __global__ void __launch_bounds__(kEThreads) emit_p_kernel(const float* __restrict__ kv, const float* __restrict__ score,
                                                            const int* __restrict__ pos, int rows,
                                                            attn::CompressorWeights w, attn::CompressorCarry carry,
-                                                           const float2* __restrict__ table, attn::Compressed ckv,
+                                                           attn::Rope table, attn::Compressed ckv,
                                                            attn::IndexKeys ik) {
   __shared__ __align__(16) ESmem sm;
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3, ratio = w.ratio;
@@ -138,7 +138,7 @@ __global__ void __launch_bounds__(kEThreads) emit_p_kernel(const float* __restri
       float x = attn::bfround(__fmul_rn(attn::bf2f(w.knorm[tid]), __fmul_rn(kx[e], krs)));
       if (warp >= 2) {  // dims 64 + 2i, 65 + 2i on lanes 2i, 2i + 1
         const float o = __shfl_xor_sync(0xffffffffu, x, 1);
-        const float2 cs = table[(size_t)rpos * 32 + ((tid - 64) >> 1)];
+        const float2 cs = attn::rope_at(table, rpos, (tid - 64) >> 1);
         float x0 = (lane & 1) ? o : x, x1 = (lane & 1) ? x : o;
         attn::rope_pair(x0, x1, cs.x, cs.y, false);
         x = attn::bfround((lane & 1) ? x1 : x0);
@@ -161,7 +161,7 @@ __global__ void __launch_bounds__(kEThreads) emit_p_kernel(const float* __restri
       if (tid >= 112) {
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
-          const float2 cs = table[(size_t)rpos * 32 + (4 * tid + 2 * h - 448) / 2];
+          const float2 cs = attn::rope_at(table, rpos, (4 * tid + 2 * h - 448) / 2);
           attn::rope_pair(ev[2 * h], ev[2 * h + 1], cs.x, cs.y, false);
           ev[2 * h] = attn::bfround(ev[2 * h]);
           ev[2 * h + 1] = attn::bfround(ev[2 * h + 1]);
@@ -203,7 +203,7 @@ void compressor_project_p(const uint16_t* x, const attn::CompressorWeights& w, f
 }
 
 void compressor_emit_p(const float* kv, const float* score, const int* pos, int rows, const attn::CompressorWeights& w,
-                       attn::CompressorCarry carry, const float2* table, attn::Compressed ckv, attn::IndexKeys ik,
+                       attn::CompressorCarry carry, attn::Rope table, attn::Compressed ckv, attn::IndexKeys ik,
                        cudaStream_t s) {
   if (rows < 1 || (w.ratio != 1 && w.ratio != 2)) die("compressor_emit_p: rows %d ratio %d", rows, w.ratio);
   const int per = kEE * w.ratio;

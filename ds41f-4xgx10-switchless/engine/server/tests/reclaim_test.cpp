@@ -1,6 +1,8 @@
 // reclaim.h's decisions against tables of cases (host only, no GPU): which line gives way first, the loop that detaches lines
-// while a consumer is short, the live set, the reservation at a request's end. Built with -DPICO_OLD_RULES the cases that
-// describe the rule fail (exit 1): the live set is every slot's session, a finished request keeps its reservation.
+// while a consumer is short, what a window plan asks of the server, the window close, the live set, the reservation at a
+// request's end, the bookmarks a run takes. Built with -DPICO_OLD_RULES the cases that describe the rule fail (exit 1): the
+// window plan names every holder on a line as busy (the own conversation and its base pinned), the live set is every slot's
+// session, a finished request keeps its reservation, the window timer ignores the requests that need the window.
 // Exit 0 when every case passes.
 #include <cstdint>
 #include <cstdio>
@@ -70,6 +72,48 @@ int main() {
     eq(n, 0, "not short: nothing detaches");
   }
 
+  // ---- the window plan (lines of finished requests hold the numbers above the window's top)
+  {
+    World w;
+    w.flying = {20, 21, 22};  // 20 runs; 21 is paused; 22 is a queued long prompt
+    w.paused = {21};
+    auto idle = [&](uint64_t id) { return !w.run(id); };
+    // holders: 241's finished line (slot 3), the request's own conversation on a line (slot 5), a paused flight (slot 2),
+    // a stored conversation on no line, a running request (20, slot 1), a queued long prompt (22, slot 6)
+    const std::vector<reclaim::Holder> holders = {{241, 3}, {248, 5}, {21, 2}, {300, -1}, {20, 1}, {22, 6}};
+    const reclaim::WindowActions a = reclaim::window_actions(holders, idle);
+    check(a.detach == std::vector<int>({3, 5, 2}), "idle holders on lines, the own conversation and a paused flight among them, are detached");
+    check(a.running == std::vector<uint64_t>({20, 22}), "the running request and the queued long prompt are named, never detached");
+    // only idle holders: the window command may go
+    const std::vector<reclaim::Holder> idle_only = {{241, 3}, {248, 5}};
+    const reclaim::WindowActions b = reclaim::window_actions(idle_only, idle);
+    check(b.running.empty() && b.detach.size() == 2, "idle blockers only: nothing to wait for");
+    // the long prompt alone, whose own conversation holds the tail: the window waits on it
+    const reclaim::WindowActions c = reclaim::window_actions({{22, 6}}, idle);
+    check(c.detach.empty() && c.running == std::vector<uint64_t>({22}), "a queued long prompt whose conversation holds the tail: the window waits, no command");
+  }
+
+  // ---- the window close: the least recently used open window no request needs
+  {
+    std::vector<reclaim::Win> w = {{32, true, false, 100}, {64, true, false, 50}};
+    eq(reclaim::window_to_close(w), 64, "both open and unused: the less recently used");
+    w[1].in_use = true;
+    eq(reclaim::window_to_close(w), 32, "the window a request needs is never closed");
+    w[0].in_use = true;
+    eq(reclaim::window_to_close(w), 0, "every open window needed: none");
+    w[0].in_use = false, w[0].open = false;
+    eq(reclaim::window_to_close(w), 0, "a window that is closed already is not a candidate");
+  }
+
+  // ---- the window timer: off by default, and never under a request of its factor
+  {
+    eq(reclaim::kWindowIdleS, 0, "--window-idle-s defaults to 0: no window is freed by time");
+    check(!reclaim::timer_may_close(0, 1000, 0, false), "timer 0: never");
+    check(reclaim::timer_may_close(300, 1000, 0, false), "timer on, idle long enough, no request of the factor: freed");
+    check(!reclaim::timer_may_close(300, 1000, 0, true), "timer on, but a request of that factor exists: kept");
+    check(!reclaim::timer_may_close(300, 100, 0, false), "timer on, not idle long enough: kept");
+  }
+
   // ---- the live set: running sessions only, so an idle line's conversation is cache (disk file space, eviction)
   {
     check(reclaim::counts_as_live(true, false), "a running request's session is live");
@@ -85,6 +129,26 @@ int main() {
     eq(reclaim::idle_reserves(s), 180 + 0 + 40, "the reservations over the slots: committed beyond mapped");
     std::vector<reclaim::SlotNums> z = {{120, 120}, {200, 200}, {10, 10}};
     eq(reclaim::idle_reserves(z), 0, "nothing reserved once the reservations are zeroed");
+  }
+
+  // ---- the bookmarks a decode run takes: one at each multiple of snap_every it crosses
+  {
+    eq(reclaim::run_snaps(1000, 64, 1024, 7), 1, "1000 + 64 crosses 1024");
+    eq(reclaim::run_snaps(100, 64, 1024, 7), 0, "100 + 64 crosses none");
+    eq(reclaim::run_snaps(1000, 2100, 1024, 7), 3, "1000 + 2100 crosses 1024, 2048, 3072");
+    eq(reclaim::run_snaps(1024, 64, 1024, 0), 0, "starting on a multiple: that one is not taken again");
+    eq(reclaim::run_snaps(1000, 64, 0, 7), 0, "no bookmarks when snap_every is 0");
+    eq(reclaim::run_snaps(1020, 0, 1024, 7), 0, "no tokens, no bookmark");
+  }
+
+  // ---- the lines of 32 idle sessions, a window wanted: every holder on a line detaches, in at most 33 passes
+  {
+    World w;  // nothing in flight
+    std::vector<reclaim::Holder> holders;
+    for (int i = 0; i < 32; ++i) holders.push_back({(uint64_t)(500 + i), i});
+    const reclaim::WindowActions a = reclaim::window_actions(holders, [&](uint64_t id) { return !w.run(id); });
+    eq((long long)a.detach.size(), 32, "32 idle lines holding the tail: 32 detaches planned");
+    check(a.running.empty(), "and nobody to wait for");
   }
 
   std::printf("%d cases, %d failed\n", g_n, g_bad);

@@ -217,12 +217,11 @@ def main():
     st, raw, resp = http_("GET", "/dashboard")
     html = raw.decode()
     check(st == 200 and resp.getheader("content-type", "").startswith("text/html") and "DSFRONT" in html and "/api/v1/" in html, "GET /dashboard is the page")
-    for label in ("'Total'", "'Users generating'", "'Time per token'", "'Speed now'", "'This prompt'", "'Median'",
-                  "'Slowest 1 %'", "'CONVERSATION MEMORY'", "'SSD CACHE'", "'Save points'", "'Found on SSD'",
-                  "'Tokens not recomputed'", "'Average wait'", "const SPARKS = 4;"):
-        check(label in html, f"the page has the label {label}")
-    # NODE HEALTH's table: one row a Spark, the units in the column heads
-    for label in ("'Hot', '°C'", "'Wear', '%'", "'Clock', 'MHz'", "'Free / total', 'GiB'", "class: 'ntab'"):
+    # the ENGINE strip's tiles (label, value with its unit, a short qualifier) and NODE HEALTH's table (units in the column heads)
+    for label in ("'FIRST TOKEN'", "median · slowest", "'CONTEXT CACHE'", "'CAPACITY'", "'CONTEXTS'", "'SHARED PREFIXES'",
+                  "'SSD CACHE'", "'RESTORES'", "saved · avg wait", "'Enabled'", "'Disabled'",
+                  "2 ** 40)} TiB`", "rate('dec', 'DECODE'", "rate('pre', 'PREFILL'", "head.rates, head.el",
+                  "'Hot', '°C'", "'Wear', '%'", "'Clock', 'MHz'", "'Free / total', 'GiB'", "class: 'strip'", "class: 'ntab'"):
         check(label in html, f"the page has {label}")
     # the page's script parses (a stray quote breaks every tile); needs node where the smoke runs
     js = html.split("<script>", 1)[1].split("</script>", 1)[0] if "<script>" in html else ""
@@ -236,8 +235,14 @@ def main():
         print("  SKIP the page's script parse: node is not installed here")
     check("const filling = x.state === 'prefill'" in html and "firstWaiting" not in html,
           "LINES takes each request's own state (two long prompts can be read at once)")
-    for label in ("'All streams'", "'Token gap'", "'p99', 'p99'", "'SESSIONS'", "'SSD TIER'", "'Disk hits'"):
-        check(label not in html, f"the old label {label} is gone")
+    check("SPARKS = 4" not in html, "the page writes no Spark count: the engine reports its ranks")
+    for label in ("'All streams'", "'Users generating'", "'Time per token'", "'Speed now'", "'This prompt'",
+                  "'Slowest 1 %'", "'Token gap'", "'p99', 'p99'", "'SESSIONS'", "'SSD TIER'", "'Disk hits'", "'Save points'",
+                  "'Found on SSD'", "'Waiting to save'", "'Free'", "'For replies'", "'Running'", ".setNow(",
+                  "'Tokens not recomputed'", "producing its reply", "'Reply tokens", "reply so far",
+                  "'Median'", "'Slowest'", "'STORAGE'", "'USAGE'", "'Tokens saved'", "'Avg wait'", "class: 'vrow'", "class: 'ncard",
+                  "class: 'sep', text: '/'", "' MHz']", "class: 'stack'"):
+        check(label not in html, f"gone from the page: {label}")
     st, raw, _ = http_("GET", "/dashboard/")
     check(st == 200 and raw.decode() == html, "GET /dashboard/ is the same page")
     # ---- the sign-in: the page loads without the key and asks for it; every data route needs it
@@ -272,16 +277,17 @@ def main():
           and pool.get("free", -1) + pool.get("held", -1) == 8913, f"sessions carry the chunk pool: {pool}")
     check(all(k in conv for k in ("on_lines", "in_memory", "on_disk", "sharing")), f"sessions carry the conversations: {conv}")
     page = http_("GET", "/dashboard", headers={"Authorization": None})[1].decode()
-    for label in ("'Pool memory'", "'KV pool'", "'Max context'", "'In use'", "'Shared starts'", "'For replies'", "'Running'",
-                  "'Paused in memory'", "'Paused on SSD'", "'Sharing a start'", "the conversation memory (the chunk pool)"):
-        check(label in page, f"the CONVERSATION MEMORY card has {label}")
+    for label in ("'CONTEXT CACHE'", "'CAPACITY'", "'CONTEXTS'", "'SHARED PREFIXES'", "`max context ${", "'in memory'",
+                  "on SSD only`", "sharing a prefix`", "the conversation memory (the chunk pool)"):
+        check(label in page, f"the ENGINE strip has {label}")
+    check("vmeter" not in page, "the ENGINE strip draws no bar (its numbers say it)")
     check(all(k not in ss for k in ("slots", "slots_big", "positions", "store_cap_bytes", "store_used_bytes")),
           "no fixed slots, no slots x window sum, no store of its own memory")
 
     # ---- the live settings (interleaved prefill): read from STATS, changed with a CONFIG frame, refused out of range
     il = s.get("interleave")
     check(il == {"on": True, "whole_rows": 32768, "push_rows": 131072, "gap_ms": 600, "share": 40, "burst_max_ms": 1000,
-                 "reading": 0, "queued": 0, "ssd_gib": 256, "keep_days": 30}, f"status.interleave: the engine's settings {il}")
+                 "reading": 0, "queued": 0, "ssd_gib": 256, "keep_days": 30, "extend": True}, f"status.interleave: the engine's settings {il}")
     st, sv = get_json("/dashboard/api/v1/settings")
     check(st == 200 and sv == il, "GET settings is the same object")
     st, raw, _ = http_("POST", "/dashboard/api/v1/settings", {"share": 60, "gap_ms": 450})
@@ -292,7 +298,23 @@ def main():
     got = wait_for(lambda: (lambda x: x if x and x["ssd_gib"] == 128 else None)(get_json("/dashboard/api/v1/settings")[1]), 3)
     check(st == 200 and bool(got) and got["keep_days"] == 14 and got["share"] == 60, f"the SSD tier's size and expiry change live: {got}")
     check(http_("POST", "/dashboard/api/v1/settings", {"ssd_gib": 256, "keep_days": 30})[0] == 200, "and back")
-    for bad in ({"share": 95}, {"share": 5}, {"gap_ms": 50}, {"whole_rows": 4096}, {"push_rows": -1}, {"on": "yes"}, {"nope": 1}, {},
+    st, raw, _ = http_("GET", "/dashboard", headers={"Authorization": None})
+    page = raw.decode()
+    check(st == 200 and "EXTEND CONTEXT" in page and "'check'" in page and "checkbox" in page,
+          "the LONG PROMPTS AND SSD card has the Extend context checkbox")
+    for label in ("'LONG PROMPTS AND SSD'", "'SPLIT LONG PROMPTS'", "'TIME FOR OTHERS'", "'MAX PAUSE FOR OTHERS'",
+                  "'READ 2 AT ONCE UP TO'", "'NO SPLIT UP TO'", "'SSD CACHE SIZE'", "'FORGET UNUSED AFTER'"):
+        check(label in page, f"the settings have the label {label}")
+    st, raw, _ = http_("POST", "/dashboard/api/v1/settings", {"extend": False})
+    got = wait_for(lambda: (lambda x: x if x and x["extend"] is False else None)(get_json("/dashboard/api/v1/settings")[1]), 3)
+    check(st == 200 and bool(got) and got["share"] == 60, f"extend changes live and keeps the rest: {got}")
+    ss = wait_for(lambda: (lambda x: x if x and x.get("ranks") else None)(get_json("/dashboard/api/v1/status")[1]["sessions"]), 3)
+    check(bool(ss) and ss["ranks"] == 4 and ss["usable_window"] == 1048576,
+          f"the window is the engine's live limit and the ranks are its: {ss and (ss['usable_window'], ss['ranks'])}")
+    check(http_("POST", "/dashboard/api/v1/settings", {"extend": True})[0] == 200, "and back")
+    got = wait_for(lambda: (lambda x: x if x and x["extend"] is True else None)(get_json("/dashboard/api/v1/settings")[1]), 3)
+    check(bool(got), "the engine shows extend on again")
+    for bad in ({"extend": "on"}, {"extend": 1}, {"share": 95}, {"share": 5}, {"gap_ms": 50}, {"whole_rows": 4096}, {"push_rows": -1}, {"on": "yes"}, {"nope": 1}, {},
                 [1], {"ssd_gib": 0}, {"keep_days": 0}):
         check(http_("POST", "/dashboard/api/v1/settings", bad)[0] == 400, f"POST settings {json.dumps(bad)} is refused (400)")
     check(get_json("/dashboard/api/v1/settings")[1]["share"] == 60, "a refused change sends nothing")

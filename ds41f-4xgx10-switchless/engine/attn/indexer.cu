@@ -42,14 +42,13 @@ struct QIn {
   uint2 raw;
   float2 cs[2];
 };
-__device__ __forceinline__ QIn q_load(const uint16_t* src, int p, const float2* table, int lane) {
+__device__ __forceinline__ QIn q_load(const uint16_t* src, int p, Rope table, int lane) {
   QIn in;
   in.raw = *reinterpret_cast<const uint2*>(src + 4 * lane);
   in.cs[0] = in.cs[1] = make_float2(0.f, 0.f);
   if (lane >= 16) {
-    const float2* tb = table + (size_t)p * 32 + 2 * lane - 32;
-    in.cs[0] = tb[0];
-    in.cs[1] = tb[1];
+    in.cs[0] = rope_at(table, p, 2 * lane - 32);
+    in.cs[1] = rope_at(table, p, 2 * lane - 31);
   }
   return in;
 }
@@ -92,14 +91,14 @@ __device__ __forceinline__ void q_prep_in(const QIn& in, float wproj, int lane, 
     for (int i = 0; i < 4; ++i) debug[4 * lane + i] = f2bf(__fmul_rn(e2m1_to_f(c[i]), s));
   }
 }
-__device__ __forceinline__ void q_prep_head(const uint16_t* src, float wproj, int p, const float2* table, int lane,
+__device__ __forceinline__ void q_prep_head(const uint16_t* src, float wproj, int p, Rope table, int lane,
                                             uint8_t* q_out, uint32_t* sc_out, float* w_out, uint16_t* debug) {
   q_prep_in(q_load(src, p, table, lane), wproj, lane, q_out, sc_out, w_out, debug);
 }
 
 // one warp per (row, head)
 __global__ void __launch_bounds__(128) q_prep_kernel(const uint16_t* iq_pre, const float* wproj, const int* pos,
-                                                     const float2* table, IndexQ q, uint16_t* debug_q, int rows) {
+                                                     Rope table, IndexQ q, uint16_t* debug_q, int rows) {
   int wid = blockIdx.x * 4 + threadIdx.x / 32, lane = threadIdx.x & 31;
   if (wid >= rows * kIdxHeads) return;
   q_prep_head(iq_pre + (size_t)wid * kIdxDim, wproj[wid], pos[wid / kIdxHeads], table, lane, q.q + (size_t)wid * 64,
@@ -273,6 +272,8 @@ __global__ void __launch_bounds__(128) score_kernel(ScoreArgs a) {
 // keys above it plus the first `need` keys equal to it, in scan order (= ascending position).
 
 constexpr int kSelThreads = 1024, kSelPer = 16, kSelChunk = kSelThreads * kSelPer;
+// The most 65536-block segments a row's block list (select_bins) tells apart: 8,388,608 blocks, 67,108,864 keys.
+constexpr int kBlistSegs = 128;
 
 struct SelectArgs {
   const uint16_t* keys;
@@ -390,7 +391,9 @@ __device__ __forceinline__ void load8(const uint16_t* row, int i0, uint32_t (&k)
 // gathers them instead and the rest works on those: over the keys, or with bmax (the maxima of the row's
 // blocks of 8 keys) over those, listing the blocks that reach the bin in blist (room for cap), then over the
 // keys of the listed blocks.
-template <bool kL2>
+// kWide: the block list may pass 131072 blocks (a scan of more than 1,048,576 keys): blist holds low 16 bits and seg
+// the segments; without it the list is the 17-bit one (16 bits plus a prefix split).
+template <bool kL2, bool kWide = false, bool kRM = false>
 __device__ __forceinline__ void select_bins(const SelectArgs& a, int r, int lo, int n, uint32_t top, uint32_t next,
                                             int cap = 0, uint16_t* ckey = nullptr, uint32_t* cidx = nullptr,
                                             const uint16_t* bmax = nullptr, uint16_t* blist = nullptr) {
@@ -445,8 +448,18 @@ __device__ __forceinline__ void select_bins(const SelectArgs& a, int r, int lo, 
     if (bmax) {  // the blocks that reach the bin, in order (each holds a candidate, so at most cap)
       const int nb = (n + 7) / 8;
       uint32_t nl = 0;
-      __shared__ uint32_t nlow;  // listed blocks below 65536: blist is ascending, so they are its prefix
-      if (tid == 0) nlow = 0;
+      // kWide: blist holds each listed block's low 16 bits; it is ascending, so the blocks of one 65536-block
+      // segment are consecutive and seg[h] (counted, then made cumulative) is the number of listed blocks in
+      // segments <= h: entry i is in the first segment h with i < seg[h], and its block is (h << 16) | blist[i].
+      // Otherwise (at most 131072 blocks) the listed blocks below 65536 are blist's prefix, nlow of them.
+      __shared__ uint32_t seg[kWide ? kBlistSegs : 1];
+      __shared__ uint32_t nlow;
+      const int nsg = (nb + 65535) >> 16;  // segments with blocks (at most kBlistSegs: the launch checks)
+      if (kWide) {
+        if (tid < kBlistSegs) seg[tid] = 0;
+      } else if (tid == 0) {
+        nlow = 0;
+      }
       __syncthreads();
       for (int base = 0; base < nb; base += kSelChunk) {
         const int b0 = base + tid * kSelPer;
@@ -458,16 +471,33 @@ __device__ __forceinline__ void select_bins(const SelectArgs& a, int r, int lo, 
         for (uint32_t t = sel; t; t &= t - 1)
           if (o < (uint32_t)cap) {
             const uint32_t blk = b0 + __ffs(t) - 1;
-            if (blk < 65536u) atomicAdd(&nlow, 1u);
+            if (kWide)
+              atomicAdd(&seg[blk >> 16], 1u);
+            else if (blk < 65536u)
+              atomicAdd(&nlow, 1u);
             blist[o++] = (uint16_t)(blk & 0xFFFFu);
           }
         nl += tot;
       }
       __syncthreads();
       nl = min(nl, (uint32_t)cap);
+      if (kWide) {
+        if (tid == 0)
+          for (int h = 1; h < nsg; ++h) seg[h] += seg[h - 1];
+        __syncthreads();
+      }
       for (uint32_t base = 0; base < nl; base += kSelThreads) {  // a thread: a listed block's keys
         const uint32_t i = base + tid;
-        const int i0 = i < nl ? (int)((blist[i] | (i >= nlow ? 0x10000u : 0u)) * 8) : 0;
+        int i0 = 0;
+        if (kWide) {
+          if (i < nl) {
+            uint32_t h = 0;
+            while (h + 1 < (uint32_t)nsg && i >= seg[h]) ++h;
+            i0 = (int)((((h << 16) | blist[i])) * 8);
+          }
+        } else {
+          i0 = i < nl ? (int)((blist[i] | (i >= nlow ? 0x10000u : 0u)) * 8) : 0;
+        }
         uint32_t k[8] = {}, c = 0;
         if (i < nl) {
           load8<kL2>(row, i0, k);
@@ -485,7 +515,7 @@ __device__ __forceinline__ void select_bins(const SelectArgs& a, int r, int lo, 
       for (int base = 0; base < n; base += kSelChunk) {
         int i0 = base + tid * kSelPer;
         uint32_t k[16], c = 0;
-        load16<kL2>(row, i0, n, k);
+        load16<kL2>(row + rm_adj<kRM>(a, i0), i0, n, k);
 #pragma unroll
         for (int j = 0; j < 16; ++j) c += k[j] && (k[j] >> 5) >= bin;
         uint32_t tot, o = nc + block_excl_scan(c, tmp, &tot);
@@ -517,7 +547,7 @@ __device__ __forceinline__ void select_bins(const SelectArgs& a, int r, int lo, 
     uint32_t bin = info[0], above = info[1];
     for (int base = 0; base < n; base += kSelChunk) {
       uint32_t k[16];
-      load16<kL2>(row, base + tid * kSelPer, n, k);
+      load16<kL2>(row + rm_adj<kRM>(a, base + tid * kSelPer), base + tid * kSelPer, n, k);
 #pragma unroll
       for (int j = 0; j < 16; ++j)
         if (k[j] && (k[j] >> 5) == bin) atomicAdd(&h2[k[j] & 31], 1u);
@@ -528,7 +558,7 @@ __device__ __forceinline__ void select_bins(const SelectArgs& a, int r, int lo, 
     for (int base = 0; base < n; base += kSelChunk) {
       int i0 = base + tid * kSelPer;
       uint32_t k[16];
-      load16<kL2>(row, i0, n, k);
+      load16<kL2>(row + rm_adj<kRM>(a, i0), i0, n, k);
       uint32_t gt = 0, eq = 0;
 #pragma unroll
       for (int j = 0; j < 16; ++j) {
@@ -574,7 +604,7 @@ __device__ __forceinline__ void select_row(const SelectArgs& a, int r) {
   __syncthreads();
   for (int base = 0; base < n; base += kSelChunk) {
     uint32_t k[16];
-    load16<kL2>(row, base + tid * kSelPer, n, k);
+    load16<kL2>(row + rm_adj<kRM>(a, base + tid * kSelPer), base + tid * kSelPer, n, k);
 #pragma unroll
     for (int j = 0; j < 16; ++j)
       if (k[j]) atomicAdd(&hist[k[j] >> 5], 1u);
@@ -593,7 +623,7 @@ constexpr int kFusedPos = kSelThreads / 32 * kScoreTiles * 16;
 struct IndexFusedArgs {
   const uint16_t* iq_pre;
   const float* wproj;
-  const float2* table;
+  Rope table;
   ScoreArgs sc;          // q, qsc and w unused
   SelectArgs top, pool;  // pool.out_pos null: no pool
   int* counters;
@@ -671,6 +701,7 @@ __global__ void __launch_bounds__(kSelThreads) index_fused_kernel(IndexFusedArgs
 // memory at the group's own offsets; a session of more rows reads its keys once per group.
 constexpr int kDensePos = kSelThreads / 32 * 16;  // a chunk: one 16-position tile per warp
 constexpr int kDenseCand = 10240, kDenseBmax = 2 * kSelChunk;  // bmax gathers past kDenseBmax keys
+constexpr int kHistFlush = 64;  // chunks between a CTA's histogram flushes: 64 * kDensePos = 32768 < 65536 (a power of 2)
 constexpr int kDenseHist = 32;  // scratch words: [0] CTAs done, [1] selecting CTAs done; then the histograms
 constexpr int kDenseRows = kDecodeGroup;  // rows of a CTA's group
 constexpr size_t kDenseSmemScore = (size_t)kDenseRows * kIdxHeads * (64 + 8) + 2 * (size_t)kDenseRows * 4096;
@@ -688,7 +719,7 @@ __device__ __forceinline__ int dense_per(int rows, int chunks, int G) {
 struct IndexDenseArgs {
   const uint16_t* iq_pre;
   const float* wproj;
-  const float2* table;
+  Rope table;
   ScoreArgs sc;          // q, qsc, w, part/nparts and blocks unused
   SelectArgs top, pool;  // pool.out_pos null: no pool
   uint32_t* scratch;     // kDenseHist words, then [kRows][2048] histograms of the keys, then of the maxima
@@ -708,18 +739,19 @@ __device__ __forceinline__ uint32_t ld_acquire(const uint32_t* p) {
 }
 
 // select_bins of row r (n keys) from its global histogram gh, which is left zero for the next launch.
-__device__ __forceinline__ void select_dense(const SelectArgs& a, int r, uint32_t* gh, int n, int cap, uint16_t* ckey,
-                                             uint32_t* cidx, const uint16_t* bmax, uint16_t* blist) {
+template <bool kWide>
+__device__ __forceinline__ void select_dense(const SelectArgs& a, int r, uint32_t* gh, int lo, int n, int cap,
+                                             uint16_t* ckey, uint32_t* cidx, const uint16_t* bmax, uint16_t* blist) {
   int tid = threadIdx.x;
   uint32_t top = __ldcg(gh + 2047 - 2 * tid), next = __ldcg(gh + 2046 - 2 * tid);
   gh[2047 - 2 * tid] = 0;
   gh[2046 - 2 * tid] = 0;
-  select_bins<true>(a, r, 0, n, top, next, cap, ckey, cidx, bmax, blist);
+  select_bins<true, kWide>(a, r, lo, n, top, next, cap, ckey, cidx, bmax, blist);
 }
 
 // kSlots: a slot table (ScoreArgs::slot); without one, the code of one session. kRows: kDenseRows, or
 // kMaxDecodeRows (groups of at most kDenseRows rows, each at the start of the shared memory)
-template <bool kSlots, int kRows>
+template <bool kSlots, int kRows, bool kWide>
 __global__ void __launch_bounds__(kSelThreads) index_dense_kernel(IndexDenseArgs a) {
   extern __shared__ __align__(16) uint8_t dsm[];
   __shared__ int slen[kRows], sslot[kRows];  // each row's own scan length, and its slot
@@ -804,16 +836,32 @@ __global__ void __launch_bounds__(kSelThreads) index_dense_kernel(IndexDenseArgs
       wq = wn;
     }
     __syncthreads();
-    for (; c < nchunks; c += stride) {
+    const int plo = cta_lo, cst = cta_stride;
+    int done = 0;  // chunks scored since the histograms were last flushed
+    for (; c < nchunks; c += cst) {
       const int i0 = c * kDensePos + warp * 16;
       TileKeys nxt = cur;
-      if (c + stride < nchunks) nxt = load_tile(s, lrow, rb, i0 + stride * kDensePos, n, 0, lane);
+      if (c + cst < nchunks) nxt = load_tile(s, lrow, rb, i0 + cst * kDensePos, n, plo, lane);
       if (i0 < n)
         for (int r = r0; r < r1; ++r)
-          score_tile_row(cur, sq[r - q0], ssc + (r - q0) * kIdxHeads, sw + (r - q0) * kIdxHeads, slen[r], i0, 0,
+          score_tile_row(cur, sq[r - q0], ssc + (r - q0) * kIdxHeads, sw + (r - q0) * kIdxHeads, slen[r], i0, plo,
                          s.keys + (size_t)r * s.keys_stride, s.bkeys ? s.bkeys + (size_t)r * s.bkeys_stride : nullptr, lane,
                          hk + (r - q0) * 1024, pool ? hb + (r - q0) * 1024 : nullptr);
       cur = nxt;
+      // A packed counter holds 65535: a chunk adds at most kDensePos keys of a row to a bin, so the CTA's
+      // histograms go to the global ones (and are zeroed) before kHistFlush chunks can fill one.
+      if (kWide && (++done & (kHistFlush - 1)) == 0 && c + cst < nchunks) {
+        __syncthreads();
+        for (int r = r0; r < r1; ++r) {
+          hist_flush(hk[(r - q0) * 1024 + tid], gk + r * 2048 + 2 * tid);
+          hk[(r - q0) * 1024 + tid] = 0;
+          if (pool) {
+            hist_flush(hb[(r - q0) * 1024 + tid], gb + r * 2048 + 2 * tid);
+            hb[(r - q0) * 1024 + tid] = 0;
+          }
+        }
+        __syncthreads();
+      }
     }
     __syncthreads();
     for (int r = r0; r < r1; ++r) {
@@ -836,11 +884,11 @@ __global__ void __launch_bounds__(kSelThreads) index_dense_kernel(IndexDenseArgs
   uint16_t* blist = reinterpret_cast<uint16_t*>(dsm + kDenseCand * 6);
   for (int r = first; r < R; r += S) {
     const int nr = s.blocks ? s.nblocks * 8 : slen[last_of(r)];  // the session's
-    select_dense(a.top, r, gk + r * 2048, nr, a.cap, ckey, cidx,
+    select_dense<kWide>(a.top, r, gk + r * 2048, nr, a.cap, ckey, cidx,
                  nr > kDenseBmax ? s.bkeys + (size_t)r * s.bkeys_stride : nullptr, blist);
     if (pool) {
       __syncthreads();
-      select_dense(a.pool, r, gb + r * 2048, (nr + 7) / 8, a.cap, ckey, cidx, nullptr, nullptr);
+      select_dense<kWide>(a.pool, r, gb + r * 2048, pr.lo, (nr + 7) / 8, a.cap, ckey, cidx, nullptr, nullptr);
     }
     __syncthreads();
   }
@@ -855,14 +903,14 @@ __global__ void __launch_bounds__(kSelThreads) merge_kernel(SelectArgs a0, Selec
   pdl_trigger();
   pdl_wait();
   if (blockIdx.y == 0)
-    select_row<false>(a0, blockIdx.x);
+    select_row<false, kRM>(a0, blockIdx.x);
   else
-    select_row<false>(a1, blockIdx.x);
+    select_row<false, kRM>(a1, blockIdx.x);
 }
 
 }  // namespace
 
-void index_q_prep(const uint16_t* iq_pre, const float* wproj, const int* pos, const float2* table, IndexQ q,
+void index_q_prep(const uint16_t* iq_pre, const float* wproj, const int* pos, Rope table, IndexQ q,
                   uint16_t* debug_q, int rows, cudaStream_t s) {
   q_prep_kernel<<<(rows * kIdxHeads + 3) / 4, 128, 0, s>>>(iq_pre, wproj, pos, table, q, debug_q, rows);
   CUDA_CHECK(cudaGetLastError());
@@ -949,7 +997,7 @@ void index_merge(const int* cand_pos, const uint16_t* cand_key, int n, int rows,
 }
 
 
-void index_fused(const uint16_t* iq_pre, const float* wproj, const int* pos, const float2* table, int rows, int ratio,
+void index_fused(const uint16_t* iq_pre, const float* wproj, const int* pos, Rope table, int rows, int ratio,
                  IndexKeys ik, const IndexScan& scan, int max_scan, uint16_t* keys, int keys_stride, uint16_t* bkeys,
                  int bkeys_stride, IndexSel top, IndexSel pool, int* counters, bool pdl, cudaStream_t s) {
   int nscan = scan.blocks ? scan.nblocks * 8 : max_scan;
@@ -980,10 +1028,15 @@ size_t index_dense_scratch() { return (kDenseHist + 2 * (size_t)kMaxDecodeRows *
 
 namespace {
 using DenseKernel = void (*)(IndexDenseArgs);
-DenseKernel dense_kernel(bool slots, int rows) {  // up to kDenseRows rows, the instances of before B4
+// wide: a scan past 1,048,576 keys (block list past 17 bits, histograms flushed).
+template <bool kWide>
+DenseKernel dense_kernel_w(bool slots, int rows) {  // kDenseRows rows or fewer: the smaller instance
   if (rows > kDenseRows)
-    return slots ? index_dense_kernel<true, kMaxDecodeRows> : index_dense_kernel<false, kMaxDecodeRows>;
-  return slots ? index_dense_kernel<true, kDenseRows> : index_dense_kernel<false, kDenseRows>;
+    return slots ? index_dense_kernel<true, kMaxDecodeRows, kWide> : index_dense_kernel<false, kMaxDecodeRows, kWide>;
+  return slots ? index_dense_kernel<true, kDenseRows, kWide> : index_dense_kernel<false, kDenseRows, kWide>;
+}
+DenseKernel dense_kernel(bool slots, int rows, bool wide) {
+  return wide ? dense_kernel_w<true>(slots, rows) : dense_kernel_w<false>(slots, rows);
 }
 int dense_sms() {  // the SM count; also the kernels' shared memory limit, once (outside any graph capture)
   static int sms = 0;
@@ -991,22 +1044,26 @@ int dense_sms() {  // the SM count; also the kernels' shared memory limit, once 
     int dev = 0;
     CUDA_CHECK(cudaGetDevice(&dev));
     CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
-    for (bool slots : {false, true})
-      for (int rows : {kDenseRows, kMaxDecodeRows})
-        CUDA_CHECK(cudaFuncSetAttribute(dense_kernel(slots, rows), cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                        (int)kDenseSmem));
+    int smem_max = 0;  // the kernels' shared memory comes from the device's opt-in limit, not an assumed one
+    CUDA_CHECK(cudaDeviceGetAttribute(&smem_max, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev));
+    if ((size_t)smem_max < kDenseSmem) die("index_dense: %zu bytes of shared memory needed, the device allows %d", kDenseSmem, smem_max);
+    for (bool wide : {false, true})
+      for (bool slots : {false, true})
+        for (int rows : {kDenseRows, kMaxDecodeRows})
+          CUDA_CHECK(cudaFuncSetAttribute(dense_kernel(slots, rows, wide), cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                          (int)kDenseSmem));
   }
   return sms;
 }
 }  // namespace
 
 
-void index_dense(const uint16_t* iq_pre, const float* wproj, const int* pos, const float2* table, int rows, int ratio,
+void index_dense(const uint16_t* iq_pre, const float* wproj, const int* pos, Rope table, int rows, int ratio,
                  IndexKeys ik, int max_scan, uint16_t* keys, int keys_stride, uint16_t* bkeys, int bkeys_stride,
                  IndexSel top, IndexSel pool, uint32_t* scratch, bool pdl, cudaStream_t s, int cand) {
   int padded = (max_scan + kScorePos - 1) / kScorePos * kScorePos;
   if (rows < 1 || rows > kMaxDecodeRows || keys_stride < padded || !bkeys || bkeys_stride < padded / 8 ||
-      bkeys_stride > 131072)  // select_bins lists blocks by 16-bit index plus a prefix split (17 bits)
+      bkeys_stride > kBlistSegs * 65536)  // select_bins tells at most kBlistSegs segments of 65536 blocks apart
     die("index_dense: %d rows, strides %d/%d for %d", rows, keys_stride, bkeys_stride, max_scan);
   const int sms = dense_sms();
   const IndexScan whole{};
@@ -1024,10 +1081,10 @@ void index_dense(const uint16_t* iq_pre, const float* wproj, const int* pos, con
     a.pool = topk_args(bkeys, bkeys_stride, pos, rows, ratio, whole, true, pool.kmax, pool.pos, pool.key, pool.stride);
   a.scratch = scratch;
   a.cap = cand < 0 ? kDenseCand : std::min(cand, kDenseCand);
-  launch(dense_kernel(ik.slot, rows), dim3(sms), dim3(kSelThreads), kDenseSmem, s, pdl, a);
+  launch(dense_kernel(ik.slot, rows, bkeys_stride > 131072), dim3(sms), dim3(kSelThreads), kDenseSmem, s, pdl, a);
 }
 
-void index_dense_blocks(const uint16_t* iq_pre, const float* wproj, const int* pos, const float2* table, int rows,
+void index_dense_blocks(const uint16_t* iq_pre, const float* wproj, const int* pos, Rope table, int rows,
                         int ratio, IndexKeys ik, const int* blocks, int nblocks, uint16_t* keys, int keys_stride,
                         IndexSel top, uint32_t* scratch, bool pdl, cudaStream_t s, int cand) {
   if (rows < 1 || rows > kMaxDecodeRows || !blocks || keys_stride < nblocks * 8 || nblocks * 8 > kDenseBmax)
@@ -1048,7 +1105,7 @@ void index_dense_blocks(const uint16_t* iq_pre, const float* wproj, const int* p
   a.top.list = ik.list, a.top.list_stride = ik.list_stride;
   a.scratch = scratch;
   a.cap = cand < 0 ? kDenseCand : std::min(cand, kDenseCand);
-  launch(dense_kernel(ik.slot, rows), dim3(sms), dim3(kSelThreads), kDenseSmem, s, pdl, a);
+  launch(dense_kernel(ik.slot, rows, false), dim3(sms), dim3(kSelThreads), kDenseSmem, s, pdl, a);
 }
 
 void index_merge2(int rows, const int* cand_pos, const uint16_t* cand_key, int n, IndexSel top, const int* pcand_pos,

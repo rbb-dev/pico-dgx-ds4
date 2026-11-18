@@ -68,7 +68,21 @@ pub struct ServerConfig {
     /// vision: the most rows the image requests being answered may take together
     /// (--max-image-rows-in-flight); a request that does not fit is answered 429 with Retry-After
     pub max_image_rows_in_flight: usize,
+    /// The most memory the session table may hold, in MiB, counted by what its buffers allocate (--front-table-mib;
+    /// 0, the default: no limit); the oldest idle sessions go first.
+    pub front_table_mib: usize,
+    /// The most memory the process may hold, in MiB, as the kernel counts it (--front-mib; 0, the default: not watched): over it, idle
+    /// sessions are dropped and no image request is taken.
+    pub front_mib: usize,
+    /// The most memory the image rows in flight count for against `front_table_mib` (--front-image-mib).
+    pub front_image_mib: usize,
 }
+
+pub const DEFAULT_FRONT_TABLE_MIB: usize = 0;
+pub const DEFAULT_FRONT_MIB: usize = 0;
+pub const DEFAULT_FRONT_IMAGE_MIB: usize = 400;
+/// How often the process's memory is read against `front_mib`.
+pub const FRONT_WATCH_EVERY: Duration = Duration::from_secs(10);
 
 /// The default body limit: 64 MiB, which holds a 1M-token prompt several times over. Image and video
 /// requests may need more (--max-body-mb); see docs/vision.md for what a large body costs in memory.
@@ -82,6 +96,7 @@ pub struct App {
     /// vision: the rows held by the image requests in flight (text requests never touch it)
     pub image_rows: Arc<crate::vision::RowsInFlight>,
     sessions: Mutex<SessionTable>,
+    governor: Mutex<crate::session::Governor>,
     think_end_id: Option<u32>,
     counter: AtomicU64,
 }
@@ -91,6 +106,8 @@ impl App {
         let think_end_id = tok.token_id("</think>");
         let gate = Gate::new(cfg.hold);
         let image_rows = crate::vision::RowsInFlight::new(cfg.max_image_rows_in_flight);
+        let mut table = SessionTable::new(256, 16 << 20);
+        table.set_byte_limits(cfg.front_table_mib << 20, cfg.front_image_mib << 20);
         table.defer_limits();
         let app = Arc::new(App {
             cfg,
@@ -98,7 +115,8 @@ impl App {
             engine,
             gate,
             image_rows,
-            sessions: Mutex::new(SessionTable::new(256, 16 << 20)),
+            sessions: Mutex::new(table),
+            governor: Mutex::new(Default::default()),
             think_end_id,
             counter: AtomicU64::new(0),
         });
@@ -150,7 +168,7 @@ impl App {
 
     /// The session table for the next start (session.rs `save`): what happened, for the log.
     pub fn save_sessions(&self, path: &std::path::Path, max_age_s: u64) -> String {
-        match self.sessions.lock().unwrap().save(path, max_age_s) {
+        match crate::session::save_table(&self.sessions, path, max_age_s).map(|(n, _)| n) {
             Ok(n) => format!("session table: {n} sessions saved to {}", path.display()),
             Err(e) => format!("session table: NOT saved: {e}"),
         }
@@ -188,11 +206,83 @@ impl App {
                         eprintln!("session table: NOT saved: {e} (tried again every {} s)", every.as_secs());
                         failing = true;
                     }
-                    Some(Ok(_)) => failing = false,
+                    Some(Ok(_)) => {
+                        failing = false;
+                        eprintln!("{}", app.status_line());
+                    }
                     _ => {}
                 }
             }
         });
+    }
+
+    /// What the table and the process hold now, as one log line (`session::front_status`).
+    pub fn status_line(&self) -> String {
+        let (bytes, sessions, tokens) = self.sessions.lock().unwrap().stats();
+        crate::session::front_status(bytes, sessions, tokens, crate::session::vm_rss_bytes(), crate::session::vm_hwm_bytes())
+    }
+
+    /// Logs `status_line` every `every` while the table has changed since the last line.
+    pub fn spawn_front_status(self: &Arc<Self>, every: Duration) {
+        let app = self.clone();
+        tokio::spawn(async move {
+            let mut seen = u64::MAX;
+            let mut tick = tokio::time::interval(every);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                let changes = app.sessions.lock().unwrap().changes();
+                if changes != seen {
+                    seen = changes;
+                    let a = app.clone();
+                    if let Ok(line) = tokio::task::spawn_blocking(move || a.status_line()).await {
+                        eprintln!("{line}");
+                    }
+                }
+            }
+        });
+    }
+
+    /// Every `every`, reads the process's memory against `--front-mib` (`govern_once`); zero starts nothing.
+    pub fn spawn_front_governor(self: &Arc<Self>, every: Duration) {
+        if every.is_zero() || self.cfg.front_mib == 0 {
+            return;
+        }
+        let app = self.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(every);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                let a = app.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Some(rss) = crate::session::vm_rss_bytes() {
+                        a.govern(rss);
+                    }
+                })
+                .await;
+            }
+        });
+    }
+
+    /// The process holds `rss` bytes: over `--front-mib`, idle sessions are dropped (and released on the engine; see
+    /// `session::Governor` for when it stops), the allocator gives back what it can, and image requests are refused until a
+    /// later reading is under the limit.
+    pub(crate) fn govern(&self, rss: usize) {
+        let limit = self.cfg.front_mib << 20;
+        let g = self.governor.lock().unwrap().step(&mut self.sessions.lock().unwrap(), rss, limit);
+        self.image_rows.set_refusing(g.over);
+        for s in &g.released {
+            self.engine.release(*s);
+        }
+        if !g.released.is_empty() {
+            crate::session::trim_heap();
+            eprintln!("front-end memory {} MiB over its limit of {} MiB: {} idle sessions dropped", rss >> 20, self.cfg.front_mib, g.released.len());
+        }
+        if let Some(line) = g.held_elsewhere {
+            eprintln!("{line}");
+        }
     }
 
     fn random_hex(&self, n: usize) -> String {
@@ -281,6 +371,13 @@ pub(crate) fn hold_image_rows(cfg: &ServerConfig, budget: &Arc<crate::vision::Ro
     if p.images.is_empty() {
         return Ok(());
     }
+    if budget.refusing() {
+        eprintln!("front-end memory is over its limit (--front-mib): a request with {} images and video frames is answered 429", p.images.len());
+        let msg = "the front-end is over its memory limit (--front-mib) and takes no image requests until it is under; try again in a few seconds";
+        let mut resp = error(StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", msg);
+        resp.headers_mut().insert("retry-after", IMAGE_RETRY_AFTER_S.into());
+        return Err(resp);
+    }
     let rows = crate::vision::rows_estimate(p.images.len(), cfg.max_image_rows);
     match budget.reserve(rows) {
         Ok(held) => {
@@ -337,16 +434,27 @@ async fn health(State(app): State<Arc<App>>) -> Response {
     }
 }
 
-async fn models(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
-    if let Err(r) = check_auth(&app, &headers) {
-        return r;
-    }
-    let max_len = app.engine.info().map(|i| i.max_context);
-    let data: Vec<Value> = std::iter::once(app.cfg.model_name.clone())
-        .chain(app.ablit_name())
+/// The /v1/models body: `max_model_len` is the window the engine reported in its HELLO (null while none is connected).
+fn models_body(names: &[String], max_len: Option<u32>) -> Value {
+    let data: Vec<Value> = names
+        .iter()
         .map(|id| json!({"id": id, "object": "model", "created": 0, "owned_by": "dsgb10", "root": id, "max_model_len": max_len}))
         .collect();
-    let body = json!({"object": "list", "data": data});
+    json!({"object": "list", "data": data})
+}
+
+/// The room left for output of a prompt of `prompt_len` ids in a window of `ctx` (the engine's HELLO value), under the
+/// request's `max_tokens`; None when the prompt leaves none.
+fn reply_room(ctx: usize, prompt_len: usize, max_tokens: u32) -> Option<u32> {
+    (prompt_len < ctx).then(|| (max_tokens as usize).min(ctx - prompt_len) as u32)
+}
+
+async fn models(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
+    if let Err(r) = check_auth(&app, &headers) {
+        return *r;
+    }
+    let names: Vec<String> = std::iter::once(app.cfg.model_name.clone()).chain(app.ablit_name()).collect();
+    let body = models_body(&names, app.engine.info().map(|i| i.max_context));
     (StatusCode::OK, [("content-type", "application/json")], body.to_string()).into_response()
 }
 
@@ -911,10 +1019,11 @@ async fn start(app: &Arc<App>, p: &Prepared, pass: Pass) -> Result<Gen, ApiError
     let (plan, released) = {
         let app2 = app.clone();
         let text = p.prompt.clone();
-        let keep = info.keep_positions;
+        let (keep, ctx_w) = (info.keep_positions, info.max_context);
         tokio::task::spawn_blocking(move || {
             let mut t = app2.sessions.lock().unwrap();
-            t.keep_for(keep);
+            t.keep_for(keep, ctx_w);
+            t.set_image_bytes(app2.image_rows.in_flight() * crate::vision::IMAGE_ROW_BYTES);
             t.plan(&text, &app2.tok, app2.cfg.tokenize_threads, ablit)
         })
         .await
@@ -924,15 +1033,14 @@ async fn start(app: &Arc<App>, p: &Prepared, pass: Pass) -> Result<Gen, ApiError
         app.engine.release(s);
     }
     let ctx = info.max_context as usize;
-    if plan.ids.len() >= ctx {
+    let Some(max_new) = reply_room(ctx, plan.ids.len(), p.max_tokens) else {
         app.sessions.lock().unwrap().abandon(plan.session_id);
         return Err(ApiError(
             StatusCode::BAD_REQUEST,
             "invalid_request_error".into(),
             format!("the prompt is {} tokens; the context window is {ctx}", plan.ids.len()),
         ));
-    }
-    let max_new = (p.max_tokens as usize).min(ctx - plan.ids.len()) as u32;
+    };
     let mut stop_ids = p.stop_ids.clone();
     if !p.ignore_eos {
         stop_ids.push(info.eos_id);
@@ -946,7 +1054,9 @@ async fn start(app: &Arc<App>, p: &Prepared, pass: Pass) -> Result<Gen, ApiError
         top_p: p.top_p,
         top_k: p.top_k,
         max_new_tokens: max_new,
-        flags: FLAG_KEEP | if p.seed.is_some() { FLAG_SEED } else { 0 } | if ablit { FLAG_ABLIT } else { 0 },
+        flags: FLAG_KEEP
+            | if p.seed.is_some() { FLAG_SEED } else { 0 }
+            | if ablit { FLAG_ABLIT } else { 0 },
         n_top_logprobs: 0,
         prefix_hint: plan.reused as u32,
         stop_ids: stop_ids.clone(),
@@ -1005,10 +1115,11 @@ async fn start_images(app: &Arc<App>, p: &Prepared, pass: Pass, info: crate::pro
     let keys: Vec<ImageKey> = (0..ats.len()).map(|i| ImageKey { at: ats[i], rows: enc.rows[i], hash: enc.hashes[i] }).collect();
     let ablit = p.ablit.unwrap_or(false);
     let (plan, released) = {
-        let (app2, text, keys, keep) = (app.clone(), text.clone(), keys.clone(), info.keep_positions);
+        let (app2, text, keys, keep, ctx_w) = (app.clone(), text.clone(), keys.clone(), info.keep_positions, info.max_context);
         tokio::task::spawn_blocking(move || {
             let mut t = app2.sessions.lock().unwrap();
-            t.keep_for(keep);
+            t.keep_for(keep, ctx_w);
+            t.set_image_bytes(app2.image_rows.in_flight() * crate::vision::IMAGE_ROW_BYTES);
             t.plan_images(&text, &app2.tok, app2.cfg.tokenize_threads, ablit, &keys)
         })
         .await
@@ -1023,10 +1134,10 @@ async fn start_images(app: &Arc<App>, p: &Prepared, pass: Pass, info: crate::pro
         app.engine.release(s);
     }
     let ctx = info.max_context as usize;
-    if plan.ids.len() >= ctx {
+    let Some(max_new) = reply_room(ctx, plan.ids.len(), p.max_tokens) else {
         app.sessions.lock().unwrap().abandon(plan.session_id);
         return Err(bad(format!("the prompt is {} tokens with its images; the context window is {ctx}", plan.ids.len())));
-    }
+    };
     let starts = match crate::vision::span_starts(&plan.ids, &enc.rows) {
         Ok(s) => s,
         Err(e) => {
@@ -1034,7 +1145,6 @@ async fn start_images(app: &Arc<App>, p: &Prepared, pass: Pass, info: crate::pro
             return Err(bad(e));
         }
     };
-    let max_new = (p.max_tokens as usize).min(ctx - plan.ids.len()) as u32;
     let mut stop_ids = p.stop_ids.clone();
     if !p.ignore_eos {
         stop_ids.push(info.eos_id);
@@ -1299,7 +1409,24 @@ pub(crate) mod tests {
             max_image_rows: crate::vision::DEFAULT_MAX_IMAGE_ROWS,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             max_image_rows_in_flight: crate::vision::DEFAULT_MAX_IMAGE_ROWS_IN_FLIGHT,
+            front_table_mib: DEFAULT_FRONT_TABLE_MIB,
+            front_mib: DEFAULT_FRONT_MIB,
+            front_image_mib: DEFAULT_FRONT_IMAGE_MIB,
         }
+    }
+
+    #[test]
+    fn the_window_comes_from_the_engines_hello() {
+        let names = vec!["m".to_string(), "m-ablit".to_string()];
+        let body = models_body(&names, Some(4_194_304));
+        assert_eq!(body["data"][0]["max_model_len"], 4_194_304);
+        assert_eq!(body["data"][1]["max_model_len"], 4_194_304);
+        assert!(models_body(&names, None)["data"][0]["max_model_len"].is_null(), "no engine, no window");
+        // the prompt and response caps follow the same value: a 3M-token prompt fits a 4M window, not a 1M one
+        assert_eq!(reply_room(4_194_304, 3_000_000, 32768), Some(32768));
+        assert_eq!(reply_room(4_194_304, 4_194_300, 32768), Some(4));
+        assert_eq!(reply_room(4_194_304, 4_194_304, 32768), None);
+        assert_eq!(reply_room(1_048_576, 3_000_000, 32768), None);
     }
 
     #[test]
@@ -1751,6 +1878,24 @@ pub(crate) mod tests {
     fn image_request(n: usize) -> Value {
         let image = json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}});
         json!({"messages": [{"role": "user", "content": vec![image; n]}]})
+    }
+
+    #[test]
+    fn image_requests_are_refused_while_the_process_is_over_its_memory_limit() {
+        use crate::vision::{RowsInFlight, DEFAULT_MAX_IMAGE_ROWS_IN_FLIGHT};
+        let mut cfg = cfg();
+        cfg.vision_addr = Some("127.0.0.1:18950".into());
+        let budget = RowsInFlight::new(DEFAULT_MAX_IMAGE_ROWS_IN_FLIGHT);
+        budget.set_refusing(true);
+        let mut img = prepare(&cfg, &image_request(1)).unwrap();
+        let refusal = hold_image_rows(&cfg, &budget, &mut img).unwrap_err();
+        assert_eq!(refusal.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(refusal.headers()["retry-after"], "5");
+        assert_eq!(budget.in_flight(), 0, "it holds nothing");
+        let mut text = prepare(&cfg, &serde_json::from_str(r#"{"messages":[{"role":"user","content":"hi"}]}"#).unwrap()).unwrap();
+        assert!(hold_image_rows(&cfg, &budget, &mut text).is_ok(), "text is never refused here");
+        budget.set_refusing(false);
+        assert!(hold_image_rows(&cfg, &budget, &mut img).is_ok());
     }
 
     #[test]

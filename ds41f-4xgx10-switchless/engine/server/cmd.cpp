@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -75,6 +76,10 @@ void apply_state(model::Model& m, const StateOp& o) {
     case kStAttach: m.slot_attach(o.a, o.h); break;
     case kStFlush: m.state_flush(o.h); break;
     case kStDiskSize: m.state_disk_resize((size_t)(uint32_t)o.a << 16); break;
+    case kStFactor:
+      m.set_slot_factor(o.a, o.b);
+      if (o.h > 0) m.state_set_factor(o.h, o.b);
+      break;
     case kStCheckpoint:
       m.state_checkpoint((uint64_t)(uint32_t)o.a | (uint64_t)(uint32_t)o.b << 32);
       heap::release();  // the index's buffers are freed: their pages go back
@@ -84,6 +89,7 @@ void apply_state(model::Model& m, const StateOp& o) {
       if (!m.image_take(o.h, (size_t)(uint32_t)o.a, o.b)) die("state: no room for the image rows of flight %d (%d rows), or the flight holds them already", o.h, o.a);
       break;
     case kStImgFree: m.image_free(o.h); break;
+    case kStLast: break;  // apply_ops passed its session as the evict-last list
     default: die("state: unknown operation %d", o.op);
   }
 }
@@ -103,8 +109,12 @@ bool store_check() {
 void apply_ops(model::Model& m, const Cmd& c) {
   if (c.slot >= 0) m.use_slot(c.slot);
   m.trim_history();
-  std::vector<int> pin;
+  std::vector<int> pin, last;
   for (int i = 0; i < c.n_ops; ++i) {
+    if (c.ops[i].op == kStLast) {  // evicted after every other session, not protected
+      last.push_back(c.ops[i].h);
+      continue;
+    }
     if (c.ops[i].op == kStUnreserve) continue;  // names a slot, no session
     pin.push_back(c.ops[i].h);
     if (c.ops[i].op == kStCopySnaps) pin.push_back(c.ops[i].a);
@@ -113,7 +123,7 @@ void apply_ops(model::Model& m, const Cmd& c) {
   std::vector<int> live;
   for (const int32_t h : c.live)
     if (h > 0) live.push_back(h);
-  m.state_pin(pin, live);
+  m.state_pin(pin, live, last);
   for (int i = 0; i < c.n_ops; ++i) apply_state(m, c.ops[i]);
   if (c.n_ops > 0 && store_check())
     std::printf("store-check: rank %d state command (%d ops, first %d) digest %016llx\n", m.rank(), c.n_ops, c.ops[0].op,
@@ -147,6 +157,14 @@ model::Ctl to_ctl(const Cmd& c) {
   t.temperature = c.sp.temperature;
   t.seed = (uint32_t)c.sp.seed;
   return t;
+}
+
+int run_window(model::Model& m, const Cmd& c) {
+  const int st = (c.pos0 == 1 || c.rows == 0) ? m.window_close(c.rows) : m.window_open(c.rows);
+  if (store_check())
+    std::printf("store-check: rank %d window command (factor %d, %s) status %d digest %016llx\n", m.rank(), c.rows,
+                c.pos0 == 1 ? "close" : "open", st, (unsigned long long)m.store_digest());
+  return st;
 }
 
 uint64_t run_prefill(model::Model& m, const Cmd& c) {
@@ -893,6 +911,11 @@ void follow(model::Model& m, comm::Ring& ring, Watchdog& wd, int rank) {
         bcast_payload(ring, img.data(), img.size() * 2, rank);
         m.set_images(c.n, lh.data(), lh.data() + c.n, img.data());
       }
+    } else if (c.op == kCmdWindow) {
+      wd.started = now_s();  // capturing the graphs takes seconds of CPU
+      run_window(m, c);
+      wd.started = 0;
+      (void)m.state_evicted();
     } else if (c.op == kCmdPrefill) {
       wd.started = now_s();
       const uint64_t n = run_prefill(m, c);

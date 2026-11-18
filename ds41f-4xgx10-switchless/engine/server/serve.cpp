@@ -49,6 +49,7 @@
 #include "server/bounds.h"
 #include "server/cancel.h"
 #include "server/reclaim.h"
+#include "server/turns.h"
 
 #include <poll.h>
 #include <signal.h>
@@ -411,8 +412,19 @@ class Io {
   std::thread rd_, wr_;
 };
 
+// The YaRN factor a session's state is rotated with: 16, 32 or 64 (windows of 1,048,576, 2,097,152 and 4,194,304
+// positions). A session keeps its factor; a request runs at the smallest factor whose window holds its prompt and
+// matches only state of that factor (Server::find_at); a conversation that outgrows its window goes on in a new session
+// (Server::acquire, Server::cross).
+constexpr int kBaseFactor = 16;
+constexpr int window_of(int factor) { return 65536 * factor; }
+constexpr int factor_for(int64_t n) { return n < window_of(16) ? 16 : n < window_of(32) ? 32 : 64; }
+
 struct Session {
   int h = 0;                   // the store's handle, the same on every rank
+  int factor = kBaseFactor;    // its rotation factor (the store's Sess::factor says the same: state_factor)
+  uint64_t owner = 0;          // 0: the front-end's session id is this entry's key; else the id this one answers to at
+                               // `factor` while another entry holds the id (Server::alt_)
   int slot = -1;               // the slot whose working state is this session's (-1: none, the store's only)
   std::vector<int32_t> hist;   // the tokens whose state the session holds: positions [0, size)
   uint64_t used = 0;           // LRU clock
@@ -430,7 +442,7 @@ struct Session {
 // The server's index of a planned stop's kept sessions (keep(); keepfile.h: 0600 in a 0700 directory,
 // whole or not at all): a header, then each session: id, handle, restart ranges, LRU clock and time,
 // history, encoder-only snapshots.
-constexpr char kSrvMagic[8] = {'D', 'S', 'G', 'B', '1', '0', 'S', '1'};
+constexpr char kSrvMagic[8] = {'D', 'S', 'G', 'B', '1', '0', 'S', '2'};  // 2: each session's factor and owner
 struct SrvHeader {
   char magic[8];
   uint64_t gen;  // the store's (state.cu): both indexes come from the same stop
@@ -503,6 +515,8 @@ struct Flight {
   DecodeEnd de;                      // the slices' drafts, summed
   double spec_tok = 1, spec_ms = 0;  // the drafts' rate (SpecRate) from slice to slice
   bool done_sent = false;            // its DONE went out when it ended inside a batch (finish() sends no other)
+  int fac = kBaseFactor;             // the factor its next run needs: its prompt's, then what its response has grown to
+  bool cross = false;                // its decode reached the window of fac: cross() before its next run
 };
 
 // b's drafts and steps added to a's (a request's decode slices)
@@ -520,7 +534,7 @@ void add(DecodeEnd& a, const DecodeEnd& b) {
 class Server {
  public:
   Server(model::Model& m, comm::Ring& ring, Watchdog& wd, const ServeOptions& o, Io& io, size_t budget)
-      : m_(m), ring_(ring), wd_(wd), o_(o), io_(io), budget_(budget), slot_(m.slots(), 0), il_(o.interleave), keep_age_s_(o.keep_age_s) {}
+      : m_(m), ring_(ring), wd_(wd), o_(o), io_(io), budget_(budget), slot_(m.slots(), 0), il_(o.interleave), keep_age_s_(o.keep_age_s), extend_(o.extend) {}
 
   // Requests let go after their session's last one ended first, then those that waited for a slot (when
   // one is there), then the front-end's frames, then a run of the requests decoding (run).
@@ -539,8 +553,8 @@ class Server {
         Request rq = std::move(ready_.front());
         ready_.pop_front();
         admit(std::move(rq));
-      } else if (!wait_.empty() &&
-                 pick_slot({}, need_clamped(wait_.front()), wait_.front().h.session_id, wait_.front().h.base_session_id) >= 0) {
+      } else if (!wait_.empty() && window_ready(wait_.front()) &&
+                 pick_slot({}, need_clamped(wait_.front()), wait_.front().h.session_id, bkr(wait_.front())) >= 0) {
         Request rq = std::move(wait_.front());
         wait_.pop_front();
         admit(std::move(rq));
@@ -557,6 +571,8 @@ class Server {
         resize_idle();
         flush_idle();
         checkpoint();
+        windows_idle();
+        idle_check();
       }
     }
     // the stop ends what is paused or held with an error (Io::stopping): "the server is stopping"
@@ -575,6 +591,18 @@ class Server {
     keep();
     bcast(ring_, Cmd{});  // stop the other ranks
   }
+
+  // Nothing in flight: no line may be reserved numbers it does not hold (finish() zeroes each reservation). A reservation left
+  // over means a path ended a flight without zeroing it; the line says so once per value.
+  void idle_check() {
+    if (!flying_.empty() || !rot_.empty() || !pfq_.empty()) return;
+    std::vector<reclaim::SlotNums> v;
+    for (int t = 0; t < (int)slot_.size(); ++t) v.push_back({m_.slot_committed(t), m_.slot_mapped(t)});
+    const int64_t n = reclaim::idle_reserves(v);
+    if (n != 0 && n != idle_reserved_) std::printf("serve: BUG: idle line holds a reservation (%lld numbers reserved, nothing in flight)\n", (long long)n);
+    idle_reserved_ = n;
+  }
+  int64_t idle_reserved_ = 0;
 
   // The sessions kept at a planned stop or checkpoint, when the store reused those files (Model::state_kept):
   // histories and ranges from o_.keep_index, which stays as the latest checkpoint's and goes when it does not check out.
@@ -609,6 +637,7 @@ class Server {
         s.end_lo = r.get<int32_t>(), s.end_clo = r.get<int32_t>(), s.end_w = r.get<int32_t>(), s.end_dec_lo = r.get<int32_t>();
         s.used = r.get<uint64_t>();
         s.t_used = r.get<double>();
+        s.factor = r.get<int32_t>(), s.owner = r.get<uint64_t>();
         const int nh = r.get<int32_t>(), ne = r.get<int32_t>();
         if (!r.ok || nh < 0 || nh > o_.max_ctx || ne < 0 || ne > 4096) {
           r.ok = false;
@@ -619,9 +648,12 @@ class Server {
         s.enc_snaps.resize(ne);
         for (int& e : s.enc_snaps) e = r.get<int32_t>();
         bool ok = r.ok && id && !kept.count(id) && s.h > 0 && wall - s.t_used <= keep_age_s_;
+        // the factor is a window the engine can hold, the same one the ranks' store recorded, and an entry that answers
+        // to another id is not that id's own
+        ok = ok && (s.factor == 16 || s.factor == 32 || s.factor == 64) && (s.factor == 16 || window_of(s.factor) / 2 < o_.max_ctx) && s.owner != id;
         for (const int32_t t : s.hist) ok = ok && t >= 0 && t < model::kVocab;
         const model::Model::StateInfo si = m_.state_info(s.h);
-        ok = ok && si.on_disk && si.saved <= nh && si.end_pos <= nh;
+        ok = ok && si.on_disk && si.saved <= nh && si.end_pos <= nh && m_.state_factor(s.h) == s.factor;
         for (const auto& [k, x] : kept) ok = ok && x.h != s.h;
         s.lo = s.clo = s.w = s.dec_lo = 0;  // nothing is live
         if (ok) kept.emplace(id, std::move(s));
@@ -648,6 +680,8 @@ class Server {
     for (const auto& [id, s] : kept) positions += s.hist.size();
     if (!kept.empty()) clock_ = std::max<uint64_t>(clock_, hd.clock);
     sess_.insert(std::make_move_iterator(kept.begin()), std::make_move_iterator(kept.end()));
+    for (const auto& [id, x] : sess_)
+      if (x.owner) alt_[{x.owner, x.factor}] = id;
     if (!why.empty() || !sess_.empty() || !v.empty())
       std::printf("serve: kept sessions: %zu back (%zu positions, %.2f GiB on disk), %zu of the store's dropped, in %.1f ms%s%s\n",
                   sess_.size(), positions, m_.state_disk_bytes() / 1073741824.0, v.size(), 1e3 * (now_s() - t0),
@@ -758,6 +792,7 @@ class Server {
       put<uint64_t>(f, id), put<int32_t>(f, s.h), put<int32_t>(f, s.pe_snap);
       put<int32_t>(f, s.end_lo), put<int32_t>(f, s.end_clo), put<int32_t>(f, s.end_w), put<int32_t>(f, s.end_dec_lo);
       put<uint64_t>(f, s.used), put<double>(f, s.t_used);
+      put<int32_t>(f, s.factor), put<uint64_t>(f, s.owner);
       put<int32_t>(f, (int32_t)s.hist.size()), put<int32_t>(f, (int32_t)s.enc_snaps.size());
       for (const int32_t t : s.hist) put<int32_t>(f, t);
       for (const int e : s.enc_snaps) put<int32_t>(f, e);
@@ -886,13 +921,23 @@ class Server {
     std::copy(v.begin(), v.end(), c.ops);
     issue(c);
   }
+  // The conversation `id` let go: its session at every factor (the primary and the alternates)
   void release(uint64_t id) {
-    const auto it = sess_.find(id);
-    if (it == sess_.end()) return;
-    std::vector<StateOp> v{{kStFree, it->second.h, 0, 0}};
-    if (it->second.slot >= 0) v.push_back({kStRelease, 0, it->second.slot, 0}), slot_[it->second.slot] = 0;
-    state(v);
-    sess_.erase(it);
+    std::vector<uint64_t> keys{id};
+    for (const int fa : {16, 32, 64}) {
+      const auto a = alt_.find({id, fa});
+      if (a == alt_.end()) continue;
+      keys.push_back(a->second);
+      alt_.erase(a);
+    }
+    for (const uint64_t k : keys) {
+      const auto it = sess_.find(k);
+      if (it == sess_.end() || (k != id && it->second.owner != id)) continue;
+      std::vector<StateOp> v{{kStFree, it->second.h, 0, 0}};
+      if (it->second.slot >= 0) v.push_back({kStRelease, 0, it->second.slot, 0}), slot_[it->second.slot] = 0;
+      state(v);
+      sess_.erase(it);
+    }
   }
   // Session s's window snapshots that keep_snap no longer keeps at its history's end, dropped (not the
   // one at its last prompt's end).
@@ -953,30 +998,19 @@ class Server {
   }
   // A request's session (or a fork's base) that was spilled comes back to the store before its plan
   // sees it. The slots' sessions stay where they are (every command pins them).
-  void unspill(const fe::SubmitHeader& h) {
-    Session* x = find(h.session_id);
+  void unspill(const fe::SubmitHeader& h, int fac) {
     uint64_t id = h.session_id;
-    if (!x && h.base_session_id) x = find(h.base_session_id), id = h.base_session_id;
+    Session* x = find_at(id, fac, &id);
+    if (!x && h.base_session_id) id = h.base_session_id, x = find_at(id, fac, &id);
     if (!x) return;
+    const uint64_t base = bk(h, fac);
     const model::Model::StateInfo si = m_.state_info(x->h);
     if (!si.on_disk) return;
     const double t0 = now_s();
     // room for what comes back: idle lines let their conversations go first (they stay in the pool, now evictable), as
-    // make_room does for a request's own need, so that the read-back does not find the pool held by idle lines
-    const int64_t want = (int64_t)m_.state_restore_chunks(x->h);
-    const std::set<uint64_t> none;
-    while ((int64_t)m_.slot_uncommitted() + giveable(none, h.session_id, h.base_session_id, true) < want) {
-      int best = -1;
-      uint64_t used = UINT64_MAX;
-      for (int t = 0; t < (int)slot_.size(); ++t) {
-        if (!slot_[t] || !idle_slot(t, none, h.session_id, h.base_session_id)) continue;
-        const auto it = sess_.find(slot_[t]);
-        const uint64_t u = it == sess_.end() ? 0 : it->second.used;
-        if (u < used) best = t, used = u;
-      }
-      if (best < 0) break;  // nothing more to let go: the read-back takes what fits
-      persist_slot(best, true, holds(h.session_id, h.base_session_id));
-    }
+    // make_room does for a request's own need, so that the read-back does not find the pool held by idle lines. What
+    // running requests hold is left: the read-back takes what fits (and never what a running request was reserved)
+    give_back((int64_t)m_.state_restore_chunks(x->h), {}, h.session_id, base, -1, 0, "a conversation read back", false);
     state({{kStUnspill, x->h, 0, 0}});
     m_.drain();
     const model::Model::StateInfo back = m_.state_info(x->h);  // what came back: the room decides how much
@@ -1075,10 +1109,25 @@ class Server {
       return Io::forget(rq);
     }
     if (flying_.count(rq.h.session_id)) return held_.push_back(std::move(rq));
-    const auto it = sess_.find(rq.h.session_id);
+    const Session* cs = find_at(rq.h.session_id, factor_for((int64_t)rq.prompt.size()));  // its session at its factor
     const int need = need_clamped(rq);
-    const uint64_t sid = rq.h.session_id, base = rq.h.base_session_id;
-    if ((it == sess_.end() || it->second.slot < 0 || !fits(it->second.slot, need) || !mem_ok(it->second.slot, need, {}, sid, base)) &&
+    const uint64_t sid = rq.h.session_id;
+    uint64_t base = bkr(rq);
+    if (const int fac = factor_for((int64_t)rq.prompt.size()); fac > kBaseFactor && (int)rq.prompt.size() < ctx_limit()) {
+      std::vector<int> own;  // the request's own conversation and its base: the window takes them last, not never
+      if (cs) own.push_back(cs->h);
+      if (const Session* b = base ? find(base) : nullptr) own.push_back(b->h);
+      const int w = ensure_window(fac, own, {}, rq.h.req_id);
+      if (w == kWinWait) return wait_.push_back(std::move(rq));
+      if (w == kWinRefuse) {
+        done(rq, fe::kError, 0, 0, now_s(), 0,
+             "the engine cannot make the memory a window of " + std::to_string(window_of(fac)) + " positions needs");
+        return Io::forget(rq);
+      }
+      // making the window may have evicted conversations (no disk tier): cs points at one that is gone
+      cs = find_at(rq.h.session_id, fac);
+    }
+    if ((!cs || cs->slot < 0 || !fits(cs->slot, need) || !mem_ok(cs->slot, need, {}, sid, base)) &&
         pick_slot({}, need, sid, base) < 0)
       return wait_.push_back(std::move(rq));
     start(std::move(rq));
@@ -1091,9 +1140,12 @@ class Server {
     const fe::SubmitHeader& h = f.rq.h;
     f.t_start = now_s();
     const int n = (int)f.rq.prompt.size();
+    f.fac = factor_for(n);  // the smallest factor whose window holds the prompt
+    FacBusy busy_fac(fac_busy_);  // its window stays open while the request is set up (it is in no queue yet)
+    busy_fac.add(f.fac);
     std::string err;
     if (n < 1) err = "empty prompt";
-    else if (n >= o_.max_ctx) err = "a prompt of " + std::to_string(n) + " tokens does not fit the context of " + std::to_string(o_.max_ctx);
+    else if (n >= ctx_limit()) err = "a prompt of " + std::to_string(n) + " tokens does not fit the context of " + std::to_string(ctx_limit());
     else if (h.session_id == 0) err = "session id 0";
     else if (h.max_new_tokens < 1) err = "max_new_tokens 0";
     else if (f.rq.stop.size() > (size_t)kMaxStop) err = "more than " + std::to_string(kMaxStop) + " stop ids";
@@ -1147,9 +1199,9 @@ class Server {
     const std::vector<int32_t>& prompt = resume ? cont : f.rq.prompt;
     const int n = (int)prompt.size();
     forget_evicted();
-    unspill(h);
-    const Session* src = find(h.session_id);
-    if (!src && h.base_session_id) src = find(h.base_session_id);
+    unspill(h, f.fac);
+    const Session* src = find_at(h.session_id, f.fac);
+    if (!src && h.base_session_id) src = find_at(h.base_session_id, f.fac);
     if (!src) return n;
     const int p = std::min(lcp(src->hist, prompt), n - 1);
     return n - choose(*src, src->slot >= 0, p, n).q;
@@ -1168,18 +1220,18 @@ class Server {
     s.owed_ms = owed_ms_;
     s.reader = L.begun;
     s.queued = !L.begun;
-    s.reader_fits = !L.begun && pick_slot({}, need_clamped(L.f.rq), L.f.rq.h.session_id, L.f.rq.h.base_session_id) >= 0;
+    s.reader_fits = !L.begun && pick_slot({}, need_long(L), L.f.rq.h.session_id, bkf(L.f)) >= 0;
     Long* cand = nullptr;  // the second reader's candidate: the first queued one of at most push_rows rows that fits
     if (L.begun && !push_ && st.push_rows > 0)
       for (size_t i = 1; i < pfq_.size() && !cand; ++i) {
         Long& q = *pfq_[i];
         if (!q.begun && q.rows <= st.push_rows &&
-            pick_slot({L.f.rq.h.session_id}, need_clamped(q.f.rq), q.f.rq.h.session_id, q.f.rq.h.base_session_id) >= 0)
+            pick_slot({L.f.rq.h.session_id}, need_long(q), q.f.rq.h.session_id, bkf(q.f)) >= 0)
           cand = &q;
       }
     s.push_fits = cand != nullptr;
-    const bool waiting = !wait_.empty() &&
-                         pick_slot({}, need_clamped(wait_.front()), wait_.front().h.session_id, wait_.front().h.base_session_id) >= 0;
+    const bool waiting = !wait_.empty() && window_ready(wait_.front()) &&
+                         pick_slot({}, need_clamped(wait_.front()), wait_.front().h.session_id, bkr(wait_.front())) >= 0;
     s.arrivals = !ready_.empty() || waiting || io_.submit_waiting();
     s.admitted_last = il_admitted_;
     const double t0 = now_s();
@@ -1285,6 +1337,11 @@ class Server {
       ssd_pending_ = c.ssd_gib;
       std::printf("serve: the disk tier goes to %lld GiB when no request is in flight\n", (long long)c.ssd_gib);
     }
+    if ((c.extend == 0 || c.extend == 1) && (c.extend == 1) != extend_) {
+      extend_ = c.extend == 1;
+      std::printf("serve: extend context %s: %s\n", extend_ ? "on" : "off",
+                  extend_ ? "the factor per request, up to the context" : "the 1,048,576-token window only");
+    }
     published_ = 0;  // the next STATS shows it
     std::printf("serve: interleave settings: %s, whole %d rows, push %d rows, gap %d ms, share %d %%, window at most %d ms\n",
                 il_.on ? "on" : "off", il_.whole_rows, il_.push_rows, il_.gap_ms, il_.share, il_.burst_max_ms);
@@ -1342,20 +1399,28 @@ class Server {
       cont.reserve(f.rq.prompt.size() + f.out.size());
       cont.assign(f.rq.prompt.begin(), f.rq.prompt.end());
       cont.insert(cont.end(), f.out.begin(), f.out.end());
-      if ((int)cont.size() >= o_.max_ctx) return ended(f, fe::kContext);
+      if ((int)cont.size() >= ctx_limit()) return ended_at_start(f, fe::kContext);
     }
     const std::vector<int32_t>& prompt = resume ? cont : f.rq.prompt;
     const int n = (int)prompt.size();
     r.tu = resume ? &r.resumed : &f.tu;  // the log splits a request's first run
     Turn& tu = *r.tu;
     forget_evicted();
-    unspill(h);
+    const int fac = f.fac = std::max(f.fac, factor_for(n));  // a resume's state is read again at the factor its length needs
+    if (fac > kBaseFactor && !m_.window_is_open(fac)) {  // admit() and the turns' loop open it first: never reached
+      std::printf("serve: req %llu: the window of factor %d is not open; the request ends\n", (unsigned long long)h.req_id, fac);
+      return ended(f, fe::kError);
+    }
+    unspill(h, fac);
 
     // ---- the slot, where the state comes from, and from which position on it is computed
-    Session* S = find(h.session_id);
+    // Only a session of this request's factor can continue it (find_at/acquire): its own, else its base's. A request
+    // whose session is at another factor makes a new one (the old stays under an alternate key for its siblings).
+    Session* S = acquire(h.session_id, fac);
     Session* src = S;
     uint64_t src_id = h.session_id;
-    if (!S && h.base_session_id) src = find(h.base_session_id), src_id = h.base_session_id;
+    if (!S && h.base_session_id) src = find_at(h.base_session_id, fac, &src_id);
+    if (src && src->factor != fac) die("serve: req %llu: a state of factor %d would continue a run of factor %d", (unsigned long long)h.req_id, src->factor, fac);
     // the session's own slot. A fork takes its base's when no request of the base is in flight: the base's
     // state goes to the store, and the fork goes on from it in place. A base in flight keeps its slot; its
     // state goes to the store, and the fork starts from there in a slot of its own.
@@ -1363,7 +1428,7 @@ class Server {
     // `keep` admit() and run() checked: a slot that cannot is left (the session's state to the store), and
     // pick_slot() gives one that can, so make_room() below always finds the memory.
     const int need = need_now(f);
-    const uint64_t sid = h.session_id, base = h.base_session_id;
+    const uint64_t sid = h.session_id, base = bk(h, fac);
     int s = S ? S->slot : -1;
     if (s >= 0 && (!fits(s, need) || !mem_ok(s, need, keep, sid, base)))
       persist_slot(s, true, holds(sid, base)), s = -1;  // a small slot (the session moves to a big one), or memory only another slot has
@@ -1406,7 +1471,8 @@ class Server {
           else std::snprintf(from + k, sizeof from - k, ", and no restart point up to it is usable");
         }
       }
-      std::printf("serve: req %llu restart: %s; reused %d (%s)\n", (unsigned long long)h.req_id, from, q, kHow[pl.how]);
+      std::printf("serve: req %llu factor %d (window %d): restart: %s; reused %d (%s)\n", (unsigned long long)h.req_id, fac,
+                  window_of(fac), from, q, kHow[pl.how]);
     }
     if (src && q > 0) {  // the cut at q copies the chunks the session shares with another (own_tail), a fork's partial piece
       // takes a number per list: those numbers must be there before the operations run (the model dies on a pool held by lines)
@@ -1434,9 +1500,14 @@ class Server {
     if (!S) {
       Session ns;
       ns.h = next_h_++;
+      ns.factor = fac;
       S = &sess_.emplace(h.session_id, std::move(ns)).first->second;
+      if (resume)
+        std::printf("serve: req %llu factor %d (window %d): a new session for its %d positions, read again (%s)\n",
+                    (unsigned long long)h.req_id, fac, window_of(fac), n - q, kHow[pl.how]);
     }
     v.push_back({kStAttach, S->h, s, 0});  // the slot holds S: its rows are S's chunk lists (the chunk pool, no copy)
+    v.push_back({kStFactor, S->h, s, fac});  // the slot rotates with S's factor from its first step; the store tags S
     if (src) {
       // S's own state is cut to q; a fork's base's [0, q) is copied into S's numbers (from a base the slot held too)
       if (q > 0 && (!src_live || src != S)) v.push_back({kStLoad, src->h, q, 0});
@@ -1527,6 +1598,7 @@ class Server {
     for (int sn = (pos / o_.snap_every + 1) * o_.snap_every; sn <= pos + R; sn += o_.snap_every)
       if (sn >= 128 && c.n_snaps < kMaxSnaps && (!o_.snap_thin || keep_snap(sn, n, o_.snap_every)))
         c.snaps[c.n_snaps++] = sn;  // none that the prompt's end would thin at once
+    room_for_bookmarks(c.n_snaps, {}, h.session_id, bk(h, f.fac));
     wd_.started = now_s();
     bool img = false;  // vision: rows of an image span take the chunk path (the step path has no injection)
     for (const fe::ImageSpan& sp : f.rq.spans) img = img || (int)(sp.start + sp.rows) > pos;
@@ -1616,6 +1688,7 @@ class Server {
       if (S->pe_snap >= 0) c.ops[c.n_ops++] = {kStDropSnap, S->h, S->pe_snap, 0};
       c.ops[c.n_ops++] = {kStSnap, S->h, n, 0};
       S->pe_snap = n;
+      room_for_bookmarks(1, {}, h.session_id, bk(h, f.fac));
       issue(c);
     }
     if (stop_id(f, tok0)) return ended(f, fe::kStop);
@@ -1654,13 +1727,15 @@ class Server {
   // are admitted against.
   // Positions a new request may reach before its first extension: its prompt and the horizon (--grow-ahead).
   int need_clamped(const Request& rq) const {
-    return (int)std::min<int64_t>((int64_t)rq.prompt.size() + std::min<int64_t>(rq.h.max_new_tokens, o_.grow_ahead), o_.max_ctx);
+    return (int)std::min<int64_t>((int64_t)rq.prompt.size() + std::min<int64_t>(rq.h.max_new_tokens, o_.grow_ahead),
+                                  cap_of(factor_for((int64_t)rq.prompt.size())));
   }
-  // A flight's: from where it is (its prompt and what it generated) a horizon on, at most its prompt + max_new.
+  // A flight's: from where it is (its prompt and what it generated) a horizon on, at most its prompt + max_new and its
+  // factor's window.
   int need_now(const Flight& f) const {
     const int64_t at = (int64_t)f.rq.prompt.size() + (int64_t)f.out.size();
     const int64_t end = (int64_t)f.rq.prompt.size() + f.rq.h.max_new_tokens;
-    return (int)std::min<int64_t>({at + o_.grow_ahead, end, o_.max_ctx});
+    return (int)std::min<int64_t>({at + o_.grow_ahead, end, cap_of(f.fac)});
   }
   bool fits(int s, int need) const { return need <= m_.slot_ctx(s); }
   // The sessions the store leaves alone for a request of session `sid` (forking from `base`): theirs, and those of the
@@ -1748,6 +1823,13 @@ class Server {
     }
     return have >= want;
   }
+  // Numbers for `snaps` window bookmarks a command takes (a prefill piece's, a decode run's, the prompt's end): the pool must
+  // give them, or the request loses a restart point it would have had. Idle and paused lines let go first (give_back).
+  void room_for_bookmarks(int snaps, const std::set<uint64_t>& keep, uint64_t sid, uint64_t base) {
+    if (snaps <= 0) return;
+    give_back((int64_t)m_.state_bookmark_numbers(snaps), keep, sid, base, -1, (int64_t)m_.state_bookmark_numbers(1), "window bookmarks",
+              false);
+  }
   // Slot memory for a request of `need` positions in slot s: the least recently used sessions with no request in
   // flight leave their slots (their state saved to the store, their chunks back to the pool) until the pool can
   // commit it, counting what the store will give back at the reservation (giveable, with every slot's session left
@@ -1767,11 +1849,13 @@ class Server {
   // a consumer asks for (`n`, and best effort `margin` more) must come from free and unreserved numbers and from the
   // conversations no running request uses. Idle and paused lines let their conversations go, least recently used first (the
   // request's own session `sid` and its base excepted, and the sessions in `keep`: they are the request's), then they are
-  // evictable store like the rest (Model::state_giveable).
+  // evictable store like the rest (Model::state_giveable); when that is not enough, a window no request needs is closed.
   // false: only running requests hold the rest. `skip_slot` is the consumer's own line. `margin` is for consumers a refusal
   // would cost a restart point (a bookmark: each detach takes an end bookmark of its own); `n` alone decides the answer.
+  // `may_close`: a window no request needs is closed only for a consumer that would otherwise wait or fail (a request, its
+  // growth, a copy, a window); a bookmark or a read-back that finds no room only starts a later turn further back.
   bool give_back(int64_t n, const std::set<uint64_t>& keep, uint64_t sid, uint64_t base, int skip_slot, int64_t margin,
-                 const char* why) {
+                 const char* why, bool may_close = true) {
     auto short_by = [&](int64_t w) {
       const int64_t u = (int64_t)m_.slot_uncommitted();
       return u < w && u + giveable(keep, sid, base, true) < w;
@@ -1792,7 +1876,8 @@ class Server {
                       (unsigned long long)slot_[t], m_.slot_committed(t), why);
           persist_slot(t, true, holds(sid, base));
         });
-    return !short_by(n);
+    if (!short_by(n)) return true;
+    return may_close && close_unused_window() && !short_by(n);
   }
   // A slot for a session that holds none, among those that hold `need` positions (with big slots, the small
   // ones first): a free one; else the least recently used one whose session no request uses (its state goes
@@ -1842,13 +1927,36 @@ class Server {
     // a run holds what one batch step takes (kMaxSess entries) and what the slots hold, whichever is less; the others
     // wait in rot_ and, with time-slicing, take their turn when this run's turns end (each turn goes to the back)
     const size_t cap = std::min<size_t>(slot_.size(), model::ops::kMaxSess);
+    FacBusy busy_facs(fac_busy_);  // the factors of the flights taken out of the turns: their windows stay while this run builds
+    int ext_waits = 0;             // flights of this pass that wait for the pool to extend their reservation
+    turns::lead_other_factor(rot_, last_fac_, [](const Flight& f) { return f.fac; });  // the factors take turns
     while (fl.size() < cap && !rot_.empty()) {
       Flight f = std::move(rot_.front());
       rot_.pop_front();
-      const auto it = sess_.find(f.rq.h.session_id);
+      busy_facs.add(f.fac);
+      // a step's rows all have one factor (the kernels rotate a step's rows by one table): the run takes the flights of
+      // the first one's factor; the others wait in line for the next run (turns, --slice, make them alternate)
+      if (!fl.empty() && f.fac != fl[0].fac) {
+        later.push_back(std::move(f));
+        continue;
+      }
+      if (f.fac > kBaseFactor) {  // a response that crossed: the window of its new factor first
+        const Session* old = find(f.rq.h.session_id);
+        const int w = ensure_window(f.fac, old ? std::vector<int>{old->h} : std::vector<int>{}, keep, f.rq.h.req_id);
+        if (w == kWinWait) {
+          later.push_back(std::move(f));
+          std::this_thread::sleep_for(std::chrono::milliseconds(20));  // the others may be waiting for the same memory
+          continue;
+        }
+        if (w == kWinRefuse) {
+          ended(f, fe::kContext);  // the response ends at its window, as without Extend context
+          continue;
+        }
+      }
+      const Session* it = find_at(f.rq.h.session_id, f.fac);  // its session at its factor (none after a crossing)
       const int need = need_now(f);
-      const bool live = it != sess_.end() && it->second.slot >= 0 && fits(it->second.slot, need);
-      if (!live && pick_slot(keep, need, f.rq.h.session_id, f.rq.h.base_session_id) < 0) {
+      const bool live = it && it->slot >= 0 && fits(it->slot, need);
+      if (!live && pick_slot(keep, need, f.rq.h.session_id, bkf(f)) < 0) {
         later.push_back(std::move(f));
         continue;
       }
@@ -1856,8 +1964,11 @@ class Server {
       // horizon further when the pool can hold it; else it waits like a paused one (its slot's memory counts as idle
       // for the others: idle_id)
       if (live && f.upto < need && f.upto - (int)(f.rq.prompt.size() + f.out.size()) < o_.grow_ahead / 4) {
-        const int s = it->second.slot;
-        if (!mem_ok(s, need, keep, f.rq.h.session_id, f.rq.h.base_session_id)) {
+        const int s = it->slot;
+        // the pool must hold it: first by the count (mem_ok), then in fact (the lines that count was based on let their
+        // conversations go); a flight that waits is paused for the next pass, and an extender after it may detach its line
+        if (!mem_ok(s, need, keep, f.rq.h.session_id, bkf(f)) || !room_for(s, need, keep, f.rq.h.session_id, bkf(f))) {
+          ++ext_waits;
           later.push_back(std::move(f));
           continue;
         }
@@ -1883,7 +1994,13 @@ class Server {
       fl.push_back(std::move(f));
     }
     for (auto it = later.rbegin(); it != later.rend(); ++it) rot_.push_front(std::move(*it));
+    // every flight of two passes in a row waited for an extension: nothing can end, pause or free what they wait for
+    // (--slice 0, whose flights are never paused, cannot break it; the production setting can)
+    if (fl.empty() && ext_waits > 0 && (size_t)ext_waits == rot_.size() && ++ext_stall_ == 2)
+      std::printf("serve: BUG: every flight waits for an extension (%d flights)\n", ext_waits);
+    if (!fl.empty() || ext_waits == 0) ext_stall_ = 0;
     if (fl.empty()) return;
+    last_fac_ = fl[0].fac;
     const bool turns = o_.slice > 0 && !rot_.empty();  // requests wait for a slot: a turn each
     std::vector<uint32_t> why(fl.size());
     if (fl.size() == 1) why[0] = decode_one(fl[0], turns);
@@ -1891,6 +2008,7 @@ class Server {
     std::vector<Flight> paused;
     for (size_t k = 0; k < fl.size(); ++k) {
       fl[k].t_paused = now_s();
+      if (fl[k].cross) cross(fl[k]);
       if (why[k] == kPaused) paused.push_back(std::move(fl[k]));
       else if (why[k] == kTurn) rot_.push_back(std::move(fl[k]));
       else finish(fl[k], why[k]);
@@ -1912,7 +2030,7 @@ class Server {
   // next token on. Its end (fe::k*), or kPaused / kTurn.
   uint32_t decode_one(Flight& f, bool turns) {
     const fe::SubmitHeader& h = f.rq.h;
-    Session* S = find(h.session_id);
+    Session* S = find_at(h.session_id, f.fac);
     const int pos = (int)(f.rq.prompt.size() + f.out.size()) - 1, max_new = (int)h.max_new_tokens;
     const int left = max_new - (int)f.out.size();
     rejoin(*S, pos, h.req_id);
@@ -1923,7 +2041,7 @@ class Server {
     c.tokens[0] = f.out.back();
     c.sp = f.sp;
     c.max_new = std::min(turns ? std::min(left, o_.slice) : left, std::max(1, f.upto - pos));  // a turn; the horizon
-    c.limit = m_.slot_ctx(S->slot);
+    c.limit = std::min(m_.slot_ctx(S->slot), cap_of(f.fac));  // positions below the factor's window
     c.n_stop = (int)f.rq.stop.size();
     std::copy(f.rq.stop.begin(), f.rq.stop.end(), c.stop);
     c.ahead = 1;
@@ -1936,6 +2054,7 @@ class Server {
     c.spec_gate = o_.spec_gate;
     std::copy(o_.spec_row_ms, o_.spec_row_ms + model::ops::kDrafts + 1, c.spec_row_ms);
     c.spec_tok = f.spec_tok, c.spec_ms = f.spec_ms;  // the drafts' rate goes on from the last run
+    room_for_bookmarks(reclaim::run_snaps(pos, c.max_new, o_.snap_every, model::ops::kDrafts + 2), {h.session_id}, h.session_id, bkf(f));
     const double t_dec = now_s();
     issue(c);
     std::vector<int32_t> samples;
@@ -1971,10 +2090,17 @@ class Server {
     // a pause's last token may be a stop id (the control word ends the loop before it checks them)
     return cancel || (e.why == kEndCancel && !pause) ? fe::kCancelled
            : e.why == kEndStop || stop_id(f, f.out.back()) ? fe::kStop
-           : e.why == kEndContext                          ? fe::kContext
+           : e.why == kEndContext                          ? window_end(f)
            : (int)f.out.size() >= max_new                  ? fe::kLength
            : pause                                         ? kPaused
                                                            : kTurn;
+  }
+  // A decode that stopped at its limit: at its factor's window the response goes on at the next factor (cross(), before the
+  // flight's next run) when it may generate more and the engine's context holds that window; else the context reason
+  uint32_t window_end(Flight& f) {
+    if ((int64_t)f.rq.prompt.size() + (int64_t)f.out.size() < cap_of(f.fac) || !crossable(f)) return fe::kContext;
+    f.cross = true;
+    return kTurn;
   }
 
   // The flights' run together, each in its own slot: a row of each per step (batch_loop), or with drafts
@@ -1987,14 +2113,14 @@ class Server {
     std::vector<Session*> S(n);
     for (int k = 0; k < n; ++k) {
       const Flight& f = fl[k];
-      S[k] = find(f.rq.h.session_id);
+      S[k] = find_at(f.rq.h.session_id, f.fac);
       const int pos = (int)(f.rq.prompt.size() + f.out.size()) - 1;
       rejoin(*S[k], pos, f.rq.h.req_id);
       BatchEntry& x = e[k];
       x.slot = S[k]->slot, x.handle = S[k]->h, x.pos0 = pos, x.token = f.out.back();
       const int left = (int)f.rq.h.max_new_tokens - (int)f.out.size();
       x.max_new = std::min(turns ? std::min(left, o_.slice) : left, std::max(1, f.upto - pos));  // a turn; the horizon
-      x.limit = m_.slot_ctx(S[k]->slot), x.snap_every = o_.snap_every;
+      x.limit = std::min(m_.slot_ctx(S[k]->slot), cap_of(f.fac)), x.snap_every = o_.snap_every;
       x.n_stop = (int)f.rq.stop.size();
       std::copy(f.rq.stop.begin(), f.rq.stop.end(), x.stop);
       x.sp = f.sp;
@@ -2012,6 +2138,15 @@ class Server {
       std::copy(o_.spec_cost, o_.spec_cost + 3, c.spec_cost);
       c.spec_gate = o_.spec_gate;
       std::copy(o_.spec_row_ms, o_.spec_row_ms + model::ops::kDrafts + 1, c.spec_row_ms);
+    }
+    {  // the run's bookmarks (one at each multiple of snap_every it crosses) need their numbers before the command
+      int snaps = 0;
+      std::set<uint64_t> run_ids;
+      for (int k = 0; k < n; ++k) {
+        snaps += reclaim::run_snaps(e[k].pos0, e[k].max_new, o_.snap_every, model::ops::kDrafts + 2);
+        run_ids.insert(fl[k].rq.h.session_id);
+      }
+      room_for_bookmarks(snaps, run_ids, 0, 0);
     }
     const double t_dec = now_s();
     issue(c);
@@ -2080,7 +2215,7 @@ class Server {
       const int max_new = (int)f.rq.h.max_new_tokens;
       why[k] = cancel[k] || x.why == kEndCancel                ? fe::kCancelled
                : x.why == kEndStop || stop_id(f, f.out.back()) ? fe::kStop
-               : x.why == kEndContext                          ? fe::kContext
+               : x.why == kEndContext                          ? window_end(f)
                : (int)f.out.size() >= max_new                  ? fe::kLength
                : x.why == kEndPause                            ? kPaused
                                                                : kTurn;
@@ -2142,6 +2277,8 @@ class Server {
     for (const auto& L : pfq_) reading += L->begun;
     sf.il_reading = reading, sf.il_queued = (uint64_t)pfq_.size() - reading;
     sf.keep_days = (uint64_t)(keep_age_s_ / 86400);
+    sf.extend = extend_ ? 1 : 0;
+    sf.ctx_limit = (uint64_t)ctx_limit(), sf.ranks = (uint64_t)model::kRanks;
     if (model::copy::mode() & model::copy::kAdapt) {
       sf.copy_adapt = 1, sf.copy_proposals_total = copy_proposals_total_, sf.copy_scored_total = copy_scored_total_;
       sf.copy_first_right_total = copy_first_right_total_, sf.copy_rows_verified_total = copy_rows_verified_total_;
@@ -2191,8 +2328,9 @@ class Server {
     flying_.erase(h.session_id);
     const bool released = later_.erase(h.session_id) > 0;  // the front-end let it go meanwhile
     forget_evicted();
-    Session* S = (h.flags & fe::kFlagKeep) && !released ? find(h.session_id) : nullptr;
+    Session* S = (h.flags & fe::kFlagKeep) && !released ? find_at(h.session_id, f.fac) : nullptr;
     if (S) thin(*S);
+    win_retry_at_ = 0;  // a window that waited for this request's memory asks again at once
     if (S && S->slot >= 0) {  // the turn saved where its line holds it: its full chunks get their images (write-behind)
       const int saved = m_.state_info(S->h).saved, E = (int)S->hist.size();
       Cmd c{};
@@ -2264,19 +2402,326 @@ class Server {
     return it == sess_.end() ? nullptr : &it->second;
   }
 
+  // ---- the factor in every match key. A conversation's state is held at one factor under the front-end's session id
+  // (the primary) and at other factors under keys of its own (alt_: (id, factor) -> key, `owner` set). Requests and fork
+  // bases are looked up at the request's factor only, so a state of another factor is never reused; a request at
+  // another factor starts a new session (cold) and leaves the old one intact for its siblings.
+  // The session of conversation `id` at `factor`, primary or alternate; *key: the entry's key in sess_ (set when found).
+  Session* find_at(uint64_t id, int factor, uint64_t* key = nullptr) {
+    if (!id) return nullptr;
+    const auto it = sess_.find(id);
+    if (it != sess_.end() && it->second.owner == 0 && it->second.factor == factor) {  // a primary, never an alternate's key
+      if (key) *key = id;
+      return &it->second;
+    }
+    const auto a = alt_.find({id, factor});
+    if (a == alt_.end()) return nullptr;
+    const auto j = sess_.find(a->second);
+    if (j == sess_.end() || j->second.owner != id || j->second.factor != factor) {  // evicted or freed meanwhile
+      alt_.erase(a);
+      return nullptr;
+    }
+    if (key) *key = a->second;
+    return &j->second;
+  }
+  // The key a request's base is known by for the pins and holds (the base at the request's factor; its id when none)
+  uint64_t bk(const fe::SubmitHeader& h, int factor) {
+    uint64_t k = h.base_session_id;
+    if (k) find_at(k, factor, &k);
+    return k;
+  }
+  uint64_t bkr(const Request& rq) { return bk(rq.h, factor_for((int64_t)rq.prompt.size())); }
+  uint64_t bkf(const Flight& f) { return bk(f.rq.h, f.fac); }
+  // Positions a request at `factor` can hold: its window, and never more than the engine's context
+  int cap_of(int factor) const { return std::min(window_of(factor), ctx_limit()); }
+  // The context this server serves now: --max-ctx with Extend context on, else at most the base factor's window
+  int ctx_limit() const { return extend_ ? o_.max_ctx : std::min(o_.max_ctx, window_of(kBaseFactor)); }
+
+  // The primary of conversation id leaves the id: it becomes an alternate under a key of its own (the node moves, so
+  // pointers to it stay valid), its slot's owner key follows. The id is then free for a session of another factor.
+  void demote(uint64_t id, int to = 0) {
+    auto node = sess_.extract(id);
+    if (node.empty()) return;
+    uint64_t k;
+    do k = (1ull << 63) | ++alt_next_;
+    while (sess_.count(k));
+    Session& x = node.mapped();
+    x.owner = id;
+    if (x.slot >= 0) slot_[x.slot] = k;
+    alt_[{id, x.factor}] = k;
+    node.key() = k;
+    Session& y = sess_.insert(std::move(node)).position->second;
+    // the conversation goes on at a larger factor (to): the copy it leaves is only for siblings under its window, so with
+    // a disk tier it leaves the pool at once (every piece written, its numbers given back) and comes back if one asks
+    if (y.factor < to && m_.state_disk_capacity() > 0 && y.len() > 0) {
+      if (y.slot >= 0) persist_slot(y.slot, true);
+      std::printf("serve: conversation %016llx goes on past its factor-%d window: that copy (%zu positions) to the disk tier\n",
+                  (unsigned long long)id, y.factor, y.len());
+      state({{kStSpill, y.h, 0, 0}});
+      forget_evicted();
+    }
+  }
+  // The session a request of conversation id runs in at `factor`, as its primary: the primary if it is at that factor,
+  // else the alternate at it (the two trade places), else none (the primary of another factor becomes an alternate; the
+  // caller makes the new one). Only for a request that is about to run: no other request of the id is in flight.
+  Session* acquire(uint64_t id, int factor) {
+    uint64_t k = 0;
+    Session* x = find_at(id, factor, &k);
+    if (x && k == id) return x;
+    demote(id, factor);
+    if (!x) return nullptr;
+    auto node = sess_.extract(k);
+    alt_.erase({id, factor});
+    node.mapped().owner = 0;
+    if (node.mapped().slot >= 0) slot_[node.mapped().slot] = id;
+    node.key() = id;
+    return &sess_.insert(std::move(node)).position->second;
+  }
+  // ---- the windows of factors 32 and 64 (Model::window_open): made out of the pool when a request first needs one,
+  // freed when none has for --window-idle-s. A command like any other: every rank makes or frees the same.
+  enum { kWinReady, kWinWait, kWinRefuse };
+  static int win_level(int factor) { return factor == 32 ? 1 : 2; }
+  // The factors of the requests the server has in its hands but in no queue (being started, or taken out of the turns for
+  // the run being built): a bit per win_level. Their windows are not closed for want of memory.
+  struct FacBusy {
+    unsigned& m;
+    const unsigned old;
+    explicit FacBusy(unsigned& x) : m(x), old(x) {}
+    void add(int factor) {
+      if (factor > kBaseFactor) m |= 1u << win_level(factor);
+    }
+    ~FacBusy() { m = old; }
+  };
+  unsigned fac_busy_ = 0;
+  int ext_stall_ = 0;  // passes in a row in which every flight waited for an extension (run)
+  // Whether a request of `factor` exists anywhere: its window is needed
+  bool factor_in_use(int factor) const {
+    if (fac_busy_ & (1u << win_level(factor))) return true;
+    for (const Flight& f : rot_)
+      if (f.fac == factor) return true;
+    for (const auto& L : pfq_)
+      if (L->f.fac == factor) return true;
+    for (const std::deque<Request>* d : {&wait_, &held_, &ready_})
+      for (const Request& r : *d)
+        if (factor_for((int64_t)r.prompt.size()) == factor) return true;
+    return false;
+  }
+  // The window to give back when a consumer is short and no line has anything left: the least recently used open one that
+  // no request needs (a paused flight is in rot_, so its window is never closed under it). Closes it, settles what the
+  // close could not give back at once, and says whether a window was closed (the caller asks the pool again).
+  bool close_unused_window() {
+    if (!m_.window_lazy()) return false;
+    std::vector<reclaim::Win> w;
+    for (const int f : {32, 64}) w.push_back({f, m_.window_is_open(f), factor_in_use(f), win_used_[win_level(f)]});
+    const int f = reclaim::window_to_close(w);
+    if (!f) return false;
+    Cmd c{};
+    c.op = kCmdWindow, c.rows = f, c.pos0 = 1;
+    wd_.started = now_s();
+    issue(c);
+    run_window(m_, c);
+    wd_.started = 0;
+    digest("window close");
+    std::printf("serve: the window of factor %d freed for a request that needs the memory (%d groups of the pool's numbers still owed)\n", f,
+                m_.window_owed());
+    settle_windows();
+    return true;
+  }
+  // What a closed window could not give back at once (a rank's device memory) is asked for again
+  void settle_windows() {
+    if (m_.window_owed() <= 0) return;
+    win_settled_ = now_s();
+    Cmd c{};
+    c.op = kCmdWindow, c.rows = 0;
+    wd_.started = now_s();
+    issue(c);
+    run_window(m_, c);
+    wd_.started = 0;
+    digest("window settle");
+  }
+  // Whether a request that waits is worth trying again now: a window it needs was refused for a moment ago
+  bool window_ready(const Request& rq) const {
+    const int fac = factor_for((int64_t)rq.prompt.size());
+    return fac <= kBaseFactor || m_.window_is_open(fac) || now_s() >= win_retry_at_;
+  }
+  // Factor `fac`'s window open (made now when it is not). `own`: the handles of the request's own conversation and its base,
+  // which the window takes last, like the rest of the cache; `keep`: the sessions of the run being built. The window is made
+  // from a plan: Model::window_plan names the sessions that hold a number the window takes; those on idle or paused lines are
+  // detached (they stay in the pool as stored conversations the model evicts piece by piece), then the pool gives back what is
+  // still short (give_back), then one command makes the window. kWinWait: running requests hold what it needs (the log names
+  // them, and no command goes out while they do) or a rank had too little device memory for a moment; finish() and cross()
+  // end the wait. kWinRefuse: the pool cannot hold one conversation of that window, or the ranks failed three times in a row.
+  int ensure_window(int fac, const std::vector<int>& own, const std::set<uint64_t>& keep, uint64_t req) {
+    if (fac <= kBaseFactor) return kWinReady;
+    if (m_.window_is_open(fac)) {
+      win_used_[win_level(fac)] = now_s();
+      return kWinReady;
+    }
+    if (now_s() < win_retry_at_) return kWinWait;
+    FacBusy busy_fac(fac_busy_);  // the window being made is not one to close
+    busy_fac.add(fac);
+    int g = m_.window_groups_estimate(fac);
+    for (int attempt = 0; attempt < 3; ++attempt) {
+      const model::Model::WindowPlan plan = m_.window_plan(fac, g);
+      std::vector<reclaim::Holder> holders;
+      for (const model::Model::WindowHolder& hd : plan.holders) {
+        uint64_t key = 0;
+        const Session* x = by_handle(hd.handle, &key);
+        if (x) holders.push_back({key, x->slot});  // a session on no line is the model's to evict
+      }
+      const reclaim::WindowActions act =
+          reclaim::window_actions(holders, [&](uint64_t id) { return idle_id(id, keep, 0, 0); });
+      if (!act.running.empty()) return window_wait(req, fac, act.running);  // no command while a running request holds it
+      for (const int t : act.detach) {
+        std::printf("serve: slot %d (session %016llx) gives its %d chunks back to the pool for the window of factor %d\n", t,
+                    (unsigned long long)slot_[t], m_.slot_committed(t), fac);
+        persist_slot(t, true);  // the own conversation and its base too: the window evicts them last (kStLast)
+      }
+      // what is still short after the holders left: free and unreserved numbers, stored conversations, idle lines' memory
+      if (!give_back(plan.removed, keep, 0, 0, -1, (int64_t)m_.state_bookmark_numbers(1), "a window"))
+        return window_wait(req, fac, running_holders());
+      Cmd c{};
+      c.op = kCmdWindow;
+      c.rows = fac;
+      for (const int h : own)
+        if (c.n_ops < kMaxOps) c.ops[c.n_ops++] = StateOp{kStLast, h, 0, 0};
+      wd_.started = now_s();
+      issue(c);
+      const int st = run_window(m_, c);
+      wd_.started = 0;
+      digest("window");
+      forget_evicted();
+      if (st == model::Model::kWindowOk) {
+        win_fails_ = 0;
+        win_used_[win_level(fac)] = now_s();
+        return kWinReady;
+      }
+      if (st == model::Model::kWindowNoRoom) {
+        std::printf("serve: req %llu needs the window of factor %d (%d positions), and the pool cannot hold one conversation of it\n",
+                    (unsigned long long)req, fac, window_of(fac));
+        return kWinRefuse;
+      }
+      if (st == model::Model::kWindowBusy) {
+        ++lend_busy_total_;
+        // the exact count of groups (the ranks' largest) may exceed this rank's estimate: plan again with it
+        const int exact = m_.window_busy_groups(fac);
+        if (exact > g) {
+          g = exact;
+          continue;
+        }
+        std::printf("serve: BUG: window waits on cache: req %llu, factor %d, %d groups, no running holder\n",
+                    (unsigned long long)req, fac, g);
+        return window_wait(req, fac, {});
+      }
+      if (st == model::Model::kWindowFailed && ++win_fails_ >= 3) {
+        std::printf("serve: req %llu: the window of factor %d failed %d times in a row for want of device memory\n",
+                    (unsigned long long)req, fac, win_fails_);
+        win_fails_ = 0;
+        return kWinRefuse;
+      }
+      win_retry_at_ = now_s() + 3.0;
+      if (now_s() - win_note_ > 10) {
+        win_note_ = now_s();
+        std::printf("serve: req %llu waits for the window of factor %d (a rank had too little device memory)\n",
+                    (unsigned long long)req, fac);
+      }
+      return kWinWait;
+    }
+    return window_wait(req, fac, {});
+  }
+  // A window that cannot be made now: no command goes out until the retry (a second on, or when a request ends or crosses:
+  // finish(), cross()). `running`: the requests whose memory it waits for, in the log
+  int window_wait(uint64_t req, int fac, const std::vector<uint64_t>& running) {
+    win_retry_at_ = now_s() + 1.0;
+    if (now_s() - win_note_ > 10) {
+      win_note_ = now_s();
+      std::string ids;
+      for (const uint64_t id : running) {
+        char b[24];
+        std::snprintf(b, sizeof b, "%s%016llx", ids.empty() ? "" : ", ", (unsigned long long)id);
+        ids += b;
+      }
+      std::printf("serve: req %llu waits for the window of factor %d (%s%s)\n", (unsigned long long)req, fac,
+                  running.empty() ? "running requests hold the pool's memory it needs" : "running requests use the memory it needs: sessions ",
+                  ids.c_str());
+    }
+    return kWinWait;
+  }
+  // The sessions of the running requests whose lines hold or are reserved numbers (what a consumer that is short waits for)
+  std::vector<uint64_t> running_holders() const {
+    std::vector<uint64_t> v;
+    for (int t = 0; t < (int)slot_.size(); ++t)
+      if (slot_[t] && m_.slot_committed(t) > 0 && reclaim::running(flying_.count(slot_[t]) > 0, paused(slot_[t]))) v.push_back(slot_[t]);
+    return v;
+  }
+  // The session with store handle h and its key in sess_; null when the server holds none
+  const Session* by_handle(int h, uint64_t* key = nullptr) const {
+    for (const auto& [k, x] : sess_)
+      if (x.h == h) {
+        if (key) *key = k;
+        return &x;
+      }
+    return nullptr;
+  }
+  // The windows of factors nobody asked to free are kept: nothing is freed by time unless --window-idle-s turned it on
+  // (never by default); what a close could not yet give back is asked for again every few seconds. A window a request of
+  // its factor exists for is never freed by time. Closing for memory is give_back's (close_unused_window).
+  void windows_idle() {
+    if (!m_.window_lazy() || !flying_.empty() || !rot_.empty() || !pfq_.empty()) return;
+    const double t = now_s();
+    for (const int f : {32, 64}) {
+      if (!m_.window_is_open(f) || !reclaim::timer_may_close(o_.window_idle_s, t, win_used_[win_level(f)], factor_in_use(f))) continue;
+      Cmd c{};
+      c.op = kCmdWindow, c.rows = f, c.pos0 = 1;
+      wd_.started = now_s();
+      issue(c);
+      run_window(m_, c);
+      wd_.started = 0;
+      digest("window close");
+      std::printf("serve: the window of factor %d was idle %d s: freed (%d groups of the pool's numbers still owed)\n", f,
+                  (int)(t - win_used_[win_level(f)]), m_.window_owed());
+    }
+    if (m_.window_owed() > 0 && t - win_settled_ >= 5) settle_windows();
+  }
+
+  // A flight whose response reached its window goes on at the next factor in a session of its own made cold by its resume
+  // (the prompt and the response so far, read again at the new factor); the session it leaves holds the window's worth
+  // of the conversation, unchanged, for its siblings, and gives up its slot at once.
+  void cross(Flight& f) {
+    const int to = factor_for((int64_t)f.rq.prompt.size() + (int64_t)f.out.size());
+    std::printf("serve: req %llu crosses from factor %d to %d at %zu positions: its prompt and reply so far are read again at the new factor\n",
+                (unsigned long long)f.rq.h.req_id, f.fac, to, f.rq.prompt.size() + f.out.size());
+    const Session* old = find(f.rq.h.session_id);
+    if (old && old->slot >= 0) persist_slot(old->slot, true);  // its state to the store, its slot's memory to the pool
+    demote(f.rq.h.session_id, to);
+    win_retry_at_ = 0;  // a window that waited for this request's memory asks again at once
+    f.fac = to;
+    f.cross = false;
+    f.upto = 0;
+  }
+  // Whether a decode that hit its window ends here (the context reason) or goes on at the next factor
+  bool crossable(const Flight& f) const {
+    const int64_t at = (int64_t)f.rq.prompt.size() + (int64_t)f.out.size();
+    return f.fac < 64 && at < ctx_limit() && window_of(f.fac) < ctx_limit() && (int)f.out.size() < (int)f.rq.h.max_new_tokens;
+  }
+
   model::Model& m_;
   comm::Ring& ring_;
   Watchdog& wd_;
   const ServeOptions& o_;
   double keep_age_s_;  // --keep-days, changed live (CONFIG keep_days)
+  bool extend_;  // --extend, changed live (CONFIG extend): a prompt is admitted, and a response crosses its window, under the setting of that moment
   int64_t ssd_pending_ = 0;  // a disk tier size the dashboard asked for (GiB), applied when nothing runs (resize_idle)
   double ckpt_at_ = 0;      // when the last checkpoint was written (checkpoint())
   uint64_t ckpt_ver_ = 0;   // the store's version it saw (Model::state_version)
   Io& io_;
   const size_t budget_;  // the store's bytes kept between requests (the rest: room for the next one)
   std::map<uint64_t, Session> sess_;
+  std::map<std::pair<uint64_t, int>, uint64_t> alt_;  // (front-end session id, factor) -> the key of its alternate in sess_
+  uint64_t alt_next_ = 0;
   std::vector<uint64_t> slot_;  // the session whose working state each slot holds (0: none)
   std::deque<Flight> rot_;      // requests between their first token and their end, in turn
+  int last_fac_ = 0;            // the factor of the last run's rows (turns::lead_other_factor alternates them)
   // Interleaved prefill: long prompts, first in first out; the front is read once it holds a slot, a second one
   // (push_) may be read beside it, the rest hold nothing. A Long lives on the heap: its Reader points at its Flight.
   struct Long {
@@ -2286,7 +2731,9 @@ class Server {
     bool resume = false;  // a flight that lost its slot, re-reading its prompt and the tokens it sent
     int rows = 0;         // rows to compute when it was queued (the second reader: at most push_rows)
   };
-  Long* push_ = nullptr;  // the second reader, a short long prompt read beside the front one (D3), first
+  // The positions a queued long prompt needs a slot for: a first run's prompt and horizon, a resume's from where it is
+  int need_long(const Long& L) const { return L.resume ? need_now(L.f) : need_clamped(L.f.rq); }
+  Long* push_ = nullptr;  // the second reader, a short long prompt read beside the front one, and first
 
   // A long prompt out of the queue (ended, or read and decoding); the second reader that is now the front is the front
   void drop_long(Long* x) {
@@ -2313,6 +2760,10 @@ class Server {
   std::deque<Request> held_, ready_, wait_;  // submits for a session in flight; those let go when it ended;
                                              // those waiting for a slot
   std::set<uint64_t> flying_, later_;  // the sessions in flight; RELEASEs of them, applied at their end
+  double win_used_[3] = {};   // when each factor's window was last used (index: win_level)
+  double win_retry_at_ = 0;   // a window refused for lack of memory is not asked for again before this
+  double win_note_ = 0, win_settled_ = 0;
+  int win_fails_ = 0;
   int next_h_ = 1;
   uint64_t clock_ = 0;
   std::mt19937_64 rng_{std::random_device{}()};

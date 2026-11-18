@@ -175,12 +175,18 @@ Model::Impl::Impl(int r, const Options& op) : rank(r), opt(op) {
     route_f = fopen(rd, "wb");
     if (!route_f) die("model: DSGB10_ROUTE_DUMP %s", rd);
   }
-  rope_plain = dalloc<float2>((size_t)opt.max_ctx * 32);
-  rope_yarn = dalloc<float2>((size_t)opt.max_ctx * 32);
-  attn::rope_table_build(rope_plain, opt.max_ctx, false, st);
-  attn::rope_table_build(rope_yarn, opt.max_ctx, true, st);
-  kstride = std::max(opt.max_ctx, kPoolBlocks * 8);
-  kstride = (kstride + attn::kScoreAlign - 1) / attn::kScoreAlign * attn::kScoreAlign;
+  // factor 16's rotations are tables; 32 and 64 are computed by the kernels from (position, factor) (attn.h Rope)
+  rope_plain_rows = attn::rope_table_rows(opt.max_ctx);
+  rope_plain = dalloc<float2>((size_t)rope_plain_rows * 32);
+  attn::rope_table_build(rope_plain, rope_plain_rows, false, st);
+  rope_y16_rows = attn::rope_table_rows(opt.max_ctx);
+  rope_y16 = dalloc<float2>((size_t)rope_y16_rows * 32);
+  attn::rope_table_build(rope_y16, rope_y16_rows, true, 16, st);
+  // Serving past 1M opens the windows of factors 32 and 64 when a request first needs them (window.cu): what is made
+  // here is what factor 16's window of 1,048,576 positions needs, whatever --max-ctx is.
+  lazy_win = opt.pool_one_line && opt.max_ctx > 65536 * 16;
+  scan_[0].stride = scan_stride_of(16);
+  scan_[0].open = true;
 
   x = dalloc<bf16>((size_t)R * kHcDim);
   mid = dalloc<bf16>((size_t)R * kHcDim);
@@ -220,8 +226,8 @@ Model::Impl::Impl(int r, const Options& op) : rank(r), opt(op) {
   os = dalloc<uint8_t>((size_t)R * kOPart / 32);
   pack = dalloc<uint8_t>(ops::attn_pack_bytes(R, 2));
   // the index scans' key buffers: one group of kDecodeRows rows (wide64 steps run the indexer in groups)
-  keys = dalloc<uint16_t>((size_t)kDecodeRows * kstride);
-  bkeys = dalloc<uint16_t>((size_t)kDecodeRows * kstride / 8);
+  scan_[0].keys = dalloc<uint16_t>((size_t)kDecodeRows * scan_[0].stride);
+  scan_[0].bkeys = dalloc<uint16_t>((size_t)kDecodeRows * scan_[0].stride / 8);
   for (int i = 0; i < kIdxSlots; ++i) {
     topk[i] = dalloc<int>((size_t)R * kIdxTopk);
     topkey[i] = dalloc<uint16_t>((size_t)R * kIdxTopk);
@@ -506,6 +512,7 @@ void Model::Impl::use_slot(int s) {
     park(imgs[cur_unit]), park(imgs[u]);
   }
   cur_slot = s, cur_unit = u;
+  sf = slot_fac[s];  // the eager paths rotate with the slot's factor
   for (int L = 0; L < kLayers; ++L) ring_kv[L] = ring_kv0[L] + u * kRingKvBytes, ring_sc[L] = ring_sc0[L] + u * kRingScBytes;
   for (int k = 0; k < kKvSlots; ++k) kvs[k] = kvs0[k].at(u);
   spec_use_slot(u);  // the draft module's windows, once bound
@@ -543,8 +550,8 @@ int Model::Impl::slot_chunks_for(int s, int need) const {
   return numbers_for(s, need - 1 + kMapLookahead + kMapSlackEntries);
 }
 
-// More numbers in the pool (the store's share, Model::state_reserve): made and mapped now, before serving, into the
-// arrays' address space (reserved for the whole device at the start).
+// More numbers in the pool (the store's share, or a window's memory coming back): made and mapped, into the arrays'
+// address space (reserved for the whole device at the start).
 void Model::Impl::pool_grow(size_t more) {
   const size_t nums = calloc->numbers() + more;
   if (nums > pool_max) die("model: a chunk pool of %zu numbers is past the device's %zu", nums, pool_max);
@@ -666,15 +673,15 @@ void Model::Impl::indexer(int L, int R, int ctx) {
     const uint16_t* iq = U(iqpre) + (size_t)r0 * kIdxQ;
     const float* wp = wproj + (size_t)r0 * kIdxHeads;
     if (reindex(L)) {
-      attn::index_dense_blocks(iq, wp, pos_d + r0, rope_yarn, m, ratio, ik, pool + (size_t)r0 * kPoolBlocks, kPoolBlocks,
-                               keys, kstride, top, dense_scratch, true, st);
+      attn::index_dense_blocks(iq, wp, pos_d + r0, yarn(), m, ratio, ik, pool + (size_t)r0 * kPoolBlocks, kPoolBlocks,
+                               scan().keys, scan().stride, top, dense_scratch, true, st);
       continue;
     }
     const attn::IndexSel ps = L == 20 ? attn::IndexSel{kPoolBlocks, pool + (size_t)r0 * kPoolBlocks,
                                                        poolkey + (size_t)r0 * kPoolBlocks, kPoolBlocks}
                                       : attn::IndexSel{};
-    attn::index_dense(iq, wp, pos_d + r0, rope_yarn, m, ratio, ik, ctx / ratio, keys, kstride, bkeys, kstride / 8, top, ps,
-                      dense_scratch, true, st);
+    attn::index_dense(iq, wp, pos_d + r0, yarn(), m, ratio, ik, ctx / ratio, scan().keys, scan().stride, scan().bkeys,
+                      scan().stride / 8, top, ps, dense_scratch, true, st);
   }
 }
 
@@ -730,7 +737,7 @@ void Model::Impl::attention(int L, int R, int ctx, bool dumps, bool sub_in, Sink
   fork(sa);
   ops::mix_ranks(amix, R, w.hc_scale[0], w.hc_base[0], a_pre, a_post, a_comb, sa);
   // window KV and compressed KV on the side; q_norm + wq_b (+ the indexer's wq_b) in one launch
-  const float2* tab = L < 2 ? rope_plain : rope_yarn;
+  const attn::Rope tab = L < 2 ? plain() : yarn();
   const attn::Window win = step_win(L);
   fork(sb);
   attn::kv_write(U(kvx), U(w.kv_norm), pos_d, tab, win, nullptr, R, sb, R > kDecodeRows ? &in_d->rows : nullptr);
@@ -747,7 +754,7 @@ void Model::Impl::attention(int L, int R, int ctx, bool dumps, bool sub_in, Sink
       if (cc.slot) cc.slot += r0;
       if (ck.slot) ck.slot += r0;
       attn::compressor_emit(ckvf + (size_t)r0 * kHead, cscf + (size_t)r0 * kHead, pos_d + r0, std::min(kDecodeRows, R - r0),
-                            cw, ca, rope_yarn, cc, ck, nullptr, 0, sb, R > kDecodeRows ? &in_d->rows : nullptr, r0);
+                            cw, ca, yarn(), cc, ck, nullptr, 0, sb, R > kDecodeRows ? &in_d->rows : nullptr, r0);
     }
   }
   const dsk::Fp8Seg qseg[2] = {{w.wqb, w.sqb, q, kQ}, {w.ix_wqb, w.ix_sqb, iqpre, kIdxQ}};
@@ -921,6 +928,7 @@ uint64_t Model::Impl::launch(int R, int pos0, const int32_t* tokens, const Sampl
       pos_last - (R - 1) / pos_group * pos_stride - (R - 1) % pos_group < 0)
     die("model: bad step R=%d pos0=%d", R, pos0);
   ensure_mapped(cur_slot, pos_last);
+  sf = slot_fac[cur_slot];
   if (opt.first_layer > 0 && !(flags & kFlagInject) && (flags & (kFlagDump | kFlagLogits)))
     die("model: starting at layer %d needs golden injection", opt.first_layer);
   bool device_tokens = false;
@@ -971,6 +979,7 @@ uint64_t Model::Impl::launch_batch(const Batch& b) {
     pos_last = std::max(pos_last, b.pos[r]);
   }
   for (int r = 0; r < R; ++r) ensure_mapped(b.slot[r], b.pos[r]);  // every row's slot, before any work is queued
+  sf = factor_of_slots(b.slot, R);  // for this step's launch or capture; use_slot / launch put the current slot's back
   if (device_tokens && (b.flags & ~kFlagProfile)) die("model: golden checks need the batch step's tokens");
   const uint64_t n = n_steps;
   if (n >= (uint64_t)ops::kInSlots) wait_done(n - ops::kInSlots);  // its StepIn slot has been read
@@ -1001,6 +1010,15 @@ uint64_t Model::Impl::launch_batch(const Batch& b) {
     }
   }
   return run_step(n, R, scan_ctx(pos_last), b.flags, b.sink, b.pos[0]);
+}
+
+int Model::Impl::factor_of_slots(const int32_t* slots, int n) const {
+  const int f = slot_fac[slots[0]];
+  for (int r = 1; r < n; ++r)
+    if (slot_fac[slots[r]] != f)
+      die("model: a step mixes YaRN factors (slot %d: %d, slot %d: %d); the server never batches them", slots[0], f,
+          slots[r], slot_fac[slots[r]]);
+  return f;
 }
 
 uint64_t Model::Impl::run_step(uint64_t n, int R, int ctx, uint32_t flags, Sink* sink, int pos0) {
@@ -1072,7 +1090,7 @@ const ops::SampleOut& Model::Impl::wait(uint64_t n) {
 }
 
 cudaGraphExec_t Model::Impl::graph(int R, int ctx) {
-  const auto key = std::make_pair(R, ctx);
+  const auto key = std::make_tuple(R, ctx, sf);  // the captured kernels' parameters bake the factor
   const auto it = graphs.find(key);
   if (it != graphs.end()) return it->second;
   cudaGraph_t g;
@@ -1392,6 +1410,18 @@ void Model::bind(dsw::WeightFile& wf, comm::Ring& ring) { d_->bind(wf, ring); }
 void Model::bind_ring2(comm::Ring& ring) { d_->ch2 = ring.dev(), d_->has_ch2 = true; }
 size_t Model::code_head(int* raw_tiles) { return d_->code_head(raw_tiles); }
 void Model::use_slot(int s) { d_->use_slot(s); }
+void Model::set_slot_factor(int s, int factor) {
+  if (s < 0 || s >= d_->nslots) die("model: set_slot_factor: slot %d of %d", s, d_->nslots);
+  if (factor != 16 && factor != 32 && factor != 64) die("model: set_slot_factor: YaRN factor %d (16, 32 or 64)", factor);
+  if (d_->lazy_win && !d_->scan_[Impl::level_of(factor)].open)
+    die("model: set_slot_factor: factor %d's window is not open (window_open comes first)", factor);
+  d_->slot_fac[s] = factor;
+  if (s == d_->cur_slot) d_->sf = factor;
+}
+int Model::slot_factor(int s) const {
+  if (s < 0 || s >= d_->nslots) die("model: slot_factor: slot %d of %d", s, d_->nslots);
+  return d_->slot_fac[s];
+}
 int Model::slot() const { return d_->cur_slot; }
 int Model::slots() const { return d_->nslots; }
 int Model::slot_ctx(int s) const { return d_->slot_ctx_[s]; }

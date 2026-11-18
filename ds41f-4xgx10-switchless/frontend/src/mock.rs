@@ -154,11 +154,12 @@ struct MockIl {
     burst_max_ms: u64,
     ssd_gib: u64,
     keep_days: u64,
+    extend: u64,
 }
 
 impl Default for MockIl {
     fn default() -> Self {
-        MockIl { on: 1, whole_rows: 32768, push_rows: 131072, gap_ms: 600, share: 40, burst_max_ms: 1000, ssd_gib: 256, keep_days: 30 }
+        MockIl { on: 1, whole_rows: 32768, push_rows: 131072, gap_ms: 600, share: 40, burst_max_ms: 1000, ssd_gib: 256, keep_days: 30, extend: 1 }
     }
 }
 
@@ -181,6 +182,9 @@ impl MockIl {
         }
         if (1..=3650).contains(&c.keep_days) {
             self.keep_days = c.keep_days as u64;
+        }
+        if c.extend == 0 || c.extend == 1 {
+            self.extend = c.extend as u64;
         }
         if (10..=90).contains(&c.share) {
             self.share = c.share as u64;
@@ -234,6 +238,10 @@ fn stats(cfg: &MockConfig, sessions: &Sessions, il: &MockIl) -> EngineStats {
         il_reading: 0,
         il_queued: 0,
         keep_days: il.keep_days,
+        extend: il.extend,
+        // as the engine: the start window with extend on, at most 1,048,576 with it off; four ranks
+        ctx_limit: if il.extend == 1 { cfg.max_context as u64 } else { (cfg.max_context as u64).min(1_048_576) },
+        ranks: 4,
     }
 }
 
