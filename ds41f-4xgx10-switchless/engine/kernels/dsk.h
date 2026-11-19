@@ -310,8 +310,18 @@ struct PrefillTuning {
   int dgrp = -1, dring = 3;  // down: column blocks per CTA (0: one, k_moe_down_p; -1: the default), weight steps in flight (3 or 9)
   int upk = -1;  // up: 0 k_moe_up_p; 1.. k_moe_up_ws's shapes (up_ws_shape); -1 the default (shape 1)
   int dwk = -1;  // down (separate combine, one column block a CTA): 0 k_moe_down_p; 1.. k_moe_down_ws's shapes (down_ws_shape); -1 the default (shape 1 for chunks of kDownWsRows rows or more, see DSGB10_PF_DWS)
+  // DSGB10_PF_TUNE (all 0 = off = the default tiles; each gives the default tiles' bits):
+  int gate_m = 0;  // the router gate (gemm_bf16_p with N = 384) in 32x32 tiles for calls of up to gate_m rows
+  int sh_m = 0;    // the shared expert's w1/w3 in 32x64 tiles for calls of up to sh_m rows
+  int down_m = 0;  // the down kernel by column groups (dgrp 10) and tile order 1 for chunks of down_m rows or more
 };
 void prefill_tuning(const PrefillTuning& t);
+// DSGB10_PF_TUNE=hc[=ROWS],gate[=M],sh[=M],small[=M],down[=M] (unset or empty: today's kernels). hc: the split mHC boundary
+// (hc_boundary_split) for chunks of up to ROWS rows a rank (default 344); gate / sh / small (= both): the small tiles
+// for calls of up to M rows (default 256); down: dgrp 10 + tord 1 from M rows (default 4096).
+// DSGB10_PF_TUNE=@FILE (tests): the same text read from FILE, re-read by prefill_tune_poll() when the file changes.
+void prefill_tune_env(int rank);
+void prefill_tune_poll();
 // k_moe_up_ws's shape v (PrefillTuning::upk): consumer warps, 64-k steps a stage, stages; false past the last.
 bool up_ws_shape(int v, int* C, int* KU, int* S);
 // k_moe_down_ws's shape v (PrefillTuning::dwk): consumer warps, 64-k steps a stage, stages; false past the last.
