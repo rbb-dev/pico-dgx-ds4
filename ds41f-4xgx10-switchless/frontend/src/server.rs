@@ -1190,7 +1190,13 @@ fn stream(app: Arc<App>, p: Prepared, req: Value, pass: Option<Pass>) -> Respons
         }
         let mut out = Vec::new();
         loop {
-            let end = gen.next(&mut out).await;
+            // The engine may send nothing for a long time (queued, waiting for memory, a long prefill): the client leaving must end the
+            // request then too, not only at the next failed send. Dropping `gen` cancels it; `Gen::next` awaits only the engine's
+            // channel and keeps its state in `gen`, so dropping it at that await loses nothing.
+            let end = tokio::select! {
+                e = gen.next(&mut out) => e,
+                _ = tx.closed() => return,
+            };
             for d in out.drain(..) {
                 let delta = match d {
                     Delta::Reasoning(s) => json!({"reasoning_content": s}),
@@ -1819,3 +1825,7 @@ pub(crate) mod tests {
     }
 
 }
+
+#[cfg(test)]
+#[path = "server_cancel_test.rs"]
+mod cancel_test;

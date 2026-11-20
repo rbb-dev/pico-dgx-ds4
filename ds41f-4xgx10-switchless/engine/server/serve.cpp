@@ -46,6 +46,7 @@
 // whose store reused those files reads them back in (load_kept), and the front-end's session ids find
 // their sessions as before the stop.
 #include "server/serve.h"
+#include "server/cancel.h"
 
 #include <poll.h>
 #include <signal.h>
@@ -122,7 +123,7 @@ struct Conn {
   const int fd;
   std::atomic<bool> dead{false};
   std::mutex mu;
-  std::set<uint64_t> cancel;  // CANCELs received (ids are per connection)
+  cancel::Set reqs;  // the requests in flight and the CANCELs received for them (ids are per connection; under mu)
   explicit Conn(int f) : fd(f) {}
   ~Conn() { close(fd); }
   void kill() {
@@ -236,17 +237,18 @@ class Io {
   static bool cancelled(const Request& r) {
     if (r.conn->dead || g_stop) return true;  // a stopping server ends the request in flight
     std::lock_guard<std::mutex> l(r.conn->mu);
-    return r.conn->cancel.count(r.h.req_id) > 0;
+    return r.conn->reqs.cancelled(r.h.req_id);
   }
   // the server's stop ends r, not its client or its front-end going away
   static bool stopping(const Request& r) {
     if (!g_stop || r.conn->dead) return false;
     std::lock_guard<std::mutex> l(r.conn->mu);
-    return r.conn->cancel.count(r.h.req_id) == 0;
+    return !r.conn->reqs.cancelled(r.h.req_id);
   }
+  // r's request is over: its id leaves the connection's live set and its cancel mark with it
   static void forget(const Request& r) {
     std::lock_guard<std::mutex> l(r.conn->mu);
-    r.conn->cancel.erase(r.h.req_id);
+    r.conn->reqs.forget(r.h.req_id);
   }
 
  private:
@@ -302,14 +304,17 @@ class Io {
       }
       r.conn = c;
       r.t_recv = now_s();
+      {
+        std::lock_guard<std::mutex> l(c->mu);
+        c->reqs.submit(r.h.req_id);  // in flight from here: only a CANCEL for an id in this set counts
+      }
       push(std::move(e));
     } else if (h.type == fe::kCancel) {
       fe::Cancel x;
       if (p.size() < sizeof x) return false;
       std::memcpy(&x, p.data(), sizeof x);
       std::lock_guard<std::mutex> l(c->mu);
-      if (c->cancel.size() > 4096) c->cancel.clear();  // ids of requests long gone
-      c->cancel.insert(x.req_id);
+      c->reqs.cancel(x.req_id);  // an id that is not in flight (ended, or never sent) is not marked: nothing to un-cancel later
     } else if (h.type == fe::kRelease) {
       fe::Release x;
       if (p.size() < sizeof x) return false;
@@ -924,6 +929,10 @@ class Server {
   // A submit: held while its session is in flight (a session's requests run one at a time); waiting while
   // no slot can be had (every slot's session in flight, and no time-slicing); else started.
   void admit(Request&& rq) {
+    if (Io::cancelled(rq)) {  // its client left (or the server stops) while it queued: nothing is made for it
+      done(rq, fe::kCancelled, 0, 0, now_s(), 0);
+      return Io::forget(rq);
+    }
     if (flying_.count(rq.h.session_id)) return held_.push_back(std::move(rq));
     const auto it = sess_.find(rq.h.session_id);
     const int need = need_clamped(rq);
@@ -1944,15 +1953,14 @@ class Server {
   double published_ = 0;
 
   void sweep() {
-    for (auto it = wait_.begin(); it != wait_.end();) {
-      if (!Io::cancelled(*it)) {
-        ++it;
-        continue;
-      }
-      done(*it, fe::kCancelled, 0, 0, now_s(), 0);
-      Io::forget(*it);
-      it = wait_.erase(it);
-    }
+    // the requests that wait before they hold a slot (for one, for their session in flight, let go to run): a client that
+    // left ends them now, whatever the others do
+    cancel::sweep_queues(
+        wait_, held_, ready_, [](const Request& r) { return Io::cancelled(r); },
+        [&](const Request& r) {
+          done(r, fe::kCancelled, 0, 0, now_s(), 0);
+          Io::forget(r);
+        });
     for (size_t i = 0; i < pfq_.size();) {  // a queued long prompt holds nothing: its cancel ends it now
       if (pfq_[i]->begun || !Io::cancelled(pfq_[i]->f.rq)) {
         ++i;
