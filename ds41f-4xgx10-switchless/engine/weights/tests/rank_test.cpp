@@ -140,6 +140,25 @@ int main(int argc, char** argv) {
       expect(any.opened, path + " opened with no rank given (no check)");
       unlink(path.c_str());
     }
+    // a rank file of the whole-table versions holds embed.weight and the Markov embedding whole: refused with the way out
+    struct Case {
+      const char* tensor;
+      uint32_t version;
+      bool opens;
+    };
+    for (const Case c : {Case{"embed.weight", 2, false}, Case{"mtp.2.markov_head.embed.weight", 2, false},
+                         Case{"embed.weight", kVersion, true}, Case{"mtp.2.markov_head.embed.weight", kVersion, true},
+                         Case{"head.weight", 2, true}}) {
+      const std::string path = dir + "/dsw_rank_test.v" + std::to_string(c.version) + ".dsw";
+      make_file(path, 0, 4, c.tensor, c.version);
+      const Outcome o = open_as(path, 0);
+      const bool said = o.err.find("cut by vocabulary rows") != std::string::npos &&
+                        o.err.find("dsw_convert") != std::string::npos && o.err.find(c.tensor) != std::string::npos;
+      expect(c.opens ? o.opened : o.aborted && said,
+             std::string(c.tensor) + " in a version " + std::to_string(c.version) + " file " +
+                 (c.opens ? "opens" : "is refused naming the cut and the converter") + (o.err.empty() ? "" : ": " + o.err));
+      unlink(path.c_str());
+    }
   } else {
     die("usage: dsw_rank_test [DIR] | --file FILE RANK | --make FILE RANK");
   }

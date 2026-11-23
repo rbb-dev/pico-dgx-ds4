@@ -447,9 +447,9 @@ struct Session {
 };
 
 // The server's index of a planned stop's kept sessions (keep(); keepfile.h: 0600 in a 0700 directory,
-// whole or not at all): a header, then each session: id, handle, restart ranges, LRU clock and time,
-// history, encoder-only snapshots.
-constexpr char kSrvMagic[8] = {'D', 'S', 'G', 'B', '1', '0', 'S', '2'};  // 2: each session's factor and owner
+// whole or not at all): a header, then each session (prefix.h's KeptRec): id, handle, restart ranges, LRU clock and time,
+// factor and owner, epoch, the count and sum of its ids file (the ids are in that file, not here), encoder-only snapshots.
+constexpr char kSrvMagic[8] = {'D', 'S', 'G', 'B', '1', '0', 'S', '3'};  // format 3: each session holds the epoch and the ids file's name (the ids are in that file)
 struct SrvHeader {
   char magic[8];
   uint64_t gen;  // the store's (state.cu): both indexes come from the same stop
@@ -691,32 +691,37 @@ class Server {
       keepfile::Reader r{f.data() + sizeof hd, (size_t)hd.body_bytes};
       const double wall = unix_now();
       for (int i = 0; i < hd.n_sess && r.ok; ++i) {
-        const uint64_t id = r.get<uint64_t>();
+        prefix::KeptRec k;
+        if (!prefix::get_rec(r, &k, o_.max_ctx, 4096)) break;
+        const uint64_t id = k.id;
         Session s;
-        s.h = r.get<int32_t>(), s.pe_snap = r.get<int32_t>();
-        s.end_lo = r.get<int32_t>(), s.end_clo = r.get<int32_t>(), s.end_w = r.get<int32_t>(), s.end_dec_lo = r.get<int32_t>();
-        s.used = r.get<uint64_t>();
-        s.t_used = r.get<double>();
-        s.factor = r.get<int32_t>(), s.owner = r.get<uint64_t>();
-        const int nh = r.get<int32_t>(), ne = r.get<int32_t>();
-        if (!r.ok || nh < 0 || nh > o_.max_ctx || ne < 0 || ne > 4096) {
-          r.ok = false;
-          break;
-        }
-        s.hist.resize(nh);
-        for (int32_t& t : s.hist) t = r.get<int32_t>();
-        s.enc_snaps.resize(ne);
-        for (int& e : s.enc_snaps) e = r.get<int32_t>();
-        bool ok = r.ok && id && !kept.count(id) && s.h > 0 && wall - s.t_used <= keep_age_s_;
+        s.h = k.h, s.pe_snap = k.pe_snap;
+        s.end_lo = k.end_lo, s.end_clo = k.end_clo, s.end_w = k.end_w, s.end_dec_lo = k.end_dec_lo;
+        s.used = k.used, s.t_used = k.t_used, s.factor = k.factor, s.owner = k.owner;
+        s.ep.value = k.epoch ? k.epoch : new_epoch(), s.ep.reported = k.reported;
+        s.enc_snaps.assign(k.enc_snaps.begin(), k.enc_snaps.end());
+        const int nh = k.ids_n;
+        bool ok = id && !kept.count(id) && s.h > 0 && wall - s.t_used <= keep_age_s_;
         // the factor is a window the engine can hold, the same one the ranks' store recorded, and an entry that answers
         // to another id is not that id's own
         ok = ok && (s.factor == 16 || s.factor == 32 || s.factor == 64) && (s.factor == 16 || window_of(s.factor) / 2 < o_.max_ctx) && s.owner != id;
-        for (const int32_t t : s.hist) ok = ok && t >= 0 && t < model::kVocab;
+        // the ids file the index names holds the count and the sum it recorded (the file's header; the ids are read back, and
+        // checked whole, when a request uses the conversation)
+        if (ok && nh > 0) {
+          uint64_t c = 0, sm = 0;
+          std::string w;
+          ok = !o_.ids_dir.empty() && k.ids_seq && idsfile::peek(o_.ids_dir, s.h, &c, &sm, &w, k.ids_seq) && c == (uint64_t)nh && sm == k.ids_sum;
+          if (ok) s.ids_out = true, s.ids_n = (size_t)nh, s.file_ok = true, s.file = {k.ids_seq, sm};
+        }
         const model::Model::StateInfo si = m_.state_info(s.h);
         ok = ok && si.on_disk && si.saved <= nh && si.end_pos <= nh && m_.state_factor(s.h) == s.factor;
-        for (const auto& [k, x] : kept) ok = ok && x.h != s.h;
+        for (const auto& [kk, x] : kept) ok = ok && x.h != s.h;
         s.lo = s.clo = s.w = s.dec_lo = 0;  // nothing is live
-        if (ok) kept.emplace(id, std::move(s));
+        if (ok) {
+          ids_files_ += s.ids_out;
+          if (s.file.seq) keeper_.adopt(s.h, s.file.seq);
+          kept.emplace(id, std::move(s));
+        }
       }
       if (!r.ok || r.at != r.n) {
         kept.clear();
@@ -857,21 +862,43 @@ class Server {
   }
 
   // The server's index of gen (keepfile.h: whole or not at all), beside the ranks' of the same gen: the sessions whose
-  // handles hs names, each with its id, handle, restart ranges, LRU clock and time, history, encoder-only snapshots.
+  // handles hs names, each with its id, handle, restart ranges, LRU clock and time, epoch, the count and sum of its ids file,
+  // encoder-only snapshots. The ids are not in it: a conversation whose file does not hold its history now has it written
+  // first (the conversations that went idle since the last index; the rest have their file), so an index is KiBs.
   bool write_index(uint64_t gen, const std::set<int>& hs, int* n, size_t* bytes, std::string* why) {
     std::vector<uint8_t> f(sizeof(SrvHeader));
-    using keepfile::put;
     *n = 0;
-    for (const auto& [id, s] : sess_) {
+    std::vector<uint64_t> lost;  // conversations whose ids file is lost: not written, freed after
+    std::map<int, uint64_t> named;  // handle -> the ids file this index names
+    for (auto& [id, s] : sess_) {
       if (!hs.count(s.h)) continue;
+      prefix::KeptRec k;
+      if (s.ids_out) {
+        uint64_t c = 0, sm = 0;
+        std::string w;
+        const bool ok = idsfile::peek(o_.ids_dir, s.h, &c, &sm, &w, s.file.seq) && c == s.ids_n && sm == s.file.sum;
+        if (idsfile::back_verdict(ok, c, s.ids_n) == idsfile::Back::kFree) {
+          std::printf("serve: conversation %016llx: its ids file %s; it is not written to the index and is freed\n", (unsigned long long)id,
+                      w.empty() ? "is gone or holds another count" : w.c_str());
+          lost.push_back(id);
+          continue;
+        }
+      } else if (!s.hist.empty() && !s.file_ok) {
+        std::string w;
+        if (!ids_file_now(s, &w)) {
+          std::printf("serve: conversation %016llx: its ids not written (%s); it is not in the index\n", (unsigned long long)id, w.c_str());
+          continue;
+        }
+      }
       ++*n;
-      put<uint64_t>(f, id), put<int32_t>(f, s.h), put<int32_t>(f, s.pe_snap);
-      put<int32_t>(f, s.end_lo), put<int32_t>(f, s.end_clo), put<int32_t>(f, s.end_w), put<int32_t>(f, s.end_dec_lo);
-      put<uint64_t>(f, s.used), put<double>(f, s.t_used);
-      put<int32_t>(f, s.factor), put<uint64_t>(f, s.owner);
-      put<int32_t>(f, (int32_t)s.hist.size()), put<int32_t>(f, (int32_t)s.enc_snaps.size());
-      for (const int32_t t : s.hist) put<int32_t>(f, t);
-      for (const int e : s.enc_snaps) put<int32_t>(f, e);
+      k.id = id, k.h = s.h, k.pe_snap = s.pe_snap;
+      k.end_lo = s.end_lo, k.end_clo = s.end_clo, k.end_w = s.end_w, k.end_dec_lo = s.end_dec_lo;
+      k.used = s.used, k.t_used = s.t_used, k.factor = s.factor, k.owner = s.owner;
+      k.ids_n = (int32_t)s.len(), k.ids_sum = k.ids_n ? s.file.sum : 0, k.ids_seq = k.ids_n ? s.file.seq : 0;
+      if (k.ids_n) named[s.h] = s.file.seq;
+      k.epoch = s.ep.value, k.reported = std::min<uint64_t>(s.ep.reported, (uint64_t)k.ids_n);
+      k.enc_snaps.assign(s.enc_snaps.begin(), s.enc_snaps.end());
+      prefix::put_rec(f, k);
     }
     SrvHeader hd{};
     std::memcpy(hd.magic, kSrvMagic, sizeof kSrvMagic);
@@ -943,6 +970,7 @@ class Server {
   // so an eviction or a planned stop writes nothing for them; conversations unused for --keep-days are dropped.
   // One command for all of them.
   void flush_idle() {
+    ids_to_files();
     const double now = unix_now();
     std::vector<StateOp> v;
     int expired = 0;
@@ -1086,20 +1114,94 @@ class Server {
     Session* x = find_at(id, fac, &id);
     if (!x && h.base_session_id) id = h.base_session_id, x = find_at(id, fac, &id);
     if (!x) return;
+    if (!need_ids(id, *x)) return;  // the ids of a conversation a request uses are in memory before its plan reads them (a lost file frees it)
     const uint64_t base = bk(h, fac);
+    split_forget(x->h);  // a request names it: it is not split meanwhile
     const model::Model::StateInfo si = m_.state_info(x->h);
+    join_incomplete_ = false;
+    if (si.split && join_now) {  // its quarter slots come back first: whole numbers before anything reads or writes them
+      const RestoreAsk ra = restore_ask(h.session_id, base, need, &prompt);
+      const bool mine = ra.found && ra.src_id == id;
+      int64_t budget = m_.state_info(x->h).slots;  // not the request's conversation (a stop's spill): every slot, a number each
+      if (mine) {
+        // the count of this join (a read-back's rule): the lists that must come back, then what the admission found spare for
+        // bookmarks (its own bookmarks' numbers included), read once in the pass that makes the reservation; each command carries what is left, never 0 (0 is no limit)
+        MemCache mc;
+        const int s = x->slot >= 0 ? x->slot : pick_slot(keep, need, h.session_id, base, &prompt);
+        int64_t have = 0, want = 0;
+        mem_sums(s >= 0 ? s : 0, need, keep, h.session_id, base, &mc, &have, &want, &prompt);
+        if (s < 0) have = want;
+        budget = model::rules::join_budget(ra.split, ra.bookmarks, have, want);
+        give_back((int)std::min<int64_t>(budget, (int64_t)ra.split + ra.bookmarks) + ra.on_disk, {}, h.session_id, base, -1, 0, "a conversation joined", false);
+      }
+      join_back(*x, mine ? ra.upto : INT_MAX, id, budget);
+      join_incomplete_ = mine && lists_split(x->h, ra.upto) > 0;  // the request is not begun on a conversation still split below `upto`
+    }
+    if (!join_now) return;  // a deferred return's units read the SSD's lists too (join_unit); its bookmarks and the rest are this call's, from pf_begin
     if (!si.on_disk) return;
     const double t0 = now_s();
+    int64_t cap = 0, room = (int64_t)m_.state_restore_chunks(x->h), asked = 0;  // 0: no limit; asked: the lists the count said can come back
+    int upto = 0;           // > 0: the read-back is commands of at most J pieces below this position (--kv-split cache); 0: one command, as with --kv-split off
+    bool nothing_below = false;  // a fork at position 0 reads nothing: its base's pieces all lie above it
+    {
+      MemCache mc;
+      const int s = x->slot >= 0 ? x->slot : pick_slot(keep, need, h.session_id, base, &prompt);
+      int64_t have = 0, want = 0;
+      mem_sums(s >= 0 ? s : 0, need, keep, h.session_id, base, &mc, &have, &want, &prompt);
+      const int back = mc.ask.on_disk;  // the lists below the need (a fork: below its fork point) that must come back
+      asked = back;
+      if (s < 0) have = want;           // no slot to count against: the lists only
+      cap = model::rules::restore_budget(back, have, want);
+      if (cap > 0) room = std::min(room, cap);
+      if (o_.kv_split) {  // no command of a return handles more than J pieces: the request's own point, or all of it for a conversation no request names
+        const bool mine = mc.ask.found && mc.ask.src_id == id;
+        upto = mine ? mc.ask.upto : INT_MAX;
+        if (upto <= 0) upto = 0, nothing_below = true;
+      }
+    }
     // room for what comes back: idle lines let their conversations go first (they stay in the pool, now evictable), as
-    // make_room does for a request's own need, so that the read-back does not find the pool held by idle lines. What
+    // room_for does for a request's own need, so that the read-back does not find the pool held by idle lines. What
     // running requests hold is left: the read-back takes what fits (and never what a running request was reserved)
-    give_back((int64_t)m_.state_restore_chunks(x->h), {}, h.session_id, base, -1, 0, "a conversation read back", false);
-    state({{kStUnspill, x->h, 0, 0}});
-    m_.drain();
+    if (o_.imager && upto > 0 && m_.state_unspill_left(x->h, upto) == 0) return;  // nothing at or below the request's point is only on the SSD: the request asks once, not again for a tail it does not read
+    give_back(room, {}, h.session_id, base, -1, 0, "a conversation read back", false);
+    int d_in = 0, d_disk = 0;
+    m_.state_list_numbers(x->h, INT_MAX, &d_in, &d_disk);
+    const uint64_t sum_cuts0 = m_.state_sum_cuts();
+    const double t_rb = now_s();
+    int commands = 0;
+    if (upto > 0) {  // units of at most J pieces; each carries what is left of the count (the numbers it may take), and the last one of a
+                     // spent count says so (a < 0) so that the core cuts where the count ended, as one command did
+      const uint64_t taken0 = m_.split_stats().unspill_taken;
+      int64_t left = cap;
+      for (; commands < 100000;) {
+        const int todo = m_.state_unspill_left(x->h, upto);
+        if (todo == 0) break;
+        const int32_t a = cap > 0 ? (left > 0 ? (int32_t)std::min<int64_t>(left, 1 << 30) : -1) : 0;
+        state({{kStUnspill, x->h, a, upto}});
+        ++commands;
+        m_.drain();
+        left = cap - (int64_t)(m_.split_stats().unspill_taken - taken0);
+        if (a < 0 || m_.state_unspill_left(x->h, upto) >= todo) break;  // the count ran out (and was cut), or nothing moved
+      }
+    } else if (!nothing_below) {
+      state({{kStUnspill, x->h, (int32_t)cap, 0}});
+      m_.drain();
+      commands = 1;
+    }
+    {  // the count paid for these lists: a read-back that is refused is a count that disagrees with the core's (rules::spare)
+      int a_in = 0, a_disk = 0;
+      m_.state_list_numbers(x->h, INT_MAX, &a_in, &a_disk);
+      jc_.learn_disk(1e3 * (now_s() - t_rb), std::max(0, a_in - d_in));  // the per-piece time of a read from the SSD, the lists that came back
+      const int64_t want_back = std::min<int64_t>(asked, d_disk);
+      if (model::rules::readback_refused(cap, want_back, std::max(0, a_in - d_in), m_.state_sum_cuts() != sum_cuts0))
+        std::printf("serve: BUG: a read-back the count paid for was refused (budget %lld, %lld lists asked, %d back)\n", (long long)cap,
+                    (long long)want_back, std::max(0, a_in - d_in));
+    }
+    if (commands > 1) std::printf("serve: session %016llx read back in %d commands of at most %d pieces\n", (unsigned long long)id, commands, o_.kv_join_pieces);
     const model::Model::StateInfo back = m_.state_info(x->h);  // what came back: the room decides how much
-    std::printf("serve: session %016llx back from disk: %.1f MiB of %.1f MiB, %zu positions, restart point %d of %d, in %.1f ms\n",
-                (unsigned long long)id, back.bytes / 1048576.0, si.disk_bytes / 1048576.0, x->hist.size(), back.restart,
-                si.restart, 1e3 * (now_s() - t0));
+    std::printf("serve: session %016llx back from disk: %.1f MiB of %.1f MiB, %zu positions, restart point %d of %d, in %.1f ms%s\n",
+                (unsigned long long)id, back.bytes / 1048576.0, si.disk_bytes / 1048576.0, x->len(), back.restart,
+                si.restart, 1e3 * (now_s() - t0), cap > 0 ? (" (budget " + std::to_string(cap) + " numbers)").c_str() : "");
     forget_evicted();
   }
 
@@ -1384,6 +1486,25 @@ class Server {
         break;
       }
       case il::Next::Piece: {
+        if (L.joining) {  // the request's first units: the join, one command at a time, each followed by the decoders' window
+          if (!L.jw.may_try(t0)) {  // no number a moment ago: arrivals, releases and the other commands go on while it waits
+            idle_wait();
+            break;
+          }
+          const int r = join_unit(L.ja, L.f.rq.h.req_id, L.f.rq.h.session_id, bkf(L.f));
+          if (r == 0) L.joining = false, L.jw.live = false;  // every list below `upto` is whole: it begins as any queued prompt does, next pass
+          else if (r == 3) {  // not units: the prompt begins as any queued one; its begin joins what is still slots and reads the rest in commands of at most J
+            L.joining = false, L.jw.live = false, L.ja.deferred = false;
+            std::printf("serve: req %llu: the return of session %016llx is read at its begin: %d lists on the SSD, the pool gives %lld without a running request's line\n",
+                        (unsigned long long)L.f.rq.h.req_id, (unsigned long long)L.f.rq.h.session_id, lists_disk(L.ja.h, L.ja.upto),
+                        (long long)return_room(L.f.rq.h.session_id, bkf(L.f)));
+            std::fflush(stdout);
+            break;
+          } else if (r == 1) L.jw.moved();
+          else L.jw.stuck(t0);
+          if (s.decoders && r != 2) owed_ms_ += il::window_ms(st, 1e3 * (now_s() - t0));
+          break;
+        }
         Long& P = push_ ? *push_ : L;  // the second reader reads first
         Reader& r = P.r;
         const bool dec = !rot_.empty();
@@ -1481,6 +1602,49 @@ class Server {
   }
 
   // A decode run's window: set at its first step; over when a long prompt waits and the window has passed
+  // whether the run is ended for another request (splitpace::pause_for_others); `can_begin` is asked last, at most every 50 ms
+  bool pause_wanted(bool batch, bool ends) {
+    splitpace::PauseIn o;
+    o.batch = batch, o.pf = !pfq_.empty(), o.pf_busy = splitpace::pfq_busy(!pfq_.empty(), pf_reading(), pf_waits_), o.burst_over = burst_over();
+    o.submit = io_.submit_waiting(), o.admissible = o.submit ? admissible() : false, o.ends = ends, o.wait = !wait_.empty();
+    if (splitpace::pause_for_others(o)) return true;
+#ifndef PICO_OLD_RULES
+    if (o.pf && o.pf_busy) return false;
+    if (!o.wait && !(pf_waits_ && !pf_reading())) return false;
+    return can_begin_ask();
+#else
+    return false;
+#endif
+  }
+  // The waiter can begin now: the head of wait_ (its retry time reached, not image-gated, its window open) or the queue's front that waits, with admission's own count
+  // (pick_slot: free, idle lines' reservations, clean pieces; no request in flight loses its line). Never larger than what the loop admits.
+  bool can_begin_ask() {
+    const double t = now_s();
+    if (!splitpace::ask_due(t, cb_last_, cb_miss_until_)) return false;
+    cb_last_ = t;
+    uint64_t id = 0;
+    bool ok = false;
+    if (!wait_.empty()) {
+      const Request& r = wait_.front();
+      id = r.h.req_id;
+      ok = start_wait_.may_try(t) && !vit_gated(r) && window_ready(r) && pick_slot({}, need_clamped(r), r.h.session_id, bkr(r), &r.prompt) >= 0;
+    } else if (!pfq_.empty() && pf_waits_ && !pf_reading()) {
+      Long& L = *pfq_.front();
+      id = L.f.rq.h.req_id;
+      ok = il::begin_fits(pick_slot({}, need_long(L), L.f.rq.h.session_id, bkf(L.f), &L.f.rq.prompt) >= 0, L.jw, t);
+    }
+    if (!ok || !id) return false;
+    if (cb_granted_ == id) {  // a run was ended for it and it waits again: a miss
+      std::printf("serve: req %llu: a run was ended for its start and it waits again\n", (unsigned long long)id);
+      cb_granted_ = 0, cb_miss_until_ = t + 1.0;
+      return false;
+    }
+    cb_granted_ = id;
+    std::printf("serve: req %llu can begin: the run is ended for it\n", (unsigned long long)id);
+    return true;
+  }
+  double cb_last_ = 0, cb_miss_until_ = 0;
+  uint64_t cb_granted_ = 0;
   bool burst_over() {
     if (burst_ms_ <= 0 || pfq_.empty()) return false;
     const double t = now_s();
@@ -2585,6 +2749,16 @@ class Server {
       if (Io::cancelled(f.rq)) {  // its entry's bit: it ends after the step that reads it
         cancel[k] = 1;
         m_.set_ctl(ctl |= 1u << k);
+        // a cancel ends like a stop or a length end (the contract above: its DONE goes out at once while the others go on): the DONE now, no token after it, its slot counted as freed
+        // for the pause check below. The run-end loop sends no second DONE (done_sent); why[k] is kCancelled by cancel[k]. PICO_OLD_RULES: the DONE waited for the run's end.
+#ifndef PICO_OLD_RULES
+        ended[k] = 1;
+        run_ended_.insert(f.rq.h.session_id);
+        f.done_sent = true;
+        const fe::DoneTail tail = report_of(f, (int64_t)f.rq.prompt.size() + (int64_t)f.out.size() - 1);
+        done(f.rq, fe::kCancelled, (uint32_t)f.q, (uint32_t)f.out.size(), f.t_start, f.t_first, "", &tail);
+        if (!(ctl & kCtlPause) && pause_wanted(true, true)) m_.set_ctl(ctl |= kCtlPause);
+#endif
         return;
       }
       const int32_t t = o.row[row].token;
@@ -2595,12 +2769,17 @@ class Server {
       const bool stop = stop_id(f, t), ends = stop || (int)f.out.size() >= (int)f.rq.h.max_new_tokens;
       if (ends) {
         ended[k] = 1;
+        run_ended_.insert(f.rq.h.session_id);
         f.done_sent = true;
-        done(f.rq, stop ? fe::kStop : fe::kLength, (uint32_t)f.q, (uint32_t)f.out.size(), f.t_start, f.t_first);
+        // the history ends with the last token fed: the prompt and the response but its last token (this run's ids join `hist` below)
+        const fe::DoneTail tail = report_of(f, (int64_t)f.rq.prompt.size() + (int64_t)f.out.size() - 1);
+        done(f.rq, stop ? fe::kStop : fe::kLength, (uint32_t)f.q, (uint32_t)f.out.size(), f.t_start, f.t_first, "", &tail);
       }
-      if (!(ctl & kCtlPause) && (pfq_.empty() ? (io_.submit_waiting() || !wait_.empty()) && (ends || admissible())
-                                              : burst_over()))
+      if (!(ctl & kCtlPause) && pause_wanted(true, ends))
         m_.set_ctl(ctl |= kCtlPause);
+    };
+    const OnStep step = [&] {  // once a step: the flips, the STATS frame and the reasons that pause a run (step_hook)
+      step_hook(rw, rs, ctl, (ctl & kCtlPause) != 0, kCtlPause);
     };
     std::vector<BatchEnd> end(n);
     std::vector<DecodeEnd> dend;
@@ -2773,13 +2952,25 @@ class Server {
     }
   }
 
+  // The epoch and the size a DONE of flight f tells the front-end: its kept session's entry at its factor, `n_hist` (-1: what the
+  // entry holds) recorded as reported. Epoch 0, size 0: the session is not kept (no kFlagKeep, released, or none made).
+  fe::DoneTail report_of(const Flight& f, int64_t n_hist) {
+    fe::DoneTail t{};
+    if (!(f.rq.h.flags & fe::kFlagKeep) || later_.count(f.rq.h.session_id)) return t;
+    Session* S = find_at(f.rq.h.session_id, f.fac);
+    if (!S) return t;
+    const uint64_t n = n_hist >= 0 ? (uint64_t)n_hist : (uint64_t)S->hist.size();
+    prefix::reported_at(&S->ep, n);
+    t.epoch = S->ep.value, t.n_hist = (uint32_t)n;
+    return t;
+  }
+
   // DONE, then the session kept (its snapshots thinned) or freed, and the store held to its budget; the
   // requests held for the session go on.
-  void finish(Flight& f, uint32_t why) {
-    const fe::SubmitHeader& h = f.rq.h;
-    if (!f.done_sent) done(f.rq, why, (uint32_t)f.q, (uint32_t)f.out.size(), f.t_start, f.t_first);
-    Io::forget(f.rq);
-    if (imghold::free_at_end(f.img)) {  // every way a request ends: its image rows go back to the pool
+  // Every way a request ends (finish): its image rows go back to the pool, and an image it left between two block ranges is no longer
+  // mid-way, so the next request's image starts from its block 0.
+  void end_images(Flight& f) {
+    if (imghold::free_at_end(f.img)) {
       state({{kStImgFree, f.img.key, 0, 0}});
       f.img.key = 0;
     }
@@ -2788,8 +2979,13 @@ class Server {
     const bool released = later_.erase(h.session_id) > 0;  // the front-end let it go meanwhile
     forget_evicted();
     Session* S = (h.flags & fe::kFlagKeep) && !released ? find_at(h.session_id, f.fac) : nullptr;
+    if (S && S->hist.size() < S->ep.reported) {  // a DONE told more than the history holds: its epoch is not true any more
+      std::printf("serve: BUG: req %llu: the history holds %zu positions, its DONE reported %llu; the epoch changes\n", (unsigned long long)h.req_id,
+                  S->hist.size(), (unsigned long long)S->ep.reported);
+      prefix::lose_below(&S->ep, (uint64_t)S->hist.size(), [&] { return new_epoch(); });
+    }
     if (S) thin(*S);
-    win_retry_at_ = 0;  // a window that waited for this request's memory asks again at once
+    win_retry_at_ = 0;
     if (S && S->slot >= 0) {  // the turn saved where its line holds it: its full chunks get their images (write-behind)
       const int saved = m_.state_info(S->h).saved, E = (int)S->hist.size();
       Cmd c{};
@@ -3273,6 +3469,8 @@ class Server {
   comm::Ring& ring_;
   Watchdog& wd_;
   const ServeOptions& o_;
+  // the conversations' ids files; no index to protect without --keep-gib
+  idsfile::Keeper keeper_{o_.ids_dir, o_.keep_bytes != 0 && !o_.keep_index.empty(), (uint64_t)(unix_now() * 1e3)};
   double keep_age_s_;  // --keep-days, changed live (CONFIG keep_days)
   bool extend_;  // --extend, changed live (CONFIG extend): a prompt is admitted, and a response crosses its window, under the setting of that moment
   int64_t ssd_pending_ = 0;  // a disk tier size the dashboard asked for (GiB), applied when nothing runs (resize_idle)
@@ -3301,6 +3499,8 @@ class Server {
   };
   // The positions a queued long prompt needs a slot for: a first run's prompt and horizon, a resume's from where it is
   int need_long(const Long& L) const { return L.resume ? need_now(L.f) : need_clamped(L.f.rq); }
+  uint64_t wait_logged_ = 0;  // the request whose "waits at its start" line was printed last (0 once a start succeeds)
+  il::JoinWait start_wait_;   // a request that waited at its start is asked again after its retry time
   Long* push_ = nullptr;  // the second reader, a short long prompt read beside the front one, and first
 
   // A long prompt out of the queue (ended, or read and decoding); the second reader that is now the front is the front

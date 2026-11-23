@@ -1,6 +1,6 @@
 """Third, independent check of a .dsw file: torch + safetensors (the reference's own stack) slice the
 checkpoint tensors from each TOC entry's declarative description, and the bytes must match. Tiled
-tensors (version 2) are un-tiled with torch reshapes and permutes, a third implementation of the
+tensors (versions 2 and 3) are un-tiled with torch reshapes and permutes, a third implementation of the
 layouts after the kernels' tile functions (which wrote them) and layout.h (which dsw_verify uses).
 It also confirms the cuts agree with the reference's tensor-parallel split (ref/inference/convert.py
 `mapping`) wherever ours follows it, and lists where it deliberately does not.

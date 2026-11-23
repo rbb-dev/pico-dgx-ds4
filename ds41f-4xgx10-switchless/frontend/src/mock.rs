@@ -43,8 +43,20 @@ const CHUNK: usize = 4096;
 /// Bytes of KV the mock claims per position.
 const BYTES_PER_POSITION: u64 = 890;
 
-/// session id -> (its history, whether it was made on the ablit path)
-type Sessions = Arc<Mutex<HashMap<u64, (Vec<u32>, bool)>>>;
+/// What the mock keeps of a session as the engine does: its history, the weights path it was made on, the epoch a request that
+/// continues it must name (new when the history loses or rewrites a position below `n_reported`) and how many ids the last DONE reported.
+struct Entry {
+    hist: Vec<u32>,
+    ablit: bool,
+    epoch: u64,
+    n_reported: usize,
+}
+
+/// session id -> its entry
+type Sessions = Arc<Mutex<HashMap<u64, Entry>>>;
+
+/// The epochs handed out: never 0.
+static EPOCHS: AtomicU64 = AtomicU64::new(1000);
 
 pub async fn run(cfg: MockConfig) -> std::io::Result<()> {
     let _ = std::fs::remove_file(&cfg.socket);
@@ -63,6 +75,7 @@ pub async fn run(cfg: MockConfig) -> std::io::Result<()> {
 }
 
 async fn connection(stream: UnixStream, cfg: MockConfig, sessions: Sessions) {
+    note(&cfg, Seen::Open);
     let (mut rd, mut wr) = stream.into_split();
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
     tokio::spawn(async move {
@@ -81,7 +94,8 @@ async fn connection(stream: UnixStream, cfg: MockConfig, sessions: Sessions) {
         keep_positions: 8913 * 16384 / 5,
         name: "mock".into(),
     };
-    let _ = tx.send(Frame::HelloEngine(hello).encode());
+    let _ = tx.send(Frame::HelloEngine(hello.clone()).encode());
+    let mut ver = VERSION;
     let cancels: Arc<Mutex<HashMap<u64, Arc<AtomicBool>>>> = Arc::new(Mutex::new(HashMap::new()));
     let mut greeted = false;
     let mut il = MockIl::default();
@@ -99,9 +113,14 @@ async fn connection(stream: UnixStream, cfg: MockConfig, sessions: Sessions) {
         };
         match frame {
             Frame::Hello { version } => {
-                if version != VERSION {
+                note(&cfg, Seen::Hello(version));
+                if version != VERSION && !(version == VERSION_PREFIX && cfg.version >= VERSION_PREFIX) {
                     eprintln!("mock engine: front-end speaks version {version}");
                     break;
+                }
+                ver = version;
+                if version == VERSION_PREFIX {
+                    let _ = tx.send(Frame::HelloEngine(HelloEngine { version, ..hello.clone() }).encode());
                 }
                 greeted = true;
             }
@@ -141,6 +160,7 @@ async fn connection(stream: UnixStream, cfg: MockConfig, sessions: Sessions) {
         f.store(true, Ordering::Relaxed);
     }
     eprintln!("mock engine: front-end disconnected");
+    note(&cfg, Seen::Closed);
 }
 
 /// Interleaved prefill's settings as the engine keeps them: its flags' defaults, then CONFIG frames in its flags' ranges.
@@ -299,7 +319,44 @@ async fn generate(mut s: Submit, cancel: Arc<AtomicBool>, tx: &mpsc::UnboundedSe
         prefill_us: 0,
         decode_us: 0,
         error: String::new(),
+        tail: None,
     };
+    // a request that carries only its suffix: its prompt is the entry's history up to `n_prefix`, then the suffix
+    if let Some((epoch, n_prefix)) = s.prefix {
+        if ver != VERSION_PREFIX {
+            done.error = "a prefix on a connection that did not say the version".into();
+            let _ = tx.send(Frame::Done(done).encode());
+            return;
+        }
+        let built = {
+            let ss = sessions.lock().unwrap();
+            let entry = ss.get(&(if s.base_session_id != 0 { s.base_session_id } else { s.session_id }));
+            match entry {
+                None => Err("no such entry".to_string()),
+                Some(e) if e.epoch != epoch => Err("the entry's epoch is another".to_string()),
+                Some(e) if n_prefix as usize > e.n_reported => Err("n_prefix is past what the entry reported".to_string()),
+                Some(e) => {
+                    let mut p = e.hist[..n_prefix as usize].to_vec();
+                    p.extend_from_slice(&s.prompt);
+                    Ok(p)
+                }
+            }
+        };
+        match built {
+            Ok(p) => {
+                s.prompt = p;
+                s.prefix = None;
+                done.prompt_tokens = s.prompt.len() as u32;
+            }
+            Err(why) => {
+                done.reason = DoneReason::PrefixGone;
+                done.prompt_tokens = 0;
+                done.error = why;
+                let _ = tx.send(Frame::Done(done).encode());
+                return;
+            }
+        }
+    }
     if s.prompt.is_empty() || s.prompt.len() >= cfg.max_context as usize || s.max_new_tokens == 0 || s.session_id == 0 {
         done.error = format!("bad request: {} prompt tokens, max_new_tokens {}, session {}", s.prompt.len(), s.max_new_tokens, s.session_id);
         let _ = tx.send(Frame::Done(done).encode());
@@ -387,9 +444,18 @@ async fn generate(mut s: Submit, cancel: Arc<AtomicBool>, tx: &mpsc::UnboundedSe
         // the last sampled id has no KV yet
         let mut hist = s.prompt.clone();
         hist.extend_from_slice(&generated[..generated.len().saturating_sub(1)]);
-        sessions.lock().unwrap().insert(s.session_id, (hist, ablit));
+        let mut ss = sessions.lock().unwrap();
+        // the epoch changes when the run starts below what the last DONE reported; appends keep it
+        let epoch = match ss.get(&s.session_id) {
+            Some(old) if lcp(&old.hist, &s.prompt) >= old.n_reported => old.epoch,
+            _ => EPOCHS.fetch_add(1, Ordering::Relaxed),
+        };
+        done.tail = (ver == VERSION_PREFIX).then_some(DoneTail { epoch, n_hist: hist.len() as u32 });
+        let n_reported = hist.len();
+        ss.insert(s.session_id, Entry { hist, ablit, epoch, n_reported });
     } else {
         sessions.lock().unwrap().remove(&s.session_id);
+        done.tail = (ver == VERSION_PREFIX).then_some(DoneTail { epoch: 0, n_hist: 0 });
     }
     FINISHED.fetch_add(1, Ordering::Relaxed);
     let _ = tx.send(Frame::Done(done).encode());

@@ -3,7 +3,8 @@
 //! cancel frame the engine side must then receive.
 
 use super::*;
-use crate::protocol::{read_frame, Frame, HelloEngine, VERSION};
+use crate::protocol::{read_frame, Done, DoneReason, Frame, HelloEngine, VERSION};
+use tokio::io::AsyncReadExt;
 use std::path::PathBuf;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpStream, UnixListener};
@@ -28,7 +29,8 @@ impl Drop for FakeEngine {
     }
 }
 
-fn fake_engine(tag: &str, vocab: usize) -> FakeEngine {
+/// With `answer`, the stand-in ends every SUBMIT at once with a DONE of that reason and text (the engine's refusal of a frame over its limit).
+fn fake_engine_with(tag: &str, vocab: usize, answer: Option<(DoneReason, String)>) -> FakeEngine {
     let path = std::env::temp_dir().join(format!("dsfront-cancel-{}-{tag}.sock", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path).unwrap();
@@ -55,6 +57,13 @@ fn fake_engine(tag: &str, vocab: usize) -> FakeEngine {
                 match Frame::decode(ty, &p, |_| 0) {
                     Ok(Frame::Submit(s)) => {
                         let _ = stx.send(s.req_id);
+                        if let Some((reason, text)) = &answer {
+                            let done = Done { req_id: s.req_id, reason: *reason, prompt_tokens: 0, cached_tokens: 0, completion_tokens: 0, queue_us: 0,
+                                              prefill_us: 0, decode_us: 0, error: text.clone(), tail: None };
+                            if wr.write_all(&Frame::Done(done).encode()).await.is_err() {
+                                break;
+                            }
+                        }
                     }
                     Ok(Frame::Cancel { req_id }) => {
                         let _ = ctx.send(req_id);
@@ -69,11 +78,15 @@ fn fake_engine(tag: &str, vocab: usize) -> FakeEngine {
 
 /// The front-end over a local TCP port, connected to a fresh fake engine.
 async fn rig(tag: &str) -> (Arc<App>, std::net::SocketAddr, FakeEngine, tokio::task::JoinHandle<()>) {
+    rig_with(tag, None, super::tests::cfg()).await
+}
+
+async fn rig_with(tag: &str, answer: Option<(DoneReason, String)>, cfg: ServerConfig) -> (Arc<App>, std::net::SocketAddr, FakeEngine, tokio::task::JoinHandle<()>) {
     let tok = Arc::new(crate::tokenizer::synthetic::tokenizer());
-    let fake = fake_engine(tag, tok.vocab_size());
+    let fake = fake_engine_with(tag, tok.vocab_size(), answer);
     let engine = EngineClient::start(fake.path.clone());
     assert!(engine.wait_connected(Duration::from_secs(5)).await.is_some(), "the front-end did not connect to the fake engine");
-    let app = App::new(super::tests::cfg(), tok, engine);
+    let app = App::new(cfg, tok, engine);
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();
     let routes = router(app.clone());

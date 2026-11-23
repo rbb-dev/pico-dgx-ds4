@@ -584,14 +584,14 @@ const quantile = (arr, p) => { if (!arr.length) return null; const a = arr.slice
 
 function linesBox() {
   const COLS = [['#', 'Requests in flight, oldest first: the number is the request\'s place in that order (the engine does not report which line serves it).'], ['PHASE', 'DECODE: generating its output. PREFILL: its prompt is being processed (the engine has reported progress on it; two long prompts can be processed at once). QUEUED: submitted, no progress reported yet.'],
-    ['STAGE', 'The request\'s context: the purple part is its prompt, the white part the output so far. A prefilling request shows how much of the prompt it has to compute is done.'], ['PROMPT tok', 'Prompt tokens of the request.'], ['OUT tok', 'Output tokens so far.'],
+    ['STAGE', 'The request\'s context: the purple part is its prompt, the white part the output so far. A prefilling request shows how much of the prompt it has to compute is done.'], ['PROMPT', 'Prompt tokens of the request.'], ['OUTPUT', 'Output tokens so far.'],
     ['WHO', 'The user field of the request, or api when it has none.'], ['CACHED', 'Prompt tokens reused from a session or restored from the disk: the prompt less what the engine reports it has to compute (all of it when nothing is computed); - until the engine reports.'],
-    ['TOK/S', 'Output tokens a second for this request, from the change in its token count between two readings (smoothed). For a prefilling request, its prompt tokens computed a second, measured the same way.'], ['WAIT', 'About how long it waited before its first token (read once per second, so ±1 s; 0 for a request this page first saw already generating). A queued or prefilling request shows how long it has waited so far.'], ['TOTAL', 'How long the request has been in the engine.']];
-  const sub = h('span', { class: 'bsub' });
+    ['TOK/S', 'Output tokens a second for this request, from the change in its token count between two readings (smoothed). For a prefilling request, its prompt tokens computed a second, measured the same way.'], ['WAIT', 'About how long it waited before its first token (read once per second, so ±1 s; - for a request this page first saw already generating). A queued or prefilling request shows how long it has waited so far.'], ['TOTAL', 'How long the request has been in the engine.']];
   const grid = h('div', { class: 'lgrid' });
   const headRow = h('div', { class: 'lrow lhead' }, COLS.map(([c, tip]) => h('span', { text: c, title: tip })));
-  const b = box('lines', 'LINES', 'Every line the engine has, always shown: what each one is doing, its stage, its speed and its tokens.', headRow, grid);
-  b.right.append(sub);
+  const b = box('lines', 'LINES', 'Every line the engine has, always shown: what each one is doing, its stage, its speed and its tokens. A request still queued has no line yet and is counted as waiting.', headRow, grid);
+  b.el.querySelector('.bhead').remove();  // no title and no count: the table says it (the waiting count is in the PHASE header's tip)
+  const phaseTip = headRow.children[1].getAttribute('title');
   const rows = [];
   const mkRow = (i) => {
     const bar = h('span', { class: 'stg' }, h('i', { class: 'pre' }), h('i', { class: 'dec' }));
@@ -829,7 +829,9 @@ function settingsBox() {
       if (!il || document.activeElement === sel) continue;
       if (sel.type === 'checkbox') { sel.checked = il[key] === true; continue; }
       const v = String(il[key]);
-      if (![...sel.options].some((o) => o.value === v)) sel.append(h('option', { value: v, text: key === 'engram_mib' ? whole.format(Number(v)) + ' MiB' : v }));
+      // the SSD size list comes from the server (128 to 1024 GiB in steps of 128); the page's own list is the same before the first status
+      if (key === 'ssd_gib' && Array.isArray(il.ssd_choices) && il.ssd_choices.join() !== [...sel.options].map((o) => o.value).join()) sel.replaceChildren(...il.ssd_choices.map((c) => h('option', { value: String(c), text: FMT.ssd_gib(c) })));
+      if (![...sel.options].some((o) => o.value === v)) sel.append(h('option', { value: v, text: FMT_OF[key] ? FMT_OF[key](Number(v)) : v }));
       if (sel.value !== v) sel.value = v;
     }
     const cp = st && st.copy;

@@ -835,6 +835,15 @@ int main(int argc, char** argv) {
     std::printf("rank %d: vision weights %s: %d tensors, %.2f MiB in %.2f s (%.2f GB/s), %.2f MiB on the device with the "
                 "padded patch embedding; set digest %016llx\n", a.rank, vision->path().c_str(), vision->tensors(),
                 vs.bytes / 1048576.0, vs.seconds, vs.gbps, vision->device_bytes() / 1048576.0, (unsigned long long)mine);
+    const vit::VisionWeights::Held& vh = vision->held();
+    std::printf("rank %d: vision weights held after the load: %.2f MiB on the device (the weights), pinned staging %.2f MiB "
+                "at most and %llu B still held; readings around the load: device free fell by %.2f MiB, available host "
+                "memory by %.2f MiB\n", a.rank, vision->device_bytes() / 1048576.0, vh.staging_peak / 1048576.0,
+                (unsigned long long)vh.staging_held, vh.device_fell / 1048576.0, vh.host_fell / 1048576.0);    // the encoder in the engine: this rank's quarter, the pinned staging buffer for pixels (made here, so the sizing read below already
+    // counts it) and tenant 3, the work area; the area itself is taken by the hand-over below
+    m.set_vision(&vision->weights());
+    std::printf("rank %d: vision encoder: %.1f MiB of pinned staging for pixels; work area to take from the pool: %llu MiB\n", a.rank,
+                model::Model::kVitStageBytes / 1048576.0, (unsigned long long)model::Model::vision_area_mib());
   }
   // 4. Engram
   std::unique_ptr<engram::HashMap> emap;

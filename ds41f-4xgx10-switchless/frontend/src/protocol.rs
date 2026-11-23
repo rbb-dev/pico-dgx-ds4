@@ -5,12 +5,19 @@
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 pub const VERSION: u32 = 4;
+/// The version of a front-end that sends `FLAG_PREFIX` and reads the DONE tail (engine/common/frontend_protocol.h
+/// `kVersionPrefix`). The engine speaks first, in `VERSION`; a front-end that says this version is answered by a second HELLO.
+pub const VERSION_PREFIX: u32 = 5;
 pub const DEFAULT_SOCKET: &str = "/tmp/dsgb10-engine.sock";
 /// Up to 100 image spans, plus room for a 1M-token prompt and framing.
 pub const MAX_FRAME: usize = crate::vision::MAX_IMAGES * crate::vision::MAX_IMAGE_ROWS * crate::vision::IMAGE_DIM * 2 + (8 << 20);
 
 /// A SUBMIT's fields before stop_ids[] (docs/protocol.md).
 const SUBMIT_FIXED: usize = 72;
+/// With `FLAG_PREFIX`, the block directly after them: u64 epoch, u32 n_prefix, u32 0.
+const SUBMIT_PREFIX: usize = 16;
+/// The block after a DONE's 56 bytes on a connection of `VERSION_PREFIX`: u64 epoch, u32 n_hist, u32 0.
+const DONE_TAIL: usize = 16;
 
 pub const T_HELLO: u16 = 0x01;
 pub const T_SUBMIT: u16 = 0x02;
@@ -42,6 +49,11 @@ pub enum DoneReason {
     Cancelled = 2,
     Context = 3,
     Error = 4,
+    /// a frame larger than the engine reads (--frame-stage-mib): skipped, not read; the error text names the limit
+    TooLarge = 5,
+    /// a `FLAG_PREFIX` request whose prompt the engine could not build (no such entry, another epoch, ids it no longer holds): nothing
+    /// was done and there is no tail; the front-end sends the whole prompt
+    PrefixGone = 6,
 }
 
 impl DoneReason {
@@ -122,6 +134,14 @@ pub struct Tokens {
     pub top: Option<Vec<(u32, f32)>>,
 }
 
+/// What a DONE of a request that ran says of the entry: the epoch a request that continues it must name, and how many ids its
+/// history holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DoneTail {
+    pub epoch: u64,
+    pub n_hist: u32,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Done {
     pub req_id: u64,
@@ -133,6 +153,8 @@ pub struct Done {
     pub prefill_us: u64,
     pub decode_us: u64,
     pub error: String,
+    /// present on a connection of `VERSION_PREFIX` for every request that ran
+    pub tail: Option<DoneTail>,
 }
 
 /// The fields of a STATS frame, in wire order (docs/protocol.md, "The dashboard's frames"); a frame of another version is refused.
@@ -595,11 +617,16 @@ impl Frame {
             Frame::Submit(s) => {
                 let mut w = W::new(T_SUBMIT);
                 // the whole frame at once: growing by doubling would hold up to twice an image part
-                w.0.reserve_exact(SUBMIT_FIXED + 4 * (s.stop_ids.len() + s.prompt.len()) + s.images.as_ref().map_or(0, Vec::len));
+                w.0.reserve_exact(
+                    SUBMIT_FIXED + if s.prefix.is_some() { SUBMIT_PREFIX } else { 0 } + 4 * (s.stop_ids.len() + s.prompt.len()) + s.images.as_ref().map_or(0, Vec::len),
+                );
                 w.u64(s.req_id).u64(s.session_id).u64(s.base_session_id).u64(s.seed);
                 w.f32(s.temperature).f32(s.top_p).u32(s.top_k).u32(s.max_new_tokens);
-                w.u32(s.flags).u32(s.n_top_logprobs).u32(s.prefix_hint);
+                w.u32(s.flags | if s.prefix.is_some() { FLAG_PREFIX } else { 0 }).u32(s.n_top_logprobs).u32(s.prefix_hint);
                 w.u32(s.stop_ids.len() as u32).u32(s.prompt.len() as u32).u32(0);
+                if let Some((epoch, n_prefix)) = s.prefix {
+                    w.u64(epoch).u32(n_prefix).u32(0);
+                }
                 w.u32s(&s.stop_ids).u32s(&s.prompt);
                 if let Some(img) = &s.images {
                     w.0.extend_from_slice(img);
@@ -669,6 +696,9 @@ impl Frame {
                 let mut w = W::new(T_DONE);
                 w.u64(d.req_id).u32(d.reason as u32).u32(d.prompt_tokens).u32(d.cached_tokens).u32(d.completion_tokens);
                 w.u64(d.queue_us).u64(d.prefill_us).u64(d.decode_us).u32(d.error.len() as u32).u32(0);
+                if let Some(t) = d.tail {
+                    w.u64(t.epoch).u32(t.n_hist).u32(0);
+                }
                 w.0.extend_from_slice(d.error.as_bytes());
                 w.finish()
             }
@@ -700,6 +730,14 @@ impl Frame {
                 let n_stop = r.u32()? as usize;
                 let n_prompt = r.u32()? as usize;
                 r.u32()?;
+                let prefix = if flags & FLAG_PREFIX != 0 {
+                    let (epoch, n_prefix) = (r.u64()?, r.u32()?);
+                    r.u32()?;
+                    Some((epoch, n_prefix))
+                } else {
+                    None
+                };
+                let flags = flags & !FLAG_PREFIX;
                 let stop_ids = r.u32s(n_stop)?;
                 let prompt = r.u32s(n_prompt)?;
                 // vision: the image part, taken only when it is laid out as rank 0 requires it
@@ -781,8 +819,16 @@ impl Frame {
                 let decode_us = r.u64()?;
                 let n = r.u32()? as usize;
                 r.u32()?;
+                // the tail is there when the payload is exactly the header, the tail and the error text
+                let tail = if p.len() == r.i + DONE_TAIL + n {
+                    let (epoch, n_hist) = (r.u64()?, r.u32()?);
+                    r.u32()?;
+                    Some(DoneTail { epoch, n_hist })
+                } else {
+                    None
+                };
                 let error = String::from_utf8_lossy(r.bytes(n)?).into_owned();
-                Frame::Done(Done { req_id, reason, prompt_tokens, cached_tokens, completion_tokens, queue_us, prefill_us, decode_us, error })
+                Frame::Done(Done { req_id, reason, prompt_tokens, cached_tokens, completion_tokens, queue_us, prefill_us, decode_us, error, tail })
             }
             T_PROGRESS => Frame::Progress { req_id: r.u64()?, computed: r.u32()?, total: r.u32()? },
             T_STATS_REQ => {
@@ -907,7 +953,7 @@ mod tests {
         let n = 7 * IMAGE_DIM * 2;
         let mut data = vec![0u8; 4 + 16 * 2 + n];
         data[4 + 16 * 2..].iter_mut().enumerate().for_each(|(i, b)| *b = (i % 251) as u8);
-        let part = crate::vision::payload(&[1, 5], Encoded { rows, hashes: vec![11, 22], data, ms: 0.0 });
+        let part = crate::vision::payload(&[1, 5], Encoded { rows, hashes: vec![11, 22], data, ms: 0.0, pixels: false });
         let mut prompt = vec![0u32; 10];
         prompt[1..4].fill(IMAGE_TOKEN_ID);
         prompt[5..9].fill(IMAGE_TOKEN_ID);

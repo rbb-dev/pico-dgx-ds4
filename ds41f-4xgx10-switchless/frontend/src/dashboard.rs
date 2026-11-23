@@ -379,6 +379,16 @@ impl Telemetry {
         self.stats.lock().unwrap().as_ref().map(|(t, _)| t.elapsed())
     }
 
+    /// The front-end's connection to the engine came up (true) or went down (false): the page shows how long it has held.
+    pub fn connected(&self, up: bool) {
+        self.connected_ms.store(if up { unix_ms() } else { 0 }, Ordering::Relaxed);
+    }
+
+    /// Seconds since the front-end connected to the engine; None while it is not connected.
+    pub fn connected_s(&self) -> Option<u64> {
+        match self.connected_ms.load(Ordering::Relaxed) { 0 => None, at => Some(unix_ms().saturating_sub(at) / 1000) }
+    }
+
     /// A dashboard request came in: the dashboard counts as watched for the next `WATCH_S` seconds.
     pub fn watch(&self) {
         self.watched_ms.store(unix_ms(), Ordering::Relaxed);
@@ -1101,6 +1111,12 @@ mod tests {
         let c = &ss["conversations"];
         assert_eq!((c["on_lines"].as_u64(), c["in_memory"].as_u64(), c["on_disk"].as_u64(), c["sharing"].as_u64()),
                    (Some(3), Some(7), Some(41), Some(2)));
+        // the split (--kv-split cache): off by default, its counts when on
+        assert_eq!(ss["split"]["on"].as_bool(), Some(false));
+        let sp = sessions_json(&EngineStats { kv_split: 1, conv_split: 5, quarter_slots: 40, ghost_numbers: 9, joins_total: 2, ..s }, 1_048_576);
+        assert_eq!((sp["split"]["on"].as_bool(), sp["conversations"]["split"].as_u64(), sp["split"]["quarter_slots"].as_u64()),
+                   (Some(true), Some(5), Some(40)));
+        assert_eq!((sp["split"]["ghost_numbers"].as_u64(), sp["split"]["joins_total"].as_u64()), (Some(9), Some(2)));
         // nothing of the fixed slots: no slots x window sum, no store of its own memory
         for gone in ["slots", "slots_big", "ctx_big", "positions", "store_cap_bytes", "store_used_bytes"] {
             assert!(ss.get(gone).is_none(), "{gone}");

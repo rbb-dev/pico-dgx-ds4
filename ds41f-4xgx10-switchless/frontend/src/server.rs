@@ -81,6 +81,19 @@ pub struct ServerConfig {
 pub const DEFAULT_FRONT_TABLE_MIB: usize = 0;
 pub const DEFAULT_FRONT_MIB: usize = 0;
 pub const DEFAULT_FRONT_IMAGE_MIB: usize = 400;
+/// What the process holds besides its session table and its image rows, in MiB (tokenizer, request bodies, allocator); the memory
+/// cap adds a margin of 10 % over the sum of the three.
+pub const FRONT_BASE_MIB: usize = 107;
+
+/// The session table's bound that follows from the one memory cap `--front-mib`: the cap is (base + table +
+/// image rows in flight) x 1.1, so the table is the cap over 1.1, less the base and the image rows. 0 (no cap): 0 (no bound). Never
+/// less than 16 MiB, so that a small cap bounds the table instead of switching its bound off.
+pub fn table_mib_from_front(front_mib: usize, image_mib: usize) -> usize {
+    if front_mib == 0 {
+        return 0;
+    }
+    (front_mib * 10 / 11).saturating_sub(FRONT_BASE_MIB + image_mib).max(16)
+}
 /// How often the process's memory is read against `front_mib`.
 pub const FRONT_WATCH_EVERY: Duration = Duration::from_secs(10);
 
@@ -1027,8 +1040,14 @@ async fn start(app: &Arc<App>, p: &Prepared, pass: Pass) -> Result<Gen, ApiError
         app.engine.release(s);
     }
     let ctx = info.max_context as usize;
-    let Some(max_new) = reply_room(ctx, plan.ids.len(), p.max_tokens) else {
-        app.sessions.lock().unwrap().abandon(plan.session_id);
+    let describe = plan.describe(p.prompt.len());
+    let (session_id, base_session_id, epoch, hint) = (plan.session_id, plan.base_session_id, plan.epoch, plan.from.ids);
+    // A request that continues an entry the engine holds carries only the text after it; any other carries its whole prompt.
+    let prefix = plan.prefix_mode(info.version, false);
+    let (from, state, ids) = if prefix || plan.from == Cut::START { (plan.from, plan.state, plan.suffix) } else { (Cut::START, Resume::start(), whole_ids(app, &p.prompt).await?) };
+    let n_prompt = from.ids as usize + ids.len();
+    let Some(max_new) = reply_room(ctx, n_prompt, p.max_tokens) else {
+        app.sessions.lock().unwrap().abandon(session_id);
         return Err(ApiError(
             StatusCode::BAD_REQUEST,
             "invalid_request_error".into(),
@@ -1052,12 +1071,15 @@ async fn start(app: &Arc<App>, p: &Prepared, pass: Pass) -> Result<Gen, ApiError
             | if p.seed.is_some() { FLAG_SEED } else { 0 }
             | if ablit { FLAG_ABLIT } else { 0 },
         n_top_logprobs: 0,
-        prefix_hint: plan.reused as u32,
+        prefix_hint: hint,
         stop_ids: stop_ids.clone(),
-        prompt: plan.ids.clone(),
+        prompt: Vec::new(),
         images: None,
+        prefix: None,
     };
-    let meta = ReqMeta { key_label: p.key_label.clone(), ablit, prompt_tokens: plan.ids.len() as u32, endpoint: ENDPOINT, priority: PRIORITY };
+    let meta = ReqMeta { key_label: p.key_label.clone(), ablit, prompt_tokens: n_prompt as u32, endpoint: ENDPOINT, priority: PRIORITY };
+    let retry = prefix.then(|| Retry { submit: template.clone(), meta: meta.clone(), ctx, max_tokens: p.max_tokens });
+    let submit = Submit { prompt: ids.clone(), prefix: prefix.then_some((epoch, from.ids)), ..template };
     let (req_id, rx) = match app.engine.submit(submit, meta) {
         Ok(x) => x,
         Err(e) => {
@@ -1071,10 +1093,15 @@ async fn start(app: &Arc<App>, p: &Prepared, pass: Pass) -> Result<Gen, ApiError
         app: app.clone(),
         _pass: pass,
         req_id,
-        session_id: plan.session_id,
+        session_id,
         prompt_text: p.prompt.clone(),
         images: Vec::new(),
-        prompt_ids: plan.ids,
+        from,
+        state,
+        suffix: ids,
+        n_prompt,
+        expects_tail: info.version >= crate::protocol::VERSION_PREFIX,
+        retry,
         rx,
         stop_ids,
         stopper: StopMatcher::new(p.stops.clone()),
@@ -1128,14 +1155,18 @@ async fn start_images(app: &Arc<App>, p: &Prepared, pass: Pass, info: crate::pro
         app.engine.release(s);
     }
     let ctx = info.max_context as usize;
-    let Some(max_new) = reply_room(ctx, plan.ids.len(), p.max_tokens) else {
-        app.sessions.lock().unwrap().abandon(plan.session_id);
-        return Err(bad(format!("the prompt is {} tokens with its images; the context window is {ctx}", plan.ids.len())));
+    let describe = plan.describe(text.len());
+    let (session_id, base_session_id, hint) = (plan.session_id, plan.base_session_id, plan.from.ids);
+    // The image spans are positions in the whole prompt, so a request with images carries its whole prompt.
+    let ids = if plan.from == Cut::START { plan.suffix } else { whole_ids(app, &text).await? };
+    let Some(max_new) = reply_room(ctx, ids.len(), p.max_tokens) else {
+        app.sessions.lock().unwrap().abandon(session_id);
+        return Err(bad(format!("the prompt is {} tokens with its images; the context window is {ctx}", ids.len())));
     };
-    let starts = match crate::vision::span_starts(&plan.ids, &enc.rows) {
+    let starts = match crate::vision::span_starts(&ids, &enc.rows) {
         Ok(s) => s,
         Err(e) => {
-            app.sessions.lock().unwrap().abandon(plan.session_id);
+            app.sessions.lock().unwrap().abandon(session_id);
             return Err(bad(e));
         }
     };
@@ -1178,10 +1209,15 @@ async fn start_images(app: &Arc<App>, p: &Prepared, pass: Pass, info: crate::pro
         app: app.clone(),
         _pass: pass,
         req_id,
-        session_id: plan.session_id,
+        session_id,
         prompt_text: text,
         images: keys,
-        prompt_ids: plan.ids,
+        from: Cut::START,
+        state: Resume::start(),
+        n_prompt: ids.len(),
+        suffix: ids,
+        expects_tail: info.version >= crate::protocol::VERSION_PREFIX,
+        retry: None,
         rx,
         stop_ids,
         stopper: StopMatcher::new(p.stops.clone()),

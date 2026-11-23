@@ -1,24 +1,22 @@
 //! Session matching for exact prefix reuse (docs/protocol.md, "Sessions and exact prefix reuse").
 //!
-//! Clients do not name their conversation, so a request is matched by text: the session whose text
-//! (prompt plus generated output) shares the longest prefix with the new prompt. The shared part is
-//! sent as that session's own token ids, which is what is in the engine's KV state; the rest is
-//! tokenised on its own from a cut next to an added token, where tokenisation restarts anyway.
-//!
-//! A session belongs to the weights path (`ablit`) and the YaRN factor (`factor_for` its ids) it was created at; a request
-//! is matched only against sessions of its own path and factor. An image is a run of placeholder tokens: a session also
-//! records each image's place, rows and content hash (`ImageKey`) and is a candidate only when the images inside the shared
-//! text are the same on both sides.
+//! A session keeps cut points (the places where tokenisation restarts), each as (bytes of text before it, ids before it, a hash of
+//! that text), and the epoch and history size the engine last reported. A request is matched by its text to the session that shares its
+//! latest cut, of its own weights path (`ablit`), YaRN factor (`factor_for`) and images (`ImageKey`); the ids before that cut are the
+//! engine's own, so only the text after it is tokenised and sent, with the epoch that vouches for the cut.
 //!
 //! The table outlives a stop (`save`, `load`; docs/engine.md, "Kept sessions"): the engine keeps its
-//! sessions across a planned stop, and the table is what finds them again. It holds the conversations'
-//! text, so its file is ours alone: mode 0600 in a directory of mode 0700, written whole or not at all.
+//! sessions across a planned stop, and the table is what finds them again. It holds hashes and numbers, never a conversation's
+//! text, and its file is ours alone all the same: mode 0600 in a directory of mode 0700, written whole or not at all.
 
+use crate::protocol::DoneTail;
 use crate::tokenizer::Tokenizer;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Bytes of shared text below which a match is not worth a session (a BOS and a few tokens).
@@ -73,8 +71,12 @@ struct Session {
     factor: u32,
     /// The images of its prompt, in order.
     images: Vec<ImageKey>,
-    /// Its text's prefix keys (`prefix_keys`), as the index holds them.
-    keys: Vec<u64>,
+    /// Its text's prefix keys (`scan`), as the index holds them.
+    keys: Vec<u128>,
+    /// The epoch the engine's last DONE gave for it (0: not known, a request cannot name it) and how many ids its history held
+    /// then (0: no finished turn).
+    epoch: u64,
+    n_hist: u32,
 }
 
 impl Session {
@@ -88,9 +90,14 @@ impl Session {
             + INDEX_ENTRY * self.keys.len()
     }
 
-    /// How many leading ids hold exactly the first `p` bytes of the text, when `p` is where a token ends.
-    fn token_end(&self, p: usize, tok: &Tokenizer) -> Option<usize> {
-        token_end_in(&self.marks, &self.ids, self.text.len(), p, |id| tok.token_bytes(id).len())
+    /// A record with no history, for a session that starts (a new conversation or a fork).
+    fn empty(ablit: bool, factor: u32, clock: u64) -> Session {
+        Session { cuts: Vec::new(), prompt_len: 0, busy: false, last_used: clock, t_used: 0, ablit, factor, images: Vec::new(), keys: Vec::new(), epoch: 0, n_hist: 0 }
+    }
+
+    /// Whether a request can continue it: its last turn finished and the engine reported its history.
+    fn ready(&self) -> bool {
+        self.n_hist > 0
     }
 }
 
@@ -98,17 +105,33 @@ pub struct Plan {
     pub session_id: u64,
     /// The session a new session may fork from (0 = none).
     pub base_session_id: u64,
-    /// Leading ids taken from a session (the rest is tokenised).
-    pub reused: usize,
-    pub ids: Vec<u32>,
-    /// For the log, counts only: the session whose text shares the most with the prompt (0: none
-    /// shares any), the bytes it shares, and the ids its history has in common with `ids`.
+    /// Where the request continues the entry the engine holds: the ids before it are the entry's own; `Cut::START` for a cold start.
+    pub from: Cut,
+    /// The epoch of that entry (0: none, or not known; a request then names no prefix and carries its whole prompt).
+    pub epoch: u64,
+    /// The hash state at `from`.
+    pub state: Resume,
+    /// The ids of the text after `from`.
+    pub suffix: Vec<u32>,
+    /// For the log, counts only: the session that shares the most with the prompt (0: none shares any) and the bytes of text it shares,
+    /// at least (`SessionTable::pick`).
     pub matched: u64,
     pub shared: usize,
-    pub common: usize,
 }
 
 impl Plan {
+    /// Whether the request carries only its suffix and names the entry it continues: the engine's protocol is the one that has the
+    /// frame (`engine_version`), the prompt has no images (their spans are positions in the whole prompt) and the entry's epoch is
+    /// known and there are ids before the cut to name.
+    pub fn prefix_mode(&self, engine_version: u32, has_images: bool) -> bool {
+        engine_version >= crate::protocol::VERSION_PREFIX && !has_images && self.epoch != 0 && self.from.ids > 0
+    }
+
+    /// The prompt's ids: the entry's before `from` and the suffix.
+    pub fn total(&self) -> usize {
+        self.from.ids as usize + self.suffix.len()
+    }
+
     /// Where the request starts, for the log (no text, no ids): a continuation of a session, a
     /// fork of one (the engine starts from it if it holds it), or a new session that names none.
     pub fn describe(&self, prompt_bytes: usize) -> String {
@@ -180,8 +203,10 @@ fn unix_now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-/// Layout `DSFT0003`: each session has a flags word and then a factor word (u64 each).
-const TABLE_MAGIC: &[u8; 8] = b"DSFT0003";
+/// Layout `DSFT0004`: each session has its cuts, keys, epoch and history size, and no text and no ids (`write_session`).
+const TABLE_MAGIC: &[u8; 8] = b"DSFT0004";
+/// `DSFT0003`: each session has its text and ids, a flags word and then a factor word (u64 each); read once, the text and ids become cuts.
+const TABLE_MAGIC_V3: &[u8; 8] = b"DSFT0003";
 /// `DSFT0002`: a flags word, no factor word; read as factor 16.
 const TABLE_MAGIC_V2: &[u8; 8] = b"DSFT0002";
 /// `DSFT0001`: no flags and no factor word; read as the plain path at factor 16.
@@ -324,22 +349,26 @@ pub fn write_table(path: &Path, bytes: &[u8]) -> Result<(), String> {
     })
 }
 
-/// Whether a session is in a saved table: a session in a request is saved as its last finished turn left it (its text and
-/// ids change only at `finish`); one with no finished turn, or unused for longer than `max_age_s`, is left out.
+/// Whether a session is in a saved table: a session in a request is saved as its last finished turn left it (its cuts, epoch and
+/// history size change only at `finish`); one with no finished turn, or unused for longer than `max_age_s`, is left out.
 fn saved_in(s: &Session, now: u64, max_age_s: u64) -> bool {
-    !s.text.is_empty() && now.saturating_sub(s.t_used) <= max_age_s
+    s.ready() && now.saturating_sub(s.t_used) <= max_age_s
 }
 
-/// One session's record in a saved table.
+/// One session's record in a saved table: u64 id, last_used, t_used, prompt_len, flags, factor, epoch, n_hist, n_keys, n_cuts; the
+/// keys (16 bytes each); the cuts as (bytes u64, ids u64, hash 16 bytes); with `TABLE_FLAG_IMAGES` the images.
 fn write_session(body: &mut Vec<u8>, id: u64, s: &Session) {
     let flags = (if s.ablit { TABLE_FLAG_ABLIT } else { 0 }) | (if s.images.is_empty() { 0 } else { TABLE_FLAG_IMAGES });
-    for v in [id, s.last_used, s.t_used, s.prompt_len as u64, s.text.len() as u64, flags, s.factor as u64] {
+    for v in [id, s.last_used, s.t_used, s.prompt_len as u64, flags, s.factor as u64, s.epoch, s.n_hist as u64, s.keys.len() as u64, s.cuts.len() as u64] {
         body.extend(v.to_le_bytes());
     }
-    body.extend(s.text.as_bytes());
-    body.extend((s.ids.len() as u64).to_le_bytes());
-    for &x in &s.ids {
-        body.extend(x.to_le_bytes());
+    for &k in &s.keys {
+        body.extend(k.to_le_bytes());
+    }
+    for c in &s.cuts {
+        body.extend((c.bytes as u64).to_le_bytes());
+        body.extend((c.ids as u64).to_le_bytes());
+        body.extend(c.hash.to_le_bytes());
     }
     if !s.images.is_empty() {
         body.extend((s.images.len() as u64).to_le_bytes());
@@ -665,37 +694,10 @@ impl SessionTable {
         let mut r = Bytes { b: body, at: 0 };
         let mut got = HashMap::new();
         for _ in 0..n {
-            let (id, last_used, t_used, prompt_len, text_len) = (r.u64()?, r.u64()?, r.u64()?, r.u64()? as usize, r.u64()? as usize);
-            let flags = if with_flags { r.u64()? } else { 0 };
-            let factor = if with_factor { r.u64()? } else { 16 };
-            if !matches!(factor, 16 | 32 | 64) {
-                return Err("a bad factor".into());
+            let one = if old { read_old_session(&mut r, with_flags, with_factor, tok, now, max_age_s)? } else { read_session(&mut r, now, max_age_s)? };
+            if let Some((id, s)) = one {
+                got.insert(id, s);
             }
-            let text = r.take(text_len)?;
-            let n_ids = r.u64()? as usize;
-            let raw = r.take(n_ids.checked_mul(4).ok_or("a bad count")?)?;
-            let ids: Vec<u32> = raw.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
-            let mut images = Vec::new();
-            if flags & TABLE_FLAG_IMAGES != 0 {
-                for _ in 0..r.u64()? {
-                    let (at, rows, hash) = (r.u64()? as usize, r.u64()?, r.u64()?);
-                    images.push(ImageKey { at, rows: rows as u32, hash });
-                }
-            }
-            let Ok(text) = std::str::from_utf8(text) else { continue };
-            let vocab = tok.vocab_size() as u32;
-            if id == 0 || now.saturating_sub(t_used) > max_age_s || prompt_len > text.len() || ids.iter().any(|&x| x >= vocab) {
-                continue;
-            }
-            let (marks, at) = mark_ids(&ids, |x| tok.token_bytes(x).len());
-            if at != text.len() || tok.decode_bytes(&ids) != text.as_bytes() {
-                continue; // another tokenizer's ids
-            }
-            if images.iter().any(|k| k.at >= text.len() || k.rows < 3) {
-                continue;
-            }
-            let ablit = flags & TABLE_FLAG_ABLIT != 0;
-            got.insert(id, Session { text: text.to_string(), ids, marks, prompt_len, busy: false, last_used, t_used, ablit, factor: factor as u32, images, keys: Vec::new() });
         }
         if r.at != body.len() {
             return Err("a bad body".into());
@@ -720,51 +722,69 @@ impl SessionTable {
         id
     }
 
-    /// Choose the session and the token ids for a prompt of the weights path `ablit`: only sessions of
-    /// that path are candidates. The chosen session is busy until `finish` or `abandon`. Returns the
-    /// plan and the sessions to RELEASE on the engine.
-    pub fn plan(&mut self, text: &str, tok: &Tokenizer, threads: usize, ablit: bool) -> (Plan, Vec<u64>) {
-        self.plan_images(text, tok, threads, ablit, &[])
+    /// The session of the prompt's weights path (and factor `only`, when given) that shares the most with the prompt, found from the
+    /// deepest index level the prompt shares with some session: the sessions of that bucket are compared by their cuts, never by reading
+    /// text. What a session shares is at least the length of the deepest level its prefix hash agrees at, and at least its latest cut
+    /// shared with the prompt; a session that shares a long text with no added token in it is still worth naming as a base (the engine
+    /// finds the ids it has in common itself), though no cut of it can be named.
+    fn pick(&self, p: &Prompt, only: Option<u32>) -> Found {
+        // (session, its latest shared cut or `Cut::START`, the bytes it shares at least)
+        let mut top: Option<(u64, Cut, usize)> = None;
+        for level in (0..p.keys.len()).rev() {
+            for &id in self.index.get(&p.keys[level]).map_or(&[][..], |v| &v[..]) {
+                let s = &self.sessions[&id];
+                if s.ablit != p.ablit || only.is_some_and(|f| s.factor != f) || !s.ready() {
+                    continue;
+                }
+                let cut = shared_cut(s, p);
+                let by_level = if images_agree(&s.images, p.images, level_len(level)) { level_len(level) } else { 0 };
+                let shared = by_level.max(cut.map_or(0, |c| c.bytes));
+                let cut_bytes = cut.map_or(0, |c| c.bytes);
+                if shared > 0 && top.is_none_or(|(_, c, sh)| (shared, cut_bytes) > (sh, c.bytes)) {
+                    top = Some((id, cut.unwrap_or(Cut::START), shared));
+                }
+            }
+            if top.is_some_and(|(_, _, sh)| sh >= level_len(level)) {
+                break;
+            }
+        }
+        let best = top.filter(|&(_, _, sh)| sh >= MIN_SHARED).map(|(sid, cut, shared)| {
+            let s = &self.sessions[&sid];
+            Best { sid, cut, shared, in_place: !s.busy && cut.bytes + PROMPT_SLACK >= s.prompt_len, epoch: s.epoch, factor: s.factor }
+        });
+        Found { top: top.map(|(id, _, sh)| (id, sh)), best }
     }
 
-    /// `plan` for a prompt with images: `text` has each image's placeholder written once per row, and
-    /// `images` says where each run starts in it, how long it is and what the image is. A session whose
-    /// images inside the shared text are not these (see the module comment) is no candidate.
-    pub fn plan_images(&mut self, text: &str, tok: &Tokenizer, threads: usize, ablit: bool, images: &[ImageKey]) -> (Plan, Vec<u64>) {
+    /// Takes the plan `found` made: the session (a new one for a fork or a start) is busy until `finish`, `give_up` or `abandon`.
+    /// Returns the plan and the sessions to RELEASE on the engine.
+    fn commit(&mut self, found: &Found, p: &Prompt, suffix: Vec<u32>, factor: u32) -> (Plan, Vec<u64>) {
         self.clock += 1;
         self.changes += 1;
-        // The request's factor follows from its ids, which follow from the session it continues: try the best
-        // match at any factor, then the best of the factor the ids came to; if that moves the factor again,
-        // start fresh (a prompt tokenised whole has one length and so one factor).
-        let mut only = None;
-        let mut tries = 0;
-        let (plan, factor) = loop {
-            let (plan, used) = self.build(text, tok, threads, ablit, only, images);
-            let f = factor_for(plan.ids.len());
-            if used.map_or(true, |u| u == f) || only == Some(0) {
-                break (plan, f);
-            }
-            tries += 1;
-            only = Some(if tries >= 2 { 0 } else { f });
+        let (session_id, base_session_id, from, epoch) = match found.best {
+            None => (self.new_id(), 0, Cut::START, 0),
+            Some(b) if b.in_place => (b.sid, 0, b.cut, b.epoch),
+            Some(b) => (self.new_id(), b.sid, b.cut, b.epoch),
+        };
+        let ablit = p.ablit;
+        let state = match p.edges.binary_search_by_key(&from.bytes, |e| e.bytes) {
+            Ok(i) if from.bytes > 0 => Resume(p.edges[i].state.clone()),
+            _ => Resume::start(),
         };
         let clock = self.clock;
-        let s = self.sessions.entry(plan.session_id).or_insert_with(|| Session {
-            text: String::new(),
-            ids: Vec::new(),
-            marks: Vec::new(),
-            prompt_len: 0,
-            busy: false,
-            last_used: clock,
-            t_used: 0,
-            ablit,
-            factor,
-            images: Vec::new(),
-            keys: Vec::new(),
-        });
+        if base_session_id != 0 && !self.sessions.contains_key(&session_id) {
+            // the fork's own record starts with the cuts it continues; it is no candidate until its first turn finishes
+            let src = &self.sessions[&base_session_id];
+            let cuts: Vec<Cut> = src.cuts.iter().copied().filter(|c| c.bytes <= from.bytes).collect();
+            let levels = (0..).take_while(|&l| level_len(l) <= from.bytes).count();
+            let keys = src.keys[..levels.min(src.keys.len())].to_vec();
+            self.sessions.insert(session_id, Session { cuts, keys, ..Session::empty(ablit, factor, clock) });
+        }
+        let s = self.sessions.entry(session_id).or_insert_with(|| Session::empty(ablit, factor, clock));
         s.busy = true;
         s.last_used = clock;
         s.t_used = unix_now();
-        let released = self.evict(plan.session_id);
+        let released = self.evict(session_id);
+        let plan = Plan { session_id, base_session_id, from, epoch, state, suffix, matched: found.top.map_or(0, |t| t.0), shared: found.top.map_or(0, |t| t.1) };
         (plan, released)
     }
 
@@ -833,53 +853,64 @@ impl SessionTable {
             ids.extend_from_slice(generated);
         }
         let (marks, at) = mark_ids(&ids, |id| tok.token_bytes(id).len());
-        debug_assert_eq!(at, text.len());
-        // the buffers grew by doubling while the reply was appended: what the session keeps is what it holds
-        shrink_text(&mut text);
-        shrink_slack(&mut ids);
-        s.text = text;
-        s.ids = ids;
-        s.marks = marks;
-        // The session's factor is the larger of its own and the one its whole text needs, so the next turn matches it at the factor the engine used.
-        s.factor = s.factor.max(factor_for(s.ids.len()));
-        s.prompt_len = prompt_text.len();
-        s.images = images.to_vec();
-        s.busy = false;
+        debug_assert_eq!(at, region.len());
+        let total = turn.from.ids as u64 + ids.len() as u64;
+        let n_hist = tail.map_or(total, |t| t.n_hist as u64);
+        let (mut edges, scanned) = scan(&region, turn.state, turn.from.bytes, tok);
+        edges.retain(|e| !in_image_run(turn.images, e.bytes));
         self.leave(session_id);
+        let s = self.sessions.get_mut(&session_id).unwrap();
+        // What the engine rewrote below the cut this request continued from is no longer what the cuts above it describe: they go
+        // before the new ones come (a cut kept would vouch for ids that are not there).
+        #[cfg(test)]
+        let truncate = !self.append_without_truncating;
+        #[cfg(not(test))]
+        let truncate = true;
+        if truncate {
+            s.cuts.retain(|c| c.bytes <= turn.from.bytes);
+        }
+        let before = s.cuts.len();
+        for e in &edges {
+            if let Some(n) = token_end_in(&marks, &ids, region.len(), e.bytes - turn.from.bytes, |id| tok.token_bytes(id).len()) {
+                let upto = turn.from.ids as u64 + n as u64;
+                if upto <= n_hist {
+                    s.cuts.push(Cut { bytes: e.bytes, ids: upto as u32, hash: e.hash });
+                }
+            }
+        }
+        debug_assert!(s.cuts[before.saturating_sub(1)..].windows(2).all(|w| w[0].bytes < w[1].bytes && w[0].ids <= w[1].ids));
+        shrink_slack(&mut s.cuts);
+        let levels = (0..).take_while(|&l| level_len(l) <= turn.from.bytes).count();
+        s.keys.truncate(levels);
+        s.keys.extend(scanned);
+        shrink_slack(&mut s.keys);
+        s.epoch = tail.map_or(0, |t| t.epoch);
+        s.n_hist = n_hist.min(u32::MAX as u64) as u32;
+        // The session's factor is the larger of its own and the one its whole history needs, so the next turn matches it at the factor the engine used.
+        s.factor = s.factor.max(factor_for(n_hist as usize));
+        s.prompt_len = turn.text.len();
+        s.images = turn.images.to_vec();
+        s.busy = false;
         self.enter(session_id);
     }
 
-    /// The session of path `ablit` (and factor `only`, when given) sharing the longest prefix with `text` (at least MIN_SHARED
-    /// bytes) with the same images inside it, and how many bytes it shares: found from the deepest index level the prompt
-    /// shares with some session.
-    fn best(&self, text: &str, ablit: bool, only: Option<u32>, images: &[ImageKey]) -> Option<(u64, usize)> {
-        let pk = prefix_keys(text.as_bytes());
-        let mut top: Option<(u64, usize)> = None;
-        for level in (0..pk.len()).rev() {
-            for &id in self.index.get(&pk[level]).map_or(&[][..], |v| &v[..]) {
-                let s = &self.sessions[&id];
-                if s.ablit != ablit || only.map_or(false, |f| s.factor != f) {
-                    continue;
-                }
-                let n = common_prefix(text.as_bytes(), s.text.as_bytes());
-                if !images_agree(&s.images, images, n) {
-                    continue;
-                }
-                if top.map_or(true, |(_, bn)| n > bn) {
-                    top = Some((id, n));
-                }
-            }
-            if top.map_or(false, |(_, n)| n >= level_len(level)) {
-                break;
-            }
+    /// A request that ended without a DONE (its client left, or it was cancelled in the queue) changes nothing in its session but
+    /// that it is no longer in a request; a session that has never finished a turn is dropped, and returned for the caller to
+    /// release on the engine. If the engine cut the history meanwhile, the next request is answered `PrefixGone` and goes whole.
+    pub fn give_up(&mut self, session_id: u64) -> bool {
+        self.changes += 1;
+        let Some(s) = self.sessions.get_mut(&session_id) else { return false };
+        s.busy = false;
+        if s.ready() {
+            return false;
         }
-        top
+        self.remove(session_id);
+        true
     }
 
-    /// Session `id`'s text into the index at every level it reaches.
+    /// The prefix keys of session `id` into the index.
     fn enter(&mut self, id: u64) {
-        let Some(s) = self.sessions.get_mut(&id) else { return };
-        s.keys = prefix_keys(s.text.as_bytes());
+        let Some(s) = self.sessions.get(&id) else { return };
         for &k in &s.keys {
             self.index.entry(k).or_default().push(id);
         }
@@ -915,7 +946,7 @@ impl SessionTable {
     /// `max_sessions` sessions, `max_tokens` ids or `max_bytes` bytes; returns their ids.
     fn evict(&mut self, keep: u64) -> Vec<u64> {
         let mut out = Vec::new();
-        let mut tokens: usize = self.sessions.values().map(|s| s.ids.len()).sum();
+        let mut tokens: usize = self.sessions.values().map(|s| s.n_hist as usize).sum();
         let mut bytes: usize = self.bytes();
         loop {
             let counts_ok = !self.limits_known || (self.sessions.len() <= self.max_sessions && tokens <= self.max_tokens);
@@ -924,7 +955,7 @@ impl SessionTable {
             }
             let Some(id) = self.lru_idle(keep) else { return out };
             let s = &self.sessions[&id];
-            tokens -= s.ids.len();
+            tokens -= s.n_hist as usize;
             bytes -= s.bytes();
             self.remove(id);
             out.push(id);
@@ -975,7 +1006,7 @@ impl SessionTable {
 
     /// (memory held by the sessions and image rows by `bytes`, sessions, ids).
     pub fn stats(&self) -> (usize, usize, usize) {
-        (self.bytes(), self.sessions.len(), self.sessions.values().map(|s| s.ids.len()).sum())
+        (self.bytes(), self.sessions.len(), self.sessions.values().map(|s| s.n_hist as usize).sum())
     }
 
     pub fn len(&self) -> usize {
@@ -1007,6 +1038,9 @@ impl SessionTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::encoding::{encode_messages, EncodeOptions, ThinkingMode};
+    use serde_json::{json, Value};
+    use std::time::Instant;
 
     const TOKENIZER: &str = "/data/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8/tokenizer.json";
 
@@ -1262,8 +1296,8 @@ mod tests {
         let mut u = SessionTable::new(8, 1 << 20);
         assert_eq!(u.load(&path, &tok, 3600), Ok(1));
         let s = &u.sessions[&plan.session_id];
-        assert_eq!(s.text, format!("{p1}Hi there."), "its earlier history, not the turn in flight");
-        assert_eq!(s.ids.len(), plan.ids.len() + gen.len());
+        assert_eq!(s.prompt_len, p1.len(), "its last finished turn, not the turn in flight");
+        assert_eq!(s.n_hist as usize, plan.total() + gen.len() - 1);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1427,16 +1461,18 @@ mod tests {
         let (pa2, _) = t.plan(&a2, &tok, 1, false);
         assert_eq!(pa2.session_id, pa.session_id);
         assert!(pa2.describe(a2.len()).starts_with(&format!("session {} in place: it shares ", pa.session_id)));
-        t.finish(pa2.session_id, &a2, &pa2.ids, &tok.encode("Sure."), &tok);
-        // a prompt that shares only the BOS and a few bytes: a new session, which names no base
-        let c = "<｜begin▁of▁sentence｜><｜User｜>hi<｜Assistant｜></think>";
-        let (pc, _) = t.plan(c, &tok, 1, false);
-        assert_eq!(pc.base_session_id, 0);
-        let n = common_prefix(c.as_bytes(), a.as_bytes());
-        assert!(n > 0 && n < MIN_SHARED);
-        let d = pc.describe(c.len());
-        assert!(d.starts_with(&format!("session {}, new: the best match, session ", pc.session_id)), "{d}");
-        assert!(d.ends_with(&format!(", shares {n} bytes (under 64)")), "{d}");
+        finish_plan(&mut t, &tok, &pa2, &a2, &reply(&tok, "Sure."), &[]);
+        // a prompt that shares under 64 bytes with a session: a new session, which names no base and no session as a match
+        let c = format!("<｜begin▁of▁sentence｜><｜System｜>{}<｜User｜>hi<｜Assistant｜></think>", &body[..18]);
+        let (pc, _) = t.plan(&c, &tok, 1, false);
+        assert_eq!((pc.base_session_id, pc.matched), (0, 0));
+        assert_eq!(pc.describe(c.len()), format!("session {}, new: no session shares {MIN_SHARED} bytes", pc.session_id));
+    }
+
+    #[test]
+    fn the_log_line_for_a_session_that_shares_too_little_names_it() {
+        let p = Plan { session_id: 7, base_session_id: 0, from: Cut::START, epoch: 0, state: Resume::start(), suffix: Vec::new(), matched: 5, shared: 30 };
+        assert_eq!(p.describe(100), "session 7, new: the best match, session 5, shares 30 bytes (under 64)");
     }
 
     #[test]
@@ -1589,7 +1625,7 @@ mod tests {
         write_v1_table(&path, &[(77, &p1, &ids)]);
         assert_eq!(w.load(&path, &tok, 3600), Ok(1));
         let (off, _) = w.plan(&turn(&p1, "more"), &tok, 1, false);
-        assert_eq!((off.session_id, off.reused), (77, ids.len()));
+        assert_eq!((off.session_id, off.from.ids as usize, off.epoch), (77, ids.len(), 0));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1644,9 +1680,8 @@ mod tests {
         let (x2, k2) = with_images(&turn(&format!("{p1}Hi.<｜end▁of▁sentence｜>"), &format!("see {PH}")), 4, &[7]);
         let (p2, _) = t.plan_images(&x2, &tok, 1, false, &k2);
         assert_eq!((p2.session_id, p2.base_session_id), (plain.session_id, 0));
-        assert_eq!(p2.reused, plain.ids.len() + gen.len());
-        assert_eq!(tok.decode(&p2.ids), x2);
-        t.finish_images(p2.session_id, &x2, &p2.ids, &tok.encode("A dog.<｜end▁of▁sentence｜>"), &tok, &k2);
+        assert_eq!(p2.from.ids as usize, plain.total() + gen.len() - 1);
+        finish_plan(&mut t, &tok, &p2, &x2, &reply(&tok, "A dog."), &k2);
         // a different conversation with the same system prompt and no image forks the session: its
         // shared text ends before the image
         let other = turn(SYS, "something else entirely");
@@ -1656,7 +1691,7 @@ mod tests {
         let (x4, k4) = with_images(&turn(&format!("{p1}Hi.<｜end▁of▁sentence｜>"), &format!("see {PH} now")), 4, &[7]);
         let (p4, _) = t.plan_images(&x4, &tok, 1, false, &k4);
         assert_eq!(p4.base_session_id, plain.session_id);
-        assert!(p4.reused >= plain.ids.len() + gen.len());
+        assert!(p4.from.ids as usize >= plain.total() + gen.len() - 1);
     }
 
     #[test]
@@ -1982,53 +2017,26 @@ mod tests {
         assert!(vm_rss_bytes().unwrap() > 1 << 20);
     }
 
-    /// The table as the periodic save found it before records were copied out in batches: one buffer.
-    fn old_snapshot(t: &SessionTable, max_age_s: u64) -> Vec<u8> {
-        let now = unix_now();
-        let (mut body, mut n) = (Vec::new(), 0u64);
-        for (&id, s) in &t.sessions {
-            if s.text.is_empty() || now.saturating_sub(s.t_used) > max_age_s {
-                continue;
-            }
-            n += 1;
-            let flags = (if s.ablit { TABLE_FLAG_ABLIT } else { 0 }) | (if s.images.is_empty() { 0 } else { TABLE_FLAG_IMAGES });
-            for v in [id, s.last_used, s.t_used, s.prompt_len as u64, s.text.len() as u64, flags, s.factor as u64] {
-                body.extend(v.to_le_bytes());
-            }
-            body.extend(s.text.as_bytes());
-            body.extend((s.ids.len() as u64).to_le_bytes());
-            for &x in &s.ids {
-                body.extend(x.to_le_bytes());
-            }
-            if !s.images.is_empty() {
-                body.extend((s.images.len() as u64).to_le_bytes());
-                for k in &s.images {
-                    for v in [k.at as u64, k.rows as u64, k.hash] {
-                        body.extend(v.to_le_bytes());
-                    }
-                }
-            }
-        }
-        let mut f = TABLE_MAGIC.to_vec();
-        for v in [unix_now(), t.next_id, t.clock, n, body.len() as u64, fnv(&body)] {
-            f.extend(v.to_le_bytes());
-        }
-        f.extend(body);
-        f
-    }
-
-    /// `n` sessions of about `bytes` of text (a token a byte), straight into the table.
-    fn bulk(t: &mut SessionTable, tok: &Tokenizer, n: usize, bytes: usize) {
+    /// `n` sessions of `cuts` cuts each (and the shapes a real table has: both weights paths, the three factors, an image now and then),
+    /// straight into the table.
+    fn bulk(t: &mut SessionTable, n: usize, cuts: usize) {
         for i in 0..n {
-            let text = format!("<｜begin▁of▁sentence｜>bulk {i:05} {}", "q".repeat(bytes));
-            put_fresh(t, 100 + i as u64, &text, i % 3 == 0);
-            let s = t.sessions.get_mut(&(100 + i as u64)).unwrap();
-            s.ids = tok.encode(&text);
-            s.factor = [16, 32, 64][i % 3];
-            s.t_used = unix_now() - (i as u64 % 5);
-            if i % 4 == 1 {
-                s.images = vec![ImageKey { at: 30, rows: 5, hash: 77 + i as u64 }];
-            }
+            let id = 100 + i as u64;
+            let list: Vec<Cut> = (1..=cuts).map(|k| Cut { bytes: 10 * k, ids: 9 * k as u32, hash: (k as u128).wrapping_mul(0x9e3779b97f4a7c15f39cc0605cedc835) ^ i as u128 }).collect();
+            t.sessions.insert(
+                id,
+                Session {
+                    cuts: list,
+                    keys: vec![i as u128 * 3, i as u128 * 3 + 1, i as u128 * 3 + 2],
+                    prompt_len: 10 * cuts,
+                    t_used: unix_now() - (i as u64 % 5),
+                    images: if i % 4 == 1 { vec![ImageKey { at: 30, rows: 5, hash: 77 + i as u64 }] } else { Vec::new() },
+                    epoch: 7 + i as u64,
+                    n_hist: 9 * cuts as u32,
+                    ..Session::empty(i % 3 == 0, [16, 32, 64][i % 3], i as u64)
+                },
+            );
+            t.enter(id);
         }
     }
 

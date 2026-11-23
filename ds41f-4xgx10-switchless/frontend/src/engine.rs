@@ -2,10 +2,10 @@
 //! Reconnects with backoff; requests in flight when the connection drops end with an error.
 
 use crate::dashboard::{ReqLive, ReqMeta, Telemetry};
-use crate::protocol::{read_frame, Done, DoneReason, Frame, HelloEngine, Submit, Tokens, VERSION};
+use crate::protocol::{read_frame, Done, DoneReason, Frame, HelloEngine, Submit, Tokens, VERSION, VERSION_PREFIX};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -36,7 +36,16 @@ struct Inner {
     next_req: AtomicU64,
     info: watch::Sender<Option<HelloEngine>>,
     telemetry: Arc<Telemetry>,
+    /// Whether the next connection says `VERSION_PREFIX`: true until a connection that said it ended without the engine's answer
+    /// (an engine of the older version closes at it), true again whenever the engine cannot be reached (if `allow_prefix`).
+    try_prefix: AtomicBool,
+    /// False: every connection says `VERSION` and every request carries its whole prompt (`--no-prefix`).
+    allow_prefix: bool,
 }
+
+/// How long a connection that said `VERSION_PREFIX` waits for the engine's second HELLO before it serves with the version-4
+/// frames (an engine that ignores the unknown version, as a stand-in may, never answers).
+const SECOND_HELLO_WAIT: Duration = Duration::from_millis(300);
 
 #[derive(Clone)]
 pub struct EngineClient {
@@ -46,8 +55,21 @@ pub struct EngineClient {
 impl EngineClient {
     /// Start connecting to the engine socket (in the background, forever).
     pub fn start(path: PathBuf) -> EngineClient {
+        EngineClient::start_with(path, true)
+    }
+
+    /// `start`, with `prefix` false to say the older version at every connection: requests then carry their whole prompt.
+    pub fn start_with(path: PathBuf, prefix: bool) -> EngineClient {
         let (info, _) = watch::channel(None);
-        let inner = Arc::new(Inner { path, conn: Mutex::new(Conn::default()), next_req: AtomicU64::new(1), info, telemetry: Arc::new(Telemetry::new()) });
+        let inner = Arc::new(Inner {
+            path,
+            conn: Mutex::new(Conn::default()),
+            next_req: AtomicU64::new(1),
+            info,
+            telemetry: Arc::new(Telemetry::new()),
+            try_prefix: AtomicBool::new(prefix),
+            allow_prefix: prefix,
+        });
         tokio::spawn(run(inner.clone()));
         EngineClient { inner }
     }
@@ -175,27 +197,37 @@ async fn run(inner: Arc<Inner>) {
 
 async fn connection(inner: &Arc<Inner>, stream: UnixStream) -> Result<(), String> {
     let (mut rd, mut wr) = stream.into_split();
-    wr.write_all(&Frame::Hello { version: VERSION }.encode()).await.map_err(|e| e.to_string())?;
+    let say = if inner.try_prefix.load(Ordering::Relaxed) { VERSION_PREFIX } else { VERSION };
+    wr.write_all(&Frame::Hello { version: say }.encode()).await.map_err(|e| e.to_string())?;
+    // The engine speaks first, in version 4; to a front-end that said version 5 it then answers with a second HELLO.
     let (ty, p) = read_frame(&mut rd).await.map_err(|e| e.to_string())?.ok_or("closed before HELLO")?;
-    let hello = match Frame::decode(ty, &p, |_| 0)? {
+    let greeting = match Frame::decode(ty, &p, |_| 0)? {
         Frame::HelloEngine(h) => h,
         f => return Err(format!("expected HELLO, got {f:?}")),
     };
-    if hello.version != VERSION {
-        return Err(format!("engine speaks protocol version {}, we speak {VERSION}", hello.version));
+    if greeting.version != VERSION && greeting.version != VERSION_PREFIX {
+        return Err(format!("engine speaks protocol version {}, we speak {VERSION}", greeting.version));
     }
     eprintln!(
         "engine: connected to {} ({}; context {}, vocab {}, eos {}, {} sessions)",
         inner.path.display(),
-        hello.name,
-        hello.max_context,
-        hello.vocab_size,
-        hello.eos_id,
-        hello.max_sessions
+        greeting.name,
+        greeting.max_context,
+        greeting.vocab_size,
+        greeting.eos_id,
+        greeting.max_sessions
     );
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    inner.conn.lock().unwrap().tx = Some(tx);
-    inner.info.send_replace(Some(hello));
+    let publish = |h: HelloEngine| {
+        inner.conn.lock().unwrap().tx = Some(tx.clone());
+        inner.info.send_replace(Some(h));
+        inner.telemetry.connected(true);
+    };
+    let mut published = say == VERSION || greeting.version == VERSION_PREFIX;
+    let mut got_second = greeting.version == VERSION_PREFIX;
+    if published {
+        publish(greeting.clone());
+    }
     let writer = tokio::spawn(async move {
         while let Some(b) = rx.recv().await {
             if wr.write_all(&b).await.is_err() {
@@ -214,6 +246,12 @@ async fn connection(inner: &Arc<Inner>, stream: UnixStream) -> Result<(), String
             Frame::decode(ty, &p, |id| c.pending.get(&id).map_or(0, |p| p.n_top))
         };
         match frame {
+            Ok(Frame::HelloEngine(h)) if h.version == VERSION_PREFIX && !got_second => {
+                got_second = true;
+                published = true;
+                eprintln!("engine: version {VERSION_PREFIX}: requests carry the suffix of their prompt");
+                publish(h);
+            }
             Ok(Frame::Tokens(t)) => {
                 let c = inner.conn.lock().unwrap();
                 if let Some(p) = c.pending.get(&t.req_id) {
@@ -240,5 +278,9 @@ async fn connection(inner: &Arc<Inner>, stream: UnixStream) -> Result<(), String
         }
     };
     writer.abort();
+    if say == VERSION_PREFIX && !got_second {
+        // an engine that closes at the version it does not know: the next connection says the old one
+        inner.try_prefix.store(false, Ordering::Relaxed);
+    }
     result
 }

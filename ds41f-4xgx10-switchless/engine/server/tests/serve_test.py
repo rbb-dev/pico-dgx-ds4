@@ -39,7 +39,10 @@ def load_npy_i32(fn):
 
 
 class Engine:
-    def __init__(self, path):
+    def __init__(self, path, version=4):
+        """version: the protocol version this connection says at HELLO. 4 is today's (DONE is 56 bytes and the error text, no kFlagPrefix);
+        5 allows kFlagPrefix and gets the DoneTail. The engine's HELLO at connect is today's version; a connection of version 5 gets a second
+        one answering 5, read here."""
         self.s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.s.connect(path)
         self.buf = b''
@@ -77,14 +80,17 @@ class Engine:
         return t, self.recv_exact(size)
 
     def submit(self, session, prompt, max_new=32, base=0, temp=0.0, top_p=1.0, top_k=0, seed=None, keep=True,
-               n_top=None, stop=(1,)):
+               n_top=None, stop=(1,), prefix=None):
+        """prefix=(epoch, n_prefix): the prompt is only the suffix (kFlagPrefix); the engine builds the rest from its history."""
         rid = self.next_id
         self.next_id += 1
         flags = (F_KEEP if keep else 0) | (F_SEED if seed is not None else 0) | (F_LOGPROBS if n_top is not None else 0)
         hdr = struct.pack('<QQQQffIIIIIIII', rid, session, base, seed or 0, temp, top_p, top_k, max_new, flags,
                           n_top or 0, 0, len(stop), len(prompt), 0)
         assert len(hdr) == 72
-        self.send(SUBMIT, hdr + struct.pack('<%dI' % len(stop), *stop) + struct.pack('<%dI' % len(prompt), *prompt))
+        px = struct.pack('<QII', prefix[0], prefix[1], 0) if prefix is not None else b''
+        self.send(SUBMIT, hdr + px + struct.pack('<%dI' % len(stop), *stop) + struct.pack('<%dI' % len(prompt), *prompt))
+        self.last_frame_bytes = len(hdr) + len(px) + 4 * (len(stop) + len(prompt))
         return rid, n_top or 0
 
     def collect(self, req, cancel_after=None):
@@ -114,8 +120,11 @@ class Engine:
             elif t == DONE:
                 (r, reason, pt, cached, comp, q_us, p_us, d_us, el, _) = struct.unpack('<QIIIIQQQII', p[:56])
                 assert r == rid, (r, rid)
+                # a DONE of a request that ran carries {u64 epoch; u32 n_hist; u32 0} after its 56 bytes
+                tail = struct.unpack('<QII', p[56:72]) if len(p) == 72 + el else (0, 0, 0)
+                out.update(epoch=tail[0], n_hist=tail[1], has_tail=len(p) == 72 + el)
                 out.update(reason=REASONS[reason], prompt=pt, cached=cached, completion=comp, queue_us=q_us,
-                           prefill_us=p_us, decode_us=d_us, error=p[56:56 + el].decode(), t_total=time.time() - t0)
+                           prefill_us=p_us, decode_us=d_us, error=p[len(p) - el:].decode(), t_total=time.time() - t0)
                 return out
 
     def run(self, *a, cancel_after=None, **k):

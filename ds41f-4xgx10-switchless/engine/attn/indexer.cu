@@ -768,7 +768,7 @@ template <bool kSlots, int kRows, bool kWide>
 __global__ void __launch_bounds__(kSelThreads) index_dense_kernel(IndexDenseArgs a) {
   extern __shared__ __align__(16) uint8_t dsm[];
   __shared__ int slen[kRows], sslot[kRows];  // each row's own scan length, and its slot
-  __shared__ int ticket;
+  __shared__ int ticket, cta_lo, cta_stride;  // the CTA's part's first key and its chunk stride, held in shared memory while the queries are prepared
   pdl_trigger();
   pdl_wait();
   const ScoreArgs& s = a.sc;

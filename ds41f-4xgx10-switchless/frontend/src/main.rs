@@ -32,8 +32,11 @@ fn usage() -> ! {
                                 waits this long (600), then is answered 503 with Retry-After: 60
       --admin-socket PATH       commands from service.sh (mode 600): status, hold IDLE_S, release
       --table-file PATH         the session table, saved here while serving and at a stop, and taken back
-                                at the next start (mode 600, in a directory of mode 700; it holds the
-                                conversations' text), so that the engine's kept sessions are found again
+                                at the next start (mode 600, in a directory of mode 700; it holds hashes and
+                                numbers, never a conversation's text), so that the engine's kept sessions are
+                                found again
+      --no-prefix               say protocol version 4 to the engine: every request carries its whole prompt
+                                (the engine's own frames before a request could carry only its suffix)
       --table-save-s N          while serving, save the table every N seconds when it has changed
                                 (30; 0 = only at the stop); written whole or not at all, off the
                                 request path
@@ -142,6 +145,10 @@ fn serve(args: &[String]) {
     if api_key.is_none() {
         eprintln!("warning: no --api-key-file, requests are not authenticated");
     }
+    let vision = vision_opt(args).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(1);
+    });
     let mut dashboard_hosts: Vec<String> = vec!["localhost".into()];
     dashboard_hosts.extend(listen.iter().map(|a| a.ip().to_string()));
     dashboard_hosts.extend(opts(args, "--dashboard-host").into_iter().map(|h| h.to_ascii_lowercase()));

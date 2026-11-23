@@ -26,7 +26,7 @@ struct ServeOptions {
   bool snap_thin = true;           // keep them dense near a session's end only (serve.cpp keep_snap); false
                                    // (--snap-all): every one kept
   bool ced = true;                 // CED prefill (docs/ced.md) for turns of at least 128 new positions
-  int slice = 64;                  // time-slicing (docs/batching.md, B1): a new request pauses the requests
+  int slice = 64;                  // time-slicing (docs/batching.md): a new request pauses the requests
                                    // decoding and is prefilled; while more of them decode than there are
                                    // slots (Model::slots), they take turns of this many tokens. 0: no turns
                                    // (a request that would need the slot of another in flight waits)
@@ -74,6 +74,14 @@ struct ServeOptions {
   // Interleaved prefill (server/interleave.h, docs/interleave.md): a prompt with more than interleave.whole_rows rows
   // to compute is read in pieces while others decode; interleave.on false: every prompt is prefilled whole
   il::Settings interleave;
+  // The lines outside the store (docs/engine.md, "The store's size"): a frame larger than this many bytes is not read (the request ends with
+  // DONE kTooLarge, the socket stays up; 0: no cap beyond the protocol's); the server's token ids over ids_host_bytes go to files in
+  // ids_dir, least recently used idle conversation first, and come back with the conversation (empty ids_dir: they stay in memory);
+  // the store's size, for STATS.
+  uint64_t frame_stage_bytes = 0;
+  std::string ids_dir;
+  uint64_t ids_host_bytes = 0;
+  uint64_t store_numbers = 0;
 };
 
 // Serves until SIGINT / SIGTERM, then stops the other ranks (kCmdStop). Rank 0 only.

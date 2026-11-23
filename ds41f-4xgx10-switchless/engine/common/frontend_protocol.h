@@ -8,12 +8,15 @@
 namespace fe {
 
 constexpr uint32_t kVersion = 4;
+// The version of a front-end that sends kFlagPrefix and reads DoneTail. The engine accepts both versions on a connection (HelloFe.version);
+// a connection of kVersion sees only the frames without SubmitPrefix and DoneTail (server/frames.h).
+constexpr uint32_t kVersionPrefix = kVersion + 1;
 constexpr const char* kDefaultSocket = "/tmp/dsgb10-engine.sock";
 
 enum MsgType : uint16_t {
   // front-end -> rank 0
   kHello = 0x01,    // HelloFe
-  kSubmit = 0x02,   // SubmitHeader, uint32 stop_ids[n_stop_ids], uint32 prompt[n_prompt]
+  kSubmit = 0x02,   // SubmitHeader, [SubmitPrefix with kFlagPrefix], uint32 stop_ids[n_stop_ids], uint32 prompt[n_prompt]
   kCancel = 0x03,   // Cancel
   kRelease = 0x04,  // Release
   kStatsReq = 0x05, // StatsReq: ask for one Stats frame (the dashboard is being watched)
@@ -21,7 +24,7 @@ enum MsgType : uint16_t {
   // rank 0 -> front-end
   kHelloEngine = 0x81,  // HelloEngine, char name[name_len]
   kTokens = 0x82,       // TokensHeader, uint32 ids[n], [float logprob[n]], [TopLogprob top[n * n_top]]
-  kDone = 0x83,         // DoneHeader, char error[error_len]
+  kDone = 0x83,         // DoneHeader, [DoneTail], char error[error_len]
   kProgress = 0x84,     // Progress: after each prefill chunk of a request
   kStats = 0x85,        // StatsFrame: the answer to a StatsReq
 };
@@ -75,7 +78,7 @@ struct SubmitHeader {
   uint32_t n_top_logprobs;   // 0..20, with kFlagLogprobs
   uint32_t prefix_hint;      // prompt tokens the front-end expects to match the session (advisory)
   uint32_t n_stop_ids;       // ids that end generation (EOS is in here)
-  uint32_t n_prompt;         // >= 1
+  uint32_t n_prompt;         // >= 1 (the suffix's count with kFlagPrefix: any, the built prompt needs one id)
   uint32_t reserved;
 };
 
@@ -120,6 +123,9 @@ enum DoneReason : uint32_t {
   kCancelled = 2,  // CANCEL
   kContext = 3,    // context window full
   kError = 4,      // rejected or failed; error text follows
+  kTooLarge = 5,   // a frame larger than the engine reads (--frame-stage-mib): skipped, not read; error text follows (the limit)
+  kPrefixGone = 6, // a kFlagPrefix request whose prompt could not be built (no such entry, another epoch, n_prefix past what the
+                   // entry reported, ids unreadable): nothing was done, no DoneTail; the reason's text follows
 };
 
 struct DoneHeader {
@@ -133,6 +139,17 @@ struct DoneHeader {
   uint64_t decode_us;          // first token -> DONE
   uint32_t error_len;
   uint32_t reserved;
+};
+
+// On a connection of kVersionPrefix only: directly after the DoneHeader of every DONE of a request that ran (not of one cancelled in the queue, rejected, too large or
+// prefix-gone): the history entry's epoch and the positions it reports. A front-end reads it when the frame holds it:
+// size == sizeof(DoneHeader) + sizeof(DoneTail) + error_len (a DONE without one is sizeof(DoneHeader) + error_len). epoch 0 and
+// n_hist 0: the session was not kept (no kFlagKeep, or released). The next request continues the entry with kFlagPrefix, epoch and
+// n_prefix <= n_hist.
+struct DoneTail {
+  uint64_t epoch;
+  uint32_t n_hist;
+  uint32_t reserved;  // 0
 };
 
 // Prefill progress of one request, sent after each prefill chunk (and so also after the last one): the
@@ -292,6 +309,8 @@ static_assert(sizeof(TokensHeader) == 16);
 static_assert(sizeof(TopLogprob) == 8);
 static_assert(sizeof(ImageSpan) == 16);
 static_assert(sizeof(DoneHeader) == 56);
+static_assert(sizeof(SubmitPrefix) == 16);
+static_assert(sizeof(DoneTail) == 16);
 static_assert(offsetof(DoneHeader, queue_us) == 24);
 static_assert(sizeof(Progress) == 16);
 static_assert(sizeof(StatsReq) == 8);

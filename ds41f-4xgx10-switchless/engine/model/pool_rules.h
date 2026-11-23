@@ -145,24 +145,48 @@ inline bool disk_victim_frees(const Holder& x, bool out) {
 }
 
 
-// ---- the pool's size and the memory ledger ----
+// ---- the store's size and the memory ledger ----
 
-// One rank's count of chunk numbers when the pool leaves `keep` bytes free of device memory and of available host memory
-// (`cache`: the Engram cache still to grow in ordinary memory, counted as used). `have` numbers exist already and
-// `number_bytes` is one number's image.
-inline uint64_t pool_offer(uint64_t have, uint64_t dfree, uint64_t avail, uint64_t keep, uint64_t cache, uint64_t number_bytes) {
+constexpr uint64_t kGroupNums = 64;  // numbers in a group (model/window.cu): the store is a whole number of them
+
+// One rank's count of numbers when the store leaves `keep` bytes free of device memory and of available host memory, and the
+// lines outside the store (`outside`: for each, what it may still take beyond what it holds at the read, outside_sum) are
+// at their caps. `counted`: memory the store's own offer is already short of (a cache still to grow in ordinary memory,
+// counted as used on the host side only). `have` numbers exist already and `number_bytes` is one number's image.
+// offer_numbers is the count before rounding; store_offer rounds it down to whole groups, so that the first group a
+// borrower takes out leaves the rest of the store whole.
+inline uint64_t offer_numbers(uint64_t have, uint64_t dfree, uint64_t avail, uint64_t keep, uint64_t outside, uint64_t counted,
+                              uint64_t number_bytes) {
   const uint64_t by_device = dfree > keep ? dfree - keep : 0;
-  const uint64_t by_host = avail > keep + cache ? avail - keep - cache : 0;
-  return have + std::min(by_device, by_host) / number_bytes;
+  const uint64_t by_host = avail > keep + counted ? avail - keep - counted : 0;
+  const uint64_t room = std::min(by_device, by_host);
+#ifdef PICO_OLD_RULES
+  (void)outside;  // without the rule: the lines outside the store sit inside `keep`, the store is not shortened for them
+  return have + room / number_bytes;
+#else
+  return have + (room > outside ? room - outside : 0) / number_bytes;
+#endif
+}
+inline uint64_t store_offer(uint64_t have, uint64_t dfree, uint64_t avail, uint64_t keep, uint64_t outside, uint64_t counted,
+                            uint64_t number_bytes) {
+  const uint64_t n = offer_numbers(have, dfree, avail, keep, outside, counted, number_bytes);
+#ifdef PICO_OLD_RULES
+  return n;  // without the rule: any count
+#else
+  return n / kGroupNums * kGroupNums;
+#endif
 }
 
-// The ledger: what a rank holds or may grow to outside the pool, one line each, in bytes, from the rank's own counters.
-// A Counted line is inside the free-memory reads the pool is sized from (allocated before, or subtracted in the offer):
-// it is shown, not summed. A Fixed line is memory that is taken or grows after sizing and is bounded by its own cap: the
-// start check sums those and keeps them inside what the pool leaves free. A line that only rank 0 holds is named so
-// (rank0_only); any other line must agree between ranks. To add a line: one name in Line, one entry in kLines.
-enum Line { kHeap, kEngramCache, kFront, kEncoder, kOutQueue, kLineCount };
-enum class Kind : uint8_t { Counted, Fixed };
+// The ledger: what a rank holds or may grow to outside the store, one line each, in bytes, from the rank's own counters.
+// A Counted line is inside the free-memory reads the store is sized from: it is shown, not summed. An Outside line is memory that
+// is taken or grows after sizing under its own cap: the store is shortened by what it may still take (cap less what it holds at the
+// read) on that line's rank, so that the memory kept free stays free with every line at its cap. A line is `own` when it is the
+// engine's own memory (over its cap at the read is a fault); another process's line over its cap is a warning and takes nothing
+// more off the store. `enforced`: something holds the line to its cap; otherwise it is shown as observed plus margin.
+// A line that only rank 0 holds is named so (rank0_only); any other line must agree between ranks. To add a line: one
+// name in Line, one entry in kLines.
+enum Line { kHeap, kEngramCache, kFront, kEncoder, kOutQueue, kFrames, kIds, kGather, kDrift, kSplit, kLineCount };
+enum class Kind : uint8_t { Counted, Outside };
 struct LineInfo {
   const char* name;
   Kind kind;

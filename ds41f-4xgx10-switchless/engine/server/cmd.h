@@ -74,6 +74,20 @@ struct StateOp {
 };
 void apply_state(model::Model& m, const StateOp& o);
 
+// The memory watch. mem_watch_init (every rank, before the first command): the ring the watch's all-gather runs on and the
+// memory left to the host (--pool-free-gib, bytes; 0: the watch reads and reports nothing). mem_watch_note
+// (rank 0): the lines the server knows to be over their cap now, named in the report's line. mem_watch_view (rank 0): what STATS shows.
+void mem_watch_init(comm::Ring* ring, uint64_t keep_bytes);
+void mem_watch_note(const std::string& over);
+bool mem_watch_on();  // the watch has a floor to watch (--pool-free-gib): without one no watch command is issued
+struct MemWatchView {
+  uint64_t min_bytes = 0;   // the smallest of the four ranks' latest readings (0: none yet)
+  uint64_t low_count = 0;   // new lows under --pool-free-gib reported since the start
+  uint64_t avail[4] = {};   // the four ranks' latest readings, rank order
+  uint64_t seq = 0;         // the number of watches rank 0 has read (0: none); a run's ride is done when it moves
+};
+MemWatchView mem_watch_view();
+
 // What rank 0 tells every rank to do next (Ring::allgather_host on the bootstrap sockets, ~0.1-2 ms:
 // once per request or chunk, never per decode step).
 constexpr int kMaxStop = 32;
