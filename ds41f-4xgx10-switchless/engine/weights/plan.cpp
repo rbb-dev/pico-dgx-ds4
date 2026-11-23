@@ -128,7 +128,7 @@ const Entry kMtpOnly[] = {
     {"main_proj.scale", Rule::Rows},
     {"main_norm.weight", Rule::Rep},
     {"norm.weight", Rule::Rep},  // mtp.2 only
-    {"markov_head.embed.weight", Rule::Rep},  // lookups, like embed
+    {"markov_head.embed.weight", kEmbedRule},  // the same vocabulary cut as embed
     {"markov_head.head.weight", Rule::Rows, L2},  // same vocab split as head, so its bias adds locally
     {"confidence_head.proj.weight", Rule::Rep},  // [1][5376]: one row does not fit L2's 8-row tiles
 };

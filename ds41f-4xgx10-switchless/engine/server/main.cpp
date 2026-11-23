@@ -947,7 +947,7 @@ int main(int argc, char** argv) {
     uint64_t by_free = UINT64_MAX, by_tokens = UINT64_MAX;
     if (a.pool_free_gib >= 0) {
       const size_t keep = (size_t)(a.pool_free_gib * gib);
-      by_free = model::rules::pool_offer(have, dfree, avail, keep, cache, img);
+      by_free = model::rules::store_offer(have, dfree, avail, keep, outside, cache, img);
     }
     if (a.pool_tokens >= 0) by_tokens = ((uint64_t)a.pool_tokens * 5 + 16383) / 16384;
     const uint64_t want = a.pool_free_gib < 0 ? by_tokens

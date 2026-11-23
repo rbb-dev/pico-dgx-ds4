@@ -899,8 +899,8 @@ struct Draft::Buf {
 };
 
 Draft::Draft(const Weights& w, int rank, Comm* comm, const float2* table, int slots)
-    : w_(w), rank_(rank), comm_(comm), table16_(table), table_(table), slots_(slots), b_(new Buf) {
-  if (rank < 0 || rank >= kRanks || !comm || !table || slots < 1) die("dspark::Draft: rank %d, %d slots", rank, slots);
+    : w_(w), rank_(rank), comm_(comm), table16_(table), table_(table ? attn::Rope(table) : attn::rope_plain_calc()), slots_(slots), b_(new Buf) {
+  if (rank < 0 || rank >= kRanks || !comm || slots < 1) die("dspark::Draft: rank %d, %d slots", rank, slots);
   Buf& b = *b_;
   // one arena, carved in two passes: sizes, then pointers
   size_t off = 0;

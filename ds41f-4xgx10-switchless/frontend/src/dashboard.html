@@ -544,7 +544,8 @@ function nodeRow(rank) {
 }
 
 // ---- the Overview: fed only by the dashboard API. Built once; `update` writes into the boxes.
-const posFmt = (v) => (none(v) ? '0' : v >= 1e6 ? (v / 1e6).toFixed(2) + ' M' : v >= 1e3 ? (v / 1e3).toFixed(0) + ' K' : whole.format(v));
+const binFmt = (v, d) => { const x = Math.round(v / d * 10) / 10; return x % 1 === 0 ? whole.format(x) : one.format(x); };
+const posFmt = (v) => (none(v) ? '0' : v >= 2 ** 20 ? binFmt(v, 2 ** 20) + 'M' : v >= 1024 ? binFmt(v, 1024) + 'K' : whole.format(v));
 // a request's age as m:ss, or h:mm:ss past an hour (the lines' column is narrow and the digits do not jump)
 function clockText(s) { s = Math.max(0, Math.floor(s)); const hh = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), ss = String(s % 60).padStart(2, '0'); return hh ? `${hh}:${String(m).padStart(2, '0')}:${ss}` : `${m}:${ss}`; }
 const secFmt = (s) => (none(s) ? '0' : s >= 100 ? whole.format(s) : s >= 10 ? one.format(s) : (Math.round(s * 100) / 100).toFixed(2));

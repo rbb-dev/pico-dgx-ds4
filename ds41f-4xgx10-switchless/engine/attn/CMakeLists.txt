@@ -22,5 +22,7 @@ target_include_directories(bench_index PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests
 target_link_libraries(bench_index dsattn)
 add_executable(rope_factor_test tests/rope_factor_test.cu)
 target_link_libraries(rope_factor_test dsattn)
+add_executable(rope_alias_test tests/rope_alias_test.cu)
+target_link_libraries(rope_alias_test dsattn)
 add_executable(sel_tests tests/sel_tests.cu)
 target_include_directories(sel_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/tests)

@@ -955,6 +955,7 @@ class Server {
       std::vector<StateOp> v{{kStFree, it->second.h, 0, 0}};
       if (it->second.slot >= 0) v.push_back({kStRelease, 0, it->second.slot, 0}), slot_[it->second.slot] = 0;
       state(v);
+      drop_ids(it->second);
       sess_.erase(it);
     }
   }
@@ -1214,7 +1215,7 @@ class Server {
 
   // The rows a request's prompt would compute: after the restart point its session (or base) offers now. A resume's
   // prompt is the request's and the tokens it sent.
-  int rows_to_compute(const Flight& f, bool resume = false) {
+  int rows_to_compute(const Flight& f, bool resume = false, JoinAsk* ja = nullptr) {
     const fe::SubmitHeader& h = f.rq.h;
     std::vector<int32_t> cont;
     if (resume) cont = f.rq.prompt, cont.insert(cont.end(), f.out.begin(), f.out.end());
@@ -1794,7 +1795,7 @@ class Server {
   bool fits(int s, int need) const { return need <= m_.slot_ctx(s); }
   // The sessions the store leaves alone for a request of session `sid` (forking from `base`): theirs, and those of the
   // slots in `keep` or in flight (all_live: of every slot, which is what Model::slot_reserve leaves alone), as handles.
-  std::vector<int> pins(uint64_t sid, uint64_t base, const std::set<uint64_t>* keep = nullptr, bool all_live = false) const {
+  std::vector<int> pins(uint64_t sid, uint64_t base, const std::set<uint64_t>* keep = nullptr, bool all_live = false, bool paused_too = true) const {
     std::vector<int> v;
     for (const uint64_t id : {sid, base}) {
       const auto it = id ? sess_.find(id) : sess_.end();
@@ -2156,12 +2157,14 @@ class Server {
       S->hist.insert(S->hist.end(), samples.begin(), samples.begin() + std::max(0, e.fed - 1));
     }
     // a pause's last token may be a stop id (the control word ends the loop before it checks them)
-    return cancel || (e.why == kEndCancel && !pause) ? fe::kCancelled
-           : e.why == kEndStop || stop_id(f, f.out.back()) ? fe::kStop
-           : e.why == kEndContext                          ? window_end(f)
-           : (int)f.out.size() >= max_new                  ? fe::kLength
-           : pause                                         ? kPaused
-                                                           : kTurn;
+    const uint32_t end = cancel || (e.why == kEndCancel && !pause) ? fe::kCancelled
+                         : e.why == kEndStop || stop_id(f, f.out.back()) ? fe::kStop
+                         : e.why == kEndContext                          ? window_end(f)
+                         : (int)f.out.size() >= max_new                  ? fe::kLength
+                         : pause                                         ? kPaused
+                                                                         : kTurn;
+    if (end == kPaused) pause_note();
+    return end;
   }
   // A decode that stopped at its limit: at its factor's window the response goes on at the next factor (cross(), before the
   // flight's next run) when it may generate more and the engine's context holds that window; else the context reason

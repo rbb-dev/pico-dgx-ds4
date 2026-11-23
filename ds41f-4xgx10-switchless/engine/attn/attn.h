@@ -348,7 +348,8 @@ void index_fused(const uint16_t* iq_pre, const float* wproj, const int* pos, Rop
 size_t index_dense_scratch();
 void index_dense(const uint16_t* iq_pre, const float* wproj, const int* pos, Rope table, int rows, int ratio,
                  IndexKeys ik, int max_scan, uint16_t* keys, int keys_stride, uint16_t* bkeys, int bkeys_stride,
-                 IndexSel top, IndexSel pool, uint32_t* scratch, bool pdl, cudaStream_t s, int cand = -1);
+                 IndexSel top, IndexSel pool, uint32_t* scratch, bool pdl, cudaStream_t s, int cand = -1, int part = 0,
+                 int nparts = 1);
 // index_fused of a block-list scan (layer 20's pool: each row's nblocks blocks of 8, nblocks * 8 <= 32768)
 // on index_dense's grid, the same outputs bit for bit: a row's blocks are its own, so a row group is one row.
 void index_dense_blocks(const uint16_t* iq_pre, const float* wproj, const int* pos, Rope table, int rows,

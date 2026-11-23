@@ -259,17 +259,11 @@ fn shrink_slack<T>(v: &mut Vec<T>) {
     }
 }
 
-fn shrink_text(s: &mut String) {
-    if slack_over(s.len(), s.capacity()) {
-        s.shrink_to_fit();
-    }
-}
-
 /// What a session costs besides its buffers: its struct, its slot in the table, the allocator's header on each of its
-/// five buffers.
-const SESSION_FIXED: usize = 64 + 16 * 5;
+/// three buffers.
+const SESSION_FIXED: usize = 64 + 16 * 3;
 /// What each of a session's index keys costs: the index slot and the bucket's list.
-const INDEX_ENTRY: usize = 96;
+const INDEX_ENTRY: usize = 112;
 
 /// The directory is ours and nobody else's (made 0700 if it was ours but open to others).
 fn private_dir(dir: &Path) -> Result<(), String> {
@@ -593,6 +587,8 @@ impl SessionTable {
             max_bytes: usize::MAX,
             image_cap: 0,
             image_bytes: 0,
+            #[cfg(test)]
+            append_without_truncating: false,
         }
     }
 
@@ -1287,7 +1283,7 @@ mod tests {
         // a crash right after the start: the next start loads the same table
         let mut b = SessionTable::new(8, 1 << 20);
         assert_eq!(b.load(&path, &tok, 3600), Ok(1));
-        assert_eq!(b.sessions[&plan.session_id].text, a.sessions[&plan.session_id].text);
+        assert_eq!(b.sessions[&plan.session_id].cuts, a.sessions[&plan.session_id].cuts);
         // the loaded table counts as changed, so the first periodic save writes it again
         let table = std::sync::Mutex::new(b);
         let mut saved = 0;
@@ -1586,20 +1582,20 @@ mod tests {
         let mut u = SessionTable::new(8, 1 << 20);
         assert_eq!(u.load(&path, &tok, 3600), Ok(2));
         // each is found again by a request of its own path, and by that one only
-        let next = |p: &str| format!("{p}Hi.<｜end▁of▁sentence｜><｜User｜>again<｜Assistant｜></think>");
+        let next = |p: &str| turn(&format!("{p}Hi.<｜end▁of▁sentence｜>"), "again");
         let (a, _) = u.plan(&next(&p2), &tok, 1, true);
         assert_eq!((a.session_id, a.base_session_id), (abl.session_id, 0));
         let (b, _) = u.plan(&next(&p1), &tok, 1, false);
         assert_eq!((b.session_id, b.base_session_id), (plain.session_id, 0));
         let (c, _) = u.plan(&next(&p1), &tok, 1, true);
-        assert_eq!((c.reused, c.base_session_id), (0, 0));
+        assert_eq!((c.from.ids, c.base_session_id), (0, 0));
         // a table of the first layout loads, every session on the plain path
         let ids = tok.encode(&p1);
         write_v1_table(&path, &[(77, &p1, &ids)]);
         let mut v = SessionTable::new(8, 1 << 20);
         assert_eq!(v.load(&path, &tok, 3600), Ok(1));
         let (on, _) = v.plan(&turn(&p1, "more"), &tok, 1, true);
-        assert_eq!(on.reused, 0, "an older table's session is not on the ablit path");
+        assert_eq!(on.from.ids, 0, "an older table's session is not on the ablit path");
         let mut w = SessionTable::new(8, 1 << 20);
         write_v1_table(&path, &[(77, &p1, &ids)]);
         assert_eq!(w.load(&path, &tok, 3600), Ok(1));

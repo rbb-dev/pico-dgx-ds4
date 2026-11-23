@@ -57,6 +57,8 @@ bool Alloc::take(uint32_t n, std::vector<uint32_t>* out) {
 void Alloc::grow(uint32_t n) {
   if (n < n_) die("chunks: a pool of %u numbers cannot shrink to %u", n_, n);
   bits_.resize((n + 63) / 64, 0ull);
+  ghost_bits_.resize((n + 63) / 64, 0ull);
+  stamp_.resize(n, 0ull);
   for (uint32_t c = n_; c < n; ++c) bits_[c >> 6] |= 1ull << (c & 63);
   free_ += n - n_;
   if (lo_ > n_) lo_ = n_;
@@ -74,7 +76,10 @@ bool Alloc::shrink(uint32_t n) {
   free_ -= n_ - n;
   n_ = n;
   bits_.resize((n + 63) / 64);
+  ghost_bits_.resize((n + 63) / 64);
+  stamp_.resize(n);
   if (n % 64) bits_.back() &= (1ull << (n % 64)) - 1;  // no numbers past n
+  if (n % 64) ghost_bits_.back() &= (1ull << (n % 64)) - 1;
   if (lo_ > n) lo_ = n;
   return true;
 }

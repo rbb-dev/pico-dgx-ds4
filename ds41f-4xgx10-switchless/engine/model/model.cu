@@ -435,16 +435,14 @@ void Model::Impl::bind(dsw::WeightFile& wf, comm::Ring& ring) {
       const bool by_rows = t.shape[0] == kMix / kRanks;
       const float* local = reinterpret_cast<const float*>(
           need(n + "fn", DType::F32, {by_rows ? kMix / kRanks : kMix, by_rows ? kHcDim : kDim}));
-      w.hc_fn[h] = dalloc<float>((size_t)kMix * kHcDim);
-      const size_t bytes = (size_t)kMix * kHcDim * 4 / kRanks;
       if (by_rows) {
-        comm::allgather(ch, local, w.hc_fn[h], bytes, st);
+        float* whole = dalloc<float>((size_t)kMix * kHcDim);
+        comm::allgather(ch, local, whole, (size_t)kMix * kHcDim * 4 / kRanks, st);
+        w.hc_fn[h] = whole;
+        w.hc_ld = 0;
       } else {
-        if (!hc_local) hc_local = dalloc<float>((size_t)kMix * kHcDim);
-        comm::allgather(ch, local, hc_local, bytes, st);
-        for (int r = 0; r < kRanks; ++r)
-          CUDA_CHECK(cudaMemcpy2DAsync(w.hc_fn[h] + (size_t)kDim * r, (size_t)kHcDim * 4, hc_local + (size_t)kMix * kDim * r,
-                                       (size_t)kDim * 4, (size_t)kDim * 4, kMix, cudaMemcpyDeviceToDevice, st));
+        w.hc_fn[h] = local;
+        w.hc_ld = kDim;
       }
       w.hc_base[h] = reinterpret_cast<const float*>(need(n + "base", DType::F32, {kMix}));
       w.hc_scale[h] = reinterpret_cast<const float*>(need(n + "scale", DType::F32, {3}));
@@ -1346,7 +1344,11 @@ void Model::Impl::cert_setup(const uint8_t* head_raw, const uint8_t* q, const ui
 void Model::Impl::forward_rows(int R, int ctx, uint32_t flags, Sink* sink, int pos0) {
   const bool lead = rank == 0 && sink;
   const bool inj = flags & kFlagInject, sub_in = flags & kFlagInjectSub, dumps = (flags & kFlagDump) && lead;
-  ops::embed(embed, tok_d, R, x, pm[0], st);
+  // the embedding: each rank's rows of the table, summed over the ranks (bf16 -0.0 where a rank holds no row)
+  ops::embed_part(embed, rank, tok_d, R, emb_slot, st);
+  if ((size_t)R * kDim * 2 <= ch.cap) comm::allreduce_bf16(ch, emb_slot, emb_slot, (size_t)R * kDim, st);
+  else comm::allreduce_bulk_bf16(ch, emb_slot, emb_slot, (size_t)R * kDim, st);
+  ops::embed_fan(emb_slot, R, x, pm[0], st);
   // Each sublayer starts from yraw, its input collapsed by the pre mix but not yet normed: the
   // all-reduce kernel ending the previous sublayer makes it; here only where the stream changed since.
   for (int L = opt.first_layer; L < opt.n_layers; ++L) {

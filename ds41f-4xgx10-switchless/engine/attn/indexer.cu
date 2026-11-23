@@ -588,7 +588,7 @@ __device__ __forceinline__ void select_bins(const SelectArgs& a, int r, int lo, 
 }
 
 // Row r's selection by the 1024 threads of a CTA: a pass over its keys for the histogram, then select_bins.
-template <bool kL2>
+template <bool kL2, bool kRM = false>
 __device__ __forceinline__ void select_row(const SelectArgs& a, int r) {
   __shared__ uint32_t hist[2048];
   int tid = threadIdx.x;
@@ -610,7 +610,7 @@ __device__ __forceinline__ void select_row(const SelectArgs& a, int r) {
       if (k[j]) atomicAdd(&hist[k[j] >> 5], 1u);
   }
   __syncthreads();
-  select_bins<kL2>(a, r, lo, n, hist[2047 - 2 * tid], hist[2046 - 2 * tid]);
+  select_bins<kL2, false, kRM>(a, r, lo, n, hist[2047 - 2 * tid], hist[2046 - 2 * tid]);
 }
 
 __global__ void __launch_bounds__(kSelThreads) select_kernel(SelectArgs a) { select_row<false>(a, blockIdx.x); }
@@ -782,24 +782,32 @@ __global__ void __launch_bounds__(kSelThreads) index_dense_kernel(IndexDenseArgs
   uint32_t* gb = gk + kRows * 2048;
   const int G = gridDim.x;
   int s0 = 0, s1 = R, n = 0, Gs = G, bl = blockIdx.x;  // this CTA's session (rows [s0, s1)), its CTAs, its index there
+  int lo = 0;  // the first key of its part
   if (s.blocks) {
     n = s.nblocks * 8;
   } else if (!kSlots || last_of(0) == R - 1) {  // one session: all the CTAs
-    n = slen[R - 1];
+    {
+      const Range d = part_of(slen[R - 1]);
+      n = d.hi - d.lo, lo = d.lo;
+    }
   } else {
     int S = 0, W = 0;
     for (int e, a0 = 0; a0 < R; a0 = e) {
       e = last_of(a0) + 1;
       ++S;
-      W += (e - a0) * ((slen[e - 1] + kDensePos - 1) / kDensePos);
+      {
+        const Range d = part_of(slen[e - 1]);
+        W += (e - a0) * ((d.hi - d.lo + kDensePos - 1) / kDensePos);
+      }
     }
     Gs = 0;  // past every session's share: idle
     for (int e, a0 = 0, off = 0; a0 < R; a0 = e, off += Gs) {
       e = last_of(a0) + 1;
-      n = slen[e - 1];
+      const Range d = part_of(slen[e - 1]);
+      n = d.hi - d.lo;
       Gs = 1 + (W ? (G - S) * ((e - a0) * ((n + kDensePos - 1) / kDensePos)) / W : 0);
       if ((int)blockIdx.x < off + Gs) {
-        s0 = a0, s1 = e, bl = blockIdx.x - off;
+        s0 = a0, s1 = e, bl = blockIdx.x - off, lo = d.lo;
         break;
       }
       if (e == R) Gs = 0;
@@ -883,8 +891,9 @@ __global__ void __launch_bounds__(kSelThreads) index_dense_kernel(IndexDenseArgs
   uint32_t* cidx = reinterpret_cast<uint32_t*>(dsm + kDenseCand * 2);
   uint16_t* blist = reinterpret_cast<uint16_t*>(dsm + kDenseCand * 6);
   for (int r = first; r < R; r += S) {
-    const int nr = s.blocks ? s.nblocks * 8 : slen[last_of(r)];  // the session's
-    select_dense<kWide>(a.top, r, gk + r * 2048, nr, a.cap, ckey, cidx,
+    const Range pr = part_of(slen[last_of(r)]);  // the session's part
+    const int nr = s.blocks ? s.nblocks * 8 : pr.hi - pr.lo;
+    select_dense<kWide>(a.top, r, gk + r * 2048, pr.lo, nr, a.cap, ckey, cidx,
                  nr > kDenseBmax ? s.bkeys + (size_t)r * s.bkeys_stride : nullptr, blist);
     if (pool) {
       __syncthreads();
@@ -899,6 +908,7 @@ __global__ void __launch_bounds__(kSelThreads) index_dense_kernel(IndexDenseArgs
 }
 
 // index_merge of one or two candidate sets (grid.y) in one launch
+template <bool kRM>
 __global__ void __launch_bounds__(kSelThreads) merge_kernel(SelectArgs a0, SelectArgs a1) {
   pdl_trigger();
   pdl_wait();
@@ -1060,7 +1070,9 @@ int dense_sms() {  // the SM count; also the kernels' shared memory limit, once 
 
 void index_dense(const uint16_t* iq_pre, const float* wproj, const int* pos, Rope table, int rows, int ratio,
                  IndexKeys ik, int max_scan, uint16_t* keys, int keys_stride, uint16_t* bkeys, int bkeys_stride,
-                 IndexSel top, IndexSel pool, uint32_t* scratch, bool pdl, cudaStream_t s, int cand) {
+                 IndexSel top, IndexSel pool, uint32_t* scratch, bool pdl, cudaStream_t s, int cand, int part,
+                 int nparts) {
+  if (nparts > 1 && (part < 0 || part >= nparts)) die("index_dense: part %d of %d", part, nparts);
   int padded = (max_scan + kScorePos - 1) / kScorePos * kScorePos;
   if (rows < 1 || rows > kMaxDecodeRows || keys_stride < padded || !bkeys || bkeys_stride < padded / 8 ||
       bkeys_stride > kBlistSegs * 65536)  // select_bins tells at most kBlistSegs segments of 65536 blocks apart
@@ -1072,7 +1084,7 @@ void index_dense(const uint16_t* iq_pre, const float* wproj, const int* pos, Rop
   a.wproj = wproj;
   a.table = table;
   check_slots(ik, "index_dense");
-  a.sc = ScoreArgs{nullptr, nullptr, nullptr, pos, rows, ratio, ik.k, reinterpret_cast<const uint32_t*>(ik.sc), 0, 1,
+  a.sc = ScoreArgs{nullptr, nullptr, nullptr, pos, rows, ratio, ik.k, reinterpret_cast<const uint32_t*>(ik.sc), part, nparts,
                    nullptr, 0, keys, keys_stride, bkeys, bkeys_stride, ik.slot, ik.list, ik.list_stride};
   a.top = topk_args(keys, keys_stride, pos, rows, ratio, whole, false, top.kmax, top.pos, top.key, top.stride);
   a.top.slot = ik.slot;  // the rows' lists (the length comes from the scan: select_dense)
