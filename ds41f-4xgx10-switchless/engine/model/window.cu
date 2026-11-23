@@ -354,6 +354,25 @@ int Model::Impl::window_close(int f) {
   return kWindowOk;
 }
 
+// The lend zone of the allocator (chunks.h): the numbers a window or a tenant will take from the top. zone_win is the groups of the
+// windows the options allow that are not open yet, each at the largest estimate of any rank (a collective, as window_open's own), on
+// top of the groups already out of the pool; the zone starts at lend::cut_top of that. Replicated by construction: only agreed values
+// go in. A tenant's groups are in lent.groups. Without --kv-split the allocator has no zone and no collective is made.
+void Model::Impl::split_zone_update() {
+  if (!opt.kv_split || !calloc || !host_ring) return;
+  const size_t gb = (size_t)kGroupNums * chunk_image();
+  uint64_t z = 0;
+  if (lazy_win)
+    for (const int f : {32, 64}) {
+      const uint64_t need = max_of(*host_ring, win_need(f));  // every rank calls for both, in this order, whether open or not
+      if (!scan_[level_of(f)].open) z += (need + gb - 1) / gb;
+    }
+  const size_t n0 = lent.groups ? lent.n0 : calloc->numbers();
+  const size_t groups = (size_t)lent.groups + z, base = n0 / kGroupNums * kGroupNums;
+  calloc->set_zone(groups * kGroupNums >= base ? 1u : (uint32_t)lend::cut_top(n0, groups));
+}
+void Model::split_zone_update() { d_->split_zone_update(); }
+
 bool Model::window_lazy() const { return d_->lazy_win; }
 bool Model::window_is_open(int factor) const {
   if (factor != 16 && factor != 32 && factor != 64) return false;

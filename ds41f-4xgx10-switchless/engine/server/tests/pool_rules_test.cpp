@@ -1,6 +1,8 @@
 // model/pool_rules.h against a pool with seven finished lines holding its top numbers and their leftover reservations (157
-// numbers reserved for nobody), the request's own conversation holding a tail number, a 543-number cut for a window and a
-// running request with a reservation. Built twice: with -DPICO_OLD_RULES (each rule built without its change) the cases marked
+// numbers reserved to nobody), the request's own conversation holding a tail number, a 543-number cut for a window and a
+// running request with a reservation, and, for the store (--pool-free-gib as the sizing rule), against the serving start's reads: the
+// count rounded to whole groups, the lines outside the store shortening it by cap less what they hold at the read, and the start
+// check's refusals. Built twice: with -DPICO_OLD_RULES (each rule built without its change) the cases marked
 // "red" fail; without it every case passes. Host only: no engine, no GPU.
 #include <algorithm>
 #include <cmath>

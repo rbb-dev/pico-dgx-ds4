@@ -214,6 +214,80 @@ pub struct EngineStats {
     pub engram_huge_pct: u64,
     /// rows the cache dropped to make room, since the engine's start
     pub engram_evictions: u64,
+    /// numbers the store was sized to at the engine's start (a whole number of groups of 64)
+    pub store_numbers: u64,
+    /// the smallest of the four ranks' MemAvailable at the engine's last watch reading, bytes (0: none yet)
+    pub mem_avail_min_bytes: u64,
+    /// new lows under the memory --pool-free-gib leaves to the host, reported since its start
+    pub mem_avail_low_count: u64,
+    /// the engine's token ids held in memory now, bytes; the rest are in its ids files
+    pub ids_host_bytes: u64,
+    /// conversations whose ids are in an ids file now
+    pub ids_file_sessions: u64,
+    /// each rank's MemAvailable at the engine's last watch reading, bytes, rank order (0: none yet)
+    pub mem_avail_bytes: [u64; 4],
+    /// the groups each of the pool's tenants holds, ids 0-7 (0 the windows, 1 the Engram cache, 2 not assigned, 3 a work area)
+    pub tenant_groups: [u64; 8],
+    /// the groups of the models loaded while the engine runs (tenants 8-15), together
+    pub tenant_models_groups: u64,
+    /// 1 when --kv-split cache is on
+    pub kv_split: u64,
+    /// conversations with a piece that is a quarter slot
+    pub conv_split: u64,
+    /// quarter slots in use
+    pub quarter_slots: u64,
+    /// chunk numbers open as quarter numbers
+    pub quarter_numbers: u64,
+    /// free numbers that still hold a split piece's bytes (ghosts)
+    pub ghost_numbers: u64,
+    /// pieces split since the start
+    pub split_pieces_total: u64,
+    /// pieces a split left whole for want of a quarter number
+    pub split_deferred_total: u64,
+    /// pieces a join took back from their ghosts (nothing crossed the ring)
+    pub revives_total: u64,
+    /// join commands that had a piece to bring back
+    pub joins_total: u64,
+    /// bytes that came from the other three Sparks in joins
+    pub join_bytes_total: u64,
+    /// time the engine thread spent in joins, ns
+    pub join_ns_total: u64,
+    /// the longest join command, ns
+    pub join_max_ns: u64,
+    /// times a window or tenant change answered busy
+    pub lend_busy_total: u64,
+    /// joins that stopped for want of a number
+    pub join_short_total: u64,
+    /// the split cache's tiers: the last pass's level (0 none, 1 aging, 2 reclaim), the pressure between the marks in
+    /// thousandths, the idle age a conversation needs for a demotion now in seconds, pieces demoted a second over the last 10 s
+    pub split_level: u64,
+    pub split_pressure_pm: u64,
+    pub split_age_now_s: u64,
+    pub split_demote_pps: u64,
+    /// chunk numbers that hold quarter slots, and conversations given back from them to the SSD since the start
+    pub l2_numbers: u64,
+    pub l2_dropped_total: u64,
+    /// held numbers whose quarter image is on the SSD, and image jobs queued
+    pub clean_numbers: u64,
+    pub image_pending: u64,
+    /// rides of the image commands inside decoding runs
+    pub split_rides_total: u64,
+    /// pieces a return had to read from the SSD (the others were taken back from their ghosts)
+    pub returns_read_total: u64,
+    /// takes that waited for an image, and the times a prompt was processed alone while a request waited and images were pending
+    pub image_waits_total: u64,
+    pub split_reader_waits_total: u64,
+    /// copy drafting's learner (rank 0's counts): 1 when the gate learns from its outcomes, proposals made and scored, the first copy
+    /// token right, copy rows verified and accepted, the shared first-token chance by match bucket (8-15, 16-31, 32-63, 64 and
+    /// longer) in thousandths, and requests that ended with at least 16 proposals scored and the first token right in under half
+    pub copy_adapt: u64,
+    pub copy_proposals_total: u64,
+    pub copy_scored_total: u64,
+    pub copy_first_right_total: u64,
+    pub copy_rows_verified_total: u64,
+    pub copy_rows_accepted_total: u64,
+    pub copy_chance_pm: [u64; 4],
+    pub copy_failing_requests_total: u64,
 }
 
 impl EngineStats {
@@ -264,6 +338,50 @@ impl EngineStats {
             self.lent_owed_groups,
             self.engram_huge_pct,
             self.engram_evictions,
+            self.store_numbers,
+            self.mem_avail_min_bytes,
+            self.mem_avail_low_count,
+            self.ids_host_bytes,
+            self.ids_file_sessions,
+            self.mem_avail_bytes[0],
+            self.mem_avail_bytes[1],
+            self.mem_avail_bytes[2],
+            self.mem_avail_bytes[3],
+            self.tenant_groups[0],
+            self.tenant_groups[1],
+            self.tenant_groups[2],
+            self.tenant_groups[3],
+            self.tenant_groups[4],
+            self.tenant_groups[5],
+            self.tenant_groups[6],
+            self.tenant_groups[7],
+            self.tenant_models_groups,
+            self.kv_split,
+            self.conv_split,
+            self.quarter_slots,
+            self.quarter_numbers,
+            self.ghost_numbers,
+            self.split_pieces_total,
+            self.split_deferred_total,
+            self.revives_total,
+            self.joins_total,
+            self.join_bytes_total,
+            self.join_ns_total,
+            self.join_max_ns,
+            self.lend_busy_total,
+            self.join_short_total,
+            self.split_level,
+            self.split_pressure_pm,
+            self.split_age_now_s,
+            self.split_demote_pps,
+            self.l2_numbers,
+            self.l2_dropped_total,
+            self.clean_numbers,
+            self.image_pending,
+            self.split_rides_total,
+            self.returns_read_total,
+            self.image_waits_total,
+            self.split_reader_waits_total,
             self.copy_adapt,
             self.copy_proposals_total,
             self.copy_scored_total,
@@ -327,6 +445,48 @@ impl EngineStats {
             lent_owed_groups: f(42),
             engram_huge_pct: f(43),
             engram_evictions: f(44),
+            store_numbers: f(45),
+            mem_avail_min_bytes: f(46),
+            mem_avail_low_count: f(47),
+            ids_host_bytes: f(48),
+            ids_file_sessions: f(49),
+            mem_avail_bytes: [f(50), f(51), f(52), f(53)],
+            tenant_groups: [f(54), f(55), f(56), f(57), f(58), f(59), f(60), f(61)],
+            tenant_models_groups: f(62),
+            kv_split: f(63),
+            conv_split: f(64),
+            quarter_slots: f(65),
+            quarter_numbers: f(66),
+            ghost_numbers: f(67),
+            split_pieces_total: f(68),
+            split_deferred_total: f(69),
+            revives_total: f(70),
+            joins_total: f(71),
+            join_bytes_total: f(72),
+            join_ns_total: f(73),
+            join_max_ns: f(74),
+            lend_busy_total: f(75),
+            join_short_total: f(76),
+            split_level: f(77),
+            split_pressure_pm: f(78),
+            split_age_now_s: f(79),
+            split_demote_pps: f(80),
+            l2_numbers: f(81),
+            l2_dropped_total: f(82),
+            clean_numbers: f(83),
+            image_pending: f(84),
+            split_rides_total: f(85),
+            returns_read_total: f(86),
+            image_waits_total: f(87),
+            split_reader_waits_total: f(88),
+            copy_adapt: f(89),
+            copy_proposals_total: f(90),
+            copy_scored_total: f(91),
+            copy_first_right_total: f(92),
+            copy_rows_verified_total: f(93),
+            copy_rows_accepted_total: f(94),
+            copy_chance_pm: [f(95), f(96), f(97), f(98)],
+            copy_failing_requests_total: f(99),
         }
     }
 }

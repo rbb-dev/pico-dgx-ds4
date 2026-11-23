@@ -8,12 +8,14 @@ The sequence, through rank 0's socket (serve_test.py's client), on a pool so sma
 requests (every stored conversation is spilled when a request ends):
   1. A, a long conversation: its full pieces get images at the turn's save.
   2. B, a fork of A at a piece edge: B shares A's pieces wholly below the restart point q.
-  3. Fillers in other sessions: A loses its line, then is spilled whole (its images stay, its numbers go back: B alone
-     holds the shared numbers, B's line is untouched).
+  3. Fillers in other sessions, none of them kept: A is spilled whole (its images stay, its numbers go back: B alone holds
+     the shared numbers, B's line is untouched: the fillers all use the other line).
   4. B again, from a prompt that leaves A's text inside the last shared piece of the first three kv sources: B restarts
      inside that piece and writes it in place (the number is no longer shared).
-  5. Fillers until B is spilled, then B's next turn (read back from the disk), compared bit for bit with the same prompt
-     prefilled cold in a fresh session. The prompt's restart point is past the piece, so the read-back entries are used.
+  5. Two fillers that are kept: the first holds the free line, the second finds none free and takes the least recently
+     used idle line, which is B's: B is spilled on purpose. Then B's next turn (read back from the disk), compared bit for
+     bit with the same prompt prefilled cold in a fresh session. The prompt's restart point is past the piece, so the
+     read-back entries are used.
 With --log the run proves each step from rank 0's log and the server's own counts (STATS: shared numbers, conversations on
 disk, images written, read-backs); a step that did not happen ends the run with exit 2 ("did not reach the path"), never 0.
 Exit 0: every step ran and the turn is bit-equal to cold. Exit 1: it ran and the turn differs (or a piece failed its
@@ -22,7 +24,9 @@ checksum).
 Engine settings (engine-test.sh takes them as one string; the context is lowered to what the pool holds):
   MAXCTX=200000 engine-test.sh BIN "--slots 2 --big-slots 0 --pool-tokens 250000 --disk-gib 1" image_link_test.py \\
       --log ~/dsgb10/logs/engine-image_link_test.log [--n 60000 --q 49152]
-- --slots 2: B keeps one line while the fillers cycle through the other and take A's.
+- --slots 2: B keeps one line. The line a request takes is a free one first (serve.cpp pick_slot), else the least recently
+  used idle one. Step 3's fillers are not kept, so each frees the line it took and the next takes it again: B's line is
+  never the one taken. Step 5's two kept fillers leave no free line for the second, which takes B's: the spill is on purpose.
 - --pool-tokens 250000 (76 numbers, under 256 MiB): the store's budget between requests is zero, so every request's end
   spills the conversations no line holds.
 - --disk-gib 1 (the smallest tier): images of A, B and the fillers fit with room to spare.

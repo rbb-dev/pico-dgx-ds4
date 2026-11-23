@@ -541,8 +541,32 @@ void add(DecodeEnd& a, const DecodeEnd& b) {
 
 class Server {
  public:
+  // What a request's return of its conversation (or its fork base) asks: which conversation, up to where, how many pieces of each
+  // kind, and what it is estimated to cost (the time ahead of the rows)
+  struct JoinAsk {
+    bool found = false, deferred = false;  // deferred: the commands go out as the request's first units, between the decoders' windows
+    int h = -1, upto = 0, back = 0, exch = 0, disk = 0;
+    uint64_t key = 0;
+    double est_ms = 0;
+  };
   Server(model::Model& m, comm::Ring& ring, Watchdog& wd, const ServeOptions& o, Io& io, size_t budget)
       : m_(m), ring_(ring), wd_(wd), o_(o), keep_age_s_(o.keep_age_s), extend_(o.extend), io_(io), budget_(budget), slot_(m.slots(), 0), il_(o.interleave) {
+    if (o.kv_split || o.imager) {  // the marks, in numbers: the room off keeps between requests (max(256 MiB, 1/16 of the pool)) is the high mark
+      const size_t cap = m.state_ceiling(), room = std::max<size_t>(256ull << 20, cap / 16);
+      const model::Model::PoolStats ps = m.pool_stats();
+      init_split_marks(ps.number_bytes ? (int64_t)(room / ps.number_bytes) : 0);
+      if (o.imager) {
+        std::printf("serve: kv split %s: a conversation's blocks are written to each Spark's SSD as quarters in the background (idle: %d pieces a command; "
+                    "in a run: %d pieces every %d ms%s) and then %s; a return takes them back when nobody used them, else reads the quarters (--ssd-flush-s is the least time between two checkpoints while nothing runs; it starts no write of its own)\n",
+                    o.kv_split_mode == 0 ? "off" : o.kv_split_mode == 1 ? "tiered" : "max", o.kv_split_budget, o.kv_split_ride_pieces, o.kv_split_ride_ms,
+                    o.kv_split_mode == 2 ? "" : (", only under the high mark of " + std::to_string((long long)split_marks_.high)).c_str(),
+                    o.kv_split_mode == 0 ? "evicted clean, writing nothing, when memory is wanted" : "marked free where they lie");
+      } else
+      std::printf("serve: kv split %s: demote at %.0f s idle with the spare numbers at the high mark of %lld, down to 0 s at the low mark of %lld "
+                  "(under it the split conversations go to the SSD first), a pass at most %d ms with requests in flight, %d pieces a command\n",
+                  o.kv_split_mode == 1 ? "tiered" : "max", o.kv_split_after_s, (long long)split_marks_.high, (long long)split_marks_.low,
+                  o.kv_split_pass_ms, o.kv_split_budget);
+    }
     engram_set_mib_ = engram_goal_mib_ = o.engram_mib;
     loan_mib_ = m.prefill_loan_mib(), loan_groups_ = m.prefill_loan_groups();
     loan_goal_ = loan_mib_ > 0 && m.tenant_group_count(model::lend::kTenantPrefill) > 0 ? 1 : -1;
@@ -560,8 +584,11 @@ class Server {
       fe::Config cf;
       if (io_.take_config(cf)) apply_config(cf);
       lend_tick();
-      publish();
+      split_tick();
+      watch_tick();
+      if (pfq_.empty()) publish();  // a prompt being prefilled publishes between its chunks' launch and wait (pf_piece), not between two chunks
       sweep();
+      vit_rotate_wait();
       if (!pfq_.empty()) {  // interleaved prefill: long prompts and decoders take turns
         il_pass();
         continue;
@@ -571,11 +598,17 @@ class Server {
         Request rq = std::move(ready_.front());
         ready_.pop_front();
         admit(std::move(rq));
-      } else if (!wait_.empty() && window_ready(wait_.front()) &&
-                 pick_slot({}, need_clamped(wait_.front()), wait_.front().h.session_id, bkr(wait_.front())) >= 0) {
+      } else if (!wait_.empty() && start_wait_.may_try(now_s()) && !vit_gated(wait_.front()) && window_ready(wait_.front()) &&
+                 pick_slot({}, need_clamped(wait_.front()), wait_.front().h.session_id, bkr(wait_.front()), &wait_.front().prompt) >= 0) {
         Request rq = std::move(wait_.front());
         wait_.pop_front();
-        admit(std::move(rq));
+        admit(std::move(rq), true);
+      } else if (!wait_.empty() && !vit_gated(wait_.front()) && flying_.empty() && pfq_.empty() && rot_.empty() && ready_.empty() && wait_.front().h.req_id != rescued_req_ &&
+                 window_ready(wait_.front()) && !imager_work()) {
+        rescued_req_ = wait_.front().h.req_id;  // once: a request that goes back to the queue (its window) is not tried again at once
+        Request rq = std::move(wait_.front());  // nothing runs: what keeps it from a slot never goes by waiting (admit: rescue)
+        wait_.pop_front();
+        admit(std::move(rq), true);
       } else if (io_.pop(e, rot_.empty() ? 250 : 0)) {
         if (e.release) {
           if (flying_.count(e.session)) later_.insert(e.session);
@@ -584,7 +617,9 @@ class Server {
           admit(std::move(e.rq));
         }
       } else if (!rot_.empty()) {
+        const double t_run = now_s();
         run();
+        owed_ms_ = splitpace::owed_left(owed_ms_, 1e3 * (now_s() - t_run), false);  // a run with no long prompt queued settles the debt too
       } else {
         resize_idle();
         flush_idle();
@@ -717,14 +752,30 @@ class Server {
   // Every rank: c's state operations, then c (rank 0's part of c.op is the caller's). c carries the
   // sessions of the slots that a running request uses, which the store keeps (pinned) and whose images it keeps in the
   // disk tier's file; a conversation on an idle or paused line is cache like any other.
-  void issue(Cmd& c) {
+  // A split command (`split`) names live every session whose request is in flight, those on no line too: false, nothing sent, when
+  // they do not all fit in the command's list.
+  bool issue(Cmd& c, bool split = false) {
     for (size_t s = 0; s < slot_.size(); ++s) {
       const auto it = slot_[s] ? sess_.find(slot_[s]) : sess_.end();
-      c.live[s] = it == sess_.end() || !reclaim::counts_as_live(flying_.count(slot_[s]) > 0, paused(slot_[s])) ? 0 : it->second.h;
+      const bool live = split ? reclaim::split_names_live(flying_.count(slot_[s]) > 0, paused(slot_[s])) : reclaim::counts_as_live(flying_.count(slot_[s]) > 0, paused(slot_[s]));
+      c.live[s] = it == sess_.end() || !live ? 0 : it->second.h;
+    }
+    if (split) {
+      for (const auto& [k, x] : sess_) {
+        if (!in_flight(k, x) || std::find(c.live, c.live + model::kMaxSlots, x.h) != c.live + model::kMaxSlots) continue;
+        int* e = std::find(c.live, c.live + model::kMaxSlots, 0);
+        if (e == c.live + model::kMaxSlots) return false;
+        *e = x.h;
+      }
     }
     bcast(ring_, c);
+    wd_.started = now_s();  // a state command is watched as a step is (a rank that waits in a state operation for a partner ends with the watchdog's line)
     apply_ops(m_, c);
+    wd_.started = 0;
+    return true;
   }
+  // A request is in flight on this conversation: its own id or the id it answers to, admitted and not yet finished.
+  bool in_flight(uint64_t key, const Session& x) const { return flying_.count(key) > 0 || (x.owner && flying_.count(x.owner) > 0); }
   // State operations on every rank, in commands of kMaxOps.
   void state(const std::vector<StateOp>& v) {
     for (size_t i = 0; i < v.size(); i += kMaxOps) {
@@ -1161,9 +1212,23 @@ class Server {
       // making the window may have evicted conversations (no disk tier): cs points at one that is gone
       cs = find_at(rq.h.session_id, fac);
     }
-    if ((!cs || cs->slot < 0 || !fits(cs->slot, need) || !mem_ok(cs->slot, need, {}, sid, base)) &&
-        pick_slot({}, need, sid, base) < 0)
-      return wait_.push_back(std::move(rq));
+    const auto blocked = [&] {
+      return (!cs || cs->slot < 0 || !fits(cs->slot, need) || !mem_ok(cs->slot, need, {}, sid, base, nullptr, &rq.prompt)) && pick_slot({}, need, sid, base, &rq.prompt) < 0;
+    };
+    if (blocked()) {
+      if (!(flying_.empty() && pfq_.empty() && rot_.empty() && (front || wait_.empty())) || imager_work()) {  // running requests hold the rest, or images are still to be made
+                                                                                                          // that free what it needs (never answered "cannot hold" while they are): it waits
+        const RestoreAsk ask = restore_ask(sid, base, need, &rq.prompt);
+        std::printf("serve: req %llu waits for a slot: %d positions need %d numbers; its stored conversation holds %d in the pool "
+                    "and needs %d back; %d free and unreserved, %lld more can be given back (the request's own conversation "
+                    "excepted), of %d numbers in the pool\n",
+                    (unsigned long long)rq.h.req_id, need, m_.slot_chunks_for(0, need), ask.in_pool, ask.on_disk, m_.slot_uncommitted(),
+                    (long long)giveable({}, sid, base, false), m_.slot_chunks_total());
+        return wait_.push_back(std::move(rq));
+      }
+      // nothing runs and nothing waits ahead: what the pool does not hold now it never will. It is made to fit, or answered.
+      if (!rescue(rq, need, base, blocked)) return;
+    }
     start(std::move(rq));
   }
 
@@ -1256,9 +1321,11 @@ class Server {
     il::State s;
     s.decoders = !rot_.empty();
     s.owed_ms = owed_ms_;
-    s.reader = L.begun;
-    s.queued = !L.begun;
-    s.reader_fits = !L.begun && pick_slot({}, need_long(L), L.f.rq.h.session_id, bkf(L.f)) >= 0;
+    s.reader = L.begun || L.joining;  // a join in flight reads like a piece: a command, then the decoders' window
+    s.queued = !L.begun && !L.joining;
+    const bool picked = !L.begun && pick_slot({}, need_long(L), L.f.rq.h.session_id, bkf(L.f), &L.f.rq.prompt) >= 0;
+    s.reader_fits = !L.begun && il::begin_fits(picked, L.jw, now_s());
+    pf_waits_ = splitpace::pf_start_waits(!L.begun && !L.joining, picked, L.start_waited);  // the front waits for the pool (read by the idle imager, the age and the rides)
     Long* cand = nullptr;  // the second reader's candidate: the first queued one of at most push_rows rows that fits
     if (L.begun && !push_ && st.push_rows > 0)
       for (size_t i = 1; i < pfq_.size() && !cand; ++i) {
@@ -1300,13 +1367,17 @@ class Server {
       case il::Next::BeginReader: {
         Long& X = L.begun ? *cand : L;  // the second reader or the front one
         if (!X.resume) X.f.t_start = t0;  // a first run's prefill starts here: its wait in the queue is queue time (DONE queue_us)
+        // a prompt that waits stays queued, never dropped: it has no DONE yet, and it is asked again after its retry time
         if (L.begun) {  // the second reader, beside the front one (whose slot it may not take)
-          if (pf_begin(cand->f, cand->resume, {L.f.rq.h.session_id}, cand->r)) cand->begun = true, push_ = cand;
-          else drop_long(cand);
-        } else if (pf_begin(L.f, L.resume, {}, L.r)) {
-          L.begun = true;
+          const Begin b = pf_begin(cand->f, cand->resume, {L.f.rq.h.session_id}, cand->r);
+          if (b == Begin::Began) cand->begun = true, cand->start_waited = false, push_ = cand;
+          else if (b == Begin::Ended) drop_long(cand);
+          else cand->jw.stuck(t0), cand->start_waited = true;
         } else {
-          drop_long(&L);  // it ended at its start
+          const Begin b = pf_begin(L.f, L.resume, {}, L.r);
+          if (b == Begin::Began) L.begun = true, L.start_waited = false, pf_waits_ = false;
+          else if (b == Begin::Ended) drop_long(&L);  // it ended at its start
+          else L.jw.stuck(t0), L.start_waited = true, pf_waits_ = true;
         }
         // the decoders have waited since their last run (the arrival, its admission, this setup): owed before a piece
         if (s.decoders) owed_ms_ += il::window_ms(st, 1e3 * (now_s() - std::max(dec_end_, t0 - 1.0)));
@@ -1320,37 +1391,45 @@ class Server {
         sr.prefill_rows = r.cap;
         const int R = il::adjust_piece(il::piece_rows(sr, il_cost_, step_ms(), dec), r.pos, r.n, r.ced, r.cap);
         const int next = il::piece_rows(sr, il_cost_, step_ms(), dec);
+        const int before = r.pos;
         const bool ok = pf_piece(r, R, next);
         const double ms = 1e3 * (now_s() - t0);
-        if (ok) il_cost_.k = 0.8 * il_cost_.k + 0.2 * ms / (il_cost_.fixed_ms + il_cost_.per_row_ms * R);
+        if (ok && r.pos > before) il_cost_.k = 0.8 * il_cost_.k + 0.2 * ms / (il_cost_.fixed_ms + il_cost_.per_row_ms * R);  // an encode unit moves no rows
+        if (ok && r.pos > before) note_unit(P.f.rq.h.req_id, 1, ms);  // every request read in pieces: the line's second half (a text prompt is the control)
         if (dec) owed_ms_ += il::window_ms(st, ms);
         if (!ok || r.pos >= r.n) {
           if (pf_end(r)) {  // it decodes from here, first in the next run
             P.f.t_paused = now_s();
             rot_.push_front(std::move(P.f));
+            stalled_ = false;  // a request that just began to decode is not behind an idle command
           }
           drop_long(&P);
         }
         break;
       }
       case il::Next::Decode:
-        burst_ms_ = std::min<double>(owed_ms_ > 0 ? owed_ms_ : st.burst_max_ms, st.burst_max_ms);
+        burst_ms_ = splitpace::run_window(pf_waits_, pf_reading(), owed_ms_, st.burst_max_ms);
+        if (burst_ms_ == 0) owed_ms_ = 0;  // nothing is being read: nobody owes the decoders
         burst_end_ = 0;
         run();
         burst_ms_ = 0;
-        owed_ms_ = std::max(0.0, owed_ms_ - 1e3 * (now_s() - t0));
+        owed_ms_ = splitpace::owed_left(owed_ms_, 1e3 * (now_s() - t0), true);
         break;
-      case il::Next::Idle: {
-        Event e;  // the front long prompt waits for a slot: wait for a request or a release
-        if (io_.pop(e, 50)) {
-          if (e.release) {
-            if (flying_.count(e.session)) later_.insert(e.session);
-            else release(e.session);
-          } else if (!e.rq.conn->dead) {
-            admit(std::move(e.rq));
-          }
-        }
+      case il::Next::Idle:
+        idle_wait();  // the front long prompt waits for a slot: wait for a request or a release
         break;
+    }
+  }
+
+  void idle_wait() {
+    publish();  // a long prompt waits for a line: the loop's own publish is off while prompts are queued
+    Event e;
+    if (io_.pop(e, 50)) {
+      if (e.release) {
+        if (flying_.count(e.session)) later_.insert(e.session);
+        else release(e.session);
+      } else if (!e.rq.conn->dead) {
+        admit(std::move(e.rq));
       }
     }
   }
@@ -1420,6 +1499,8 @@ class Server {
     Turn resumed;
     Turn* tu = nullptr;
     double t0 = 0;
+    bool whole = false;  // go(): the prompt is prefilled in one run (the encode of its images is not cut to the gap)
+    bool fail = false;   // the request ended in an error inside a piece (Flight::err says which)
     // The set of row-sized prefill buffers the prompt is read on (Cmd::rows_set) and the rows a piece may have at most: chosen at the
     // prompt's begin, one value for every piece (its look-ahead lookups, its CED state and its snapshots belong to one set).
     int rows_set = 0, cap = 0;
@@ -1433,17 +1514,23 @@ class Server {
   // slot; false when that token (or a cancel) ended the request. The sampler's noise is a function of the
   // seed and the position, so a request run in pieces samples what a single run would. Here the pieces run
   // back to back: the whole-prompt path.
-  bool go(Flight& f, bool resume, const std::set<uint64_t>& keep = {}) {
+  // What pf_begin did: it began (the slot and the state are set), the request ended at its start (its DONE is sent), or it waits
+  // (the pool cannot hold it yet: nothing of it is held, the caller keeps it and asks again).
+  enum class Begin { Began, Ended, Waits };
+  // go() gives the same answers: Began after the prompt is prefilled and its first token sent, Ended when that token (or a cancel) ended it.
+  Begin go(Flight& f, bool resume, const std::set<uint64_t>& keep = {}) {
     Reader r;
-    if (!pf_begin(f, resume, keep, r)) return false;
+    r.whole = true;
+    if (const Begin b = pf_begin(f, resume, keep, r); b != Begin::Began) return b;
     while (r.pos < r.n)
       if (!pf_piece(r, std::min(r.cap, r.n - r.pos), r.cap)) break;
-    return pf_end(r);
+    return pf_end(r) ? Begin::Began : Begin::Ended;
   }
 
   // The prompt's setup: the slot, where the state comes from, the restart point q, the state operations and the
-  // prompt's tokens on every rank. False when the request ended here (a resume cancelled, or past the context).
-  bool pf_begin(Flight& f, bool resume, const std::set<uint64_t>& keep, Reader& r) {
+  // prompt's tokens on every rank. Ended when the request ended here (a resume cancelled, or past the context); Waits when no slot
+  // or not enough memory is there for it now (what the running requests are owed leaves less than admission counted).
+  Begin pf_begin(Flight& f, bool resume, const std::set<uint64_t>& keep, Reader& r) {
     r.f = &f, r.resume = resume;
     const fe::SubmitHeader& h = f.rq.h;
     const double t0 = r.t0 = now_s();
@@ -1626,7 +1713,30 @@ class Server {
       tu.ops_ms = 1e3 * (now_s() - (resume ? t0 : f.t_start));
     }
     r.S = S, r.s = s, r.n = n, r.q = q, r.ced = ced, r.pos = q;
-    return true;
+    r.rows_set = n - q > o_.prefill_rows ? pick_rows_set() : 0;  // a prompt that fits the standing buffers never holds the lent set
+    r.cap = m_.prefill_rows_cap(r.rows_set);
+    return Begin::Began;
+  }
+  Begin ended_at_start(Flight& f, uint32_t why) {
+    finish(f, why);
+    return Begin::Ended;
+  }
+  // pf_begin's third answer: the request stays as it was (a read-back and the line's detach are all it did), the count that let it
+  // in disagrees with what the pool can give. One line a request; each retry is the caller's.
+  Begin begin_waits(const Flight& f, const char* what, int s, int need, const std::set<uint64_t>& keep, uint64_t sid, uint64_t base,
+                    const std::vector<int32_t>* pr) {
+    if (wait_logged_ != f.rq.h.req_id) {
+      wait_logged_ = f.rq.h.req_id;
+      int t = s;
+      for (int u = 0; t < 0 && u < (int)slot_.size(); ++u)
+        if (fits(u, need)) t = u;
+      MemCache mc;
+      int64_t have = 0, want = 0;
+      mem_sums(t < 0 ? 0 : t, need, keep, sid, base, &mc, &have, &want, pr);
+      std::printf("serve: req %llu waits at its start (%s): have %lld, want %lld numbers\n", (unsigned long long)f.rq.h.req_id, what,
+                  (long long)have, (long long)want);
+    }
+    return Begin::Waits;
   }
 
   // The set of row-sized buffers a prompt that begins now is read on: the lent set when it is held whole on every rank and nobody has asked
@@ -1962,26 +2072,68 @@ class Server {
       if (f.rq.h.session_id == id) return true;
     return false;
   }
-  // A session whose slot memory the request may take (make_room, mem_ok): not the request's own or its base, not in the
+  // A session whose slot memory the request may take (room_for, mem_ok): not the request's own or its base, not in the
   // run (`keep`), and with no request in flight, or paused between turns. Counting paused ones keeps every admitted
   // request able to run: a flight that lost its slot finds one when its turn comes.
-  bool idle_id(uint64_t id, const std::set<uint64_t>& keep, uint64_t sid, uint64_t base) const {
-    return id != sid && id != base && !keep.count(id) && (!flying_.count(id) || paused(id));
+  // `paused_too` false: a paused request's line is not idle (a read-back unit's rule, reclaim::unit_may_detach).
+  bool idle_id(uint64_t id, const std::set<uint64_t>& keep, uint64_t sid, uint64_t base, bool paused_too = true) const {
+    if (id == sid || id == base || keep.count(id)) return false;
+    // a request that is not running takes nothing from one that is, so the line of a paused request is not idle for any taker (PICO_OLD_RULES: it is, for a reservation)
+    return paused_too ? reclaim::idle_for_taker(flying_.count(id) > 0, paused(id)) : reclaim::unit_may_detach(flying_.count(id) > 0, paused(id));
   }
-  // A slot whose session no request uses and the request does not need: its memory can be given back (make_room)
-  bool idle_slot(int t, const std::set<uint64_t>& keep, uint64_t sid, uint64_t base) const {
-    return idle_id(slot_[t], keep, sid, base);
+  // A slot whose session no request uses and the request does not need: its memory can be given back (room_for)
+  bool idle_slot(int t, const std::set<uint64_t>& keep, uint64_t sid, uint64_t base, bool paused_too = true) const {
+    return idle_id(slot_[t], keep, sid, base, paused_too);
   }
-  // Chunks go() will map before it decides the slot: it brings the request's session (or its fork's base) back from the
-  // disk tier first (unspill). An upper bound (Model::state_restore_chunks: every block of the record), counted in
-  // mem_ok's want so that an admitted request finds its slot after the restore.
-  int64_t restore_extra(uint64_t sid, uint64_t base) const {
-    int64_t n = 0;
-    for (const uint64_t id : {sid, base}) {
-      const auto it = id ? sess_.find(id) : sess_.end();
-      if (it != sess_.end()) n += (int64_t)m_.state_restore_chunks(it->second.h);
+  // What the request continues from, read at the moment of the count (never kept across passes: the base may be rewritten
+  // meanwhile): its own conversation, else its fork's base. The lists that hold positions below `upto` (the request's need for
+  // its own conversation; the fork point p = min(lcp(base history, prompt), n - 1), as the plan computes it, for a base), those
+  // in the pool and those only on the disk, the bookmarks' numbers on the disk, and the copies a fork makes at p. mem_ok's want
+  // takes the lists in the pool off (they become the slot's) and leaves the bookmarks out (they come back into what is spare:
+  // unspill's budget).
+  struct RestoreAsk {
+    bool found = false, fork = false;
+    uint64_t src_id = 0;           // the key of the conversation counted
+    int in_pool = 0, on_disk = 0;  // its lists below `upto`
+    int split = 0;                 // its lists below `upto` that are quarter slots: each needs a whole number to come back into
+    int upto = 0;                  // the position the count and a join go to (the request's need; a fork's point)
+    int64_t bookmarks = 0;         // its bookmarks' numbers on the disk
+    int64_t cow = 0;               // a fork's copies at p
+  };
+  RestoreAsk restore_ask(uint64_t sid, uint64_t base, int need, const std::vector<int32_t>* pr) const {
+    RestoreAsk a;
+    auto it = sid ? sess_.find(sid) : sess_.end();
+    int upto = need;
+    if (it == sess_.end() && base && base != sid) {
+      it = sess_.find(base);
+      if (it != sess_.end()) {
+        a.fork = true;
+        const int p = pr && !pr->empty() ? std::min(lcp(it->second.hist, *pr), (int)pr->size() - 1) : 0;
+        upto = std::max(0, p);
+        a.cow = (int64_t)m_.state_cow_numbers(it->second.h, -1, p);
+      }
     }
-    return n;
+    if (it == sess_.end()) return a;
+    a.found = true, a.src_id = it->first;
+    a.upto = upto;
+    m_.state_list_numbers(it->second.h, upto, &a.in_pool, &a.on_disk, &a.split);
+    int all_in = 0, all_disk = 0;
+    m_.state_list_numbers(it->second.h, INT_MAX, &all_in, &all_disk);
+    a.bookmarks = (int64_t)m_.state_restore_chunks(it->second.h) - all_disk;
+    return a;
+  }
+  // The credit slot s gives: the lists of the conversation the request continues that are in the pool. Not when that
+  // conversation holds slot s: they are in the slot's commitment already (own).
+  int64_t credit_of(int s, const RestoreAsk& a) const { return a.found && slot_[s] != a.src_id ? model::rules::list_credit(a.in_pool) : 0; }
+  // The numbers slot s needs from the pool for the request (mem_ok): see pool_rules.h request_want.
+  int64_t want_of(int s, int need, const RestoreAsk& a, int64_t img) const {
+    return model::rules::request_want((int64_t)m_.slot_chunks_for(s, need), credit_of(s, a), a.on_disk + a.split, a.bookmarks, a.cow, img);
+  }
+  // What the reservation of slot s still needs from free and given-back numbers (room_for, the copy at the restart
+  // point): the same count, read now, with the slot's own commitment taken off.
+  int64_t room_n(int s, int need, const std::set<uint64_t>& keep, uint64_t sid, uint64_t base, const std::vector<int32_t>* pr) const {
+    const RestoreAsk a = restore_ask(sid, base, need, pr);
+    return model::rules::room_want((int64_t)m_.slot_chunks_for(s, need), credit_of(s, a), img_extra(sid)) - own(s, keep, sid, base);
   }
   // The numbers a request's image rows will take at its first go, counted in its want like a restore: admission and room_for
   // find them before the request is let in, and kStReserve reserves them until kStImgTake takes them.
@@ -2010,22 +2162,66 @@ class Server {
   };
   // Whether the pool (Model::slot_*, Options::vmm) can hold `need` positions in slot s: s's own commitment is replaced
   // by the request's; what is uncommitted plus what can be given back (idle slots' memory and, with the store on the
-  // pool, what the store holds under unused sessions: make_room, Model::slot_reserve) must cover it. The request's own
-  // session and base on disk count as restored first (restore_extra). Without the pool: always.
-  bool mem_ok(int s, int need, const std::set<uint64_t>& keep, uint64_t sid = 0, uint64_t base = 0,
-              MemCache* mc = nullptr) const {
+  // pool, what the store holds under unused sessions: room_for, Model::slot_reserve) must cover it. The request's own
+  // session and base on disk count as restored first (restore_ask, want_of). Without the pool: always.
+  bool mem_ok(int s, int need, const std::set<uint64_t>& keep, uint64_t sid = 0, uint64_t base = 0, MemCache* mc = nullptr,
+              const std::vector<int32_t>* pr = nullptr) const {
     MemCache tmp;
     MemCache& c = mc ? *mc : tmp;
-    if (!c.ex) c.extra = restore_extra(sid, base) + img_extra(sid), c.ex = true;
-    const int64_t want = (int64_t)m_.slot_chunks_for(s, need) + c.extra;
-    int64_t have = (int64_t)m_.slot_uncommitted() + own(s, keep, sid, base);
+    if (!c.ex) c.ask = restore_ask(sid, base, need, pr), c.img = img_extra(sid), c.ex = true;
+    const int64_t want = want_of(s, need, c.ask, c.img);
+    int64_t have = m_.slot_spare() + own(s, keep, sid, base);
+#ifdef PICO_OLD_RULES
+    have = idle_sum_have(s, keep, sid, base, have, c, want);
+#else
+    if (!o_.kv_split) have = idle_sum_have(s, keep, sid, base, have, c, want);  // --kv-split off: the same sum, with the spare signed: smaller by what the reservations exceed the free numbers, equal elsewhere
+    else if (have < want) have = pool_have_for(s, keep, sid, base, have);
+#endif
+    return model::rules::admissible(have, want);
+  }
+  // The sum without the split tiers (--kv-split off, and PICO_OLD_RULES): each idle line's commitment, then what eviction gives back for the conversations no
+  // line holds; it stops adding once `want` is covered. A number two idle lines name is counted by each.
+  int64_t idle_sum_have(int s, const std::set<uint64_t>& keep, uint64_t sid, uint64_t base, int64_t have, MemCache& c, int64_t want) const {
     for (int t = 0; t < (int)slot_.size() && have < want; ++t)
       if (t != s && idle_slot(t, keep, sid, base)) have += m_.slot_committed(t);
     if (have < want) {
       if (!c.gv) c.giveable = giveable(keep, sid, base, false), c.gv = true;
       have += c.giveable;
     }
-    return have >= want;
+    return have;
+  }
+  // What the pool can give the request in slot s, counted once (pool_rules.h pool_have): the free numbers beside the reservations (`have`),
+  // the reservations of the idle lines the request may take (they end with the detach), and what eviction gives back for the conversations
+  // of those lines counted as if no line held them, a number two of them name only once. The conversations of the lines are
+  // `lines`; the request's own and its base are pinned out as always.
+  int64_t pool_have_for(int s, const std::set<uint64_t>& keep, uint64_t sid, uint64_t base, int64_t have, bool paused_too = true) const {
+    int64_t reservations = 0;
+    std::vector<int> lines;
+    for (int t = 0; t < (int)slot_.size(); ++t)
+      if (t != s && idle_slot(t, keep, sid, base, paused_too)) {
+        reservations += m_.slot_unheld_reservation(t);
+        const auto it = sess_.find(slot_[t]);
+        if (it != sess_.end()) lines.push_back(it->second.h);
+      }
+    return model::rules::pool_have(have, reservations, (int64_t)m_.state_giveable_joint(pins(sid, base, &keep, false, paused_too), lines));
+  }
+  // What the pool gives a read-back unit: the sum admission makes (free and unreserved numbers, the reservations of the lines the unit may
+  // detach, the store those lines' conversations free), less the lines of paused requests: a unit never takes a request's line.
+  int64_t return_room(uint64_t sid, uint64_t base) const {
+    return pool_have_for(-1, {}, sid, base, m_.slot_spare(), false);
+  }
+  // mem_ok's two sums whole (no early stop): what the pool can give the request in slot s, and what it needs
+  void mem_sums(int s, int need, const std::set<uint64_t>& keep, uint64_t sid, uint64_t base, MemCache* mc, int64_t* have_out,
+                int64_t* want_out, const std::vector<int32_t>* pr = nullptr) const {
+    MemCache& c = *mc;
+    if (!c.ex) c.ask = restore_ask(sid, base, need, pr), c.img = img_extra(sid), c.ex = true;
+    const int64_t have = m_.slot_spare() + own(s, keep, sid, base);
+#ifdef PICO_OLD_RULES
+    *have_out = idle_sum_have(s, keep, sid, base, have, c, INT64_MAX);
+#else
+    *have_out = o_.kv_split ? pool_have_for(s, keep, sid, base, have) : idle_sum_have(s, keep, sid, base, have, c, INT64_MAX);
+#endif
+    *want_out = want_of(s, need, c.ask, c.img);
   }
   // Numbers for `snaps` window bookmarks a command takes (a prefill piece's, a decode run's, the prompt's end): the pool must
   // give them, or the request loses a restart point it would have had. Idle and paused lines let go first (give_back).
@@ -2053,9 +2249,9 @@ class Server {
   // `may_close`: a window no request needs is closed only for a consumer that would otherwise wait or fail (a request, its
   // growth, a copy, a window); a bookmark or a read-back that finds no room only starts a later turn further back.
   bool give_back(int64_t n, const std::set<uint64_t>& keep, uint64_t sid, uint64_t base, int skip_slot, int64_t margin,
-                 const char* why, bool may_close = true) {
+                 const char* why, bool may_close = true, bool paused_too = true) {
     auto short_by = [&](int64_t w) {
-      const int64_t u = (int64_t)m_.slot_uncommitted();
+      const int64_t u = m_.slot_spare();
       return u < w && u + giveable(keep, sid, base, true) < w;
     };
     if (!short_by(n + margin)) return true;
@@ -2095,7 +2291,7 @@ class Server {
     int best = -1;
     uint64_t used = UINT64_MAX;
     for (int s = 0; s < ns; ++s) {
-      if (!fits(s, need) || flying_.count(slot_[s]) || keep.count(slot_[s]) || !mem_ok(s, need, keep, sid, base, &mc)) continue;
+      if (!fits(s, need) || !splitpace::slot_free_for_arrival(flying_.count(slot_[s]) > 0, run_ended_.count(slot_[s]) > 0) || keep.count(slot_[s]) || !mem_ok(s, need, keep, sid, base, &mc, pr)) continue;
       const auto it = sess_.find(slot_[s]);
       const uint64_t u = it == sess_.end() ? 0 : it->second.used;
       if (u < used) best = s, used = u;
@@ -2130,6 +2326,10 @@ class Server {
     const size_t cap = std::min<size_t>(slot_.size(), model::ops::kMaxSess);
     FacBusy busy_facs(fac_busy_);  // the factors of the flights taken out of the turns: their windows stay while this run builds
     int ext_waits = 0;             // flights of this pass that wait for the pool to extend their reservation
+    int holders = 0;               // flights of this pass with a live line (the standstill's test)
+    std::set<uint64_t> ext_ids;    // the requests put back for an extension (the one with the longest response is the one ended)
+    bool start_waits = false;      // a flight of this pass waits at its start for the pool
+    int pool_waits = 0;            // flights this pass put back because memory could not be had (the imager's reason, as a request in wait_ is)
     turns::lead_other_factor(rot_, last_fac_, [](const Flight& f) { return f.fac; });  // the factors take turns
     while (fl.size() < cap && !rot_.empty()) {
       Flight f = std::move(rot_.front());
@@ -2145,6 +2345,7 @@ class Server {
         const Session* old = find(f.rq.h.session_id);
         const int w = ensure_window(f.fac, old ? std::vector<int>{old->h} : std::vector<int>{}, keep, f.rq.h.req_id);
         if (w == kWinWait) {
+          ++pool_waits;
           later.push_back(std::move(f));
           std::this_thread::sleep_for(std::chrono::milliseconds(20));  // the others may be waiting for the same memory
           continue;
@@ -2157,7 +2358,9 @@ class Server {
       const Session* it = find_at(f.rq.h.session_id, f.fac);  // its session at its factor (none after a crossing)
       const int need = need_now(f);
       const bool live = it && it->slot >= 0 && fits(it->slot, need);
-      if (!live && pick_slot(keep, need, f.rq.h.session_id, bkf(f)) < 0) {
+      if (live) ++holders;
+      if (!live && pick_slot(keep, need, f.rq.h.session_id, bkf(f), &f.rq.prompt) < 0) {
+        ++pool_waits;
         later.push_back(std::move(f));
         continue;
       }
@@ -2168,8 +2371,11 @@ class Server {
         const int s = it->slot;
         // the pool must hold it: first by the count (mem_ok), then in fact (the lines that count was based on let their
         // conversations go); a flight that waits is paused for the next pass, and an extender after it may detach its line
-        if (!mem_ok(s, need, keep, f.rq.h.session_id, bkf(f)) || !room_for(s, need, keep, f.rq.h.session_id, bkf(f))) {
-          ++ext_waits;
+        const bool room = mem_ok(s, need, keep, f.rq.h.session_id, bkf(f), nullptr, &f.rq.prompt) && room_for(s, need, keep, f.rq.h.session_id, bkf(f), &f.rq.prompt);
+        const int left = f.upto - (int)(f.rq.prompt.size() + f.out.size());
+        if (!room && reclaim::ext_blocks(left)) {  // (b): only when its reservation is used up; else it runs on with what it holds
+          ++ext_waits, ++pool_waits;
+          ext_ids.insert(f.rq.h.req_id);
           later.push_back(std::move(f));
           continue;
         }
@@ -2198,8 +2404,11 @@ class Server {
       fl.push_back(std::move(f));
     }
     for (auto it = later.rbegin(); it != later.rend(); ++it) rot_.push_front(std::move(*it));
+    pool_waits_ = pool_waits;  // read by the idle imager, its age and the rides (splitpace::rot_stalled, pool_waiter)
+    stalled_ = splitpace::rot_stalled((int)fl.size(), pool_waits, pf_reading());
     // every flight of two passes in a row waited for an extension: nothing can end, pause or free what they wait for
     // (--slice 0, whose flights are never paused, cannot break it; the production setting can)
+#ifdef PICO_OLD_RULES
     if (fl.empty() && ext_waits > 0 && (size_t)ext_waits == rot_.size() && ++ext_stall_ == 2)
       std::printf("serve: BUG: every flight waits for an extension (%d flights)\n", ext_waits);
     if (!fl.empty() || ext_waits == 0) ext_stall_ = 0;
@@ -2275,12 +2484,16 @@ class Server {
       tokens(f.rq, o, row);  // a paused request's last tokens too: the session holds them
       f.out.push_back(o.row[row].token);
       // a new request: this one pauses for its prefill; while long prompts are prefilled, at its window's end instead
-      if (!ctl && (pfq_.empty() ? io_.submit_waiting() && admissible() : burst_over())) {
-        m_.set_ctl(1);
+      if (!ctl && pause_wanted(false, false)) {
+        m_.set_ctl(word |= 1);
         ctl = pause = true;
       }
+    }, [&] {  // once a step: the flips, the STATS frame and the reasons that pause a run (step_hook)
+      if (step_hook(rw, rs, word, ctl, 1u)) ctl = pause = true;
     });
-    if (ctl) m_.set_ctl(0);
+    if (word) m_.set_ctl(0);
+    ride_watch_end(rw);
+    ride_split_run_end(rs);
     f.dec_s += now_s() - t_dec;
     f.decoded += e.sampled;
     f.spec_tok = e.spec_tok, f.spec_ms = e.spec_ms;
@@ -2499,6 +2712,28 @@ class Server {
       sf.engram_huge_pct = li.huge_pct, sf.engram_evictions = li.evictions;
     }
     sf.lent_owed_groups = (uint64_t)std::max(0, m_.window_owed());
+    {
+      const MemWatchView mw = mem_watch_view();
+      sf.store_numbers = o_.store_numbers, sf.mem_avail_min_bytes = mw.min_bytes, sf.mem_avail_low_count = mw.low_count;
+      sf.ids_host_bytes = ids_bytes(), sf.ids_file_sessions = (uint64_t)std::max<int64_t>(0, ids_files_);
+      for (int r = 0; r < 4; ++r) sf.mem_avail_bytes[r] = mw.avail[r];
+    }
+    for (const model::Model::TenantRow& r : m_.tenant_rows()) {
+      if (r.id < 8) sf.tenant_groups[r.id] = (uint64_t)r.groups;
+      else sf.tenant_models_groups += (uint64_t)r.groups;
+    }
+    {
+      const model::Model::SplitStats sp = m_.split_stats();
+      sf.kv_split = o_.kv_split ? 1 : 0, sf.conv_split = sp.conv_split, sf.quarter_slots = sp.quarter_slots, sf.quarter_numbers = sp.quarter_numbers;
+      sf.ghost_numbers = sp.ghost_numbers, sf.split_pieces_total = sp.split_pieces, sf.split_deferred_total = sp.split_deferred;
+      sf.revives_total = sp.revives, sf.joins_total = sp.joins, sf.join_bytes_total = sp.join_bytes, sf.join_ns_total = sp.join_ns;
+      sf.join_max_ns = sp.join_max_ns, sf.lend_busy_total = lend_busy_total_, sf.join_short_total = sp.join_short;
+      sf.split_level = (uint64_t)split_level_.level, sf.split_pressure_pm = (uint64_t)(split_level_.pressure * 1000 + 0.5);
+      sf.split_age_now_s = (uint64_t)(split_level_.age_s + 0.5), sf.split_demote_pps = demote_pps();
+      sf.l2_numbers = sp.quarter_numbers, sf.l2_dropped_total = l2_dropped_total_;
+      sf.clean_numbers = sp.clean_numbers, sf.image_pending = sp.image_pending, sf.split_rides_total = sp.rides;
+      sf.returns_read_total = sp.returns_read, sf.image_waits_total = sp.image_waits, sf.split_reader_waits_total = reader_waits_total_;
+    }
     if (model::copy::mode() & model::copy::kAdapt) {
       sf.copy_adapt = 1, sf.copy_proposals_total = copy_proposals_total_, sf.copy_scored_total = copy_scored_total_;
       sf.copy_first_right_total = copy_first_right_total_, sf.copy_rows_verified_total = copy_rows_verified_total_;
@@ -2717,6 +2952,8 @@ class Server {
     ~FacBusy() { m = old; }
   };
   unsigned fac_busy_ = 0;
+  double ext_since_ = 0, ext_end_last_ = 0;  // when the standstill began; when a request was last ended for it
+  bool ext_noted_ = false;
   int ext_stall_ = 0;  // passes in a row in which every flight waited for an extension (run)
   // Whether a request of `factor` exists anywhere: its window is needed
   bool factor_in_use(int factor) const {
@@ -3057,6 +3294,10 @@ class Server {
     bool begun = false;
     bool resume = false;  // a flight that lost its slot, re-reading its prompt and the tokens it sent
     int rows = 0;         // rows to compute when it was queued (the second reader: at most push_rows)
+    JoinAsk ja;           // the return of its conversation (or base) that its first units are
+    bool joining = false; // the join commands are not all done: the prompt is not begun until they are
+    il::JoinWait jw;      // a unit that found no number waits (the request holds nothing up meanwhile)
+    bool start_waited = false;  // its begin answered Waits (a prompt waiting at its start waits for the pool as a request in wait_ does)
   };
   // The positions a queued long prompt needs a slot for: a first run's prompt and horizon, a resume's from where it is
   int need_long(const Long& L) const { return L.resume ? need_now(L.f) : need_clamped(L.f.rq); }

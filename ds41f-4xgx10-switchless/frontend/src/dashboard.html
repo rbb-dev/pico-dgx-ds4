@@ -382,15 +382,17 @@ function chart(label, tip, color, unit, name) {
     if (n < 2) return;
     const i = hoverIndex(s.plot, n, e), v = state.pts[i], pk = state.peaks[i];
     const end = state.t0 + i * state.step * 1000;
-    s.hair.hidden = s.tipBox.hidden = false;
-    s.hair.style.left = (i / (n - 1) * 100) + '%';
-    s.tipBox.style.left = Math.min(88, Math.max(12, i / (n - 1) * 100)) + '%';
+    for (const c of CHARTS) c.hairAt(i / (n - 1));
+    s.tipBox.hidden = false;
     dot.hidden = v == null;
     if (v != null) { dot.style.left = (i / (n - 1) * 100) + '%'; dot.style.top = plotY(v / state.top) + '%'; }
-    clear(s.tipBox).append(h('div', { class: 'dim', text: `${dayTime.format(new Date(end - state.step * 1000))} to ${dayTime.format(new Date(end))}` }), h('div', { class: 'num', text: v == null ? 'no reading' : `${fmt(v)} ${unit}${state.step > 1 ? ' average' : ''}` }), pk != null && state.step > 1 ? h('div', { class: 'num dim', text: `peak ${fmt(pk)} ${unit}` }) : null);
+    clear(s.tipBox).append(h('div', { class: 'dim', text: `${dayTime.format(new Date(end - state.step * 1000))} to ${dayTime.format(new Date(end))}` }), h('div', { class: 'num', text: v == null ? 'no reading' : `${fmt(v)} ${unit}${state.step > 1 ? ` averaged over ${state.step} s (idle seconds count as 0)` : ''}` }), pk != null && state.step > 1 ? h('div', { class: 'num dim', text: `best 3 s rate ${fmt(pk)} ${unit}` }) : null);
+    placeTip(s.plot, s.tipBox, i / (n - 1));
   });
-  s.plot.addEventListener('pointerleave', () => { s.hair.hidden = dot.hidden = s.tipBox.hidden = true; });
-  return {
+  s.plot.addEventListener('pointerleave', () => { for (const c of CHARTS) c.hairAt(null); dot.hidden = s.tipBox.hidden = true; });
+  const me = { hairAt: s.hairAt };
+  CHARTS.push(me);
+  return Object.assign(me, {
     el: s.el, name,
     draw(body, atMs, goal) {
       const pts = body.points.map((p) => (p == null ? null : Number(p)));
@@ -459,8 +461,8 @@ const RAIL_TIP = [
 // the columns: key, group, head, unit, tip, and whether the temperature colour scale paints the value
 const NODE_COLS = [
   ['mem', 'MEMORY', 'Free / total', 'GiB', `Memory this Spark has free now (MemAvailable) of its total, in GiB. From /proc/meminfo on this Spark, as it last reported it.`],
-  ['split', 'MEMORY', 'Weights · work · KV', 'GiB', `How the memory was divided when the engine started, in GiB: the model weights, the engine's working memory, the conversation memory (the chunk pool).`],
-  ['tz', 'TEMP.', 'Hot', '°C', `The hottest of this Spark's ACPI thermal zones, in °C (/sys/class/thermal). ${TEMP_TIP}`, true],
+  ['split', 'MEMORY', 'Weights · work · pool', 'GiB', `How this Spark's memory was divided when the engine started, in GiB: the model weights; work, which is everything else in use then (the engine's buffers and graphs, other programs on the box: what is left after the other two, not a figure measured by itself); and the memory pool (the conversations' caches, their bookmarks, image rows, the lines' own chunks and the split cache's pieces).`],
+  ['tz', 'TEMP.', 'Hot', '°C', `The hottest of this Spark's ACPI thermal zones, in °C (/sys/class/thermal). ${TEMP_TIP} The zones trip at ${TEMP_TRIP_C} °C.`, true],
   ['tg', 'TEMP.', 'GPU', '°C', `The GPU die temperature in °C (NVML). ${TEMP_TIP}`, true],
   ['gb', 'GPU', 'Busy', '%', `GPU utilisation in per cent over NVML's last sample window.`],
   ['gc', 'GPU', 'Clock', 'MHz', `The GPU's current clock and the highest clock NVML names, in MHz. The limit is set in COOLING AND CLOCK. The reasons NVML gives for holding it down show here when any is set.`],
@@ -510,7 +512,8 @@ function nodeRow(rank) {
       const led = ledger && ledger.get(rank);
       if (led) {
         setText(wN, gib(led.w)); setText(mN, gib(led.m)); setText(kN, gib(led.k));
-        setTip(td.split, `How the memory was divided when the engine started: the model weights ${gib(led.w)} GiB, the engine's working memory ${gib(led.m)} GiB, the conversation memory (the chunk pool) ${gib(led.k)} GiB.`);
+        setTip(td.split, `How this Spark's memory was divided when the engine started: the model weights ${gib(led.w)} GiB; work ${gib(led.m)} GiB, everything else in use then (the engine's buffers and graphs, other programs on the box: a remainder); the memory pool ${gib(led.k)} GiB (the conversations' caches, their bookmarks, image rows, the lines' own chunks and the split cache's pieces). ` +
+          (led.live ? `The pool figure is the pool now, which has grown since the start; work is the start's remainder less that growth, so the three still add up to the start's total.` : `The pool figure is the pool's size at the start.`));
       }
       if (!have) return;
       const gpu = r.gpu || {}, nv = r.nvme || {};
@@ -784,16 +787,23 @@ function tierTiles() {
 // Interleaved prefill's settings (the engine's --interleave-* flags), changed here at once: what the engine runs comes back in
 // its next status. Each list holds the useful values; a value set at start that is not in a list is shown too.
 function settingsBox() {
+  // each setting's value as its list prints it; a value set at start that is not in a list prints the same way
+  const FMT = {
+    rows: (v) => posFmt(v) + ' tokens',
+    share: (v) => v + ' %', gap_ms: (v) => v + ' ms', ssd_gib: (v) => v + ' GiB a Spark',
+    keep_days: (v) => v + (v === 1 ? ' day' : ' days'), engram_mib: (v) => whole.format(Number(v)) + ' MiB a Spark',
+  };
+  const FMT_OF = { share: FMT.share, gap_ms: FMT.gap_ms, push_rows: FMT.rows, whole_rows: FMT.rows, ssd_gib: FMT.ssd_gib, keep_days: FMT.keep_days, engram_mib: FMT.engram_mib };
   const ROWS = [
-    ['on', 'SPLIT LONG PROMPTS', 'On: a long prompt is read in pieces while others decode. Off: every prompt is read whole.', [[true, 'on'], [false, 'off']]],
-    ['share', 'TIME FOR OTHERS', 'Of the time while a long prompt is read, the part the decoding users get. More: they write faster, the prompt takes longer.', [10, 20, 30, 40, 50, 60, 70, 80, 90].map((v) => [v, v + ' %'])],
-    ['gap_ms', 'MAX PAUSE FOR OTHERS', 'The longest a decoding user waits between tokens while a long prompt is read; it sets the piece size (shorter: smaller pieces, the prompt a little slower).', [300, 450, 600, 800, 1000, 1500].map((v) => [v, v + ' ms'])],
-    ['push_rows', 'READ 2 AT ONCE UP TO', 'A long prompt with at most this many tokens to compute reads beside one already being read, instead of waiting behind it.', [32768, 65536, 131072, 262144, 524288].map((v) => [v, (v / 1024) + 'K tokens'])],
-    ['whole_rows', 'NO SPLIT UP TO', 'A prompt with at most this many tokens to compute (after what is cached) is read whole: the decoding users wait for it.', [8192, 16384, 32768, 65536, 131072].map((v) => [v, (v / 1024) + 'K tokens'])],
-    ['ssd_gib', 'SSD CACHE SIZE', 'How much of each Spark\'s SSD the conversations kept on disk may use: at most the file made when the engine started (a larger one takes a restart). Smaller drops the least recently used conversations\' copies to fit.', [16, 32, 64, 128, 256].map((v) => [v, v + ' GiB'])],
-    ['keep_days', 'FORGET UNUSED AFTER', 'A conversation unused this long is dropped (from memory and the SSD).', [1, 3, 7, 14, 30, 60, 90].map((v) => [v, v + (v === 1 ? ' day' : ' days')])],
-    ['engram_mib', 'ENGRAM CACHE SIZE', 'The memory each Spark lends the Engram row cache, in MiB (the display reservation included). The pool hands groups to it or takes them back when no step is running; a size the pool cannot lend is cut, and the engine\'s own largest size is the limit. The tile shows the size now and a change under way.', [2032, 4096, 6912].map((v) => [v, whole.format(v) + ' MiB'])],
-    ['extend', 'EXTEND CONTEXT', 'Lets a conversation grow past 1,048,576 tokens, up to the window the engine was started with. At 1M and again at 2M the whole conversation is read again, once each. Off: a 1M window; a longer prompt is refused and an output that reaches it ends.', 'check'],
+    ['on', 'SPLIT LONG PROMPTS', 'On: a long prompt is processed in pieces while others decode. Off: every prompt is processed whole.', [[true, 'on'], [false, 'off']]],
+    ['share', 'TIME FOR OTHERS', 'Of the time while a long prompt is processed, the part the decoding users get. More: they write faster, the prompt takes longer.', [10, 20, 30, 40, 50, 60, 70, 80, 90].map((v) => [v, FMT.share(v)])],
+    ['gap_ms', 'MAX PAUSE FOR OTHERS', 'The longest a decoding user waits between tokens while a long prompt is processed; it sets the piece size (shorter: smaller pieces, the prompt a little slower).', [300, 450, 600, 800, 1000, 1500].map((v) => [v, FMT.gap_ms(v)])],
+    ['push_rows', 'JUMP THE QUEUE UP TO', 'While a long prompt is being processed, a prompt with at most this many tokens to compute does not wait behind it: it is processed first, then the long one continues. One at a time. A larger prompt waits its turn.', [32768, 65536, 131072, 262144, 524288].map((v) => [v, FMT.rows(v)])],
+    ['whole_rows', 'NO SPLIT UP TO', 'A prompt with at most this many tokens to compute (after what is cached) is processed whole: the decoding users wait for it.', [8192, 16384, 32768, 65536, 131072].map((v) => [v, FMT.rows(v)])],
+    ['ssd_gib', 'SSD CACHE SIZE', 'How much of each Spark\'s SSD the conversations kept on disk may use: grows or shrinks when no request is in flight; growing needs the space on every Spark (its free space less 32 GiB), else it grows as far as that allows. Smaller drops the least recently used conversations\' copies to fit.', [128, 256, 384, 512, 640, 768, 896, 1024].map((v) => [v, FMT.ssd_gib(v)])],
+    ['keep_days', 'FORGET UNUSED AFTER', 'A conversation unused this long is dropped (from memory and the SSD).', [1, 3, 7, 14, 30, 60, 90].map((v) => [v, FMT.keep_days(v)])],
+    ['engram_mib', 'ENGRAM CACHE SIZE', 'The memory each Spark lends the Engram row cache, in MiB (part of it is memory the display normally holds). The pool lends it memory or takes it back when no step is running; a size the pool cannot lend is cut, and the engine\'s own largest size is the limit. The tile shows the size now and a change under way.', [2032, 4096, 6912].map((v) => [v, FMT.engram_mib(v)])],
+    ['extend', 'EXTEND CONTEXT', 'Lets a conversation grow past 1,048,576 tokens, up to the window the engine was started with. At 1M and again at 2M the whole conversation is processed again, once each. Off: a 1M window; a longer prompt is refused and an output that reaches it ends.', 'check'],
   ];
   const note = h('span', { class: 'note' });
   const copyLine = h('span', { class: 'note', hidden: true });
@@ -982,10 +992,10 @@ function headerTiles() {
     const down = S.fails > 0 || en.connected === false;
     eng.el.classList.toggle('bad', down);
     setText(eng.v, S.fails > 0 ? 'Not answering' : en.connected === false ? 'Not connected' : 'Serving');
-    setText(eng.q, 'front-end up ' + dur(en.uptime_s));
+    setText(eng.q, none(en.connected_s) ? 'not connected' : 'connected ' + dur(en.connected_s));
     setText(names.v, st.model_name || '');
     const alias = st.ablit && st.ablit.alias;
-    setText(names.q, alias || 'no ablit name');
+    setText(names.q, alias || 'no second name');
     el.classList.toggle('stale', stale);
   }
   return { el, rates, update };

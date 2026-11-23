@@ -13,6 +13,9 @@ target_include_directories(alloc_seal_test PRIVATE ${CMAKE_SOURCE_DIR})
 # interleave.h decisions against a table of cases (host only)
 add_executable(interleave_test tests/interleave_test.cpp)
 
+# split_pace.h: when a split command is due and what it leaves on the pending list (host only)
+add_executable(split_pace_test tests/split_pace_test.cpp)
+
 # turns.h: which waiting request leads the next run (host only)
 add_executable(turns_test tests/turns_test.cpp)
 

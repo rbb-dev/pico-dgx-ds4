@@ -20,6 +20,12 @@ target_link_libraries(engram_rowcache_test PRIVATE engram)
 add_executable(engram_block_test tools/block_test.cpp)
 target_link_libraries(engram_block_test PRIVATE engram)
 
+# the byte a test break serves is a changed value and never a NaN (tools/break_test.cpp; host only, built with the fault
+# definition whatever the option says, since it tests the header's own function)
+add_executable(engram_break_test tools/break_test.cpp)
+target_compile_definitions(engram_break_test PRIVATE DSGB10_TEST_FAULTS)
+target_link_libraries(engram_break_test PRIVATE engram)
+
 foreach(tool hashcheck iobench rowcheck storecheck gathercheck cachesim e2e pack)
   add_executable(engram_${tool} tools/${tool}.cpp)
   target_link_libraries(engram_${tool} PRIVATE engram)

@@ -24,10 +24,51 @@ import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from path_proof import END_NUMBERS, SNAP_NUMBERS, Log, NotReached, back_re, need, reservation, spill_re  # noqa: E402
 from serve_test import Engine, load_npy_i32, same, show  # noqa: E402
+from stats_test import stats  # noqa: E402
 
 
-def run(e, T, n):
+SNAP_EVERY = 4096    # --snap-every of both servers
+FILLER_NUMBERS = 4   # the filler line: 2,000 positions, 1 + 1 + 1 + 1 numbers
+
+
+class Proof:
+    """The premise of the compare arm, read from rank 0's log: what each compared turn must have been preceded and followed by."""
+
+    def __init__(self, log):
+        self.log = log
+        self.mark = None  # where the log stood when the conversation's last turn ended
+        self.hist = {}    # session -> positions its history holds
+        self.whole = 0    # compared turns preceded by a whole spill of their conversation
+
+    def after_turn(self, session, o, prompt_len):
+        self.hist[session] = prompt_len + len(o['ids'])
+        self.mark = self.log.mark()
+
+    def before(self, name, key, expect_continuation):
+        """Called after the turn: the conversation's pieces went to the disk since its last turn and came back whole: its read-back
+        line, something read (the store's line before it), restart point N of N, every checksum equal. In a small pool a stored
+        conversation leaves piece by piece during the next request's prefill, and the end-of-request spill skips one already
+        partly on the disk, so a whole spill ("serve: spill session ...") is counted here, not required; done() requires one."""
+        m = re.search(spill_re(key), self.log.text(self.mark), re.M)
+        if m and int(m.group(2)) == self.hist[key]:
+            self.whole += 1
+            print('  log: %s (whole)' % m.group(0).strip())
+        b = self.log.wait_for(back_re(key), 'the read-back before "%s"' % name, since=self.mark)
+        text = self.log.text(self.mark)
+        reads = re.findall(r'state: session \d+ back from disk: ([\d.]+) MiB in', text[:text.find(b.group(0))])
+        need(bool(reads) and float(reads[-1]) > 0, '"%s": pieces of the conversation came back from the disk (%s MiB read)' % (
+            name, reads[-1] if reads else 'nothing'))
+        need(int(b.group(4)) == int(b.group(5)), '"%s": every piece came back (restart point %s of %s)' % (name, b.group(4), b.group(5)))
+        need(not re.search(r'state: session \d+: ERROR', text), '"%s": every piece read back matched its checksum' % name)
+        return int(b.group(5))
+
+    def done(self):
+        need(self.whole >= 1, 'a whole spill came before at least one compared turn (%d)' % self.whole)
+
+
+def run(e, T, n, proof):
     S = 0x5d15000000000000 + (n << 20)
     F = S + 0x80000
     k = [0]
@@ -76,6 +117,19 @@ def run(e, T, n):
     e.release(A)
     e.release(A + 1)
     return res, rec
+
+
+def compare(files):
+    x, y = (json.load(open(f)) for f in files)
+    ok = 0
+    for name in x:
+        eq = name in y and x[name] == y[name]
+        ok += eq
+        print('  %-34s %s' % (name, 'EQUAL' if eq else 'DIFFER: %s' % (
+            {k: (x[name][k][:6], y.get(name, {}).get(k, [])[:6]) if isinstance(x[name][k], list) else (x[name][k], y.get(name, {}).get(k))
+             for k in x[name] if y.get(name, {}).get(k) != x[name][k]})))
+    print('disk_test --compare: %d of %d requests equal' % (ok, len(x)))
+    return 0 if ok == len(x) == len(y) else 1
 
 
 def main():

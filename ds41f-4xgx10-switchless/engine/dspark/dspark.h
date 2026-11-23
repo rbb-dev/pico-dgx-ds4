@@ -300,7 +300,7 @@ class Draft {
   Weights w_;
   int rank_;
   Comm* comm_;
-  const float2* table16_;  // the factor-16 table
+  const float2* table16_;  // the factor-16 table; null: always computed
   attn::Rope table_;       // what the launches rotate with (use_factor)
   int slots_ = 1, cur_ = 0;
   // EXPERIMENT, bench only (the draft pass study): DSPARK_VROWS, the vocabulary rows the FP8 head GEMV and the

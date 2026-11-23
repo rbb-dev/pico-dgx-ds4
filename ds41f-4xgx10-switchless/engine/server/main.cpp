@@ -497,6 +497,26 @@ Args parse(int argc, char** argv) {
     else if (s == "--slice") a.slice = std::atoi(val().c_str());
     else if (s == "--grow-ahead") a.grow_ahead = std::atoi(val().c_str());
     else if (s == "--ssd-flush-s") a.ssd_flush_s = std::atoi(val().c_str());
+    else if (s == "--kv-split") {
+      const std::string v = val();
+      if (v != "off" && v != "tiered" && v != "max" && v != "cache") die("--kv-split is off, tiered or max, not %s", v.c_str());
+      a.kv_split_mode = v == "off" ? 0 : v == "tiered" ? 1 : 2;  // cache is max
+      a.kv_split = a.kv_split_mode != 0;
+    }
+    else if (s == "--kv-split-after-s") a.kv_split_after_s = std::max(0.0, std::atof(val().c_str()));
+    else if (s == "--kv-split-high") a.kv_split_high = std::max<int64_t>(0, std::atoll(val().c_str()));
+    else if (s == "--kv-split-low") a.kv_split_low = std::max<int64_t>(0, std::atoll(val().c_str()));
+    else if (s == "--kv-split-pass-ms") a.kv_split_pass_ms = std::max(1, std::atoi(val().c_str()));
+    else if (s == "--pscan") {
+      const std::string v = val();
+      if (v != "off" && v != "ext" && v != "all") die("--pscan is off, ext or all, not %s", v.c_str());
+      a.pscan = v == "off" ? model::PScan::Off : v == "ext" ? model::PScan::Ext : model::PScan::All;
+    }
+    else if (s == "--kv-split-budget") a.kv_split_budget = std::max(1, std::atoi(val().c_str()));
+    else if (s == "--kv-split-ride-ms") a.kv_split_ride_ms = std::max(1, std::atoi(val().c_str()));
+    else if (s == "--kv-split-ride-pieces") a.kv_split_ride_pieces = std::max(1, std::atoi(val().c_str()));
+    else if (s == "--kv-join-pieces") a.kv_join_pieces = std::max(1, std::atoi(val().c_str()));
+    else if (s == "--kv-join-whole-ms") a.kv_join_whole_ms = std::max(0, std::atoi(val().c_str()));
     else if (s == "--window-idle-s") a.window_idle_s = std::atoi(val().c_str());
     else if (s == "--interleave") a.il.on = true;
     else if (s == "--no-interleave") a.il.on = false;
@@ -957,19 +977,20 @@ int main(int argc, char** argv) {
     struct Mine {
       uint64_t dfree, avail, offer;
       rules::Ledger ledger;
-    } mine{dfree, avail, std::max(want, have), {}};
-    mine.ledger.bytes[rules::kHeap] = std::max<uint64_t>(heap::kCap, heap::in_use());
-    mine.ledger.bytes[rules::kEngramCache] = cache;
-    if (a.rank == 0) {
-      mine.ledger.bytes[rules::kFront] = (uint64_t)a.front_mib << 20;
-      mine.ledger.bytes[rules::kEncoder] = (uint64_t)a.encoder_mib << 20;
-      mine.ledger.bytes[rules::kOutQueue] = bounds::kOutCap;
-    }
+    } mine{dfree, avail, std::max(want, have), ledger};
     Mine all[model::rules::kRanks];
-    ring.allgather_host(&mine, all, sizeof mine);
+    alloc_seal::open();  // the sizing read is done: from here every allocation call is in a scope of its class or counted as outside
+    ring.allgather_host(&mine, all, sizeof mine, comm::kCallMain0 + 4);
     uint64_t pool = mine.offer;
     for (const auto& r : all) pool = std::min(pool, r.offer);
+    store_numbers = pool;
     m.state_reserve((size_t)(pool - have) * img);
+    m.split_zone_update();  // with --kv-split cache: the lend zone, one collective, before the first command
+    if (a.rank == 0 && a.kv_split && !mo.imager)
+      std::printf("kv split (%s): a conversation is split between decoding runs, never inside one: each Spark keeps a quarter; a returning "
+                  "conversation takes its numbers back when nobody used them, else the Sparks exchange quarters; split commands of at most %d "
+                  "pieces, one return command of at most %d pieces; the split's buffers %.1f MiB on every rank (the start table's line)\n",
+                  a.kv_split_mode == 1 ? "tiered" : "max", a.kv_split_budget, a.kv_join_pieces, model::rules::split_buffer_bytes(true) / 1048576.0);
     if (a.rank == 0) {
       std::printf("chunk pool: %llu numbers of %.2f MiB (%.2f GiB, %.1fM positions) on every rank (", (unsigned long long)pool,
                   img / 1048576.0, pool * (double)img / gib, pool * 16384.0 / 5 / 1e6);
@@ -994,24 +1015,40 @@ int main(int argc, char** argv) {
     uint64_t projected[rules::kRanks];
     for (int r = 0; r < rules::kRanks; ++r) {
       ledgers[r] = all[r].ledger;
+      rd.dfree[r] = all[r].dfree, rd.avail[r] = all[r].avail;
       projected[r] = rules::projected_available(all[r].avail, (pool - have) * img, ledgers[r]);
     }
+    const uint64_t whole = ((uint64_t)a.max_ctx * 5 + 16383) / 16384 + 2;  // one conversation of --max-ctx (5 numbers per 16,384 positions) and the guard
+    uint64_t engram_groups = 0;
+    if (carved) {
+      const uint64_t gb = (uint64_t)model::lend::kGroupNums * img;
+      engram_groups = std::min<uint64_t>(model::lend::sizes((uint64_t)a.engram_cache_mib, store->cache_display_bytes(), engram::kRowBytes, gb).groups,
+                                         model::lend::max_total_groups(pool, whole));
+    }
+    const uint64_t window_groups = a.max_ctx > 65536 * 16 ? (uint64_t)m.window_groups_estimate(64) : 0;  // the largest window a request may open
+    const uint64_t image_nums = model::imgrows::numbers_for(((uint64_t)a.frame_stage_mib << 20) / model::imgrows::kRowBytes);
+    const uint64_t need_min = rules::need_min_numbers(whole, engram_groups, image_nums, window_groups);
     const size_t keep_bytes = a.pool_free_gib >= 0 ? (size_t)(a.pool_free_gib * gib) : 0;
-    const rules::StartCheck chk = rules::start_check(ledgers, (uint64_t)(a.pool_slack_gib * gib), keep_bytes);
-    const std::string table = rules::ledger_table(ledgers, projected, (uint64_t)(a.pool_slack_gib * gib), keep_bytes, chk);
+    const rules::StoreCheck chk = rules::store_check(ledgers, pool, need_min);
     if (a.rank == 0) {
-      std::printf("%s", table.c_str());
+      std::printf("%s", rules::store_table(ledgers, rd, have, cache, pool, img, keep_bytes, engram_groups, window_groups, chk).c_str());
       if (!rules::unequal_lines(ledgers).empty()) std::printf("memory ledger: a line differs between ranks (marked above)\n");
       for (int r = 0; r < rules::kRanks; ++r)
         if (projected[r] < rules::kProjectedFloor)
           std::printf("WARNING: rank %d is projected to have %.2f GiB of memory available once the pool, the Engram cache and "
                       "the fixed lines are taken (below %.0f GiB)\n", r, projected[r] / gib, rules::kProjectedFloor / gib);
     }
-    if (a.pool_free_gib >= 0 && chk.refuse)
-      die("the start is refused: rank %d's fixed lines and the slack need %.2f GiB, more than the %.1f GiB --pool-free-gib keeps free "
-          "(table above; lower --front-mib, --encoder-mib or --pool-slack-gib, or raise --pool-free-gib)", chk.worst, chk.need / gib,
-          a.pool_free_gib);
-    // the Engram cache from the pool's groups (model/lend.cu): the pool is made whole, so the groups that leave are real memory.
+    if (a.pool_free_gib >= 0 && chk.refuse) {
+      if (chk.why == rules::Refuse::OwnLineOver)
+        die("the start is refused: rank %d's own line %s holds %.2f GiB at the read, more than its cap of %.2f GiB (table above)", chk.rank,
+            rules::kLines[chk.line].name, ledgers[chk.rank].now[chk.line] / gib, ledgers[chk.rank].cap[chk.line] / gib);
+      die("the start is refused: the store of %llu numbers cannot hold one conversation of --max-ctx %d, the Engram cache, one largest image request "
+          "and the largest window (%llu numbers; table above; lower --front-mib, --encoder-mib, --frame-stage-mib, --ids-host-mib or --pool-slack-gib, "
+          "or --pool-free-gib)", (unsigned long long)chk.store, a.max_ctx, (unsigned long long)chk.need);
+    }
+    srv::mem_watch_init(&ring, keep_bytes);
+    srv::split_ride_init(&ring);  // the ride's host all-gather: without it every rank rode alone
+    // the Engram cache from the pool's groups (model/tenant.cu): the pool is made whole, so the groups that leave are real memory.
     // A size the pool cannot lend is cut to what fits, a failed hand-over leaves the cache empty and the engine serving; the
     // server asks again (a start is never refused by the cache)
     if (carved && m.engram_lend_enabled()) {
@@ -1062,6 +1099,17 @@ int main(int argc, char** argv) {
     so.slice = a.slice;
     so.grow_ahead = a.grow_ahead;
     so.ssd_flush_s = a.ssd_flush_s;
+    so.kv_split = a.kv_split;
+    so.kv_split_mode = a.kv_split_mode;
+    so.kv_split_after_s = a.kv_split_after_s;
+    so.kv_split_high = a.kv_split_high;
+    so.kv_split_low = a.kv_split_low;
+    so.kv_split_pass_ms = a.kv_split_pass_ms;
+    so.kv_split_budget = a.kv_split_budget;
+    so.imager = mo.imager;
+    so.kv_split_ride_ms = a.kv_split_ride_ms, so.kv_split_ride_pieces = a.kv_split_ride_pieces;
+    so.kv_join_whole_ms = a.kv_join_whole_ms;
+    so.kv_join_pieces = a.kv_join_pieces;
     so.window_idle_s = a.window_idle_s;
     so.engram_mib = a.engram_cache_mib;
     so.engram_min_mib = a.engram_cache_min_mib < 0 ? a.engram_cache_mib : a.engram_cache_min_mib;

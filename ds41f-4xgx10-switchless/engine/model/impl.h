@@ -199,9 +199,8 @@ struct Model::Impl {
   uint8_t* ent_addr(int k, int a, int j) const;  // the current unit's entry j of kv source k's array a
   // The rotation tables cover what a factor-16 session can reach (attn::rope_table_rows: its 1M window and a margin) at any
   // max_ctx, read by the kernels; factors 32 and 64 compute theirs (attn.h Rope: the same bits either way).
-  // rope_plain: layers 0-1 (theta 1e4); rope_y16: the YaRN layers.
-  float2* rope_plain = nullptr;
-  int rope_plain_rows = 0;
+  // rope_y16: the YaRN layers' table, written once when the model is made and only read after. The plain rotation
+  // (layers 0-1 and the drafter, theta 1e4) has no table: plain() computes it at every factor.
   float2* rope_y16 = nullptr;
   int rope_y16_rows = 0;
   // The YaRN factor (16, 32 or 64) of every slot (Model::set_slot_factor) and the one the step being built or
@@ -295,6 +294,10 @@ struct Model::Impl {
   float *ckvf, *cscf, *wproj, *gl, *rwts, *ymoe, *logits, *lgath, *po, *pml;
   uint8_t *yq, *ys, *oq, *os, *pack;
   uint32_t* dense_scratch;  // index_dense's counters and histograms (zero between launches)
+  // --pscan: the four ranks' candidate lists as the all-gather leaves them, [rank][row][kIdxTopk] and [rank][row][kPoolBlocks]
+  // (positions or pool entries, and keys); made only with --pscan ext or all
+  int *cand_pos = nullptr, *pcand_pos = nullptr;
+  uint16_t *cand_key = nullptr, *pcand_key = nullptr;
   uint16_t *topkey[kIdxSlots], *poolkey;
   int *topk[kIdxSlots], *pool, *ridx;
   void* moe_ws;

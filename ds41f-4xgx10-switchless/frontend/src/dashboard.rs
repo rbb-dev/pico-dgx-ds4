@@ -465,8 +465,17 @@ pub fn sessions_json(s: &EngineStats, usable_window: u32) -> Value {
                     "reserved": s.pool_reserved, "number_bytes": s.number_bytes, "positions": s.pool_positions,
                     "image_numbers": s.image_numbers},
            "conversations": {"on_lines": s.conv_on_lines, "in_memory": s.conv_in_memory, "on_disk": s.conv_on_disk,
-                             "sharing": s.conv_sharing}})
+                             "sharing": s.conv_sharing, "split": s.conv_split},
+           "split": {"on": s.kv_split != 0, "quarter_slots": s.quarter_slots, "quarter_numbers": s.quarter_numbers,
+                     "ghost_numbers": s.ghost_numbers, "pieces_total": s.split_pieces_total, "deferred_total": s.split_deferred_total,
+                     "revives_total": s.revives_total, "joins_total": s.joins_total, "join_short_total": s.join_short_total,
+                     "join_bytes_total": s.join_bytes_total, "join_ns_total": s.join_ns_total, "join_max_ns": s.join_max_ns,
+                     "lend_busy_total": s.lend_busy_total}})
 }
+
+/// The Engram cache's size in MiB, to the nearest: its rows (264 bytes) leave it a few bytes short of a whole MiB, and the sizes the
+/// page offers are whole MiB. The tile and the settings list both read this.
+pub fn engram_mib(s: &EngineStats) -> u64 { (s.engram_cache_bytes + (1 << 19)) >> 20 }
 
 /// The Engram row cache as the page's tile reads it: its size, the groups of the pool it holds, the size a change under way goes to,
 /// lookups and hits since the engine's start with the hit rate of the last minute (`rate`, null without lookups), evictions, size changes

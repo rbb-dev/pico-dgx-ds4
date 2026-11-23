@@ -121,6 +121,18 @@ def wait_landed(e, before, timeout=CHANGE_WINDOW):
     raise SystemExit('the change did not land in %d s' % timeout)
 
 
+def wait_refused(e, before, timeout=REFUSAL_WINDOW):
+    """after a change made to fail: until the failed total moved (the engine answered the change with its refusal); returns
+    (seconds, STATS). The change stays pending afterwards: the engine does not try the same size again until its back-off has
+    passed (300 s) or the setting changes, so no landing is waited for"""
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        s = stats(e)
+        if s['failed'] > before['failed']:
+            return time.time() - t0, s
+    raise SystemExit('the engine did not refuse the change in %d s' % timeout)
+
+
 def prompt_of(T, i, n):
     return T[i * n:(i + 1) * n]
 
@@ -249,7 +261,22 @@ def cmd_load(a):
             pump(min(end, time.time() + 1.0))
             stats_live()
 
+    def probe_then_settle(tag):
+        """The first-token probe (a 2,048-token prompt: the interleaver stops the decoders while it prefills), then until every
+        session has had two token arrivals after the probe's DONE: the probe's silence ends before the next window starts, so no
+        window holds a gap that is the probe's. Returns the probe's time to its first token."""
+        pr.update(rid=None, t0=time.time(), first=None, done=False, done_at=None)
+        for r in post:
+            post[r] = 0
+        pr['rid'] = e.submit(tag, prompt_of(T, 9, 2048), max_new=1, keep=False)[0]
+        pump(time.time() + 120, lambda: pr['done'])
+        pump(time.time() + 120, lambda: all(v >= 2 for v in post.values()))
+        pr['done_at'] = None
+        return pr['first']
+
     window(20)  # the sessions settle
+    pump(time.time() + 2)
+    probes = [probe_then_settle(0x70726f00)]  # the control window's probe: the same one every change window is preceded by
     t = time.time()
     window(a.window)
     marks.append(('control (no change)', t, time.time()))
@@ -266,17 +293,16 @@ def cmd_load(a):
         check(done is not None, '%d MiB landed while %d sessions decode' % (mib, a.sessions))
         if done:
             s = done
-        pr.update(rid=None, t0=time.time(), first=None, done=False)
-        pr['rid'] = e.submit(0x70726f62 + mib, prompt_of(T, 9, 2048), max_new=1, keep=False)[0]
-        pump(time.time() + 120, lambda: pr['done'])
-        ttft.append((mib, pr['first']))
+        probes.append(probe_then_settle(0x70726f00 + mib))
     ctrl = max((g for ts, g in gaps if marks[0][1] <= ts <= marks[0][2]), default=0)
     print('control window %.0f s: longest gap between a session\'s tokens %.0f ms' % (a.window, ctrl * 1000))
-    for label, t0, t1 in marks[1:]:
+    for k, (label, t0, t1) in enumerate(marks[1:]):
         g = max((g for ts, g in gaps if t0 <= ts <= t1), default=0)
-        check(g <= ctrl + a.gap_slack_ms / 1000.0, '%s (%.0f s): the longest gap %.0f ms, the control\'s %.0f ms' % (label, t1 - t0, g * 1000, ctrl * 1000))
-    for mib, tt in ttft:
-        print('first request after %d MiB: TTFT %.2f s' % (mib, tt if tt is not None else -1))
+        pp = probes[k] if 1 <= k < len(probes) else None  # the probe that came before this window (the first change follows the control)
+        check(g <= ctrl + a.gap_slack_ms / 1000.0, '%s (%.0f s): the longest gap %.0f ms, the control\'s %.0f ms (the probe before it: prefill %.0f ms, -1000: none)' %
+              (label, t1 - t0, g * 1000, ctrl * 1000, (pp if pp is not None else -1) * 1000))
+    for k, tt in enumerate(probes):
+        print('probe %d (%s): TTFT %.2f s' % (k, 'before the control window' if k == 0 else 'after the window of %s' % marks[k][0], tt if tt is not None else -1))
     for r in rids:
         e.send(CANCEL, struct.pack('<Q', r))
     return 0

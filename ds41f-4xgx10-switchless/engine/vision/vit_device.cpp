@@ -10,6 +10,26 @@
 
 namespace vit {
 
+namespace {
+// /proc/meminfo's MemAvailable in bytes (0 when unreadable)
+uint64_t mem_available() {
+  FILE* f = std::fopen("/proc/meminfo", "r");
+  if (!f) return 0;
+  char line[256];
+  unsigned long long kb = 0;
+  while (std::fgets(line, sizeof line, f))
+    if (std::sscanf(line, "MemAvailable: %llu kB", &kb) == 1) break;
+  std::fclose(f);
+  return kb << 10;
+}
+uint64_t device_free() {
+  size_t f = 0, t = 0;
+  CUDA_CHECK(cudaMemGetInfo(&f, &t));
+  return f;
+}
+const char* kPatchW = "vision.patch_embed.proj.weight";
+}  // namespace
+
 VisionWeights::VisionWeights(const std::string& path, int rank) : path_(path) {
   file_ = std::make_unique<dsw::WeightFile>(path, rank, kRanks);
   const std::string why = check_vision_toc(file_->tensors());
@@ -56,6 +76,9 @@ dsw::LoadStats VisionWeights::load(int threads) {
   dev_.table = static_cast<bf16*>(t);
   CUDA_CHECK(cudaDeviceSynchronize());
   extra_bytes_ = prow * kDim + tab.size() * 2;
+  heap::release();  // the threads' free pages go back to the system with the staging
+  held_.staging_peak = st.staging_peak, held_.staging_held = st.staging_held;
+  held_.device_fell = dev0 - (int64_t)device_free(), held_.host_fell = host0 - (int64_t)mem_available();
   return st;
 }
 

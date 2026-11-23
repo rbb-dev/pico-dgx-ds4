@@ -1,6 +1,6 @@
 // A finished request's reservation and the admission arithmetic (host only, no GPU). The sums mirror model.cu
-// (slot_committed = max(resv, held), slot_uncommitted = max(0, free - the sum of max(0, resv - held))) and serve.cpp's
-// mem_ok (uncommitted, plus the committed numbers of the idle lines it may take). Over random sets of lines:
+// (slot_committed = max(resv, held), slot_spare = free - the sum of max(0, resv - held), signed: rules::spare) and serve.cpp's
+// mem_ok (the spare, plus the committed numbers of the idle lines it may take). Over random sets of lines:
 //   - once finish() zeroes the reservation of each finished line (reclaim::unreserve_at_finish), nothing is reserved while
 //     nothing runs (the dashboard's reserved, the tripwire's sum), and
 //   - mem_ok's count of what an admission can use is the same with the reservations zeroed as without wherever

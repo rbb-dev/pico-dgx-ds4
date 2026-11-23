@@ -89,7 +89,11 @@ void apply_state(model::Model& m, const StateOp& o) {
       if (!m.image_take(o.h, (size_t)(uint32_t)o.a, o.b)) die("state: no room for the image rows of flight %d (%d rows), or the flight holds them already", o.h, o.a);
       break;
     case kStImgFree: m.image_free(o.h); break;
+    case kStSplit: m.state_split(o.h, o.a); break;
+    case kStJoin: m.state_join(o.h, o.a, o.b); break;
     case kStLast: break;  // apply_ops passed its session as the evict-last list
+    case kStMemWatch: mem_watch_run(m.rank()); break;
+    case kStRide: die("state: a ride is a command of its own");
     default: die("state: unknown operation %d", o.op);
   }
 }
@@ -115,8 +119,9 @@ void apply_ops(model::Model& m, const Cmd& c) {
       last.push_back(c.ops[i].h);
       continue;
     }
-    if (c.ops[i].op == kStUnreserve || c.ops[i].op == kStReserve || c.ops[i].op == kStImgTake || c.ops[i].op == kStImgFree)
-      continue;  // names a slot or a flight, no session
+    if (c.ops[i].op == kStUnreserve || c.ops[i].op == kStReserve || c.ops[i].op == kStImgTake || c.ops[i].op == kStImgFree ||
+        c.ops[i].op == kStMemWatch || c.ops[i].op == kStSplit)
+      continue;  // names a slot or a flight, or nothing: no session
     pin.push_back(c.ops[i].h);
     if (c.ops[i].op == kStCopySnaps) pin.push_back(c.ops[i].a);
   }
@@ -165,6 +170,7 @@ int run_window(model::Model& m, const Cmd& c) {
   if (store_check())
     std::printf("store-check: rank %d window command (factor %d, %s) status %d digest %016llx\n", m.rank(), c.rows,
                 c.pos0 == 1 ? "close" : "open", st, (unsigned long long)m.store_digest());
+  if (store_check()) std::printf("store-check: rank %d tenant table %s\n", m.rank(), m.tenant_table_ok() ? "adds up" : "BROKEN");
   return st;
 }
 

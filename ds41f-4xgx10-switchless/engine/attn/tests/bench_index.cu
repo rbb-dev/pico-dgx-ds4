@@ -415,6 +415,22 @@ int main(int argc, char** argv) {
                       bad ? "DIFFERENT" : "same", dbad || !same ? "DIFFERENT" : "same");
           g_bad += bad + dbad + !same;
           if (bad || dbad || !same || g_keep_all) keep(c, kind, seed, fo, dout);
+          if (g_split >= 2 && kind != 2 && !many) {  // the same selection by positions over g_split ranks, against dense (dout)
+            c.split_init(g_split);
+            for (int dp = 0; dp < 2; ++dp) {
+              if (g_part != 2 && g_part != dp) continue;
+              c.others(dp);
+              c.part(0, dp);
+              c.merge();
+              const int sbad = c.split_diff(dout);
+              const double tp0 = time_us([&] { c.part(0, dp); }), tmg = time_us([&] { c.merge(); }),
+                           tsp = time_us([&] { c.part(0, dp); c.merge(); });
+              std::printf("%8d %4d %4d %-14s SPLIT %d (%s parts): whole %9.1f | part0 %8.1f merge %8.1f split %9.1f us | %s\n",
+                          ctx, R, S, kind ? "20 (+pool)" : "2, 8, 14", g_split, dp ? "dense" : "fused", td, tp0, tmg, tsp,
+                          sbad ? "PICKS DIFFER" : "picks equal to the whole scan");
+              g_bad += sbad;
+            }
+          }
         }
   return g_bad ? 1 : 0;
 }

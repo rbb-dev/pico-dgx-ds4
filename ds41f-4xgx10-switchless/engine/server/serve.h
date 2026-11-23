@@ -31,6 +31,18 @@ struct ServeOptions {
                                    // slots (Model::slots), they take turns of this many tokens. 0: no turns
                                    // (a request that would need the slot of another in flight waits)
   int ssd_flush_s = 30;            // seconds between idle checkpoints; without the imager also the idle age at which a conversation's pieces are written (0: none)
+  bool kv_split = false;           // --kv-split tiered|max (cache = max): conversations are split into quarter slots when the pool needs room or after an idle age (split_pace.h)
+  int kv_split_mode = 0;           // splitpace::Mode: 0 off, 1 tiered, 2 max
+  double kv_split_after_s = 0;     // the idle age before a conversation is imaged (--kv-split-after-s; 0: at once, every mode)
+  int64_t kv_split_high = 0;       // the spare numbers at which nothing is demoted (--kv-split-high; 0: the room off keeps between requests)
+  int64_t kv_split_low = 0;        // the spare numbers under which L2 is given back first (--kv-split-low; 0: half of high)
+  int kv_split_pass_ms = 50;       // the longest a pass of split commands runs with requests in flight, at the highest pressure
+  int kv_split_budget = 16;        // pieces one image command queues when nothing is in flight
+  bool imager = false;             // the disk tier is written in the background as each Spark's own quarter (every mode)
+  int kv_split_ride_ms = 250;      // a ride of the image commands inside a decoding run at most this often
+  int kv_split_ride_pieces = 4;    // pieces a ride queues
+  int kv_join_pieces = 64;         // the pieces one join command brings back (a unit's give_back asks for this many numbers at most)
+  int kv_join_whole_ms = 250;      // a return estimated at most this long (or with nobody decoding) goes back to back; above it, units
   int grow_ahead = 131072;         // growth (the chunk pool): a response's reservation reaches this many positions past
                                    // where it is, and goes further at its next run (serve.cpp need_now)
   // Kept sessions (docs/engine.md): a planned stop (SIGTERM) spills the sessions in device memory to the

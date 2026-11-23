@@ -23,7 +23,18 @@ NAMES = ['pool_numbers', 'pool_free', 'pool_held', 'pool_shared', 'pool_reserved
          'il_on', 'il_whole_rows', 'il_push_rows', 'il_gap_ms', 'il_share', 'il_burst_max_ms', 'il_reading', 'il_queued',
          'keep_days', 'extend', 'ctx_limit', 'ranks', 'image_numbers',
          'engram_cache_bytes', 'engram_groups', 'engram_pending_mib', 'engram_lookups', 'engram_hits', 'engram_lend_ok_total',
-         'engram_lend_failed_total', 'lent_owed_groups', 'engram_huge_pct', 'engram_evictions']
+         'engram_lend_failed_total', 'lent_owed_groups', 'engram_huge_pct', 'engram_evictions',
+         'store_numbers', 'mem_avail_min_bytes', 'mem_avail_low_count', 'ids_host_bytes', 'ids_file_sessions',
+         'mem_avail_bytes_0', 'mem_avail_bytes_1', 'mem_avail_bytes_2', 'mem_avail_bytes_3',
+         'tenant_groups_0', 'tenant_groups_1', 'tenant_groups_2', 'tenant_groups_3', 'tenant_groups_4', 'tenant_groups_5',
+         'tenant_groups_6', 'tenant_groups_7', 'tenant_models_groups',
+         'kv_split', 'conv_split', 'quarter_slots', 'quarter_numbers', 'ghost_numbers', 'split_pieces_total', 'split_deferred_total',
+         'revives_total', 'joins_total', 'join_bytes_total', 'join_ns_total', 'join_max_ns', 'lend_busy_total', 'join_short_total',
+         'split_level', 'split_pressure_pm', 'split_age_now_s', 'split_demote_pps', 'l2_numbers', 'l2_dropped_total',
+         'clean_numbers', 'image_pending', 'split_rides_total', 'returns_read_total', 'image_waits_total', 'split_reader_waits_total',
+         'copy_adapt', 'copy_proposals_total', 'copy_scored_total', 'copy_first_right_total', 'copy_rows_verified_total',
+         'copy_rows_accepted_total', 'copy_chance_pm_0', 'copy_chance_pm_1', 'copy_chance_pm_2', 'copy_chance_pm_3',
+         'copy_failing_requests_total']
 S0 = 0x7374617400000000  # 'stat'
 fails = 0
 
@@ -51,15 +62,26 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--socket', default='/tmp/dsgb10-engine.sock')
     ap.add_argument('--tokens', default='/data/dsgb10/golden/synth270k/tokens.npy')
-    ap.add_argument('--numbers', type=int, required=True, help="the pool's numbers (its startup line)")
-    ap.add_argument('--lines', type=int, required=True)
+    ap.add_argument('--numbers', type=int, help="the pool's numbers (its startup line)")
+    ap.add_argument('--lines', type=int)
+    ap.add_argument('--arm', choices=('inprompt', 'inrun'), help='a 5.15 arm instead of the frame checks (see the top)')
+    ap.add_argument('--log', help='rank 0\'s log (the arms\' premises)')
+    ap.add_argument('--from-offset', type=int, default=0, help='the log\'s size when the arm starts')
+    ap.add_argument('--prompt-tokens', type=int, default=463939)
+    ap.add_argument('--seconds', type=float, default=20)
     a = ap.parse_args()
+    if a.arm:
+        return ARMS[a.arm](a)
+    if a.numbers is None or a.lines is None:
+        ap.error('--numbers and --lines are required without --arm')
     T = [int(x) for x in load_npy_i32(a.tokens)]
     e = Engine(a.socket)
 
     print('(a) at the start')
     ver, n, s = stats(e)
     check(e.version == 4 and ver == 2 and n == len(NAMES), 'protocol %d, STATS version %d with %d fields' % (e.version, ver, n))
+    check(s['kv_split'] in (0, 1) and s['quarter_slots'] == 0 and s['conv_split'] == 0 and s['join_ns_total'] == 0 and s['split_pieces_total'] == 0,
+          'the split counters at the start: kv_split %d, no slot, nothing split or joined' % s['kv_split'])
     check(s['ctx_limit'] == e.max_ctx and s['ranks'] == 4,
           'a request may use %d tokens (HELLO max_context %d), on %d ranks' % (s['ctx_limit'], e.max_ctx, s['ranks']))
     check(s['image_numbers'] == 0, 'no image rows held at the start')

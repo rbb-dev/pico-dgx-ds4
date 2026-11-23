@@ -66,6 +66,19 @@ def main():
           'A\'s turn wrote %d images (%.1f MiB) with no conversation on the disk' % (
               s1['spills_total'] - s0['spills_total'], (s1['spill_bytes_total'] - s0['spill_bytes_total']) / 2 ** 20))
 
+    if a.cache:
+        # (a3) the split's write-behind (step C): a save writes no image in cache mode; the split command (500 ms apart) writes each slot's
+        # quarter image from the slot, 786,432 B (12 grains: the quarter and its trailer). Pass: after the split goes quiet, the bytes
+        # written since the turn are a whole number of quarter images, at least one per slot, and STATS shows the slots.
+        print('(a3) the quarters\' write-behind (--kv-split cache)')
+        time.sleep(8)
+        s1c = stats(e)
+        written = s1c['spill_bytes_total'] - s1['spill_bytes_total']
+        check(s1c['quarter_slots'] > 0 and written > 0 and written % 786432 == 0,
+              'A was split into %d quarter slots and %d bytes were written since the turn: %.1f images of 786,432 B' % (
+                  s1c['quarter_slots'], written, written / 786432.0))
+        s1 = s1c
+
     def squeeze(round_):
         for i in range(a.fillers):
             off = 50000 + (round_ * a.fillers + i) * 7919 % max(1, len(T) - a.filler_n - 1)

@@ -1442,19 +1442,28 @@ int Model::slot() const { return d_->cur_slot; }
 int Model::slots() const { return d_->nslots; }
 int Model::slot_ctx(int s) const { return d_->slot_ctx_[s]; }
 int Model::slot_chunks_for(int s, int need) const { return d_->slot_chunks_for(s, need); }
-int Model::slot_committed(int s) const { return d_->calloc ? std::max(d_->resv[s], d_->held(s)) : 0; }
+// what the line's request holds or has reserved, whichever is more; a conversation split on the line counts the whole numbers its
+// slots stand for (4 slots = 1), so that an idle line whose conversation is fully split still has something to give (reclaim.h)
+int Model::slot_committed(int s) const {
+  return d_->calloc ? rules::line_committed(d_->core->resv[s], d_->held(s), d_->core->held_slots(s)) : 0;
+}
+// the numbers the line is reserved beyond what it holds (they end with its detach)
+int Model::slot_unheld_reservation(int s) const { return d_->calloc ? std::max(0, d_->core->resv[s] - d_->held(s)) : 0; }
 int Model::slot_mapped(int s) const { return d_->calloc ? d_->held(s) : 0; }
-// free numbers no running request has reserved (its reservation past what its session holds); what evicting the
-// sessions no line holds would give back is the server's to add (state_giveable)
-int Model::slot_uncommitted() const {
+// free numbers no running request has been reserved (its reservation past what its session holds), signed (rules::spare): below 0
+// where the reservations are backed by stored conversations; what evicting the sessions no line holds would give back is the server's
+// to add (state_giveable)
+int64_t Model::slot_spare() const {
   if (!d_->calloc) return 0;
   int64_t reserved = 0;
-  for (int s = 0; s < d_->nslots; ++s) reserved += std::max(0, d_->resv[s] - d_->held(s)) + d_->resv_img[s];
-  return (int)std::max<int64_t>(0, (int64_t)d_->calloc->free() - reserved);
+  for (int s = 0; s < d_->nslots; ++s) reserved += std::max(0, d_->core->resv[s] - d_->held(s)) + d_->core->resv_img[s];
+  return rules::spare((int64_t)d_->calloc->free(), reserved);
 }
-void Model::slot_attach(int s, int h) { d_->slot_attach(s, h); }
+// the same held at 0 (the log lines')
+int Model::slot_uncommitted() const { return (int)std::max<int64_t>(0, slot_spare()); }
+void Model::slot_attach(int s, int h, int upto) { d_->slot_attach(s, h, upto); }
 int Model::slot_chunks_total() const { return d_->calloc ? (int)d_->calloc->total() : 0; }
-int Model::slot_chunks_peak() const { return (int)d_->held_peak; }
+int Model::slot_chunks_peak() const { return (int)d_->core->held_peak; }
 void Model::slot_reserve(int s, int need, int img) { d_->slot_reserve(s, need, img); }
 void Model::slot_release(int s) { d_->slot_release(s); }
 void Model::set_engram(const engram::HashMap* map, engram::Store* store) {

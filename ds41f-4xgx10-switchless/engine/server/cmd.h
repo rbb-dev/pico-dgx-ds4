@@ -58,7 +58,16 @@ enum : int32_t {
   kStImgTake,      // image_take(h, a, b): flight h's image rows (a rows) get their numbers; slot b's reservation for them is spent (h is
                    // the flight's key, not a session: nothing is pinned for it)
   kStImgFree,      // image_free(h): flight h's image numbers back to the pool (h = 0: every flight's)
+  kStSplit,        // state_split(h, a): at most a of h's whole pieces become quarter slots (never evicts); names no session to pin: the
+                   // command is its own, issued by the server between requests (a command's own sessions are pinned, and a pinned one is not split)
+  kStJoin,         // state_join(h, a, b): h's pieces below position a that are slots become whole numbers again, at most b numbers
+                   // taken (0: no limit) and at most --kv-join-pieces pieces; pins h as any operation does
   kStLast,         // nothing: names session h, which the command's operations evict after every other session (not pinned)
+  kStRide,         // the imager's ride with nothing in flight: every rank settles what the four ranks' image streams have finished
+                   // and, when h > 0, queues at most a of h's plain pieces' images on its image stream; names no session to pin; the command's live
+                   // list is the sessions a request is in flight on. The same function a decoding run's ride calls (split_ride)
+  kStMemWatch,     // the memory watch (mem_watch.h): every rank reads MemAvailable and its heap, one host all-gather, rank 0 keeps
+                   // the four (mem_watch_view) and prints a line at each new low under the memory kept free; names no session
 };
 struct StateOp {
   int32_t op = 0, h = -1, a = 0, b = 0;
@@ -228,6 +237,26 @@ struct BatchEntry {
   double spec_tok = 1, spec_ms = 0;  // kCmdSpecBatch: the entry's drafts' rate (SpecRate) to start from
 };
 constexpr uint32_t kCtlPause = 1u << 31;
+// kCtlWatch (mem_watch.h kCtlBit) is a toggle, not a stop: rank 0 starts every run with it clear and flips it when the memory watch is
+// due; every rank's decode loop runs the reading (mem_watch_run) after the step whose output shows the other value than the one it saw
+// last, and goes on. No session ends for it, and a single session's response does not take it for a cancel.
+constexpr uint32_t kCtlWatch = memwatch::kCtlBit;
+// kCtlSplit (mem_watch.h kCtlSplitBit, bit 29) is the imager's ride: a toggle like the watch's. Rank 0 flips it when a ride is due (the request in
+// split_ride_set: the conversation, the budget, the sessions a request is in flight on); every rank runs split_ride after the step that shows the
+// other value, and the run goes on. No session ends for it.
+constexpr uint32_t kCtlSplit = memwatch::kCtlSplitBit;
+// The ride (every rank, at the same point of the command stream): one host all-gather of each rank's reading of its image stream (the
+// highest command whose work has ended: no wait) and of the pieces its staging takes now; then, on every rank alike, settle up to the
+// smallest reading and queue the images rank 0 asked for, at most as many pieces as the smallest staging room. `live`: from rank 0.
+struct RideReq {
+  int32_t h = 0, budget = 0;                // h <= 0: settle only
+  int32_t live[model::kMaxSlots] = {};      // the sessions a request is in flight on, on a line or not (0: none)
+};
+void split_ride_init(comm::Ring* ring);
+void split_ride_set(const RideReq& r);      // rank 0: what the next ride asks for
+uint64_t split_ride_count();                // rank 0: rides run so far
+void split_ride_take_longest(uint64_t* ns); // rank 0: the longest ride since the last call, ns (reset)
+void split_ride_run(model::Model& m, const RideReq& mine);
 enum : uint32_t { kBatchSolo = 1 };  // kCmdBatch's flags
 struct BatchEnd {
   int sampled = 0;  // tokens sampled: tok_1 .. tok_sampled

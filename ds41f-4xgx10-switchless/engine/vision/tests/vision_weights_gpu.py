@@ -63,9 +63,35 @@ def read(p):
         return f.read()
 
 
-def offer(with_log, without_log=None):
-    t = read(with_log)
+def readings(path):
+    """rank 0's pool line: [(device GiB, host GiB)] for ranks 0-3, or None."""
+    m = POOL.search(read(path))
+    if not m:
+        return None
+    return [(float(x), float(y)) for x, y in re.findall(r"([\d.]+) / ([\d.]+)", m.group(1))]
+
+
+def judge(no_a, no_b, with_, expect_mib):
+    """Per rank and reading: (name, rank, mean_without, with, lower_by_mib, s_mib, ok). Returns (rows, valid)."""
+    rows, valid = [], True
+    for k, name in enumerate(("device", "host")):
+        for r in range(4):
+            a, b, w = no_a[r][k], no_b[r][k], with_[r][k]
+            s = abs(a - b) * 1024
+            lower = ((a + b) / 2 - w) * 1024
+            valid &= s < expect_mib
+            rows.append((name, r, (a + b) / 2, w, lower, s, abs(lower - expect_mib) <= s + RES))
+    return rows, valid
+
+
+def offer(no_a, no_b, with_log, *workers):
     ok = True
+    ra, rb, rw = readings(no_a), readings(no_b), readings(with_log)
+    for p, r in ((no_a, ra), (no_b, rb), (with_log, rw)):
+        if r is None:
+            print(f"FAIL no 'chunk pool: ... free device / available host memory before it' line in {p}")
+            sys.exit(1)
+    t = read(with_log)
     digs = DIGEST.findall(t)
     print(f"digest lines: {len(digs)}")
     for r, n, mib, d in digs:
@@ -150,9 +176,18 @@ def selftest():
     print("selftest ok")
 
 
+def quiet_swap(fn, arg):
+    import io, contextlib
+    with contextlib.redirect_stdout(io.StringIO()):
+        try:
+            fn(arg)
+        except SystemExit as e:
+            return e.code
+
+
 if __name__ == "__main__":
     c = sys.argv[1:2]
-    if c == ["offer"] and len(sys.argv) in (3, 4): offer(*sys.argv[2:])
+    if c == ["offer"] and len(sys.argv) >= 5: offer(*sys.argv[2:])
     elif c == ["golden"] and len(sys.argv) == 4: golden(*sys.argv[2:])
     elif c == ["swap"] and len(sys.argv) == 3: swap(sys.argv[2])
     elif c == ["vote"] and len(sys.argv) == 3: vote(sys.argv[2])

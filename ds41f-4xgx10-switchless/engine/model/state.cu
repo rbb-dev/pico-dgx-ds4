@@ -438,11 +438,14 @@ void Model::Impl::state_checkpoint(uint64_t gen) {
 }
 
 void Model::Impl::state_reserve(size_t bytes) {
-  Store& s = store_of();
-  if (s.gather) die("state: the store is reserved once");
+  const alloc_seal::Scoped seal(alloc_seal::kStore);
+  core->store_of();  // the store is made here
+  EngineDev& d = static_cast<EngineDev&>(*store_dev);
+  if (d.gather) die("state: the store is reserved once");
   if (!calloc) die("state: the store needs the chunk pool");
   // a page or a bookmark at a time between the chunks and the disk tier (the draft module's windows counted in)
-  s.gather = dalloc<uint8_t>(Pool::round(std::max({chunk_image(), end_bytes(true), snap_bytes(true)})));
+  d.gather = dalloc<uint8_t>(Pool::round(std::max({chunk_image(), end_bytes(true), snap_bytes(true)})));
+  if ((opt.kv_split || opt.imager) && !d.qbuf) die("state: the split's buffers were not made before the free-memory read (Model::split_prepare)");
   const size_t more = bytes / chunk_image();
   if (!more) return;
   const double t0 = wall_s();
@@ -687,67 +690,96 @@ void Model::state_snap(int h, int pos) { d_->state_snap(h, pos); }
 void Model::state_snap_end(int h, int pos) { d_->state_snap_end(h, pos); }
 void Model::state_restore(int h, int pos) { d_->state_restore(h, pos); }
 void Model::state_restore_end(int h) { d_->state_restore_end(h); }
-void Model::state_drop(int h, int from) { d_->state_drop(h, from); }
-void Model::state_free(int h) { d_->state_free(h); }
-void Model::state_copy_snaps(int src, int dst, int upto) { d_->state_copy_snaps(src, dst, upto); }
-void Model::state_drop_snap(int h, int pos) { d_->state_drop_snap(h, pos); }
-void Model::state_flush(int h) { d_->state_flush(h); }
-bool Model::state_disk_resize(size_t bytes) { return d_->state_disk_resize(bytes); }
+void Model::state_drop(int h, int from) { d_->core->drop(h, from); }
+void Model::state_free(int h) { d_->core->free_session(h); }
+void Model::state_copy_snaps(int src, int dst, int upto) { d_->core->copy_snaps(src, dst, upto); }
+void Model::state_drop_snap(int h, int pos) { d_->core->drop_snap(h, pos); }
+void Model::state_flush(int h) { d_->core->flush(h); }
+bool Model::state_disk_resize(size_t bytes) { return d_->core->disk_resize(bytes); }
 uint64_t Model::state_kept_check(const std::string& base, uint64_t run_id, double max_age_s, size_t* bytes,
                                  std::string* why) {
-  return d_->state_kept_check(base, run_id, max_age_s, bytes, why);
+  return d_->core->kept_check(base, run_id, max_age_s, bytes, why);
 }
 void Model::state_disk(const std::string& base, size_t bytes, size_t staging, bool reuse, uint64_t run_id) {
-  d_->state_disk(base, bytes, staging, reuse, run_id);
+  d_->core->disk(base, bytes, staging, reuse, run_id);
 }
-void Model::state_keep(uint64_t gen) { d_->state_keep(gen); }
-void Model::state_checkpoint(uint64_t gen) { d_->state_checkpoint(gen); }
-std::vector<int> Model::state_checkpointed() const { return d_->store_s ? d_->store_s->ckpt_sess : std::vector<int>{}; }
-uint64_t Model::state_version() const { return d_->store_s ? d_->store_s->ver : 0; }
-uint64_t Model::state_kept() const { return d_->store_s ? d_->store_s->loaded_gen : 0; }
-std::vector<int> Model::state_sessions() const {
-  std::vector<int> v;
-  if (d_->store_s)
-    for (const auto& kv : d_->store_s->sess)
-      if (kv.first > 0) v.push_back(kv.first);  // not a unit's own (tools' steps)
-  return v;
+void Model::state_keep(uint64_t gen) { d_->core->keep(gen); }
+void Model::state_checkpoint(uint64_t gen) { d_->core->checkpoint(gen); }
+std::vector<int> Model::state_checkpointed() const { return d_->core->checkpointed(); }
+uint64_t Model::state_version() const { return d_->core->version(); }
+uint64_t Model::state_kept() const { return d_->core->kept_generation(); }
+std::vector<int> Model::state_sessions() const { return d_->core->sessions(); }
+size_t Model::state_disk_capacity() const { return d_->core->disk_capacity(); }
+size_t Model::state_disk_bytes() const { return d_->core->disk_bytes(); }
+std::string Model::state_disk_path() const { return d_->core->disk_path(); }
+void Model::state_spill(int h) { d_->core->spill(h); }
+void Model::state_split(int h, int budget) { d_->core->split(h, budget); }
+// The imager. image: queued on the image stream, never waited for; settle: the entries of the commands at or below `upto` are clean and
+// the idle conversations are marked (host bookkeeping, no device call); image_done: this rank's reading of the highest command whose work ended.
+// A ride (cmd.h split_ride_run): the commands every rank has finished are settled, then h's pieces are queued
+void Model::state_ride(uint64_t settled, int h, int budget, const std::vector<int>& live) {
+  ++d_->core->split_counts.rides;
+  d_->core->settle(settled, live);
+  if (h > 0 && budget > 0) d_->core->image(h, budget, live);
 }
-size_t Model::state_disk_capacity() const { return d_->store_s && d_->store_s->disk ? d_->store_s->dpool.size : 0; }
-size_t Model::state_disk_bytes() const { return d_->store_s ? d_->store_s->dbytes : 0; }
-std::string Model::state_disk_path() const { return d_->store_s && d_->store_s->disk ? d_->store_s->disk->path() : ""; }
-void Model::state_spill(int h) { d_->state_spill(h); }
-void Model::state_unspill(int h) { d_->state_unspill(h); }
-void Model::state_set_factor(int h, int factor) {
-  if (factor != 16 && factor != 32 && factor != 64) die("state: session %d tagged with factor %d", h, factor);
-  if (!d_->store_s) return;
-  const auto it = d_->store_s->sess.find(h);
-  if (it == d_->store_s->sess.end()) return;
-  if (it->second.factor != factor && (it->second.saved > 0 || it->second.end_pos >= 0 || !it->second.snaps.empty()))
-    die("state: session %d holds state of factor %d and is tagged %d (a session keeps its factor for life)", h,
-        it->second.factor, factor);
-  it->second.factor = factor;
+int Model::image_room_pieces(int maxn) const {
+  int n = maxn;
+  while (n > 0 && !d_->store_dev->image_room((size_t)n * sgeom::kQuarterDiskBytes)) --n;
+  return n;
 }
-int Model::state_factor(int h) const {
-  if (!d_->store_s) return 16;
-  const auto it = d_->store_s->sess.find(h);
-  return it == d_->store_s->sess.end() ? 16 : it->second.factor;
+void Model::ride_readings(uint64_t out[4]) const {
+  const StoreCore& c = *d_->core;
+  out[0] = c.image_seq(), out[1] = c.image_pending(), out[2] = c.calloc ? c.calloc->ghosts() : 0, out[3] = c.calloc ? c.calloc->free() : 0;
 }
+bool Model::has_host_ring() const { return d_->host_ring != nullptr; }
+uint64_t Model::image_pending() const { return d_->core->image_pending(); }
+int Model::image_todo(int h) const { return d_->core->image_todo(h); }
+uint64_t Model::image_done() const { return d_->store_dev->image_done(); }
+bool Model::image_room(size_t bytes) const { return d_->store_dev->image_room(bytes); }
+uint64_t Model::image_seq() const { return d_->core->image_seq(); }
+bool Model::imager() const { return d_->core->imager(); }
+void Model::state_join(int h, int upto, int max_numbers) {
+  d_->core->join_pieces = std::max(1, d_->opt.kv_join_pieces);
+  d_->core->join(h, upto, (size_t)std::max(0, max_numbers), d_->core->join_pieces);
+}
+// The split's buffers, made at the start before the free-memory read the store is sized from, so that the read already lacks them
+// (pool_rules.h kSplit is a Counted line of the start table, class Fixed). A no-op without --kv-split cache.
+void Model::split_prepare() {
+  if (d_->opt.kv_split || d_->opt.imager) static_cast<EngineDev&>(*d_->store_dev).prepare();
+}
+void Model::state_join_plan(int h, int upto, int* back, int* exch) const { d_->core->join_plan(h, upto, back, exch); }
+Model::SplitStats Model::split_stats() const {
+  const StoreCore& c = *d_->core;
+  SplitStats r;
+  r.split_pieces = c.split_counts.split_pieces, r.split_deferred = c.split_counts.split_deferred, r.revives = c.split_counts.revives;
+  r.joins = c.split_counts.joins, r.join_bytes = c.split_counts.join_bytes, r.join_ns = c.split_counts.join_ns;
+  r.join_max_ns = c.split_counts.join_max_ns, r.join_short = c.split_counts.join_short, r.join_bad = c.split_counts.join_bad;
+  r.exchanged = c.split_counts.exchanged, r.join_taken = c.split_counts.join_taken, r.unspill_taken = c.split_counts.unspill_taken;
+  r.imaged = c.split_counts.imaged, r.image_voids = c.split_counts.image_voids, r.image_waits = c.split_counts.image_waits;
+  r.returns_read = c.split_counts.returns_read, r.rides = c.split_counts.rides;
+  const StoreCore::ImageView iv = c.image_view();
+  r.clean_numbers = iv.clean_numbers, r.image_pending = iv.image_pending;
+  const StoreCore::SplitView v = c.split_view();
+  r.conv_split = v.conv_split, r.quarter_slots = v.quarter_slots, r.quarter_numbers = v.quarter_numbers, r.ghost_numbers = v.ghost_numbers;
+  return r;
+}
+bool Model::split_can_open() const { return d_->core->split_can_open(); }
+void Model::state_list_numbers(int h, int upto, int* in_pool, int* on_disk, int* split) const {
+  d_->core->list_numbers(h, upto, in_pool, on_disk, split);
+}
+void Model::state_unspill(int h, int max_numbers, int upto) {
+  const size_t cap = max_numbers < 0 ? StoreCore::kSpent : (size_t)max_numbers;
+  if (upto > 0) d_->core->unspill(h, cap, upto, std::max(1, d_->opt.kv_join_pieces));
+  else d_->core->unspill(h, cap);
+}
+int Model::state_unspill_left(int h, int upto) const { return d_->core->unspill_left(h, upto); }
+void Model::state_set_factor(int h, int factor) { d_->core->set_factor(h, factor); }
+int Model::state_factor(int h) const { return d_->core->factor(h); }
 Model::StateInfo Model::state_info(int h) const {
+  const StoreCore::Info i = d_->core->info(h);
   StateInfo r;
-  if (!d_->store_s) return r;
-  const auto it = d_->store_s->sess.find(h);
-  if (it == d_->store_s->sess.end()) return r;
-  const Store::Sess& ss = it->second;
-  const bool spec = d_->spec != nullptr;
-  r.saved = ss.saved;
-  r.on_disk = ss.out();
-  r.restart = restart_of(ss.saved, ss.end_pos, ss.snaps);  // its pieces in the pool or on the disk
-  r.end_pos = ss.end_pos;
-  for (const auto& sn : ss.snaps) r.snaps.push_back(sn.first);
-  r.bytes = ss.numbers() * d_->chunk_image();
-  for (const auto& d : ss.dl)
-    for (const size_t o : d) r.disk_bytes += o != Pool::kNone ? Pool::round(d_->chunk_image()) : 0;
-  r.disk_bytes += ss.dsnaps.size() * Pool::round(snap_bytes(spec)) + (ss.dend != Pool::kNone ? Pool::round(end_bytes(spec)) : 0);
+  r.saved = i.saved, r.end_pos = i.end_pos, r.snaps = i.snaps, r.bytes = i.bytes, r.on_disk = i.on_disk;
+  r.disk_bytes = i.disk_bytes, r.restart = i.restart, r.split = i.split, r.slots = i.slots;
   return r;
 }
 size_t Model::state_bytes() const {  // device memory the store's sessions hold (no line holds them)

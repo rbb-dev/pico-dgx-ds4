@@ -229,6 +229,56 @@ struct StatsFrame {
   uint64_t lent_owed_groups;        // groups a borrower gave back that the pool could not make into numbers yet
   uint64_t engram_huge_pct;         // % of its block's resident bytes in huge pages at the last change's end
   uint64_t engram_evictions;        // rows the cache dropped to make room, since the start
+  // the store's sizing rule and the memory watch (rank 0's; the store's size is every rank's)
+  uint64_t store_numbers;           // numbers the store was sized to at the start, a whole number of groups of 64
+  uint64_t mem_avail_min_bytes;     // the smallest of the four ranks' MemAvailable at the watch's last reading (0: no reading yet)
+  uint64_t mem_avail_low_count;     // new lows under the memory --pool-free-gib leaves to the host, reported since the start
+  uint64_t ids_host_bytes;          // the server's token ids held in memory now, bytes (the rest are in the ids files)
+  uint64_t ids_file_sessions;       // conversations whose ids are in a file now
+  uint64_t mem_avail_bytes[4];      // each rank's MemAvailable at the watch's last reading, rank order (0: none yet)
+  // the pool's tenants (lend.h): the groups each holds, by id
+  uint64_t tenant_groups[8];        // tenants 0-7: 0 the windows, 1 the Engram cache, 2 not assigned, 3 a work area, 4 the prefill's lent row buffers
+  uint64_t tenant_models_groups;    // the groups of the models loaded while the engine runs (tenants 8-15), together
+  // the cache conversation split (--kv-split cache; model/store_core.h)
+  uint64_t kv_split;               // 1 when --kv-split cache is on
+  uint64_t conv_split;             // conversations with a piece that is a quarter slot
+  uint64_t quarter_slots;          // quarter slots in use
+  uint64_t quarter_numbers;        // chunk numbers open as quarter numbers
+  uint64_t ghost_numbers;          // free numbers that still hold a split piece's bytes (ghosts)
+  uint64_t split_pieces_total;     // pieces split since the start
+  uint64_t split_deferred_total;   // pieces a split left whole for want of a quarter number
+  uint64_t revives_total;          // pieces a join took back from their ghosts (nothing crossed the ring)
+  uint64_t joins_total;            // join commands that had a piece to bring back
+  uint64_t join_bytes_total;       // bytes that came from the other three Sparks in joins
+  uint64_t join_ns_total;          // time the engine thread spent in joins, ns
+  uint64_t join_max_ns;            // the longest join command, ns
+  uint64_t lend_busy_total;        // times a window or tenant change answered busy
+  uint64_t join_short_total;       // joins that stopped for want of a number
+  // the split cache's tiers (server/split_pace.h): L1 whole conversations, L2 quarter slots, L3 the SSD
+  uint64_t split_level;            // the last pass's level: 0 none, 1 aging, 2 reclaim
+  uint64_t split_pressure_pm;      // the pressure between the marks, thousandths
+  uint64_t split_age_now_s;        // the idle age a conversation must have for a demotion now, seconds
+  uint64_t split_demote_pps;       // pieces demoted a second over the last 10 s
+  uint64_t l2_numbers;             // chunk numbers that hold quarter slots
+  uint64_t l2_dropped_total;       // conversations given back from L2 to the SSD since the start
+  // the imager (model/store_core.h)
+  uint64_t clean_numbers;          // held numbers whose quarter image is on the SSD (an eviction gives them back writing nothing)
+  uint64_t image_pending;          // image jobs queued, not yet settled
+  uint64_t split_rides_total;      // rides of the image commands inside decoding runs
+  uint64_t returns_read_total;     // pieces a return had to read from the SSD (the others were taken back from their ghosts)
+  uint64_t image_waits_total;      // takes that waited for an image (a broken count: always 0)
+  uint64_t split_reader_waits_total;  // at most: times a prompt was read alone while a request waited and images were pending (it waits for the reader's end; 0 is conclusive)
+  // copy drafting's learner (DSGB10_COPY_ADAPT; rank 0's counts, every rank learns the same): proposals scored since the start and the
+  // outcomes it holds, the first copy token right, copy rows verified and accepted, and the shared first-token chance by match
+  // bucket (8-15, 16-31, 32-63, 64 and longer) in thousandths
+  uint64_t copy_adapt;                // 1 when the gate learns, else 0 (and the others are 0)
+  uint64_t copy_proposals_total;      // proposals the gate made (a proposal is scored a step later, unless that step is not the verify of it)
+  uint64_t copy_scored_total;
+  uint64_t copy_first_right_total;
+  uint64_t copy_rows_verified_total;
+  uint64_t copy_rows_accepted_total;
+  uint64_t copy_chance_pm[4];
+  uint64_t copy_failing_requests_total;  // requests that ended with 16 or more proposals scored and the first token right in under half of them
 };
 
 static_assert(sizeof(FrameHeader) == 8);
@@ -255,7 +305,15 @@ static_assert(offsetof(StatsFrame, ranks) == 8 + 8 * 33);
 static_assert(offsetof(StatsFrame, image_numbers) == 8 + 8 * 34);
 static_assert(offsetof(StatsFrame, engram_cache_bytes) == 8 + 8 * 35);
 static_assert(offsetof(StatsFrame, engram_huge_pct) == 8 + 8 * 43);
-static_assert(offsetof(StatsFrame, engram_evictions) == 8 + 8 * (kStatsFields - 1));
+static_assert(offsetof(StatsFrame, engram_evictions) == 8 + 8 * 44);
+static_assert(offsetof(StatsFrame, store_numbers) == 8 + 8 * 45);
+static_assert(offsetof(StatsFrame, ids_file_sessions) == 8 + 8 * 49);
+static_assert(offsetof(StatsFrame, mem_avail_bytes) == 8 + 8 * 50);
+static_assert(offsetof(StatsFrame, mem_avail_bytes) + sizeof(StatsFrame::mem_avail_bytes) == offsetof(StatsFrame, tenant_groups));
+static_assert(offsetof(StatsFrame, tenant_groups) == 8 + 8 * 54);
+static_assert(offsetof(StatsFrame, tenant_models_groups) == 8 + 8 * 62);
+static_assert(offsetof(StatsFrame, kv_split) == 8 + 8 * 63);
+static_assert(offsetof(StatsFrame, copy_failing_requests_total) + sizeof(StatsFrame::copy_failing_requests_total) == sizeof(StatsFrame));
 static_assert(sizeof(Config) == 8 + 8 * kConfigFields);
 
 }  // namespace fe

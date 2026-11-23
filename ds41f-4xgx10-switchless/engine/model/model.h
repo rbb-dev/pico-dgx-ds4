@@ -155,6 +155,7 @@ struct Options {
   std::string ablit;
   // the hand-over proof's MemAvailable tolerance is at least 256 MiB; this is the null control's spread (MiB) when that is larger
   int lend_null_mib = 0;
+  PScan pscan = PScan::Off;  // --pscan off|ext|all: which step graphs split the decode index scan over the ranks
 };
 
 class Model {
@@ -263,10 +264,12 @@ class Model {
   int slot_chunks_for(int s, int need) const;  // chunks slot s needs from empty to hold `need` positions
   int slot_committed(int s) const;             // chunks slot s holds or has reserved, whichever is more
   int slot_mapped(int s) const;                // chunks mapped in slot s
+  int slot_unheld_reservation(int s) const;               // numbers slot s is reserved beyond what it holds (they end with its detach)
   int slot_uncommitted() const;                // chunks no slot holds or has reserved
+  int64_t slot_spare() const;                  // the same, signed: below 0 where the reservations exceed the free numbers (rules::spare)
   int slot_chunks_total() const;               // chunks the pool made
   int slot_chunks_peak() const;                // most chunks mapped at once
-  // `img`: numbers also reserved for the request's image rows, which image_take takes next (counted like the reservation)
+  // `img`: numbers also reserved to the request's image rows, which image_take takes next (counted like the reservation)
   void slot_reserve(int s, int need, int img = 0);
   void slot_unreserve(int s);  // slot s's reservation to 0: its request has finished (the line keeps what it holds)
   void slot_release(int s);

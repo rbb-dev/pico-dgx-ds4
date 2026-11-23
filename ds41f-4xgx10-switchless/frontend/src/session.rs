@@ -644,11 +644,14 @@ impl SessionTable {
         }
         let mut f = Vec::new();
         file.read_to_end(&mut f).map_err(|e| e.to_string())?;
-        if f.len() < 56 || (&f[..8] != TABLE_MAGIC && &f[..8] != TABLE_MAGIC_V2 && &f[..8] != TABLE_MAGIC_V1) {
+        let known = [TABLE_MAGIC, TABLE_MAGIC_V3, TABLE_MAGIC_V2, TABLE_MAGIC_V1];
+        if f.len() < 56 || !known.iter().any(|m| f[..8] == m[..]) {
             return Err("not a saved table".into());
         }
+        // Layouts before `DSFT0004` hold each conversation's text and ids: read once, they become cuts.
+        let old = &f[..8] != TABLE_MAGIC;
         let with_flags = &f[..8] != TABLE_MAGIC_V1;
-        let with_factor = &f[..8] == TABLE_MAGIC;
+        let with_factor = &f[..8] == TABLE_MAGIC_V3;
         let mut h = Bytes { b: &f[8..56], at: 0 };
         let (written, next_id, clock, n, body_len, hash) = (h.u64()?, h.u64()?, h.u64()?, h.u64()?, h.u64()?, h.u64()?);
         let now = unix_now();

@@ -21,6 +21,34 @@ target_include_directories(vmm_test PRIVATE ${CMAKE_SOURCE_DIR})
 add_executable(chunks_test tests/chunks_test.cpp chunks.cpp)
 target_include_directories(chunks_test PRIVATE ${CMAKE_SOURCE_DIR})
 
+# A piece's quarters (quarter_map.h): the ownership maps and the quarter layout against an oracle written from the entry's
+# arithmetic, the exact sums, the trailer's round trip and its refusals; host only, no GPU
+add_executable(quarter_map_test tests/quarter_map_test.cpp)
+target_include_directories(quarter_map_test PRIVATE ${CMAKE_SOURCE_DIR})
+
+# The quartering kernels (quarter.cu) on a GB10 (small allocations only): k_quarter, k_unquarter and the exact sums against the
+# oracle's bytes and sums, a flip in a quarter's last word
+add_executable(quarter_test tests/quarter_test.cu)
+target_include_directories(quarter_test PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(quarter_test dsmodel)
+
+# The store's trace (store_trace.h): the format written from a scripted sequence of entries and read back, the comparison's
+# controls, the refusals; host only, no GPU
+add_executable(store_trace_test tests/store_trace_test.cpp store_trace.cpp)
+target_include_directories(store_trace_test PRIVATE ${CMAKE_SOURCE_DIR})
+
+# The store's bookkeeping (store_core.h) over a fake device: unit rows with their controls, the replay of recorded traces
+# (tests/traces) with the invariants after every record, the coverage of entry and answer kinds; host only, no GPU, no CUDA header
+# on the include path of what it builds. STORE_CORE_TEST_RULES adds the wrong-rule switches the controls use to the core
+add_executable(store_core_test tests/store_core_test.cpp store_core.cpp chunks.cpp store_trace.cpp)
+target_include_directories(store_core_test PRIVATE ${CMAKE_SOURCE_DIR})
+target_compile_definitions(store_core_test PRIVATE STORE_CORE_TEST_RULES STORE_TRACES_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/tests/traces\")
+
+# Four cores in step over four fake devices whose collectives meet at a barrier (host only)
+add_executable(four_rank_test tests/four_rank_test.cpp store_core.cpp chunks.cpp store_trace.cpp)
+target_include_directories(four_rank_test PRIVATE ${CMAKE_SOURCE_DIR})
+target_compile_definitions(four_rank_test PRIVATE STORE_CORE_TEST_RULES)
+
 # A request's image rows as store numbers: geometry, runs, the flights' ledger against the allocator, the reservation (host only)
 add_executable(img_rows_test tests/img_rows_test.cpp chunks.cpp)
 target_include_directories(img_rows_test PRIVATE ${CMAKE_SOURCE_DIR})
@@ -66,3 +94,15 @@ endif()
 add_executable(tokwin_test tests/tokwin_test.cpp)
 target_include_directories(tokwin_test PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(tokwin_test PRIVATE engram)
+
+# The embedding's vocabulary cut and its exchange (common/embed_shard.h) against the replicated row, all 129,280 ids, four
+# slots simulated; host only, no GPU. Built with -DPICO_OLD_RULES the other ranks' slots hold +0.0 and its red rows fail
+add_executable(embed_shard_test tests/embed_shard_test.cpp)
+target_include_directories(embed_shard_test PRIVATE ${CMAKE_SOURCE_DIR})
+
+# The embedding lookup's kernels on a GB10 (stop the engine first: four shards of 331 MB): embed_part over four ranks' shards summed
+# like the ring, embed_fan, and prefill's embed_send / embed_pick, for all 129,280 ids against the replicated row
+# (tests/embed_shard_dev_test.cu)
+add_executable(embed_shard_dev_test tests/embed_shard_dev_test.cu)
+target_include_directories(embed_shard_dev_test PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(embed_shard_dev_test dsmodel)

@@ -137,6 +137,7 @@ async fn run(inner: Arc<Inner>) {
                     Err(e) => eprintln!("engine: connection lost: {e}"),
                 }
                 inner.info.send_replace(None);
+                inner.telemetry.connected(false);
                 let pending = {
                     let mut c = inner.conn.lock().unwrap();
                     c.tx = None;

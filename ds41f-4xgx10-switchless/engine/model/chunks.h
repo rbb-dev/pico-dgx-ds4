@@ -20,6 +20,26 @@ class Alloc {
   bool take(uint32_t n, std::vector<uint32_t>* out);
   // c back to the free set; dies on a number that is not taken (a double give, or the guard).
   void give(uint32_t c);
+  // c back to the free set as a ghost with this stamp; dies on a number that is not taken
+  void give_ghost(uint32_t c, uint64_t stamp);
+  bool is_ghost(uint32_t c) const;
+  // the ghost c becomes a plain free number (its link was cut: nothing can revive it, so it is no ghost to be kept for)
+  void unghost(uint32_t c);
+  uint64_t stamp(uint32_t c) const;  // 0 for a number that is not a ghost
+  // the ghost c taken back: it becomes a taken number again; dies on a number that is not a ghost
+  void revive(uint32_t c);
+  // step 1 or 2 of take() only: false, nothing taken, when no free number is below the zone
+  bool take_below_zone(uint32_t* c);
+  // the numbers at or above `from` are the zone (kNoZone: none)
+  static constexpr uint32_t kNoZone = 0xFFFFFFFFu;
+  void set_zone(uint32_t from) { zone_ = from; }
+  uint32_t zone() const { return zone_; }
+  uint32_t ghosts() const { return ghosts_; }
+  uint32_t free_plain() const { return free_ - ghosts_; }  // free numbers that are not ghosts
+  uint32_t free_below_zone() const;                         // free numbers (ghosts too) below the zone
+  std::vector<uint32_t> ghosts_from(uint32_t c) const;      // the ghosts at or above c, lowest first
+  // the ghosts and the zone, mixed: 0 when there is no ghost and no zone, so a store that never splits mixes nothing
+  uint64_t split_digest() const;
   // numbers [numbers(), n) join the free set (the store's share of the pool, or a closed window's numbers coming back)
   void grow(uint32_t n);
   // numbers [n, numbers()) leave the pool (a window's memory taken out of it, Model::window_open): false, nothing

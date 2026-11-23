@@ -40,6 +40,12 @@ class SpillFile {
   // `bytes` of device memory at src to the file at `off`, after the work queued on st so far. Waits
   // while staging is full. Returns the write's number (wait() for it).
   uint64_t write(const void* src, size_t bytes, size_t off, cudaStream_t st);
+  // Whether staging takes `bytes` more now, so that a write of them does not wait (the image writer asks first and queues less).
+  bool room(size_t bytes);
+  // The stream the writes not yet flushed were queued on (nullptr: none pending). Two writers on two streams each flush before they
+  // return; a flush that finds the other's writes pending, or a write after them, stops the engine (an event recorded on the wrong
+  // stream would let the writer read staging before its copy had landed).
+  cudaStream_t pending_stream() const { return pend_st_; }
   // Marks st before the work that precedes the next writes (their checksums), to time it apart.
   void begin(cudaStream_t st);
   // Hands the writes since the last flush to the writer (they wait for one event recorded on st now).
@@ -56,6 +62,18 @@ class SpillFile {
 
   // The checksum slot of the block at file offset `off`: as it went out, or as it came back.
   uint64_t* sum(size_t off, bool back) { return sums_ + (back ? slots_ : 0) + off / kPoolGrain; }
+
+  // The file made `bytes` long (rounded down to the store's grain), its space reserved, the checksum slots of the new range added
+  // and every old slot kept as it is. Waits for the writes in flight first, so the caller has flushed and has no read or
+  // checksum queued on its stream (its slots are moved). False, with nothing changed, when the disk has no room for it; dies
+  // for any other reason. A size at or below the file's is a no-op that returns true.
+  bool grow(size_t bytes);
+
+  // The file cut to `bytes` (rounded down to the store's grain): its space is the disk's again, the checksum slots below the new
+  // end are kept as they are and those past it go. Waits for the writes in flight first; the caller has flushed, holds no
+  // block at or past `bytes` and has no read or checksum queued on its stream (its slots are moved). A size at or above the
+  // file's is a no-op that returns true; false, with nothing changed, if the file cannot be cut.
+  bool shrink(size_t bytes);
 
   const std::string& path() const { return path_; }
   size_t size() const { return size_; }
