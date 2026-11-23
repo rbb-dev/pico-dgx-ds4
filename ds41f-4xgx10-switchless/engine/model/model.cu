@@ -14,7 +14,9 @@
 #include <vector>
 
 #include "attn/launch.h"
+#include "common/alloc_seal.h"
 #include "model/impl.h"
+#include "model/store_trace.h"
 #include "model/prefill.h"
 #include "model/spec.h"
 #include "model/state.h"
@@ -61,6 +63,10 @@ bool unfused16() {
 }  // namespace
 
 Model::Impl::Impl(int r, const Options& op) : rank(r), opt(op) {
+  tenants.add(lend::kTenantWindows, lend::kKindDevice, lend::kRequired);  // a request's window must not be given away under it
+#ifdef DSGB10_TEST_FAULTS
+  tenants.add(15, lend::kKindDevice, lend::kOnDemand);  // the dummy block of the hand-over's GPU test
+#endif
   CUDA_CHECK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
   // the side streams' few small kernels go ahead of the main stream's queued GEMV CTAs, or they wait
   // for whole GEMVs to drain (and their results, e.g. the mixes, end up on the critical path)
@@ -140,6 +146,7 @@ Model::Impl::Impl(int r, const Options& op) : rank(r), opt(op) {
     }
     if (slot_pool->add_slot(0, 1) != 0 || !slot_pool->ensure(0, bytes)) die("model: chunk pool: %s", slot_pool->error().c_str());
     calloc = std::make_unique<chunks::Alloc>((uint32_t)nums);
+    make_store();
     if (!pool_poison)  // the guard (number 0) reads as zero; with poison 0xFF, so an over-read that is not masked shows
       for (int a = 0; a < 4; ++a) CUDA_CHECK(cudaMemset(pool_arr[a], 0, (size_t)attn::kChunkEntries * kKvEntryBytes[a]));
     for (int L : {2, 8, 14, 20}) {
@@ -242,6 +249,7 @@ Model::Impl::Impl(int r, const Options& op) : rank(r), opt(op) {
   pos_d = in_d->pos;
   in_ctr = dalloc<uint32_t>(1);
   fb = dalloc<int32_t>(kMaxRows);
+  emb_slot = dalloc<bf16>((size_t)kMaxRows * kDim);
   out_h = halloc<ops::SampleOut>(ops::kOutSlots);
   ctl_h = halloc<uint32_t>(1);
   samp_ctr = dalloc<uint32_t>(1);
@@ -339,7 +347,10 @@ void Model::Impl::bind(dsw::WeightFile& wf, comm::Ring& ring) {
     CUDA_CHECK(cudaMemcpyAsync(s, scratch + wb, sb, cudaMemcpyDeviceToDevice, st));
   };
 
-  embed = reinterpret_cast<const bf16*>(need("embed.weight", DType::BF16, {kVocab, kDim}));
+  embed = reinterpret_cast<const bf16*>(need("embed.weight", DType::BF16, {kVocabPart, kDim}));
+  std::printf("model: embedding by vocabulary rows: rank %d holds token ids [%d, %d), %.3f GiB of the table's %.3f GiB\n", rank,
+              rank * kVocabPart, (rank + 1) * kVocabPart, (double)kVocabPart * kDim * 2 / 1073741824.0,
+              (double)kVocab * kDim * 2 / 1073741824.0);
   norm_w = reinterpret_cast<const bf16*>(need("norm.weight", DType::BF16, {kDim}));
   {
     uint8_t* h = need("head.weight", DType::BF16, {kVocabPart, kDim});
@@ -390,7 +401,7 @@ void Model::Impl::bind(dsw::WeightFile& wf, comm::Ring& ring) {
       // rank's 96 rows, less than their all-gather on the critical path (the tiles of 8 rows concatenate)
       uint8_t* g = need(p + "ffn.gate.weight", DType::BF16, {kGatePart, kDim});
       tile8(p + "ffn.gate.weight", g, kGatePart, kDim * 2, Layout::L2);
-      w.gate = dalloc<uint8_t>((size_t)kExperts * kDim * 2);
+      w.gate = !pgw.empty() && pgw[L].gate ? pgw[L].gate : dalloc<uint8_t>((size_t)kExperts * kDim * 2);
       comm::allgather(ch, g, w.gate, (size_t)kGatePart * kDim * 2, st);
       w.gate_bias = reinterpret_cast<const float*>(need(p + "ffn.gate.bias", DType::F32, {kExperts}));
       if (const dsw::DeviceTensor* vl = wf.find(p + "ffn.gate.bias_vl"))  // vision (prefill of image spans only)
@@ -1406,9 +1417,12 @@ void Model::Impl::forward_rows(int R, int ctx, uint32_t flags, Sink* sink, int p
 
 // ---- Model ----------------------------------------------------------------------------------------
 
-Model::Model(int rank, const Options& opt) : d_(std::make_unique<Impl>(rank, opt)) {}
+Model::Model(int rank, const Options& opt) : d_(std::make_unique<Impl>(rank, opt)) { store_trace::init(); }
 Model::~Model() = default;
 void Model::bind(dsw::WeightFile& wf, comm::Ring& ring) { d_->bind(wf, ring); }
+void Model::reserve_gathered(bool engram) { d_->reserve_gathered(engram); }
+void* Model::gathered_dest(const std::string& name, uint64_t bytes) { return d_->gathered_dest(name, bytes); }
+void Model::aliased(size_t* tensors, size_t* bytes) const { *tensors = d_->alias_n, *bytes = d_->alias_bytes; }
 void Model::bind_ring2(comm::Ring& ring) { d_->ch2 = ring.dev(), d_->has_ch2 = true; }
 size_t Model::code_head(int* raw_tiles) { return d_->code_head(raw_tiles); }
 void Model::use_slot(int s) { d_->use_slot(s); }
@@ -1447,6 +1461,7 @@ void Model::set_engram(const engram::HashMap* map, engram::Store* store) {
   d_->emap = map;
   d_->store = store;
   d_->el.enabled = store && store->cache_max_bytes() > 0;
+  if (d_->el.enabled) d_->tenants.add(lend::kTenantEngram, lend::kKindHost, lend::kCache);
 }
 uint64_t Model::launch(int R, int pos0, const int32_t* tokens, const Sampling& sp, uint32_t flags, Sink* sink) {
   return d_->launch(R, pos0, tokens, sp, flags, sink);
@@ -1480,7 +1495,7 @@ void Model::set_images(int n, const int32_t* lo, const int32_t* hi, int key) {
     I.img_span.emplace_back(lo[i], hi[i]), I.img_row0.push_back(total), total += hi[i] - lo[i];
   }
   if (!n) return;
-  const imgrows::Ledger::Rows* r = I.store_s ? I.store_s->img.find(key) : nullptr;
+  const imgrows::Ledger::Rows* r = I.core->img_find(key);
   if (!r) die("model: the images of flight %d are not in the store", key);
   if (r->rows != total) die("model: flight %d holds %zu image rows, its spans name %zu", key, r->rows, total);
   I.img_key = key;

@@ -52,7 +52,12 @@ class Engine:
         at = 32 if ver >= 4 else 24
         self.name = p[at:at + nl].decode()
         self.version = ver
-        self.send(HELLO, struct.pack('<II', ver, 0))
+        want = ver if version == 4 else version
+        self.send(HELLO, struct.pack('<II', want, 0))
+        if want != ver:
+            t, p = self.frame()
+            assert t == HELLO_E and struct.unpack('<I', p[:4])[0] == want, (t, p[:4])
+            self.version = want
         self.next_id = 1
 
     def send(self, t, payload):

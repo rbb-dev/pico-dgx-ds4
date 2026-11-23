@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <string>
 
+#include "common/alloc_seal.h"
 #include "model/vmm.h"
 
 namespace model::vmm {
@@ -21,6 +22,7 @@ class CudaBackend : public Backend {
     acc_.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
   }
   bool reserve(size_t bytes, uint64_t* va) override {
+    const alloc_seal::Scoped seal(alloc_seal::kStore);
     CUdeviceptr p = 0;
     if (!ok(cuMemAddressReserve(&p, bytes, kChunk, 0, 0), "cuMemAddressReserve")) return false;
     *va = (uint64_t)p;
@@ -28,6 +30,7 @@ class CudaBackend : public Backend {
   }
   void release_va(uint64_t va, size_t bytes) override { cuMemAddressFree((CUdeviceptr)va, bytes); }
   bool create(uint64_t* handle) override {
+    const alloc_seal::Scoped seal(alloc_seal::kStore);
     CUmemGenericAllocationHandle h = 0;
     if (!ok(cuMemCreate(&h, kChunk, &prop_, 0), "cuMemCreate")) return false;
     *handle = (uint64_t)h;

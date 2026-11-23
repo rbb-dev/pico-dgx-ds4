@@ -11,7 +11,10 @@ namespace model::chunks {
 class Alloc {
  public:
   explicit Alloc(uint32_t n);  // numbers [1, n)
-  // The lowest free number; dies when none is free (callers count first: free()).
+  // The next number; dies when none is free (callers count first: free()). In this order:
+  //   1. the lowest free number that is not a ghost, below the zone;  2. the oldest ghost below the zone (lowest number on a
+  //   tie);  3. the lowest free number that is not a ghost, in the zone;  4. the oldest ghost in the zone.
+  // With no ghost and no zone that is the lowest free number.
   uint32_t take();
   // n numbers, lowest first, appended to *out: all of them, or none and false.
   bool take(uint32_t n, std::vector<uint32_t>* out);
@@ -20,7 +23,8 @@ class Alloc {
   // numbers [numbers(), n) join the free set (the store's share of the pool, or a closed window's numbers coming back)
   void grow(uint32_t n);
   // numbers [n, numbers()) leave the pool (a window's memory taken out of it, Model::window_open): false, nothing
-  // changed, when one of them is taken or n would leave no number to take; the taken set and its digest stay as they were
+  // changed, when one of them is taken or n would leave no number to take; the taken set and its digest stay as they were.
+  // A ghost there is cut (it leaves with the number)
   bool shrink(uint32_t n);
   // the first taken number at or above c (the numbers a shrink to c would have to wait for), 0 when none
   uint32_t first_taken_from(uint32_t c) const;
@@ -32,9 +36,48 @@ class Alloc {
   uint64_t digest() const { return digest_; }     // of the taken set, whatever the order it was taken in
 
  private:
+  uint32_t pick(bool below_zone_only, bool* found) const;
+  void claim(uint32_t c, bool lowest);  // c leaves the free set (a ghost leaves the ghost set with it); lowest: c was the lowest free
   uint32_t n_, free_, lo_;      // lo_: no free number below it
-  std::vector<uint64_t> bits_;  // bit c set: c is free
+  std::vector<uint64_t> bits_;  // bit c set: c is free (a ghost is free)
   uint64_t digest_ = 0;
+  uint32_t zone_ = kNoZone, ghosts_ = 0;
+  std::vector<uint64_t> ghost_bits_;           // bit c set: c is a ghost
+  std::vector<uint64_t> stamp_;                // a ghost's stamp, by number
+  std::set<std::pair<uint64_t, uint32_t>> by_stamp_;  // the ghosts, oldest first
+  uint64_t ghost_digest_ = 0;
+};
+
+// The quarter slots (the split's unit): a number taken for quarters holds four slots, s = (c << 2) | q, each a quarter of the
+// number in every array. A slot is named by as many holders as hold it; the number goes back when its four slots are free.
+// The numbers themselves come from the allocator through the store's take, so the slot map never takes one.
+class SlotMap {
+ public:
+  static uint32_t slot(uint32_t c, int q) { return c << 2 | (uint32_t)q; }
+  static uint32_t number(uint32_t s) { return s >> 2; }
+  static int quarter(uint32_t s) { return (int)(s & 3); }
+  void open(uint32_t c);          // c is a quarter number with four free slots; dies when c is open already
+  bool has_room() const { return !roomy_.empty(); }
+  uint32_t take_slot();           // the lowest free slot of the lowest open number with room, one reference; dies when none
+  void ref(uint32_t s);           // one more holder; dies on a slot that is free
+  // one holder less: the references left. When that frees the number's last used slot the number is closed and *freed is it
+  // (the caller gives it back to the allocator); else *freed is 0.
+  uint32_t unref(uint32_t s, uint32_t* freed);
+  uint32_t refs(uint32_t s) const;  // 0: free (or its number is not open)
+  bool is_open(uint32_t c) const { return nums_.count(c) != 0; }
+  uint32_t open_numbers() const { return (uint32_t)nums_.size(); }
+  uint32_t used() const { return used_; }  // slots with a holder
+  std::vector<uint32_t> open_from(uint32_t c) const;  // open numbers at or above c, lowest first
+  uint64_t digest() const;                            // 0 when nothing is open
+
+ private:
+  struct Num {
+    uint32_t refs[4] = {};
+  };
+  static bool room(const Num& n) { return !(n.refs[0] && n.refs[1] && n.refs[2] && n.refs[3]); }
+  std::map<uint32_t, Num> nums_;
+  std::set<uint32_t> roomy_;  // open numbers with a free slot
+  uint32_t used_ = 0;
 };
 
 uint64_t mix(uint64_t x);  // the digest's per-number hash (splitmix64's finaliser)

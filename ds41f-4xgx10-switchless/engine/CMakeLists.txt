@@ -27,6 +27,16 @@ foreach(dir common weights comm kernels attn vision dspark engram model server t
   endif()
 endforeach()
 
+# tools/alloc_audit.py against alloc_sites.txt: the tripwire for new allocation sites, and its own selftest (host only; needs
+# python3). `alloc_audit` is the check itself: it fails the build target when the sources and the list differ.
+add_executable(alloc_audit_test tools/alloc_audit_test.cpp)
+target_compile_definitions(alloc_audit_test PRIVATE ENGINE_SRC_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}\")
+# tools/store_trace_check.py `same` on a real failed-give-back trace (a rank's rolled-back attempt is its own; a real difference fails)
+add_executable(store_trace_check_test tools/store_trace_check_test.cpp)
+target_compile_definitions(store_trace_check_test PRIVATE ENGINE_SRC_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}\")
+add_custom_target(alloc_audit COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/alloc_audit.py --src ${CMAKE_CURRENT_SOURCE_DIR}
+                  COMMENT "alloc_audit: allocation call sites against alloc_sites.txt")
+
 # This project's fleet file beside the binaries that read one (dsgb10_rank, ring_test, coll_tests), as
 # fleet.conf, where they look by default; run4.sh and service.sh install their FLEET beside the copies
 # they run, and --fleet FILE reads another.

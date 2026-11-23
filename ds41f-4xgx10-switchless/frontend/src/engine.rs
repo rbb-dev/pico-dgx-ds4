@@ -92,6 +92,7 @@ impl EngineClient {
                 prefill_us: 0,
                 decode_us: 0,
                 error: String::new(),
+                tail: None,
             });
             return Err("engine not connected".into());
         }
@@ -153,10 +154,13 @@ async fn run(inner: Arc<Inner>) {
                         prefill_us: 0,
                         decode_us: 0,
                         error: "engine connection lost".into(),
+                        tail: None,
                     }));
                 }
             }
             Err(e) => {
+                // an engine that comes back may be a newer one
+                inner.try_prefix.store(inner.allow_prefix, Ordering::Relaxed);
                 if !logged_down {
                     eprintln!("engine: cannot connect to {}: {e}; retrying", inner.path.display());
                     logged_down = true;

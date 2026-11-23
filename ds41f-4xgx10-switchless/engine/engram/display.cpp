@@ -10,6 +10,8 @@
 #include <cstdio>
 #include <cstring>
 
+#include "common/alloc_seal.h"
+
 namespace engram {
 
 // uapi drm.h / drm_mode.h, spelled out so that no libdrm is needed
@@ -54,6 +56,7 @@ bool Display::fail(const char* step, int err) {
 }
 
 bool Display::create(const std::string& card, const std::string& sysfs_root, size_t max_bytes) {
+  const alloc_seal::Scoped seal(alloc_seal::kSide);
   destroy();
   why_.clear();
   card_ = open(card.c_str(), O_RDWR | O_CLOEXEC);

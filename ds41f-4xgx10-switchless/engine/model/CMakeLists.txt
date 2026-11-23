@@ -30,6 +30,12 @@ target_include_directories(img_rows_test PRIVATE ${CMAKE_SOURCE_DIR})
 add_executable(lend_test tests/lend_test.cpp chunks.cpp vmm.cpp)
 target_include_directories(lend_test PRIVATE ${CMAKE_SOURCE_DIR})
 
+# The tenants' table (lend.h) and the three steps of a tenant's change (tenant.h) with fake bodies over the same fake pool: the
+# invariant, every tenant's room, a body failing on one rank, the one queue of store changes, the order tenants give way in, the
+# digest's tenant terms; host only, no GPU. Built with -DPICO_OLD_RULES its red cases fail
+add_executable(tenant_test tests/tenant_test.cpp chunks.cpp vmm.cpp store_core.cpp store_trace.cpp)
+target_include_directories(tenant_test PRIVATE ${CMAKE_SOURCE_DIR})
+
 # The pool on a GB10 (stop the engine first): a graph captured over a reserved range replays after more is mapped;
 # maps and unmaps beside a replaying graph (tests/vmm_probe.cu)
 add_executable(vmm_probe tests/vmm_probe.cu)
@@ -43,8 +49,9 @@ target_link_libraries(vmm_giveback dsmodel)
 
 # Profiling builds (-DDSGB10_NVTX=ON): NVTX ranges per turn, chunk, layer and part for nsys (model/nvtx.h),
 # and DSGB10_ROUTE_DUMP (model/prefill.cu). The ranges cost nothing without a profiler attached.
-# Fault injection for the Engram hand-over tests (model/lend.cu): DSGB10_LEND_FAIL=rank:R,step:B|C|back
-option(DSGB10_TEST_FAULTS "DSGB10_LEND_FAIL fault injection in the Engram hand-over" OFF)
+# Fault injection for the tenants' hand-over tests (model/tenant.cu): DSGB10_LEND_FAIL=rank:R,step:B|C|back[,tenant:N], and
+# tenant 15, a dummy device block driven by CONFIG's test_tenant_groups
+option(DSGB10_TEST_FAULTS "DSGB10_LEND_FAIL fault injection and the dummy tenant in the pool's hand-over" OFF)
 if(DSGB10_TEST_FAULTS)
   target_compile_definitions(dsmodel PUBLIC DSGB10_TEST_FAULTS)
 endif()

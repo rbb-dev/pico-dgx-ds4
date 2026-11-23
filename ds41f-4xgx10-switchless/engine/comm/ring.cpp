@@ -598,20 +598,14 @@ void Ring::barrier() {
   }
 }
 
-void Ring::allgather_host(const void* mine, void* all, size_t n) {
+void Ring::allgather_host(const void* mine, void* all, size_t n, uint32_t call) {
   Impl& I = *impl_;
   if (I.opt.mode != Options::kRing) {
     for (int k = 0; k < kRanks; k++) memcpy((char*)all + k * n, mine, n);
     return;
   }
   if (n > 65536) die("allgather_host: %zu bytes is too large for the bootstrap sockets", n);
-  char* a = (char*)all;
-  memcpy(a + I.rank * n, mine, n);
-  for (int step = 0; step < kRanks - 1; step++) {
-    int out = (I.rank - step + kRanks) % kRanks, in = (I.rank - step - 1 + kRanks) % kRanks;
-    send_all(I.sock_next, a + out * n, n);
-    recv_all(I.sock_prev, a + in * n, n);
-  }
+  host_allgather(I.rank, kRanks, I.sock_next, I.sock_prev, mine, all, n, call);  // every hop names its call: ranks in different calls stop naming both
 }
 
 std::string Ring::describe() const {

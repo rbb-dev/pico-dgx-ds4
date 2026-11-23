@@ -17,6 +17,8 @@ class VisionWeights {
   // vision weights. Reads no tensor data.
   VisionWeights(const std::string& path, int rank);
   ~VisionWeights();
+  static constexpr uint64_t kStageChunk = 16ull << 20;  // one read; two threads x two buffers = 64 MiB of staging at most
+  static constexpr int kStageThreads = 2;
   VisionWeights(const VisionWeights&) = delete;
   VisionWeights& operator=(const VisionWeights&) = delete;
 

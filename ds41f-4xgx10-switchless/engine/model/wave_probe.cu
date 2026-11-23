@@ -22,11 +22,13 @@ struct ActSet {
   uint8_t *yq, *ys;
 };
 ActSet act_get(const Prefill& p) {
-  return {p.x, p.mid, p.y, p.yraw, p.sub, p.a_pre, p.a_post, p.a_comb, p.pm, p.f_post, p.f_comb, p.yq, p.ys};
+  const Prefill::Rows& r = *p.rs;
+  return {r.x, r.mid, r.y, r.yraw, r.sub, r.a_pre, r.a_post, r.a_comb, r.pm, r.f_post, r.f_comb, r.yq, r.ys};
 }
 void act_put(Prefill& p, const ActSet& s) {
-  p.x = s.x, p.mid = s.mid, p.y = s.y, p.yraw = s.yraw, p.sub = s.sub, p.a_pre = s.a_pre, p.a_post = s.a_post;
-  p.a_comb = s.a_comb, p.pm = s.pm, p.f_post = s.f_post, p.f_comb = s.f_comb, p.yq = s.yq, p.ys = s.ys;
+  Prefill::Rows& r = *p.rs;
+  r.x = s.x, r.mid = s.mid, r.y = s.y, r.yraw = s.yraw, r.sub = s.sub, r.a_pre = s.a_pre, r.a_post = s.a_post;
+  r.a_comb = s.a_comb, r.pm = s.pm, r.f_post = s.f_post, r.f_comb = s.f_comb, r.yq = s.yq, r.ys = s.ys;
 }
 ActSet act_alloc(int Q) {
   const size_t M4 = 4 * (size_t)Q;
@@ -71,7 +73,7 @@ void Model::Impl::wave_probe(int L, int a, int M) {
   static cudaEvent_t t0, t1;
   if (!init) {
     init = true;
-    saved = act_alloc(p.Q), other = act_alloc(p.Q);
+    saved = act_alloc(p.rs->Q), other = act_alloc(p.rs->Q);
     int lo = 0, hi = 0;
     CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&lo, &hi));
     for (int i = 0; i < 4; ++i) {
@@ -88,7 +90,7 @@ void Model::Impl::wave_probe(int L, int a, int M) {
   }
   const ActSet live = act_get(p);
   cudaStream_t const st0 = st;
-  act_copy(saved, live, p.Q, st0);
+  act_copy(saved, live, p.rs->Q, st0);
   // a lane's streams and events in place of the main ones while its work is issued
   auto enter = [&](Lane& l) {
     std::swap(st, l.st), std::swap(p.cs, l.cs), std::swap(p.ev_cs, l.ev_cs);
@@ -114,8 +116,8 @@ void Model::Impl::wave_probe(int L, int a, int M) {
   float ms[kCfg][kRounds];
   for (int r = 0; r < kRounds; ++r)
     for (int c = 0; c < kCfg; ++c) {
-      act_copy(live, saved, p.Q, st0);
-      act_copy(other, saved, p.Q, st0);
+      act_copy(live, saved, p.rs->Q, st0);
+      act_copy(other, saved, p.rs->Q, st0);
       CUDA_CHECK(cudaEventRecord(t0, st0));
       Lane& lf = lane[c == 4 ? 1 : 0];
       Lane& la = lane[c == 5 ? 3 : 2];
@@ -132,7 +134,7 @@ void Model::Impl::wave_probe(int L, int a, int M) {
       CUDA_CHECK(cudaEventSynchronize(t1));
       CUDA_CHECK(cudaEventElapsedTime(&ms[c][r], t0, t1));
     }
-  act_copy(live, saved, p.Q, st0);
+  act_copy(live, saved, p.rs->Q, st0);
   float med[kCfg];
   for (int c = 0; c < kCfg; ++c) {
     std::vector<float> v(ms[c] + 1, ms[c] + kRounds);  // round 0 warms up

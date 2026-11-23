@@ -5,14 +5,7 @@
 #include <cstdlib>
 #include <cuda_runtime.h>
 
-[[noreturn]] inline void die(const char* fmt, ...) {
-  va_list ap;
-  va_start(ap, fmt);
-  std::vfprintf(stderr, fmt, ap);
-  va_end(ap);
-  std::fputc('\n', stderr);
-  std::abort();
-}
+#include "common/die.h"
 
 #define CUDA_CHECK(x)                                                                     \
   do {                                                                                    \

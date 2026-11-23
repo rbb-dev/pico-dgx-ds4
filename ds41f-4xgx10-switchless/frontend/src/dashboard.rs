@@ -71,6 +71,7 @@ impl ReqLive {
             total: AtomicU32::new(0),
             progressed: AtomicBool::new(false),
             decoding: AtomicBool::new(false),
+            counted: AtomicBool::new(false),
         }
     }
 
@@ -264,6 +265,12 @@ pub struct Telemetry {
     prefill_series: Mutex<Buckets>,
     stats: Mutex<Option<(Instant, EngineStats)>>,
     engram_hits: Mutex<HitWindow>,
+    cache: Mutex<CacheSeries>,
+    cache_prompts: AtomicU64,
+    cache_prompt_tokens: AtomicU64,
+    cache_cached_tokens: AtomicU64,
+    cache_seen: Mutex<[u64; 3]>,
+    stats_asked_ms: AtomicU64,
     node_addrs: Mutex<Vec<String>>,
     nodes: Mutex<Vec<Option<NodeSample>>>,
 }
@@ -290,6 +297,12 @@ impl Telemetry {
             prefill_series: Mutex::new(Buckets::default()),
             stats: Mutex::new(None),
             engram_hits: Mutex::new(HitWindow::default()),
+            cache: Mutex::new(CacheSeries::default()),
+            cache_prompts: AtomicU64::new(0),
+            cache_prompt_tokens: AtomicU64::new(0),
+            cache_cached_tokens: AtomicU64::new(0),
+            cache_seen: Mutex::new([0; 3]),
+            stats_asked_ms: AtomicU64::new(0),
             node_addrs: Mutex::new(Vec::new()),
             nodes: Mutex::new(Vec::new()),
         }
@@ -315,12 +328,13 @@ impl Telemetry {
         live.total.store(total, Ordering::Relaxed);
         live.progressed.store(true, Ordering::Relaxed);
         self.prefill_tokens.fetch_add(computed.saturating_sub(before) as u64, Ordering::Relaxed);
+        self.count_prompt(live);
     }
 
-    /// A request ended (an error is not a finished request for the TTFT figures).
+    /// A request ended (an error, or a request the engine could not build from its prefix, is not a finished request for the TTFT figures).
     pub fn finish(&self, d: &Done) {
         let live = self.live.lock().unwrap().remove(&d.req_id);
-        if d.reason == DoneReason::Error {
+        if matches!(d.reason, DoneReason::Error | DoneReason::TooLarge | DoneReason::PrefixGone) {
             return;
         }
         let ablit = live.is_some_and(|l| l.meta.ablit);
@@ -336,8 +350,18 @@ impl Telemetry {
     }
 
     pub fn set_stats(&self, s: EngineStats) {
+        self.set_stats_at(unix_ms(), s);
+    }
+
+    /// A STATS frame that arrived at `now_ms`.
+    pub fn set_stats_at(&self, now_ms: u64, s: EngineStats) {
         let now = Instant::now();
         self.engram_hits.lock().unwrap().push(now, s.engram_lookups, s.engram_hits);
+        {
+            let mut c = self.cache.lock().unwrap();
+            c.add_stats(now_ms, CacheCounters::of(&s));
+            c.add_pool(now_ms, PoolFill::of(&s));
+        }
         *self.stats.lock().unwrap() = Some((now, s));
     }
 
@@ -550,9 +574,12 @@ pub fn status_json(app: &App) -> Value {
     };
     json!({"at_ms": unix_ms(), "model_name": app.cfg.model_name,
            "ablit": {"alias": app.ablit_name()},
-           "engine": {"connected": info.is_some(), "name": info.as_ref().map(|i| i.name.clone()), "uptime_s": t.started.elapsed().as_secs()},
+           "engine": {"connected": info.is_some(), "name": info.as_ref().map(|i| i.name.clone()), "uptime_s": t.started.elapsed().as_secs(), "connected_s": t.connected_s()},
            "health": health, "sessions": kv, "node_health": node_health_json(t),
            "engram": stats.as_ref().map_or(Value::Null, |s| engram_json(s, t.engram_hit_rate())),
+           "memory": stats.as_ref().map_or(Value::Null, memory_json),
+           "copy": stats.as_ref().map_or(Value::Null, copy_json),
+           "cache": cache_json(t, unix_ms()),
            "interleave": settings_json(stats.as_ref())})
 }
 
@@ -736,12 +763,16 @@ async fn series(State(app): State<Arc<App>>, headers: HeaderMap, uri: Uri) -> Re
         return failure(StatusCode::BAD_REQUEST, "seconds and step must be whole numbers");
     };
     let name = query_param(&uri, "name").unwrap_or("decode_tps");
+    if name == "cache" {
+        let step_s = (step.max(BUCKET_S) / BUCKET_S).min(BUCKETS) * BUCKET_S;
+        return json_response(StatusCode::OK, cache_answer_json(&t.cache_series(unix_ms(), seconds, step), step_s));
+    }
     match t.series(name, unix_ms(), seconds, step) {
         Some(a) => {
             let step_s = (step.max(BUCKET_S) / BUCKET_S).min(BUCKETS) * BUCKET_S;
             json_response(StatusCode::OK, json!({"points": a.points, "peaks": a.peaks, "step_s": step_s, "last_ms": a.last_ms}))
         }
-        None => failure(StatusCode::BAD_REQUEST, "name is decode_tps or prefill_tps"),
+        None => failure(StatusCode::BAD_REQUEST, "name is decode_tps, prefill_tps or cache"),
     }
 }
 
@@ -1128,6 +1159,7 @@ mod tests {
             prefill_us,
             decode_us: 7,
             error: String::new(),
+            tail: None,
         };
         t.finish(&done(1, DoneReason::Stop, 500_000, 1_250_000));
         t.finish(&done(2, DoneReason::Error, 1, 1));

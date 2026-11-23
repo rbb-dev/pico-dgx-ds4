@@ -17,13 +17,14 @@
 #                             or more IPv4 addresses, separated by spaces or commas ("127.0.0.1 <private
 #                             address>": loopback, and the box's address on a private network), each a
 #                             specific one, never 0.0.0.0 (HTTP stays off public interfaces). Port 8888 is
-#                             the production endpoint (M9, the owner's go-ahead on 2026-10-12): only with
+#                             the production endpoint: only with
 #                             DSGB10_PROD=1
 #   DSGB10_KEY_FILE           the API key, which dsfront reads from this file (mode 600):
 #                             ~/dsgb10-data/dev-api-key. It is never on a command line
 #   DSGB10_ENGINE_ARGS        the engine's arguments after --mode serve --socket <run/engine.sock>:
-#                             --max-ctx 262144 --pool-free-gib 10 (the chunk pool leaves 10 GiB free on every
-#                             Spark; the rest are serve's defaults)
+#                             --max-ctx 262144 --pool-free-gib 10 --front-mib 840 (the chunk pool leaves 10 GiB free on
+#                             every Spark; --front-mib is the front-end process's memory cap, which serve mode requires and
+#                             the store is sized beside; the rest are serve's defaults)
 #   DSGB10_FRONT_ARGS         more of dsfront's arguments
 #   DSGB10_NOTE               added to ring.owner: how long the service will hold the ring, say
 #   DSGB10_BIN, DSGB10_FRONT_BIN  the binaries, copied at start (to the workers once the service has
@@ -88,7 +89,7 @@ state() {  # state words...: run/state is "<state> <epoch> <what>"; starting|wai
 settings() {
   ADDR=${DSGB10_ADDR:-127.0.0.1} PORT=${DSGB10_PORT:-18893}
   KEY=${DSGB10_KEY_FILE:-$HOME/dsgb10-data/dev-api-key}
-  EARGS=${DSGB10_ENGINE_ARGS:---max-ctx 262144 --pool-free-gib 10} FARGS=${DSGB10_FRONT_ARGS:-} NOTE=${DSGB10_NOTE:-}
+  EARGS=${DSGB10_ENGINE_ARGS:---max-ctx 262144 --pool-free-gib 10 --front-mib 840} FARGS=${DSGB10_FRONT_ARGS:-} NOTE=${DSGB10_NOTE:-}
   [ "$MOCK" = 1 ] && EARGS=${DSGB10_ENGINE_ARGS:---delay-ms 5}  # the mock engine's arguments
   BIN=${DSGB10_BIN:-$SRC/engine/build/server/$NAME} FBIN=${DSGB10_FRONT_BIN:-$SRC/frontend/target/release/dsfront}
   MIN_AVAIL_GIB=${MIN_AVAIL_GIB:-100}

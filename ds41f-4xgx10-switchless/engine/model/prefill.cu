@@ -47,62 +47,21 @@ void Model::Impl::prefill_alloc(comm::Ring* ring) {
   CUDA_CHECK(cudaMemGetInfo(&free0, &total));
   pf = std::make_unique<Prefill>();
   Prefill& p = *pf;
-  const int M = std::max(opt.prefill_rows, kReplay), Q = q_rows(M), M4 = 4 * Q;  // CED replays 128 rows
-  p.cap = M, p.Q = Q;
+  const int M = std::max(opt.prefill_rows, kReplay);  // CED replays 128 rows
+  StandingAlloc sa;
+  rows_alloc(p.rows, M, sa);
+  const int Q = p.rows.Q;
+  if (opt.prefill_rows_max > p.rows.cap && !tenants.find(lend::kTenantPrefill))
+    tenants.add(lend::kTenantPrefill, lend::kKindDevice, lend::kOnDemand);  // the lent set (rows_lend.cu): never evicts, the first to give way
   int mf = M;  // the largest chunk whose MoE fuses its combine: only those use ymoe and ysum
   while (mf > 1 && !dsk::moe_prefill_fuses(mf)) --mf;
-  p.x = dalloc<bf16>((size_t)Q * kHcDim);
-  p.mid = dalloc<bf16>((size_t)Q * kHcDim);
-  p.y = dalloc<bf16>((size_t)Q * kDim);
-  p.yraw = dalloc<bf16>((size_t)Q * kDim);
-  p.sub = dalloc<bf16>((size_t)Q * kDim);
-  p.a_pre = dalloc<float>((size_t)Q * kHc);
-  p.a_post = dalloc<float>((size_t)Q * kHc);
-  p.a_comb = dalloc<float>((size_t)Q * kHc * kHc);
-  p.pm = dalloc<float>((size_t)Q * kHc);
-  p.f_post = dalloc<float>((size_t)Q * kHc);
-  p.f_comb = dalloc<float>((size_t)Q * kHc * kHc);
   p.ysum = dalloc<float>((size_t)q_rows(mf) * kDim);
-  p.gl = dalloc<float>((size_t)Q * kExperts);
-  p.wpf = dalloc<float>((size_t)Q * kIdxHeads);
-  p.iq = dalloc<bf16>((size_t)Q * kIdxQ);
-  p.part = dalloc<bf16>((size_t)M4 * kDim);
-  p.qa = dalloc<bf16>((size_t)M4 * kQLora);
-  p.kvx = dalloc<bf16>((size_t)M4 * kHead);
-  p.qr = dalloc<bf16>((size_t)M * kQLora);
-  p.q = dalloc<bf16>((size_t)M * kQ);
-  p.o = dalloc<bf16>((size_t)M * kQ);
-  p.ckvf = dalloc<float>((size_t)M4 * kHead);
-  p.cscf = dalloc<float>((size_t)M4 * kHead);
-  p.rwts = dalloc<float>((size_t)M4 * kTopK);
   p.ymoe = dalloc<float>((size_t)4 * q_rows(mf) * kDim);
-  p.yq = dalloc<uint8_t>((size_t)M4 * kDim);
-  p.ys = dalloc<uint8_t>((size_t)M4 * kDim / 32);
-  p.qq = dalloc<uint8_t>((size_t)M * kQLora);
-  p.qs = dalloc<uint8_t>((size_t)M * kQLora / 32);
-  p.oq = dalloc<uint8_t>((size_t)M * kOPart);
-  p.os = dalloc<uint8_t>((size_t)M * kOPart / 32);
-  p.oqa = dalloc<uint8_t>((size_t)M4 * kOPart);
-  p.osa = dalloc<uint8_t>((size_t)M4 * kOPart / 32);
   p.gath = dalloc<uint8_t>((size_t)kRanks * kDim * 2);
-  p.lin_kv = dalloc<uint8_t>((size_t)(M + 127) * kHead);
-  p.lin_sc = dalloc<uint8_t>((size_t)(M + 127) * kHead / 32);
-  p.tok = dalloc<int>(M);
-  p.pos = dalloc<int>(M);
-  p.ridx = dalloc<int>((size_t)M4 * kTopK);
-  p.counters = dalloc<int>(Q);
-  p.topk_mine = dalloc<int>((size_t)Q * kIdxTopk);
-  for (auto& t : p.topk) t = dalloc<int>((size_t)M4 * kIdxTopk);
-  p.pool = dalloc<int>((size_t)Q * kPoolBlocks);
-  p.keys = dalloc<uint16_t>(std::max((size_t)kIdxBatch * scan_[0].stride, (size_t)Q * kPoolBlocks * 8));
+  p.key_q = q_rows(std::max(M, opt.prefill_rows_max));  // the lent set's chunks use these keys too
+  p.keys = dalloc<uint16_t>(std::max((size_t)kIdxBatch * scan_[0].stride, (size_t)p.key_q * kPoolBlocks * 8));
   p.bkeys = dalloc<uint16_t>((size_t)kIdxBatch * scan_[0].stride / 8);
   scan_[0].pkeys = p.keys, scan_[0].pbkeys = p.bkeys;
-  p.iqf = dalloc<uint8_t>((size_t)Q * kIdxHeads * 64);
-  p.iqsc = dalloc<uint32_t>((size_t)Q * kIdxHeads);
-  p.iqw = dalloc<float>((size_t)Q * kIdxHeads);
-  p.topkey = dalloc<uint16_t>((size_t)Q * kIdxTopk);
-  p.poolkey = dalloc<uint16_t>((size_t)Q * kPoolBlocks);
-  p.moe_ws = dalloc<uint8_t>(dsk::moe_prefill_workspace_bytes(M, kExperts));
   {
     int lo = 0, hi = 0;
     CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&lo, &hi));

@@ -999,10 +999,10 @@ impl Gen {
 impl Drop for Gen {
     fn drop(&mut self) {
         if !self.done {
-            // The client went away mid-request. A cancelled session keeps what it processed, of
-            // which what we received is a prefix: still good for the conversation's next turn.
+            // The client went away mid-request: the session stays as it was. If the engine cut its history meanwhile, the
+            // conversation's next request is answered `PrefixGone` and goes whole.
             self.app.engine.cancel(self.req_id);
-            self.app.sessions.lock().unwrap().finish_images(self.session_id, &self.prompt_text, &self.prompt_ids, &self.ids, &self.app.tok, &self.images);
+            self.give_up();
         }
     }
 }
@@ -1019,15 +1019,9 @@ async fn start(app: &Arc<App>, p: &Prepared, pass: Pass) -> Result<Gen, ApiError
     let (plan, released) = {
         let app2 = app.clone();
         let text = p.prompt.clone();
-        let (keep, ctx_w) = (info.keep_positions, info.max_context);
-        tokio::task::spawn_blocking(move || {
-            let mut t = app2.sessions.lock().unwrap();
-            t.keep_for(keep, ctx_w);
-            t.set_image_bytes(app2.image_rows.in_flight() * crate::vision::IMAGE_ROW_BYTES);
-            t.plan(&text, &app2.tok, app2.cfg.tokenize_threads, ablit)
-        })
-        .await
-        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "server_error".into(), e.to_string()))?
+        tokio::task::spawn_blocking(move || crate::session::plan_shared(&app2.sessions, &text, &app2.tok, app2.cfg.tokenize_threads, ablit, &[]))
+            .await
+            .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "server_error".into(), e.to_string()))?
     };
     for s in released {
         app.engine.release(s);
@@ -1114,16 +1108,16 @@ async fn start_images(app: &Arc<App>, p: &Prepared, pass: Pass, info: crate::pro
     let (text, ats) = crate::vision::expand_text(&p.prompt, &enc.rows).map_err(bad)?;
     let keys: Vec<ImageKey> = (0..ats.len()).map(|i| ImageKey { at: ats[i], rows: enc.rows[i], hash: enc.hashes[i] }).collect();
     let ablit = p.ablit.unwrap_or(false);
+    {
+        let mut t = app.sessions.lock().unwrap();
+        t.keep_for(info.keep_positions, info.max_context);
+        t.set_image_bytes(app.image_rows.image_bytes());
+    }
     let (plan, released) = {
-        let (app2, text, keys, keep, ctx_w) = (app.clone(), text.clone(), keys.clone(), info.keep_positions, info.max_context);
-        tokio::task::spawn_blocking(move || {
-            let mut t = app2.sessions.lock().unwrap();
-            t.keep_for(keep, ctx_w);
-            t.set_image_bytes(app2.image_rows.in_flight() * crate::vision::IMAGE_ROW_BYTES);
-            t.plan_images(&text, &app2.tok, app2.cfg.tokenize_threads, ablit, &keys)
-        })
-        .await
-        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "server_error".into(), e.to_string()))?
+        let (app2, text, keys) = (app.clone(), text.clone(), keys.clone());
+        tokio::task::spawn_blocking(move || crate::session::plan_shared(&app2.sessions, &text, &app2.tok, app2.cfg.tokenize_threads, ablit, &keys))
+            .await
+            .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "server_error".into(), e.to_string()))?
     };
     let (n_images, n_rows, encoder_ms) = (enc.rows.len(), enc.rows.iter().sum::<u32>(), enc.ms);
     // the encoder has said what the images really take: hold that, not the estimate
@@ -1165,12 +1159,13 @@ async fn start_images(app: &Arc<App>, p: &Prepared, pass: Pass, info: crate::pro
             | if p.seed.is_some() { FLAG_SEED } else { 0 }
             | if ablit { FLAG_ABLIT } else { 0 },
         n_top_logprobs: 0,
-        prefix_hint: plan.reused as u32,
+        prefix_hint: hint,
         stop_ids: stop_ids.clone(),
-        prompt: plan.ids.clone(),
+        prompt: ids.clone(),
         images: Some(crate::vision::payload(&starts, enc)), // the encoder's buffer itself, not a copy
+        prefix: None,
     };
-    let meta = ReqMeta { key_label: p.key_label.clone(), ablit, prompt_tokens: plan.ids.len() as u32, endpoint: ENDPOINT, priority: PRIORITY };
+    let meta = ReqMeta { key_label: p.key_label.clone(), ablit, prompt_tokens: ids.len() as u32, endpoint: ENDPOINT, priority: PRIORITY };
     let (req_id, rx) = match app.engine.submit(submit, meta) {
         Ok(x) => x,
         Err(e) => {

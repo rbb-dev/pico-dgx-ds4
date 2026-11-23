@@ -294,10 +294,23 @@ struct SelectArgs {
   // the rows' chunk lists (attn.h): positions picked from the scan (unit 1, no cand) are written as pool entries
   const uint32_t* list;
   int list_stride;
+  // merge candidates as an all-gather delivers them (index_merge2's rank_major_parts): rm_parts parts of n / rm_parts
+  // candidates, part q of the rm_rows rows at q * rm_rows * width (width = n / rm_parts); 0: the rows are `stride` apart
+  int rm_parts, rm_rows;
 };
 
+// where candidate i of a row sits, past its row's start, when the candidates are rank-major (kRM): part i / width's rows
+// are rm_rows * width apart, this row's share of it r * width in (the row's start already holds that for part 0)
+template <bool kRM>
+__device__ __forceinline__ int rm_adj(const SelectArgs& a, int i) {
+  if (!kRM) return 0;
+  const int w = a.n / a.rm_parts;
+  return (i / w) * (a.rm_rows - 1) * w;
+}
+
+template <bool kRM = false>
 __device__ __forceinline__ int scan_pos(const SelectArgs& a, int r, int i, int lo) {
-  if (a.cand) return a.cand[(size_t)r * a.cand_stride + i];
+  if (a.cand) return a.cand[(size_t)r * a.cand_stride + i + rm_adj<kRM>(a, i)];
   if (a.blocks) {
     int b = a.blocks[(size_t)r * a.nblocks + (i >> 3)];
     return b < 0 ? -1 : b * 8 + (i & 7);
@@ -773,6 +786,14 @@ __global__ void __launch_bounds__(kSelThreads) index_dense_kernel(IndexDenseArgs
       r = R - 1;
     return r;
   };
+  // a session of n keys: the part of its scan this launch scans, as index_fused's part scans it (dense_range): keys [lo, hi); one
+  // part (the whole scan): [0, n). The keys and block maxima are written from 0, the selections' positions from lo
+  auto part_of = [&](int n) {
+    if (s.nparts <= 1) return Range{0, n};
+    const int chunk = ((n + s.nparts - 1) / s.nparts + 63) & ~63;
+    const int lo = min(n, s.part * chunk);
+    return Range{lo, min(n, lo + chunk)};
+  };
   uint8_t(*sq)[kIdxHeads][64] = reinterpret_cast<uint8_t(*)[kIdxHeads][64]>(dsm);  // [row][head]
   uint32_t* ssc = reinterpret_cast<uint32_t*>(dsm + kDenseRows * kIdxHeads * 64);
   float* sw = reinterpret_cast<float*>(ssc + kDenseRows * kIdxHeads);
@@ -828,7 +849,8 @@ __global__ void __launch_bounds__(kSelThreads) index_dense_kernel(IndexDenseArgs
     }
     const int* rb = s.blocks ? s.blocks + (size_t)r0 * s.nblocks : nullptr;  // a block list: the group's one row
     const uint32_t* lrow = kSlots ? s.list + (size_t)sslot[r0] * s.list_stride : s.list;  // the group's session's keys
-    TileKeys cur = load_tile(s, lrow, rb, c * kDensePos + warp * 16, n, 0, lane);
+    TileKeys cur = load_tile(s, lrow, rb, c * kDensePos + warp * 16, n, lo, lane);
+    if (tid == 0) cta_lo = lo, cta_stride = stride;  // not kept in registers through the queries' preparation (they spilled there)
     QIn qi = q_load(a.iq_pre + ((size_t)r0 * kIdxHeads + warp) * kIdxDim, s.pos[r0], a.table, lane);
     float wq = a.wproj[r0 * kIdxHeads + warp];
     for (int r = r0; r < r1; ++r) {  // the queries (warp h: head h of each row), the next row's loading
@@ -1121,10 +1143,22 @@ void index_dense_blocks(const uint16_t* iq_pre, const float* wproj, const int* p
 }
 
 void index_merge2(int rows, const int* cand_pos, const uint16_t* cand_key, int n, IndexSel top, const int* pcand_pos,
-                  const uint16_t* pcand_key, int pn, IndexSel pool, bool pdl, cudaStream_t s) {
+                  const uint16_t* pcand_key, int pn, IndexSel pool, bool pdl, cudaStream_t s, int rank_major_parts) {
   SelectArgs a0 = merge_args(cand_pos, cand_key, n, top.kmax, top.pos, top.key, top.stride), a1 = a0;
   if (pool.pos) a1 = merge_args(pcand_pos, pcand_key, pn, pool.kmax, pool.pos, pool.key, pool.stride);
-  launch(merge_kernel, dim3(rows, pool.pos ? 2 : 1), dim3(kSelThreads), 0, s, pdl, a0, a1);
+  if (rank_major_parts) {  // the candidates as the all-gather leaves them: [parts][rows][n / parts]
+    if (rank_major_parts < 1 || n % (rank_major_parts * 16) || (pool.pos && pn % (rank_major_parts * 16)))
+      die("index_merge2: %d rank-major parts of %d / %d candidates (each part a multiple of 16)", rank_major_parts, n, pn);
+    for (SelectArgs* m : {&a0, &a1}) {
+      m->rm_parts = rank_major_parts;
+      m->rm_rows = rows;
+      m->keys_stride = m->n / rank_major_parts;  // a row's part: its candidates in part order are rows apart by rows * that
+      m->cand_stride = m->keys_stride;
+    }
+    launch(merge_kernel<true>, dim3(rows, pool.pos ? 2 : 1), dim3(kSelThreads), 0, s, pdl, a0, a1);
+    return;
+  }
+  launch(merge_kernel<false>, dim3(rows, pool.pos ? 2 : 1), dim3(kSelThreads), 0, s, pdl, a0, a1);
 }
 
 }  // namespace attn

@@ -226,7 +226,7 @@ class Model {
   // (0: none), the same on every rank: a plan made with the first is made again with the second.
   int window_groups_estimate(int f) const;
   int window_busy_groups(int f) const;
-  // ---- the Engram row cache as a borrower of the pool's memory (lend.cu; docs/engine.md, "The Engram cache's memory") ----
+  // ---- the Engram row cache as a borrower of the pool's memory (tenant.cu; docs/engine.md, "The Engram cache's memory") ----
   // The cache's block (slots, keys, reference bits, tables) is host memory taken from the pool by whole groups: the store
   // gives the groups' chunks back to the driver, the cache's worker commits and populates the same bytes as one block and
   // gives them back the other way. engram_lend(kLendBegin, mib) starts a change to `mib` MiB of slots (the display
@@ -270,7 +270,7 @@ class Model {
   void slot_reserve(int s, int need, int img = 0);
   void slot_unreserve(int s);  // slot s's reservation to 0: its request has finished (the line keeps what it holds)
   void slot_release(int s);
-  void slot_attach(int s, int h);  // slot s's unit holds stored session h from now on (no copy: its rows are h's)
+  void slot_attach(int s, int h, int upto = INT32_MAX);  // slot s's unit holds stored session h from now on (no copy: its rows are h's); what is split of it below `upto` comes back, the tail stays split
 
   // Queue one step of R rows at positions pos0 .. pos0 + R - 1 on every rank, without waiting for it;
   // returns its number. tokens[r] >= 0 is the token; -1 - j stands for row j of the previous step's
@@ -389,9 +389,20 @@ class Model {
   // Chunks the store could give back to the slots without touching the sessions in `keep` (handles): the chunks
   // it has mapped less those under their blocks in RAM. 0 when it does not share the pool.
   size_t state_giveable(const std::vector<int>& keep) const;
+  // the same with the conversations of `lines` (handles) counted as if no line held them: the numbers only those conversations
+  // name, each once, and the quarter numbers all of whose used slots only they name (one count for every line the request may take)
+  size_t state_giveable_joint(const std::vector<int>& keep, const std::vector<int>& lines) const;
   // An upper bound of the chunks bringing session h back from the disk tier can map (0: it is not there, or the store
   // has a pool of its own): each block of its record maps at most ceil(bytes / chunk) + 1 chunks.
   size_t state_restore_chunks(int h) const;
+  // the read-backs cut so far at a piece whose sums differed from the ones written (a cut for sums leaves lists not back without a refused take)
+  uint64_t state_sum_cuts() const;
+  // the numbers h's lists hold in the pool and the lists only on the disk tier (the other numbers state_restore_chunks counts are bookmarks)
+  void state_list_numbers(int h, int upto, int* in_pool, int* on_disk) const;
+  // and, in `split`, the lists below `upto` that are quarter slots (counted in neither of the others)
+  void state_list_numbers(int h, int upto, int* in_pool, int* on_disk, int* split) const;
+  // h's window bookmarks by position with the numbers each holds in the pool (0: only on the disk tier)
+  std::vector<std::pair<int, int>> state_snap_numbers(int h) const;
   struct StoreChunks {  // the shared budget (zero without it)
     uint64_t total = 0, committed = 0, mapped = 0, idle = 0, live_bytes = 0, trimmed = 0, give_backs = 0;
   };
@@ -464,6 +475,8 @@ class Model {
     bool on_disk = false;    // spilled: its blocks are in the disk tier (disk_bytes), none in the pool
     size_t disk_bytes = 0;
     int restart = -1;        // the latest position it can restart from with what it holds (state.cu restart_of); -1: none
+    bool split = false;      // a piece of it is a quarter slot (kStJoin brings it back)
+    int slots = 0;           // the quarter slots it names, lists and bookmarks
   };
   StateInfo state_info(int h) const;
   // The YaRN factor session h's stored state is rotated with (16, 32, 64; 16 when unknown). Set once, when a slot takes the

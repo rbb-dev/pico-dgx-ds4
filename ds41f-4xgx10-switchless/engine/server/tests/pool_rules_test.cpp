@@ -41,6 +41,14 @@ int64_t reserved_of(const std::vector<Slot>& s) {
 }  // namespace
 
 int main() {
+  {
+    const int slot_at = 5000;  // entries from position 5,000 on are quarter slots
+    const auto below = [&](int u) { return u > slot_at ? (u - slot_at + 999) / 1000 : 0; };
+    check(rules::whole_below(60000, below) == slot_at, "the reuse after a stopped join stops at the first slot");
+    check(rules::whole_below(3000, below) == 3000, "a reuse below every slot is kept");
+    check(rules::whole_below(60000, [](int) { return 0; }) == 60000, "nothing split: the reuse is kept");
+    check(rules::whole_below(0, below) == 0, "no reuse stays none");
+  }
   const std::vector<int> none;
 
   // the finished lines: the server's finish() unreserves each (kStUnreserve), the model applies resv_after_finish

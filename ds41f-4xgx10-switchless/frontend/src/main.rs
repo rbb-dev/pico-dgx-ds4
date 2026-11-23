@@ -39,10 +39,12 @@ fn usage() -> ! {
                                 request path
       --table-days N            sessions unused for longer are not kept: 7
       --front-table-mib N       the most memory the session table may hold, counted by what its buffers allocate:
-                                0 = no limit (the default); the oldest idle sessions go first, beside the
+                                0 = from --front-mib when that is set (the cap / 1.1, less 107 and --front-image-mib),
+                                else no limit (the default); the oldest idle sessions go first, beside the
                                 engine's position limit
       --front-mib N             the most memory this process may hold as the kernel counts it, read every 10 s:
-                                0 = not watched (the default); over it, idle sessions go, oldest first (not
+                                0 = not watched (the default; pico-front.service passes PICO_FRONT_MIB, the same
+                                setting as the engine's --front-mib); over it, idle sessions go, oldest first (not
                                 below half of what the table held when it went over, and not at all while the
                                 memory does not fall as they go), and image requests are answered 429 with
                                 Retry-After: 5 until it is under

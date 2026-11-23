@@ -4,6 +4,7 @@
 #pragma once
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <functional>
@@ -28,9 +29,11 @@
 #include "model/img_rows.h"
 #include "model/tokwin.h"
 #include "model/lend.h"
+#include "model/tenant.h"
 #include "model/model.h"
 #include "model/ops.h"
 #include "model/pool_rules.h"
+#include "model/store_core.h"
 #include "model/vmm.h"
 
 namespace model {
@@ -75,8 +78,11 @@ struct LayerW {
   const float* gate_bias = nullptr;
   const float* gate_bias_vl = nullptr;  // vision: image-span rows' selection bias (nullptr: the file lacks it)
   dsk::MoeWeights moe{};
-  // mHC: the full projections [24][20480] (all-gathered at bind), base [24], scale [3]
-  float* hc_fn[2] = {};
+  // mHC: decode's operand of hc_fn . stream: this rank's own [24][5120] quarter of each projection (row stride
+  // hc_ld = 5120; the weight file's tensor), or in a file cut by rows the whole [24][20480] (all-gathered at bind;
+  // hc_ld = 0). prefill_alloc builds the whole of a quarter file transiently for p_hcfn and frees it. base [24], scale [3]
+  const float* hc_fn[2] = {};
+  int hc_ld = 0;
   const float *hc_base[2] = {}, *hc_scale[2] = {};
   // Engram
   const uint8_t *e_wkv = nullptr, *e_skv = nullptr;
@@ -154,7 +160,8 @@ struct Model::Impl {
 
   // weights
   detail::LayerW lw[kLayers];
-  const bf16 *embed = nullptr, *norm_w = nullptr;
+  const bf16 *embed = nullptr, *norm_w = nullptr;  // embed: this rank's 32,320 rows of the table (common/embed_shard.h)
+  bf16* emb_slot = nullptr;                          // [kMaxRows][5120]: a step's lookup slot, summed in place over the ranks
   const uint8_t* head = nullptr;
   bool head_coded = false;  // head holds the coded head (code_head): the head GEMVs read it with gemv_bf16x*
 
@@ -170,15 +177,17 @@ struct Model::Impl {
   int unit_of[kMaxSlots] = {}, slot_ctx_[kMaxSlots] = {};
   // the slot memory pool (vmm.h; Options::vmm): the kv sources' sixteen arrays are ranges of it, mapped per
   // slot as its session grows (ensure_mapped): array a of kv source k is the pool's array 4 * k + a
-  // (kKvEntryBytes order); mapped_upto[s]: the position up to which every array of slot s is mapped (-1: none)
+  // (kKvEntryBytes order); the position up to which every array of slot s is mapped is the store core's (mapped_upto)
   std::unique_ptr<vmm::Pool> slot_pool;
-  int mapped_upto[kMaxSlots] = {};
   // The chunk pool (attn.h Compressed): slot_pool holds four pool-wide arrays (pool_arr: KV, KV scales, index keys, key
-  // scales) cut into chunk numbers of attn::kChunkEntries entries, taken from the allocator `calloc` (chunks.h), lowest free first. line_h[u]: the
-  // session unit u holds (kNoLine: none; negative: the unit's own); its rows of lists_d [kKvSlots][nunits][list_len] are
-  // that session's lists, lists_h the pinned mirror. resv[s]: numbers reserved for slot s's request; store_numbers: the store's share.
+  // scales) cut into chunk numbers of attn::kChunkEntries entries, taken from the allocator `calloc` (chunks.h), lowest free first. The session
+  // each unit holds (line_h), the reservations (resv) and the numbers' reference counts (refs) are the store core's; a unit's
+  // rows of lists_d [kKvSlots][nunits][list_len] are its session's lists, lists_h the pinned mirror; store_numbers: the store's share.
   std::unique_ptr<chunks::Alloc> calloc;
-  std::vector<uint32_t> refs;  // refs[c]: the lists and bookmarks naming number c (forks share numbers by count)
+  // The session store: the bookkeeping (detail::StoreCore, host only) over the device's side of it (state.cu), made with the
+  // allocator. The device side is declared first, so the core is destroyed first.
+  std::unique_ptr<detail::StoreDev> store_dev;
+  std::unique_ptr<detail::StoreCore> core;
   uint8_t* pool_arr[4] = {};
   uint32_t *lists_d = nullptr, *lists_h = nullptr;
   int list_len = 0;
@@ -426,6 +435,10 @@ struct Model::Impl {
 
   // ---- weights ------------------------------------------------------------------------------
   void bind(dsw::WeightFile& wf, comm::Ring& ring);
+  void reserve_gathered(bool engram);
+  void* gathered_dest(const std::string& name, uint64_t bytes);
+  std::vector<detail::GatheredW> pgw;  // per layer, from reserve_gathered until prefill_alloc takes them
+  size_t pgw_bytes = 0, alias_n = 0, alias_bytes = 0;
   size_t code_head(int* raw_tiles);
 
   // ---- session slots ------------------------------------------------------------------------
@@ -523,55 +536,16 @@ struct Model::Impl {
   void ced_replay(int P, const std::vector<std::pair<int, const std::vector<uint32_t>*>>& snaps);
 
   // ---- sessions' saved state (state.cu) -----------------------------------------------------
-  detail::Store& store_of();
+  void make_store();   // state.cu: the core over the device's side, once the allocator exists
+  void store_notes();  // state.cu: what is bound after it: the host ring and the draft module (bookmarks hold its windows)
   void state_reserve(size_t bytes);
-  // The store in the chunk pool. take_nums: n numbers for session h, lowest free first, evicting the least recently used
-  // idle session (store_evict_step) while too few are free; false, nothing taken, when none is left. give_nums: back to
-  // the pool. bk_at / bk_copy: a bookmark's byte `off` (its numbers' KV slices, 2 MiB each), copies split at their edges.
+  // bk_at / bk_copy: a bookmark's byte `off` (its numbers' KV slices, 2 MiB each), copies split at their edges.
   size_t chunk_image() const;  // bytes a chunk number holds across the four arrays
-  bool take_nums(int h, size_t n, std::vector<uint32_t>* out);
-  // take_extra: the same for a bookmark of session h, only from room no line's reservation needs (false: none taken)
-  bool take_extra(int h, size_t n, std::vector<uint32_t>* out);
-  // numbers for a piece read back from the disk tier: only what no running request has reserved (take_extra's rule)
-  bool take_restore(int h, size_t n, std::vector<uint32_t>* out);
-  void give_nums(std::vector<uint32_t>& v);
-  // share_nums: the first n numbers of `from` appended to *out, each counted once more (nothing copied). own_tail: session
-  // h's numbers from the one holding position pos on become its own (refs 1) before anything writes them: a shared one
-  // holding pos is copied (its entries below pos), shared ones above it are replaced; false when the pool has no room.
-  void share_nums(const std::vector<uint32_t>& from, size_t n, std::vector<uint32_t>* out);
-  bool own_tail(int h, int pos);
-  // The disk tier per piece: img_write / bk_write put an image of a number / a bookmark on disk (kNone without room);
-  // img_drop drops a reference to an image (its file space is freed at none); drop_images / free_lists: all of a session's
-  // images / its entries out of the pool and the disk; write_sealed: a turn's full entries and bookmarks, write-behind.
-  size_t img_write(int h, uint32_t c);
-  size_t bk_write(int h, const std::vector<uint32_t>& b, size_t bytes);
-  void img_drop(size_t off, size_t bytes);
-  void drop_images(int h);
-  void free_lists(int h);
-  void write_sealed(int h);
-  bool evict_piece(int v, int h);  // one piece of session v out of the pool (the last first)
-  void cut_at(int h, int pos);     // session h cut to [0, pos)
-  bool own_bk(int h, std::vector<uint32_t>& b);
-  bool store_evict_step(int h);
   uint8_t* bk_at(const std::vector<uint32_t>& n, size_t off) const;
-  void bk_copy(const std::vector<uint32_t>& n, size_t off, uint8_t* dev, size_t bytes, bool to_bk);
-  void slot_attach(int s, int h);  // slot s's unit holds session h (its rows are h's lists)
+  void bk_copy(const std::vector<uint32_t>& n, size_t off, uint8_t* dev, size_t bytes, bool to_bk, cudaStream_t on = nullptr);  // on: the stream (default: the model's)
+  void bk_zero(const std::vector<uint32_t>& n, size_t bytes);  // the bookmark's first `bytes` bytes zero
+  void slot_attach(int s, int h, int upto = INT32_MAX);  // slot s's unit holds session h (its rows are h's lists)
   void pool_grow(size_t more);     // model.cu: more numbers in the pool, made and mapped
-  size_t state_giveable(const std::vector<int>& keep) const;
-  uint64_t state_kept_check(const std::string& base, uint64_t run_id, double max_age_s, size_t* bytes, std::string* why);
-  void state_disk(const std::string& base, size_t bytes, size_t staging, bool reuse, uint64_t run_id);
-  void state_keep(uint64_t gen);
-  // state_checkpoint: a planned stop's index while serving (every rank alike; the sessions it names in ckpt_sess).
-  // kept_index: an index body of gen: the sessions as a planned stop keeps them (all false) or every one as far as its
-  // pieces have images (true), the images in *names. space_free: an image's file space back (inside the tier's size).
-  void state_checkpoint(uint64_t gen);
-  std::vector<uint8_t> kept_index(uint64_t gen, bool all, std::vector<int>* hs, std::set<size_t>* names);
-  void space_free(size_t off, size_t bytes);
-  size_t disk_take(int h, size_t bytes);  // room in the disk tier's file for session h (dropping), or kNone
-  void state_spill(int h);
-  void state_unspill(int h);
-  void state_save(int h, int from, int to);
-  void state_load(int h, int to);
   // a new bookmark's numbers (the caller fills them: bk_copy), nullptr: no room
   const std::vector<uint32_t>* state_snap_buf(int h, int pos);
   void state_snap(int h, int pos);

@@ -228,6 +228,10 @@ class Io {
     stats_ = std::move(f);
   }
   // The latest CONFIG frame, once (the main loop applies it)
+  bool config_pending() {  // a CONFIG frame is waiting for the main loop
+    std::lock_guard<std::mutex> l(cmu_);
+    return cfg_new_;
+  }
   bool take_config(fe::Config& c) {
     std::lock_guard<std::mutex> l(cmu_);
     if (!cfg_new_) return false;
@@ -438,6 +442,7 @@ struct Session {
   int dec_lo = 0, end_dec_lo = 0;
   std::vector<int> enc_snaps;
   double t_used = 0;  // unix time of its last request (kept sessions age out by it)
+  double t_fin = 0;   // now_s() when its last request finished: a split's idle age counts from it (0: from the server's start)
   uint64_t flushed = 0;  // the LRU clock at its last flush to the disk tier (flush_idle)
 };
 
@@ -610,7 +615,7 @@ class Server {
   void idle_check() {
     if (!flying_.empty() || !rot_.empty() || !pfq_.empty()) return;
     std::vector<reclaim::SlotNums> v;
-    for (int t = 0; t < (int)slot_.size(); ++t) v.push_back({m_.slot_committed(t), m_.slot_mapped(t)});
+    for (int t = 0; t < (int)slot_.size(); ++t) v.push_back({m_.slot_committed(t), m_.slot_mapped(t), m_.slot_unheld_reservation(t)});  // the reservation: a split line's quarter slots are committed, not reserved
     const int64_t n = reclaim::idle_reserves(v);
     if (n != 0 && n != idle_reserved_) std::printf("serve: BUG: idle line holds a reservation (%lld numbers reserved, nothing in flight)\n", (long long)n);
     idle_reserved_ = n;
@@ -618,6 +623,7 @@ class Server {
     if (imghold::tripwire(flying_.size() + rot_.size() + pfq_.size(), m_.image_numbers())) {
       std::printf("serve: BUG: %zu image numbers held with nothing in flight; freed\n", m_.image_numbers());
       state({{kStImgFree, 0, 0, 0}});
+      enc_mark_.clear();
     }
     if (wait_.empty() && held_.empty() && ready_.empty()) img_ask_.clear();  // an ask whose request is gone
   }
@@ -823,7 +829,10 @@ class Server {
     hd.body_hash = keepfile::fnv(f.data() + sizeof hd, hd.body_bytes);
     std::memcpy(f.data(), &hd, sizeof hd);
     *bytes = f.size();
-    return keepfile::write_atomic(o_.keep_index, f.data(), f.size(), why);
+    const bool wrote = keepfile::write_atomic(o_.keep_index, f.data(), f.size(), why);
+    if (wrote) keeper_.committed(named);  // the files this index does not name are not needed by any index now
+    for (const uint64_t id : lost) free_session(id);
+    return wrote;
   }
 
   // While nothing runs, a checkpoint a crash comes back to (docs/engine.md "Checkpoints while serving"): when the
@@ -842,7 +851,7 @@ class Server {
       if (slot_[s] && !flying_.count(slot_[s]))
         if (Session* x = find(slot_[s])) {
           persist_slot(s, false);
-          fl.push_back({kStFlush, x->h, 0, 0});
+          if (!o_.imager) fl.push_back({kStFlush, x->h, 0, 0});
           x->flushed = x->used;
         }
     if (!fl.empty()) state(fl);
@@ -899,7 +908,7 @@ class Server {
         ++expired;
         continue;
       }
-      if (o_.ssd_flush_s > 0 && S.flushed != S.used && now - S.t_used >= o_.ssd_flush_s) {
+      if (!o_.imager && o_.ssd_flush_s > 0 && S.flushed != S.used && now - S.t_used >= o_.ssd_flush_s) {  // the imager is the write-behind: nothing to flush
         v.push_back({kStFlush, S.h, 0, 0});
         S.flushed = S.used;
       }
@@ -1018,7 +1027,10 @@ class Server {
   }
   // A request's session (or a fork's base) that was spilled comes back to the store before its plan
   // sees it. The slots' sessions stay where they are (every command pins them).
-  void unspill(const fe::SubmitHeader& h, int fac) {
+  // The read-back has a budget (kStUnspill's count): the lists that must come back, then what the admission found spare for
+  // bookmarks (pool_rules.h restore_budget), so that it leaves the numbers the request's reservation takes next (it is made
+  // after this): a request admitted on its need finds it. `need` and `keep` are the request's, as mem_ok is asked.
+  void unspill(const fe::SubmitHeader& h, int fac, int need, const std::set<uint64_t>& keep, const std::vector<int32_t>& prompt, bool join_now = true) {
     uint64_t id = h.session_id;
     Session* x = find_at(id, fac, &id);
     if (!x && h.base_session_id) id = h.base_session_id, x = find_at(id, fac, &id);
@@ -1199,11 +1211,14 @@ class Server {
     f.sp.ablit = (h.flags & fe::kFlagAblit) ? 1.f : 0.f;  // the runtime abliteration on this request (--ablit)
     for (const fe::ImageSpan& sp : f.rq.spans) f.img.rows += sp.rows;
     flying_.insert(h.session_id);
-    const int rows = il_.on ? rows_to_compute(f) : 0;
-    if (il_.on && !il::read_whole(il_, rows)) {
+    JoinAsk ja;
+    const int rows = il_.on ? rows_to_compute(f, false, &ja) : 0;
+    if (il_.on && (ja.deferred || !il::read_whole(il_, rows, img_ms(f, rows), run_edge_ms(f)))) {
       auto L = std::make_unique<Long>();  // a long prompt: read in pieces, between the decoders' windows
       L->f = std::move(f);
       L->rows = rows;
+      L->ja = ja;
+      L->joining = ja.deferred;
       pfq_.push_back(std::move(L));
       return;
     }
@@ -1248,14 +1263,14 @@ class Server {
     if (L.begun && !push_ && st.push_rows > 0)
       for (size_t i = 1; i < pfq_.size() && !cand; ++i) {
         Long& q = *pfq_[i];
-        if (!q.begun && q.rows <= st.push_rows &&
-            pick_slot({L.f.rq.h.session_id}, need_long(q), q.f.rq.h.session_id, bkf(q.f)) >= 0)
+        if (!q.begun && q.rows <= st.push_rows && il::may_begin_beside(L.f.img.rows > 0, q.f.img.rows > 0, q.joining) &&
+            il::begin_fits(pick_slot({L.f.rq.h.session_id}, need_long(q), q.f.rq.h.session_id, bkf(q.f), &q.f.rq.prompt) >= 0, q.jw, now_s()))
           cand = &q;
       }
     s.push_fits = cand != nullptr;
-    const bool waiting = !wait_.empty() && window_ready(wait_.front()) &&
-                         pick_slot({}, need_clamped(wait_.front()), wait_.front().h.session_id, bkr(wait_.front())) >= 0;
-    s.arrivals = !ready_.empty() || waiting || io_.submit_waiting();
+    const bool waiting = !wait_.empty() && start_wait_.may_try(now_s()) && !vit_gated(wait_.front()) && window_ready(wait_.front()) &&
+                         pick_slot({}, need_clamped(wait_.front()), wait_.front().h.session_id, bkr(wait_.front()), &wait_.front().prompt) >= 0;
+    s.arrivals = !join_active() && (!ready_.empty() || waiting || io_.submit_waiting());  // a join is a store change: nothing is admitted meanwhile
     s.admitted_last = il_admitted_;
     const double t0 = now_s();
     const il::Next nx = il::next(s);
@@ -1372,6 +1387,15 @@ class Server {
       engram_next_ = 0;
       std::printf("serve: the Engram cache goes to %lld MiB at the next run boundary\n", (long long)emib);
     }
+#ifdef DSGB10_TEST_FAULTS
+    if (c.test_tenant_groups >= 0 && c.test_tenant_groups != tenant_set_groups_) {  // the dummy tenant 15, at a run boundary
+      tenant_set_groups_ = c.test_tenant_groups;
+      tenant_goal_mib_ = tenant_set_groups_ * (int64_t)(m_.group_bytes() >> 20);
+      ++tenant_gen_;
+      tenant_next_ = 0;
+      std::printf("serve: tenant 15 goes to %lld groups at the next run boundary\n", (long long)tenant_set_groups_);
+    }
+#endif
     published_ = 0;  // the next STATS shows it
     std::printf("serve: interleave settings: %s, whole %d rows, push %d rows, gap %d ms, share %d %%, window at most %d ms\n",
                 il_.on ? "on" : "off", il_.whole_rows, il_.push_rows, il_.gap_ms, il_.share, il_.burst_max_ms);
@@ -1439,9 +1463,9 @@ class Server {
     const int fac = f.fac = std::max(f.fac, factor_for(n));  // a resume's state is read again at the factor its length needs
     if (fac > kBaseFactor && !m_.window_is_open(fac)) {  // admit() and the turns' loop open it first: never reached
       std::printf("serve: req %llu: the window of factor %d is not open; the request ends\n", (unsigned long long)h.req_id, fac);
-      return ended(f, fe::kError);
+      return ended_at_start(f, fe::kError);
     }
-    unspill(h, fac);
+    unspill(h, fac, need_now(f), keep, prompt);
 
     // ---- the slot, where the state comes from, and from which position on it is computed
     // Only a session of this request's factor can continue it (find_at/acquire): its own, else its base's. A request
@@ -1456,25 +1480,30 @@ class Server {
     // state goes to the store, and the fork starts from there in a slot of its own.
     // With the pool, a slot is taken only when mem_ok() says the pool can hold the request there, with the same
     // `keep` admit() and run() checked: a slot that cannot is left (the session's state to the store), and
-    // pick_slot() gives one that can, so make_room() below always finds the memory.
+    // pick_slot() gives one that can, so room_for() below finds the memory; where the count and the pool disagree the request waits.
     const int need = need_now(f);
     const uint64_t sid = h.session_id, base = bk(h, fac);
     int s = S ? S->slot : -1;
-    if (s >= 0 && (!fits(s, need) || !mem_ok(s, need, keep, sid, base)))
+    if (s >= 0 && (!fits(s, need) || !mem_ok(s, need, keep, sid, base, nullptr, &prompt)))
       persist_slot(s, true, holds(sid, base)), s = -1;  // a small slot (the session moves to a big one), or memory only another slot has
     if (!S && src && src->slot >= 0) {
-      if (!flying_.count(src_id) && fits(src->slot, need) && mem_ok(src->slot, need, keep, sid, base)) s = src->slot;
+      if (!flying_.count(src_id) && fits(src->slot, need) && mem_ok(src->slot, need, keep, sid, base, nullptr, &prompt)) s = src->slot;
       else persist_slot(src->slot, false, holds(sid, base));
     }
-    if (s < 0) s = pick_slot(keep, need, sid, base);
-    if (s < 0) die("serve: no slot for request %llu", (unsigned long long)h.req_id);  // admit() saw one
+    if (s < 0) s = pick_slot(keep, need, sid, base, &prompt);
+    if (s < 0) return begin_waits(f, "no slot", -1, need, keep, sid, base, &prompt);
     const bool src_live = src && src->slot == s;
     // the session that holds slot s (unless it is the fork's own base) leaves the line first, in a command of its own:
-    // its numbers then belong to a conversation no line holds, which make_room may evict for this request
+    // its numbers then belong to a conversation no line holds, which room_for may evict for this request
     if (slot_[s] && slot_[s] != sid && !src_live) persist_slot(s, true, holds(sid, base));
-    make_room(s, need, keep, sid, base);
-    const int p = src ? std::min(lcp(src->hist, prompt), n - 1) : 0;
-    const Plan pl = src ? choose(*src, src_live, p, n) : Plan{};
+    if (!room_for(s, need, keep, sid, base, &prompt)) return begin_waits(f, "no room", s, need, keep, sid, base, &prompt);
+    wait_logged_ = 0;
+    int p = src ? std::min(lcp(src->hist, prompt), n - 1) : 0;
+    if (src && join_incomplete_) {  // the join stopped for want of a number: the restart is planned from what is whole, never past the first slot the store's guard would cut at
+      p = model::rules::whole_below(p, [&](int u) { return lists_split(src->h, u); });
+    }
+    Plan pl = src ? choose(*src, src_live, p, n) : Plan{};
+    if (src && join_incomplete_ && pl.how != kLive && pl.how != kCold && m_.state_info(src->h).slots > 0) pl = Plan{};  // a bookmark that may still be a quarter slot is not read
     const int q = pl.q;
     NVTX_RANGE("req %llu new %d ctx %d %s", (unsigned long long)h.req_id, n - q, n, kHow[pl.how]);
     if (!resume) {
@@ -1507,10 +1536,10 @@ class Server {
     if (src && q > 0) {  // the cut at q copies the chunks the session shares with another (own_tail), a fork's partial piece
       // takes a number per list: those numbers must be there before the operations run (the model dies on a pool held by lines)
       const int64_t cow = (int64_t)m_.state_cow_numbers(src->h, S ? S->h : -1, q);
-      // one count with the request's own reservation (make_room above): the copy's numbers must not come out of what the
+      // one count with the request's own reservation (room_for above): the copy's numbers must not come out of what the
       // reservation was admitted against
       if (cow > 0)
-        give_back((int64_t)m_.slot_chunks_for(s, need) - own(s, keep, sid, base) + cow + img_extra(sid), keep, sid, base, s, 0,
+        give_back(room_n(s, need, keep, sid, base, &prompt) + cow, keep, sid, base, s, 0,
                   "a request and its copy at the restart point");
     }
     std::vector<StateOp> v, pv;  // pv: a fork's base's turn on this line, saved after the reservation
@@ -1537,7 +1566,7 @@ class Server {
         std::printf("serve: req %llu factor %d (window %d): a new session for its %d positions, read again (%s)\n",
                     (unsigned long long)h.req_id, fac, window_of(fac), n - q, kHow[pl.how]);
     }
-    v.push_back({kStAttach, S->h, s, 0});  // the slot holds S: its rows are S's chunk lists (the chunk pool, no copy)
+    v.push_back({kStAttach, S->h, s, src ? std::max(q, 1) : 0});  // the slot holds S: its rows are S's chunk lists (the chunk pool, no copy); a restart brings back only what is below its point
     v.push_back({kStFactor, S->h, s, fac});  // the slot rotates with S's factor from its first step; the store tags S
     if (src) {
       // S's own state is cut to q; a fork's base's [0, q) is copied into S's numbers (from a base the slot held too)
@@ -1600,6 +1629,107 @@ class Server {
     return true;
   }
 
+  // The set of row-sized buffers a prompt that begins now is read on: the lent set when it is held whole on every rank and nobody has asked
+  // it back, else the standing one. (Cmd::rows_set; the same value goes to every rank in the piece's command.)
+  int pick_rows_set() const { return loan_goal_ == 1 && m_.prefill_rows_cap(1) > 0 ? 1 : 0; }
+
+  // ---- the lent prefill row set (model/rows_lend.cu, rows_loan.h) ----
+  // loan_goal_: 1 the set is wanted, 0 it is asked back, -1 not steered yet. A prompt being read on it holds it (loan_in_use).
+  int loan_goal_ = -1;
+  bool loan_forced_ = false;  // a consumer asked it back (give_back's tier 0): it goes whatever the marks say
+  int64_t loan_mib_ = 0;  // the set's size, MiB (0: no second set)
+  int loan_groups_ = 0;
+  double loan_check_ = 0, loan_next_ = 0;
+  model::lend::Backoff loan_backoff_;
+  uint64_t loan_gen_ = 0;
+  bool loan_enabled() const { return loan_mib_ > 0; }
+  bool loan_held() const { return m_.tenant_group_count(model::lend::kTenantPrefill) > 0; }
+  bool loan_in_use() const {
+    for (const auto& q : pfq_)
+      if (q->begun && q->r.rows_set == 1) return true;
+    return false;
+  }
+  // One line on rank 0 whenever the loan's reason changes (the start, then every transition), so that a loan that is not held, or not
+  // given back, says why: the free groups against the ones the policy needs, the readers it waits for.
+  rowsloan::Why loan_why_ = rowsloan::Why::Off;
+  bool loan_why_said_ = false, loan_busy_said_ = false;
+  int loan_readers() const {
+    int n = 0;
+    for (const auto& q : pfq_) n += q->begun && q->r.rows_set == 1;
+    return n;
+  }
+  void loan_say(const rowsloan::State& s) {
+    const rowsloan::Why w = rowsloan::why(s);
+    if (loan_why_said_ && w == loan_why_) return;
+    loan_why_said_ = true, loan_why_ = w;
+    using W = rowsloan::Why;
+    switch (w) {
+      case W::Off: return;
+      case W::Changing: return;  // the change's own lines follow
+      case W::HeldPlenty: std::printf("serve: prefill rows: held (%d groups), the pool has %d groups free (goes back under %d)\n", s.held, s.free_groups, s.marks.low_free); break;
+      case W::HeldReading: std::printf("serve: prefill rows: the pool has %d groups free (under %d): waiting for %d prompt(s) reading on the second set before it goes back\n", s.free_groups, s.marks.low_free, loan_readers()); break;
+      case W::HeldShort: std::printf("serve: prefill rows: the pool has %d groups free (under %d) and nothing reads on the second set: it goes back\n", s.free_groups, s.marks.low_free); break;
+      case W::WaitBackoff: std::printf("serve: prefill rows: not held; the last ask failed and is not repeated yet\n"); break;
+      case W::WaitTopBusy: std::printf("serve: prefill rows: not held; a number in the pool's top %d groups is in use (a take would evict): not asked\n", s.loan); break;
+      case W::WaitFewFree: std::printf("serve: prefill rows: not held; the pool has %d groups free, %d needed (the set's %d plus %d): not asked\n", s.free_groups, s.loan + s.marks.high_extra, s.loan, s.marks.high_extra); break;
+      case W::CanAsk: std::printf("serve: prefill rows: not held; %d groups free and the top %d groups unused: asked for\n", s.free_groups, s.loan); break;
+    }
+    std::fflush(stdout);
+  }
+
+  // Once a second at most: what the policy says now, and the goal it sets. The pool's questions are read only.
+  void loan_policy(double t) {
+    if (!loan_enabled() || t < loan_check_) return;
+    loan_check_ = t + 1.0;
+    m_.tenant_mark_idle(model::lend::kTenantPrefill, !loan_in_use());
+    if (m_.tenant_active()) return;
+    rowsloan::State s;
+    s.enabled = true, s.loan = loan_groups_;
+    s.marks.low_free = o_.loan_low_groups, s.marks.high_extra = o_.loan_high_extra;
+    s.held = m_.tenant_group_count(model::lend::kTenantPrefill);
+    s.in_use = loan_in_use();
+    s.going_back = s.held > 0 && loan_goal_ == 0;  // asked back: the state is sticky (rows_loan.h)
+    s.free_groups = (int)(m_.pool_free_numbers() / model::lend::kGroupNums);
+    s.top_free = s.held == 0 && m_.pool_top_free(loan_groups_);
+    s.backoff = loan_backoff_.blocked((uint64_t)loan_mib_, t, loan_gen_);
+    loan_say(s);
+    switch (rowsloan::decide(s)) {
+      case rowsloan::Act::Ask:
+        std::printf("serve: the pool has %d groups free and none of its top %d in use: the prefill's second set of row buffers is asked for\n",
+                    s.free_groups, loan_groups_);
+        loan_goal_ = 1, loan_next_ = 0;
+        break;
+      case rowsloan::Act::GiveBack:
+        if (loan_goal_ != 0) {
+          std::printf("serve: the pool has %d groups free (under %d): the prefill's second set of row buffers is going back%s\n", s.free_groups,
+                      s.marks.low_free, s.in_use ? " (when the prompt reading on it has ended)" : "");
+          loan_goal_ = 0, loan_next_ = 0, loan_backoff_ = model::lend::Backoff();
+        }
+        break;
+      case rowsloan::Act::Withdraw:
+        if (!loan_forced_) {
+          std::printf("serve: the pool has %d groups free again (the set's %d plus %d): the prefill's second set stays\n", s.free_groups, s.loan,
+                      s.marks.high_extra);
+          loan_goal_ = 1;
+        }
+        break;
+      case rowsloan::Act::Keep:  // an ask whose conditions went is withdrawn; a held loan keeps its goal
+        if (s.held == 0) loan_goal_ = 0, loan_forced_ = false;
+        else if (loan_goal_ < 0) loan_goal_ = 1;
+        break;
+    }
+  }
+  // Tier 0 of give_back: a consumer is short and the second set is held and unused: it goes back before any line is detached or any
+  // conversation evicted. True when its return is under way (the consumer waits for the groups and asks again).
+  bool loan_give_way(double t) {
+    if (!loan_enabled() || !loan_held() || loan_in_use()) return false;
+    if (m_.tenant_active()) return m_.tenant_change_id() == model::lend::kTenantPrefill;
+    if (loan_backoff_.blocked(0, t, loan_gen_)) return false;
+    std::printf("serve: a request needs the pool's memory: the prefill's second set of row buffers goes back first\n");
+    loan_goal_ = 0, loan_next_ = 0, loan_forced_ = true;
+    return true;
+  }
+
   // One piece of the prompt: rows [pos, pos + R), the next piece's Engram look-ahead sized next_rows. False when
   // the request was cancelled before it (nothing run).
   bool pf_piece(Reader& r, int R, int next_rows) {
@@ -1644,13 +1774,20 @@ class Server {
       S->w = std::max(S->w, pos + R + (m_.spec() ? model::ops::kDrafts : 0));  // its draft's block keys
     } else {
       c.op = kCmdPrefill;
-      c.flags = (last ? kPfSample : 0) | (ced ? kPfCed : 0);
+      const bool watch = memwatch::chunk_ride_due(mem_watch_on(), now_s(), watch_at_);  // the memory watch rides this chunk
+      c.flags = (last ? kPfSample : 0) | (ced ? kPfCed : 0) | (watch ? kPfWatch : 0);
       const int rest = n - pos - R;
       c.next = rest > o_.small_rows || (ced && rest > 0) ? std::min(next_rows, rest) : 0;
       for (int i = 0; i < c.n_snaps; ++i)
         if (ced && c.snaps[i] < n) S->enc_snaps.push_back(c.snaps[i]);  // the replay covers only one at n
       issue(c);
+      if (watch) mem_watch_note(watch_over());
       const uint64_t k = run_prefill(m_, c);
+      if (watch) {  // every rank has read: rank 0's run_prefill returns after the all-gather
+        watch_at_ = now_s();
+        watch_line("in a prompt's chunk");
+      }
+      publish();  // the STATS frame is built while the device computes the chunk, not in the gap before the next one
       if (k != ~0ull) first = m_.wait(k), first_row = 0;
       if (!last) m_.drain();  // every chunk but the last drains here; the last chunk's tail (the draft windows' seeding) drains after tok0 is out
       if (!last) tu.add_split(m_);
@@ -1900,17 +2037,11 @@ class Server {
   // Slot memory for a request of `need` positions in slot s: the least recently used sessions with no request in
   // flight leave their slots (their state saved to the store, their chunks back to the pool) until the pool can
   // commit it, counting what the store will give back at the reservation (giveable, with every slot's session left
-  // alone: what Model::slot_reserve does). go() took slot s only where mem_ok() said it can, with the same `keep`:
-  // running out here is a broken count, which stops the engine rather than run a request on memory it does not hold.
-  void make_room(int s, int need, const std::set<uint64_t>& keep, uint64_t sid = 0, uint64_t base = 0) {
-    if (!room_for(s, need, keep, sid, base))
-      die("serve: no slot memory for %d positions in slot %d (%d chunks wanted)", need, s, m_.slot_chunks_for(s, need));
-  }
-  // make_room without the die: false when only running requests hold the rest (the caller waits)
-  bool room_for(int s, int need, const std::set<uint64_t>& keep, uint64_t sid, uint64_t base) {
+  // alone: what Model::slot_reserve does). false when only running requests hold the rest (the caller waits)
+  bool room_for(int s, int need, const std::set<uint64_t>& keep, uint64_t sid, uint64_t base, const std::vector<int32_t>* pr = nullptr) {
     char why[48];
     std::snprintf(why, sizeof why, "a request of %d positions", need);
-    return give_back((int64_t)m_.slot_chunks_for(s, need) - own(s, keep, sid, base) + img_extra(sid), keep, sid, base, s, 0, why);
+    return give_back(room_n(s, need, keep, sid, base, pr), keep, sid, base, s, 0, why);
   }
   // Whether every request in flight holds what it was reserved beyond what is free and what eviction gives: the numbers
   // a consumer asks for (`n`, and best effort `margin` more) must come from free and unreserved numbers and from the
@@ -1953,7 +2084,8 @@ class Server {
   // to the store); else, with time-slicing, the slot of the paused request whose turn comes last. Never the
   // slot of a session in `keep`. -1: none. (sid, base: the request's session and its base, whose stored state the
   // store keeps.)
-  int pick_slot(const std::set<uint64_t>& keep, int need = 0, uint64_t sid = 0, uint64_t base = 0) const {
+  int pick_slot(const std::set<uint64_t>& keep, int need = 0, uint64_t sid = 0, uint64_t base = 0,
+                const std::vector<int32_t>* pr = nullptr) const {
     const int ns = (int)slot_.size();
     const int big = m_.slot_ctx(0);
     MemCache mc;
@@ -2048,13 +2180,16 @@ class Server {
       }
       f.paused_s += now_s() - f.t_paused;
       // a resume with more rows to read than a prompt read whole: read in pieces like a long prompt, between windows
-      const int rows = !live && il_.on ? rows_to_compute(f, true) : 0;
-      if (!live && il_.on && !il::read_whole(il_, rows)) {
+      JoinAsk ja;
+      const int rows = !live && il_.on ? rows_to_compute(f, true, &ja) : 0;
+      if (!live && il_.on && (ja.deferred || !il::read_whole(il_, rows, img_ms(f, rows, true), run_edge_ms(f)))) {
         std::printf("serve: req %llu resumes in pieces: %d rows to read again\n", (unsigned long long)f.rq.h.req_id, rows);
         auto L = std::make_unique<Long>();
         L->f = std::move(f);
         L->resume = true;
         L->rows = rows;
+        L->ja = ja;
+        L->joining = ja.deferred;
         pfq_.push_back(std::move(L));
         continue;
       }
@@ -2324,9 +2459,13 @@ class Server {
   // The dashboard's STATS frame (docs/dashboard.md), at most every half second, from this thread, the only one that
   // touches the model: the chunk pool and its conversations, the disk tier and its counters since the start, the
   // lines, interleaved prefill. The reader answers the front-end's StatsReq with the latest one.
-  void publish() {
-    const double t = now_s();
-    if (t - published_ < 0.5) return;
+  // Called from the top of the loop while no prompt is queued, from step_hook once a step of a decoding run (in_run: after the next step was
+  // queued), from pf_piece between a chunk's launch and its wait and from idle_wait, and, forced, when a tenant's change landed or failed
+  // (lend_pace.h): a long response does not freeze it. It reads rank 0's state on the engine thread, nothing a step or a chunk computes.
+  void publish(bool in_run = false, double now = -1) {
+    const double t = now < 0 ? now_s() : now;
+    if (!lendpace::publish_due(t, published_, publish_forced_, in_run)) return;
+    publish_forced_ = false;
     published_ = t;
     const model::Model::TierStats ts = m_.tier_stats();
     const model::Model::PoolStats ps = m_.pool_stats();
@@ -2607,34 +2746,73 @@ class Server {
       engram_poll_at_ = t + 0.1;
       c.rows = model::Model::kLendPoll;
     } else {
-      if ((int64_t)li.mib == engram_goal_mib_ || t < engram_next_ || engram_backoff_.blocked((uint64_t)engram_goal_mib_, t, engram_gen_)) return;
-      c.rows = model::Model::kLendBegin, c.pos0 = (int32_t)engram_goal_mib_;
+      id = lend_begin_id(t);
+      if (id < 0) return;
+      c.rows = model::Model::kLendBegin;
+      c.pos0 = (int32_t)(id == model::lend::kTenantEngram ? engram_goal_mib_ : id == model::lend::kTenantPrefill ? (loan_goal_ == 1 ? loan_mib_ : 0) : tenant_goal_mib_);
     }
+    c.tenant = id;
+    const bool engram = id == model::lend::kTenantEngram, loan = id == model::lend::kTenantPrefill;
+    int64_t loan_goal_mib = loan_goal_ == 1 ? loan_mib_ : 0;
+    int64_t& goal = engram ? engram_goal_mib_ : loan ? loan_goal_mib : tenant_goal_mib_;
+    double& next = engram ? engram_next_ : loan ? loan_next_ : tenant_next_;
+    model::lend::Backoff& backoff = engram ? engram_backoff_ : loan ? loan_backoff_ : tenant_backoff_;
+    const uint64_t gen = engram ? engram_gen_ : loan ? loan_gen_ : tenant_gen_;
     wd_.started = now_s();
     issue(c);
     const int st = run_lend(m_, c);
     wd_.started = 0;
-    digest("engram lend");
+    digest(engram ? "engram lend" : "tenant lend");
     forget_evicted();
     using M = model::Model;
+    if (loan && st != M::kLendBusy && st != M::kLendPending) loan_busy_said_ = false;
+    if (loan && (st == M::kLendNoRoom || st == M::kLendSame))
+      std::printf("serve: prefill rows: the change to %lld MiB was refused (%s); not asked again for 300 s\n", (long long)goal, st == M::kLendNoRoom ? "the pool cannot lend it" : "already that size");
+    if (st == M::kLendDone || st == M::kLendFailed) {
+      publish_forced_ = true;  // STATS shows the change at once
+      publish();
+    }
     if (st == M::kLendPending) {
       engram_poll_at_ = now_s() + 0.05;
     } else if (st == M::kLendDone) {
       win_retry_at_ = 0;  // groups came back to the pool: a consumer that waited for them asks again at once
     } else if (st == M::kLendBusy) {
-      engram_next_ = now_s() + 1.0;  // running requests hold what the cut takes
+      ++lend_busy_total_;  // STATS: a tenant change answered busy
+      if (loan && !loan_busy_said_) {
+        loan_busy_said_ = true;
+        std::printf("serve: prefill rows: the pool answered busy (a running request holds numbers the cut takes); asked again every second\n");
+      }
+      next = now_s() + 1.0;  // running requests hold what the cut takes
     } else if (st == M::kLendSame || st == M::kLendNoRoom || st == M::kLendFailed) {
-      engram_backoff_.fail((uint64_t)engram_goal_mib_, now_s(), engram_gen_);
+      backoff.fail((uint64_t)goal, now_s(), gen);
       if (st == M::kLendFailed) win_retry_at_ = 0;  // its groups are back in the pool, or owed
-      if (st == M::kLendSame)
+      if (engram && st == M::kLendSame)
         std::printf("serve: the Engram cache stays at %llu MiB (the pool cannot lend more; %lld MiB asked for)\n", (unsigned long long)m_.engram_lend_info().mib,
                     (long long)engram_goal_mib_);
     }
+  }
+  // Tenant `id`'s size now, MiB (0 when it has none)
+  int64_t tenant_size_mib(int id) const {
+    for (const model::Model::TenantRow& r : m_.tenant_rows())
+      if (r.id == id) return (int64_t)(r.size_bytes >> 20);
+    return 0;
   }
   // A consumer is short, no line has anything left and no window can be closed: the Engram cache gives up one group, when its
   // floor (--engram-cache-min-mib) is below its size. The cache is smaller until the setting changes; what it gives arrives at
   // the change's poll, which wakes the consumer. With the floor at the set size (the default) the cache never gives way.
   void engram_give_way() {
+    // a tenant ahead of the Engram cache in the order of giving way (an idle work area, a test build's dummy block) gives its group first
+    const int victim = m_.tenant_victim();
+    if (victim == 15 && !m_.tenant_active() && tenant_goal_mib_ >= 0) {
+      const int64_t cur = tenant_size_mib(15), gb = (int64_t)(m_.group_bytes() >> 20);
+      if (cur >= gb) {
+        std::printf("serve: a request needs the pool's memory: tenant 15 gives up a group, %lld -> %lld MiB\n", (long long)cur, (long long)(cur - gb));
+        tenant_goal_mib_ = cur - gb;
+        tenant_next_ = 0;
+        tenant_backoff_ = model::lend::Backoff();
+        return;
+      }
+    }
     if (!m_.engram_lend_enabled() || o_.engram_min_mib < 0) return;
     const model::Model::EngramLendInfo li = m_.engram_lend_info();
     if (li.running || li.groups < 1 || (int64_t)li.mib <= o_.engram_min_mib) return;
@@ -2649,7 +2827,7 @@ class Server {
   // no request needs (a paused flight is in rot_, so its window is never closed under it). Closes it, settles what the
   // close could not give back at once, and says whether a window was closed (the caller asks the pool again).
   bool close_unused_window() {
-    if (!m_.window_lazy()) return false;
+    if (!m_.window_lazy() || !m_.window_may_run()) return false;
     std::vector<reclaim::Win> w;
     for (const int f : {32, 64}) w.push_back({f, m_.window_is_open(f), factor_in_use(f), win_used_[win_level(f)]});
     const int f = reclaim::window_to_close(w);
@@ -2668,7 +2846,7 @@ class Server {
   }
   // What a closed window could not give back at once (a rank's device memory) is asked for again
   void settle_windows() {
-    if (m_.window_owed() <= 0) return;
+    if (m_.window_owed() <= 0 || !m_.window_may_run()) return;
     win_settled_ = now_s();
     Cmd c{};
     c.op = kCmdWindow, c.rows = 0;
@@ -2681,7 +2859,7 @@ class Server {
   // Whether a request that waits is worth trying again now: a window it needs was refused for a moment ago
   bool window_ready(const Request& rq) const {
     const int fac = factor_for((int64_t)rq.prompt.size());
-    return fac <= kBaseFactor || m_.window_is_open(fac) || now_s() >= win_retry_at_;
+    return fac <= kBaseFactor || m_.window_is_open(fac) || (m_.window_may_run() && now_s() >= win_retry_at_);
   }
   // Factor `fac`'s window open (made now when it is not). `own`: the handles of the request's own conversation and its base,
   // which the window takes last, like the rest of the cache; `keep`: the sessions of the run being built. The window is made
@@ -2696,6 +2874,7 @@ class Server {
       win_used_[win_level(fac)] = now_s();
       return kWinReady;
     }
+    if (!m_.window_may_run()) return kWinWait;  // a tenant's change is in flight: no window command runs until it ends (lend_tick wakes the wait)
     if (now_s() < win_retry_at_) return kWinWait;
     FacBusy busy_fac(fac_busy_);  // the window being made is not one to close
     busy_fac.add(fac);
@@ -2815,7 +2994,7 @@ class Server {
   // (never by default); what a close could not yet give back is asked for again every few seconds. A window a request of
   // its factor exists for is never freed by time. Closing for memory is give_back's (close_unused_window).
   void windows_idle() {
-    if (!m_.window_lazy() || !flying_.empty() || !rot_.empty() || !pfq_.empty()) return;
+    if (!m_.window_lazy() || !flying_.empty() || !rot_.empty() || !pfq_.empty() || !m_.window_may_run()) return;
     const double t = now_s();
     for (const int f : {32, 64}) {
       if (!m_.window_is_open(f) || !reclaim::timer_may_close(o_.window_idle_s, t, win_used_[win_level(f)], factor_in_use(f))) continue;
@@ -2913,6 +3092,10 @@ class Server {
   uint64_t engram_gen_ = 1;                          // changes with the setting: a failed size is tried again
   double engram_poll_at_ = 0, engram_next_ = 0;
   model::lend::Backoff engram_backoff_;
+  int64_t tenant_goal_mib_ = -1, tenant_set_groups_ = -1;  // a test build's dummy tenant 15: the size the server steers to (-1: none), and CONFIG's groups
+  uint64_t tenant_gen_ = 1;
+  double tenant_next_ = 0;
+  model::lend::Backoff tenant_backoff_;
   double win_retry_at_ = 0;   // a window refused for lack of memory is not asked for again before this
   double win_note_ = 0, win_settled_ = 0;
   int win_fails_ = 0;

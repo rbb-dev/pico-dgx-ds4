@@ -75,13 +75,15 @@ main#view:focus { outline: none; }
 .board > [data-box="lines"] { grid-area: lines; }
 .board > [data-box="health"] { grid-area: health; }
 .board > [data-box="engine"] { grid-area: engine; }
-.plots { grid-area: plots; display: flex; flex-direction: column; gap: 12px; min-width: 0; }
-.plots > .plotbox { flex: 1; display: flex; flex-direction: column; }
-.plots .pbox { flex: 1; }
-.plots .pbody { flex: 1; min-height: 110px; }
-.plots .gutter, .plots .plot { height: auto; }
+.board > [data-box="store"] { grid-area: store; }
+.plots { grid-area: plots; display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.plots > .plotbox { flex: 1; display: flex; flex-direction: column; gap: 8px; padding: 8px 10px 6px; }
+.plots .pbox { flex: 1; gap: 2px; }
+.plots .pbody { flex: 1; min-height: 64px; }
+.plots .gutter, .plots .rgutter, .plots .plot { height: auto; }
+.plots .phead { height: 13px; align-items: center; padding-right: var(--gr, 0px); }
+.plots .pfoot { height: 11px; margin-top: 1px; }
 .box { background: var(--panel); border: 1px solid var(--line); padding: 14px 16px; display: flex; flex-direction: column; gap: 10px; min-width: 0; }
-.box.plotbox { padding: 11px 13px; }
 .bhead { display: flex; align-items: baseline; justify-content: space-between; gap: 14px; }
 .bt { font-family: var(--mono); font-size: 11px; letter-spacing: .14em; color: var(--t3); white-space: nowrap; }
 .bsub, .bright { font-family: var(--mono); font-size: 10px; color: var(--t5); white-space: nowrap; }
@@ -136,11 +138,11 @@ nav.sections button[aria-current="page"] { background: transparent; color: var(-
 
 /* ENGINE: one strip of tiles, a value and a short qualifier each (hover a tile for its detail); eight in a row, four in a
    narrower box, two on a phone */
-[data-box="engine"] { container-type: inline-size; padding: 0; gap: 0; overflow: hidden; }
-.strip { display: grid; grid-template-columns: repeat(8, minmax(0, 1fr)); margin: 0 -1px -1px 0; }
-@container (max-width: 1300px) { .strip { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
+[data-box="engine"], [data-box="store"] { container-type: inline-size; padding: 0; gap: 0; overflow: hidden; }
+.strip { display: grid; grid-template-columns: repeat(9, minmax(0, 1fr)); margin: 0 -1px -1px 0; }
+@container (max-width: 1440px) { .strip { grid-template-columns: repeat(5, minmax(0, 1fr)); } }
 @container (max-width: 640px) { .strip { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
-.etile { padding: 7px 12px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); display: flex; flex-direction: column; gap: 2px; min-width: 0; cursor: help; }
+.etile { padding: 7px 10px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); display: flex; flex-direction: column; gap: 2px; min-width: 0; cursor: help; }
 .etile .k { font-family: var(--mono); font-size: 9px; letter-spacing: .14em; color: var(--t4); white-space: nowrap; }
 .etile .v { font-family: var(--mono); font-size: 17px; font-weight: 500; color: var(--t1); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .etile .u { font-size: 12px; font-weight: 400; color: var(--t4); margin-left: 5px; }
@@ -272,7 +274,8 @@ function svg(tag, attrs) {
   return el;
 }
 function clear(el) { el.replaceChildren(); return el; }
-// ---- formatting: whole numbers with thousands separators, never "6.5k"
+// ---- formatting: whole numbers with thousands separators; a count of tokens past 1,024 is binary with one decimal (K = 1,024, M = 1,048,576:
+// 128K, 24.4M; a whole value drops the ".0": 4M), never "6.5k" and never a decimal K or M
 const whole = new Intl.NumberFormat('en-AU', { maximumFractionDigits: 0 });
 const one = new Intl.NumberFormat('en-AU', { minimumFractionDigits: 1, maximumFractionDigits: 1 });
 const two = new Intl.NumberFormat('en-AU', { minimumSignificantDigits: 2, maximumSignificantDigits: 2 });
@@ -283,7 +286,11 @@ const dayName = new Intl.DateTimeFormat(undefined, { day: 'numeric', month: 'sho
 const dayKey = new Intl.DateTimeFormat('en-CA');
 const none = (x) => x == null || (typeof x === 'number' && !Number.isFinite(x));
 const fmt = (x) => (none(x) ? '0' : whole.format(Number(x)));
-const gib = (b) => (none(b) ? one.format(0) : one.format(Number(b) / 2 ** 30));
+const gib = (b) => (none(b) ? '-' : one.format(Number(b) / 2 ** 30));
+// a chunk is 2.78 MiB: two decimals, so a count of chunks times the shown size is right to a fraction of a per cent
+const mib2 = new Intl.NumberFormat('en-AU', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+// a count with its noun, singular for one: "1 group", "2 groups"
+const pl = (n, word) => `${whole.format(Number(n))} ${word}${Number(n) === 1 ? '' : 's'}`;
 function dur(s) {
   if (none(s)) return '0 s';
   s = Math.floor(s);
@@ -337,13 +344,23 @@ function plotShell(label, tip, aria) {
   const hair = h('div', { class: 'hair', 'aria-hidden': 'true', hidden: true });
   const tipBox = h('div', { class: 'tip', 'aria-hidden': 'true', hidden: true });
   const plot = h('div', { class: 'plot', role: 'img', 'aria-label': aria }, plotSvg, hair, tipBox);
-  const xlab = h('div', { class: 'xlab', 'aria-hidden': 'true' });
-  const el = h('div', { class: 'pbox' }, h('div', { class: 'phead' }, h('span', { class: 'pl', text: label, title: tip || null })), h('div', { class: 'pbody' }, gutter, plot), h('div', { class: 'pfoot' }, h('span'), xlab));
-  return { el, g, plotSvg, hair, tipBox, plot, xlab };
+  // the time row is written once, under the last plot
+  const xlab = o.foot ? h('div', { class: 'xlab', 'aria-hidden': 'true' }) : null;
+  const el = h('div', { class: 'pbox' }, h('div', { class: 'phead' }, h('span', { class: 'pl', text: label, title: tip || null }), o.legend || null), h('div', { class: 'pbody' }, gutter, plot, rgutter), xlab ? h('div', { class: 'pfoot' }, h('span'), xlab, h('span', { class: 'rfoot' })) : null);
+  // the hairline at a fraction of the width (null: gone), on every plot at once
+  const hairAt = (frac) => { hair.hidden = frac == null; if (frac != null) hair.style.left = (frac * 100) + '%'; };
+  return { el, g, rg, plotSvg, hair, tipBox, plot, xlab, hairAt };
 }
+const CHARTS = [];
 function hoverIndex(plot, n, e) {
   const r = plot.getBoundingClientRect();
   return Math.round(Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)) * (n - 1));
+}
+// the hover box beside the hairline at `frac` of the plot: to its right when it fits inside the plot, else to its left, never outside
+// the plot (8 px from the hairline). Called after the box is filled, so its width is the one it shows.
+function placeTip(plot, tip, frac) {
+  const w = plot.clientWidth, x = frac * w, tw = tip.offsetWidth, gap = 8;
+  tip.style.left = Math.round(x + gap + tw <= w ? x + gap : Math.max(0, x - gap - tw)) + 'px';
 }
 function xlabels(xlab, t0, stepMs, n) {
   const want = [0, 1, 2, 3, 4].map((k) => hm.format(new Date(t0 + (n - 1) * stepMs * k / 4)));
@@ -380,7 +397,8 @@ function chart(label, tip, color, unit, name) {
       const peaks = (body.peaks || []).map((p) => (p == null ? null : Number(p)));
       const n = pts.length;
       const real = pts.filter((p) => p != null);
-      const top = niceTop(Math.max(0, goal || 0, ...peaks.filter((p) => p != null), ...real) * 1.1);
+      // the scale fits the data, never under the chart's floor (an idle plot reads 0 to 10, not 0 to 1 with a 0.5 between)
+      const top = Math.max(CHART_FLOOR[name] || 1, niceTop(Math.max(0, goal || 0, ...peaks.filter((p) => p != null), ...real) * 1.1));
       const lastMs = body.last_ms != null ? Number(body.last_ms) : atMs;
       Object.assign(state, { pts, peaks, top, step: body.step_s, t0: lastMs - (n - 1) * body.step_s * 1000 });
       let d = '', a = '', run = [];
@@ -406,7 +424,7 @@ function chart(label, tip, color, unit, name) {
 }
 
 // ---- temperatures: one fixed colour scale, green at 45 °C or under through yellow (65) and orange (80) to bright red at 90 and over.
-// The zones' own critical trip is 104 °C. A reading the host did not give has no colour.
+// The ACPI zones' critical trip is 104 °C (said on the Hot column only). A reading the host did not give has no colour.
 const TEMP_STOPS = [[45, [78, 201, 160]], [65, [230, 194, 122]], [80, [232, 135, 58]], [90, [255, 59, 48]]];
 const TEMP_TRIP_C = 104;
 function tempColor(c) {
@@ -421,16 +439,21 @@ function tempColor(c) {
   }
   return `rgb(${TEMP_STOPS[TEMP_STOPS.length - 1][1].join(',')})`;
 }
-const NVME_TIP = `The NVMe drive's wear, per cent of its rated life used (the SMART page, as the sampler reports it).`;
+const NVME_TIP = `The NVMe drive's wear, per cent of its rated life used (the SMART page, as the sampler reports it; - when the drive gave no reading).`;
+// the reasons NVML names for a held-down clock, in words
+const CLOCK_REASONS = { applications_clocks_setting: 'a clock limit is set', sw_power_cap: 'software power cap', hw_slowdown: 'hardware slowdown',
+  sync_boost: 'sync boost', sw_thermal_slowdown: 'software thermal slowdown', hw_thermal_slowdown: 'hardware thermal slowdown',
+  hw_power_brake_slowdown: 'hardware power brake', display_clock_setting: 'display clock setting' };
 const SPACE_TIP = `Free space of this Spark's / file system (free to a user) of its total, in TB (as the sampler reports it).`;
-const TEMP_TIP = `Colour: green at 45 °C or under, yellow near 65, orange near 80, bright red at 90 and over; the zones trip at ${TEMP_TRIP_C} °C.`;
+const TEMP_TIP = `Colour: green at 45 °C or under, yellow near 65, orange near 80, bright red at 90 and over.`;
 
 // ---- NODE HEALTH: one table row a Spark, its figures in groups of columns with the units in the column heads. Each rank's sampler
-// answers the front-end's poll; a row shows the last answer and, when it is late, its age. A figure the host did not give reads 0,
-// never a dash (a dash flipping with 0 is noise). The GPU clock is shown with the limit NVML names and the reasons it gives for
-// holding it down; the clock limit is set from the COOLING AND CLOCK box, not from a row.
+// answers the front-end's poll; a row shows the last answer and, when it is late, its age. A figure the host did not give reads -,
+// never 0 (a drive with no SMART reading is not a drive with no wear); the rails alone hold their last rate between reports. The GPU
+// clock is shown with the chip's top clock and the reasons NVML gives for holding it down, in words; the clock limit is set from the
+// COOLING AND CLOCK box, not from a row.
 const RAIL_TIP = [
-  `The first RoCE port function (mlx5_0): bits per second in and out, from its port counters between two reports, both in the larger value's unit (bps, Kbps, Mbps or Gbps; decimal: 1 Gbps = 10^9 bits per second).`,
+  `The first RoCE port function (mlx5_0): bits per second in and out, from its port counters between two reports, both in the larger value's unit (bps, Kbps, Mbps or Gbps; decimal: 1 Gbps = 10^9 bits per second). Before the first two reports it reads 0.`,
   `The second RoCE port function (mlx5_2): bits per second in and out, from its port counters between two reports, both in the larger value's unit (bps, Kbps, Mbps or Gbps).`,
 ];
 // the columns: key, group, head, unit, tip, and whether the temperature colour scale paints the value
@@ -446,7 +469,7 @@ const NODE_COLS = [
   ['cb', 'CPU', 'Busy', '%', `CPU busy time in per cent over all CPUs since the last report (/proc/stat).`],
   ['tn', 'NVMe', 'Temp', '°C', `The NVMe drive's temperature in °C (the SMART page's composite). ${TEMP_TIP}`, true],
   ['nw', 'NVMe', 'Wear', '%', NVME_TIP],
-  ['ns', 'NVMe', 'Space', 'TB', SPACE_TIP],
+  ['ns', 'NVMe', 'Free / total', 'TB', SPACE_TIP],
   ['ra', 'RAILS IN/OUT', 'Rail A', '', RAIL_TIP[0]],
   ['rb', 'RAILS IN/OUT', 'Rail B', '', RAIL_TIP[1]],
 ];
@@ -463,12 +486,12 @@ function nodeRow(rank) {
   for (const [key, , , , tip] of NODE_COLS) td[key] = h('td', { 'data-row': key, class: GROUP_START.has(key) ? 'gs' : null, title: tip, text: '0', style: NODE_W[key] ? `width: ${NODE_W[key]}ch` : null });
   const rail = { ra: h('span', { class: 'rail', text: '0' }), rb: h('span', { class: 'rail', text: '0' }) };
   td.ra.replaceChildren(rail.ra); td.rb.replaceChildren(rail.rb);
-  // the memory split: each number in its own colour (weights, working memory, conversation memory)
+  // the memory split: each number in its own colour (weights, working memory, the memory pool)
   const wN = h('span', { class: 'num mw', text: '0' }), mN = h('span', { class: 'num mm', text: '0' }), kN = h('span', { class: 'num mk', text: '0' });
   td.split.replaceChildren(wN, ' / ', mN, ' / ', kN);
   const ageEl = h('span', { class: 'age', 'data-age': '', hidden: true });
   const el = h('tr', { 'data-node': String(rank) },
-    h('td', { class: 'who', style: 'width: 11ch' }, h('span', { class: 'nn', text: 'SPARK ' + (rank + 1) }), h('span', { class: 'role', text: rank === 0 ? 'rank 0 · API' : 'rank ' + rank }), ageEl),
+    h('td', { class: 'who', style: 'width: 11ch', title: rank === 0 ? 'Rank 0: the engine\'s API and the front-end run here.' : 'Rank ' + rank + '.' }, h('span', { class: 'nn', text: 'SPARK ' + (rank + 1) }), ageEl),
     NODE_COLS.map(([key]) => td[key]));
   let prev = null;
   // each rail's last rate in and out: a status poll that brings no new report shows it again, since a poll between two reports
@@ -495,12 +518,12 @@ function nodeRow(rank) {
       const zoneTip = (r.zones_c || []).map((z, i) => (z == null ? null : `${(nh.zone_names && nh.zone_names[i]) || 'zone ' + i}: ${one.format(z)} °C`)).filter(Boolean).join('\n');
       setText(td.mem, `${gib(r.mem_available_bytes)} / ${gib(r.mem_total_bytes)}`);
       paintTemp(td.tz, zs.length ? Math.max(...zs) : null);
-      setTip(td.tz, `The hottest of this Spark's ACPI thermal zones, in °C (/sys/class/thermal). ${TEMP_TIP}${zoneTip ? '\n' + zoneTip : ''}`);
+      setTip(td.tz, `The hottest of this Spark's ACPI thermal zones, in °C (/sys/class/thermal). ${TEMP_TIP} The zones trip at ${TEMP_TRIP_C} °C.${zoneTip ? '\n' + zoneTip : ''}`);
       paintTemp(td.tg, gpu.temp_c); paintTemp(td.tn, nv.temp_c);
       setText(td.gb, f0(gpu.util_pct));
-      setText(td.gc, f0(gpu.clock_mhz) + (gpu.clock_max_mhz == null ? '' : ' / ' + f0(gpu.clock_max_mhz)));
-      setColor(td.gc, gpu.reasons && gpu.reasons.length ? '#e0a33e' : '');
-      setTip(td.gc, `The GPU's current clock and the highest clock NVML names, in MHz. The limit is set in COOLING AND CLOCK.` + (gpu.reasons && gpu.reasons.length ? `\nHeld down by: ${gpu.reasons.join(', ')}` : '\nNo clock limit event is set.'));
+      setText(td.gc, gpuClockCell(gpu));
+      setColor(td.gc, heldDown(gpu) ? '#e0a33e' : '');
+      setTip(td.gc, `The GPU's clock now, in MHz. The clock limit in force on this Spark is ${fan && fan.gpu_clock && fan.gpu_clock.limit ? whole.format(Number(fan.gpu_clock.limit)) + ' MHz' : 'not reported'} (set in COOLING AND CLOCK). The chip's own top clock is ${none(gpu.clock_max_mhz) ? 'not reported' : whole.format(Number(gpu.clock_max_mhz)) + ' MHz'}.` + (gpu.reasons && gpu.reasons.length ? `\nHeld down by: ${gpu.reasons.map((x) => CLOCK_REASONS[x] || x).join(', ')}` : '\nNo clock limit event is set.'));
       setText(td.gp, f1(gpu.power_w));
       setText(td.cl, f1(r.load1) + (r.cpus > 0 ? ' / ' + r.cpus : ''));
       setText(td.cb, f1(r.cpu_busy_pct));
@@ -527,7 +550,7 @@ function nodeRow(rank) {
           if (tx != null) held[i][1] = tx;
         }
         setText(rail[k], fmtPair(held[i][0], held[i][1]));
-        setTip(td[k], `${RAIL_TIP[i]}\n${f0(Number(rl.errors || 0) + Number(rl.discards || 0))} errors and discards since boot.`);
+        setTip(td[k], `${RAIL_TIP[i]}\n${none(rl.errors) && none(rl.discards) ? '-' : f0(Number(rl.errors || 0) + Number(rl.discards || 0))} receive errors and transmit discards since the driver loaded.`);
       });
       if (fresh) prev = { at, rails: r.rails || [] };
     },
@@ -580,11 +603,11 @@ function linesBox() {
     update(st, inflight, seen) {
       // one row per line: the requests the engine runs at once (HELLO's max_sessions is what the pool can keep, not lines)
       const max = st.sessions ? Number(st.sessions.lines) : null;
-      const used = inflight.length;
-      const n = Math.max(none(max) ? 0 : max, used);
+      const used = inflight.filter((x) => x.state !== 'queued').length, waiting = inflight.length - used;  // a queued request has no line yet
+      const n = Math.max(none(max) ? 0 : max, inflight.length);
       while (rows.length < n) { const r = mkRow(rows.length); rows.push(r); grid.append(r.el); }
       while (rows.length > n) rows.pop().el.remove();
-      setText(sub, none(max) ? `${used} in use` : `${used} of ${max} in use`);
+      setTip(headRow.children[1], `${phaseTip} Now: ${none(max) ? used : `${used} of ${pl(max, 'line')}`} in use, ${waiting} waiting (a queued request has no line yet).`);
       rows.forEach((r, i) => {
         const x = inflight[i];
         const c = r.c;
@@ -606,9 +629,9 @@ function linesBox() {
         setText(c[5], x.key_label);
         setText(c[6], none(x.cached_tokens) ? '-' : whole.format(x.cached_tokens));
         setText(c[7], dec ? one.format(m.tps == null ? 0 : m.tps) : whole.format(filling && m.ptps != null ? m.ptps : 0));
-        setText(c[8], dec ? `~${one.format(m.waitS == null ? 0 : m.waitS)} s` : `${one.format(x.age_s)} s`);
+        setText(c[8], dec ? (m.waitS == null ? '-' : `~${one.format(m.waitS)} s`) : `${one.format(x.age_s)} s`);
         setText(c[9], clockText(x.age_s));
-        setTip(r.el, `Seat ${i + 1}: ${x.endpoint}, ${x.priority}, key ${x.key_label}; holds ${whole.format(x.kv_tokens)} KV positions.`);
+        setTip(r.el, `Request ${i + 1} in order: user ${x.key_label}; holds ${whole.format(x.kv_tokens)} tokens of context.`);
       });
     },
   };
@@ -643,9 +666,9 @@ function healthBox() {
     el: b.el,
     update(st, ledger) {
       const nh = st.node_health, list = nh && nh.ranks ? nh.ranks : [];
-      // the ledger's store is the store's share of the chunk pool: the split shows the whole pool as the conversations' memory
+      // the ledger's store is the store's share of the chunk pool: the split shows the whole memory pool
       const pp = st.sessions && st.sessions.pool, pool = pp ? Number(pp.numbers) * Number(pp.number_bytes) : 0;
-      const led = ledger && { get: (rk) => { const e = ledger.get(rk); return e && pool > e.k ? { w: e.w, k: pool, m: Math.max(0, e.m - (pool - e.k)), total: e.total } : e; } };
+      const led = ledger && { get: (rk) => { const e = ledger.get(rk); return e && pool > e.k ? { w: e.w, k: pool, m: Math.max(0, e.m - (pool - e.k)), total: e.total, live: true } : e; } };
       b.el.hidden = false;
       none_.hidden = list.length > 0;
       const shape = `${list.length}`;
@@ -688,7 +711,7 @@ function sessionsTiles() {
   const shared = etile('shared', 'SHARED PREFIXES', 'The memory the beginnings that conversations share take, kept once, and how many conversations share one.');
   const els = [used.el, cap.el, ctx.el, shared.el];
   return {
-    els,
+    els, by: { kv: used.el, cap: cap.el, ctx: ctx.el, shared: shared.el },
     update(st) {
       const ss = st.sessions;
       for (const e of els) e.hidden = !ss;
@@ -711,7 +734,7 @@ function sessionsTiles() {
 // The Engram cache (rows of the Engram tables kept in memory the pool lends): its size now, the share of lookups the last minute found
 // in it, and the groups of the pool it holds; a size change under way is named. The tip has the rest.
 function engramTile() {
-  const t = etile('engram', 'ENGRAM CACHE', 'The Engram row cache: the memory the pool lends to keep rows of the Engram tables, its size, how many of the rows looked up in the last minute it had, and the groups of the pool it holds.');
+  const t = etile('engram', 'ENGRAM CACHE', 'The Engram row cache: the memory the pool lends to keep rows of the Engram tables, the size of its rows on each Spark, and how many of the rows looked up in the last minute it had (the tile). The pool memory it borrows is in LENT OUT.');
   return {
     els: [t.el],
     update(st) {
@@ -722,8 +745,8 @@ function engramTile() {
       const going = Number(e.pending_mib) > 0 ? ` · changing to ${whole.format(Number(e.pending_mib))} MiB` : '';
       const failed = Number(e.lend_failed);
       t.qual.classList.toggle('warn', failed > 0);
-      t.set(whole.format(Number(e.size_mib)), 'MiB', `${e.hit_rate_1m == null ? 'no recent lookups' : one.format(100 * Number(e.hit_rate_1m)) + ' % hit'} · ${whole.format(Number(e.groups))} groups${going}`,
-        `The cache holds ${whole.format(Number(e.size_mib))} MiB on each Spark (${whole.format(Number(e.groups))} groups of the pool), ${rate}. ` +
+      t.set(e.hit_rate_1m == null ? '-' : one.format(100 * Number(e.hit_rate_1m)) + ' %', e.hit_rate_1m == null ? '' : 'hit, last minute', e.hit_rate_1m == null ? `no lookups, last minute${going}` : `since start: ${posFmt(Number(e.lookups))} rows${going}`,
+        `The cache's rows take ${whole.format(Number(e.size_mib))} MiB on each Spark; it borrows ${pl(e.groups, 'group')} of the pool${groupDef} (see LENT OUT). ${rate[0].toUpperCase() + rate.slice(1)}. ` +
         `Since the engine started: ${whole.format(Number(e.lookups))} rows looked up, ${whole.format(Number(e.hits))} found, ${whole.format(Number(e.evictions))} dropped to make room. ` +
         `Size changes: ${whole.format(Number(e.lend_ok))} done, ${whole.format(failed)} failed (a failed change leaves the old size)` +
         (Number(e.pending_mib) > 0 ? `; one to ${whole.format(Number(e.pending_mib))} MiB is under way` : '') + '. ' +
@@ -732,14 +755,13 @@ function engramTile() {
   };
 }
 function tierTiles() {
-  const ssd = etile('ssd', 'SSD CACHE', 'The bytes the saved conversations take on the SSDs of all the engine\'s Sparks together (every Spark writes the same copy), of the space the cache may use there, and the bytes written since the engine started: what wears them.');
-  const rs = etile('restores', 'RESTORES', 'Conversations read back from the SSD since the engine started, the prompt tokens read back instead of computed, and the average time a request waited for a read-back.');
-  const els = [ssd.el, rs.el];
+  const ssd = etile('ssd', 'SSD CACHE', 'The saved conversation caches on each Spark\'s SSD, in GiB a Spark, of the size the cache may use a Spark; how full that is and the four Sparks together. The tip has the bytes written since the engine started, which wear the drive.');
+  const els = [ssd.el];
   return {
-    els,
+    els, by: { ssd: ssd.el },
     update(st) {
       const hh = st.health || {}, pc = hh.prompt_cache, sp = hh.spill, t = pc && pc.spill && pc.spill[0];
-      const ss = st.sessions || {}, SPARKS = Number(ss.ranks) || 1;  // the engine's ranks: each keeps the same disk tier
+      const ss = st.sessions || {}, SPARKS = Number(ss.ranks) || 1;  // the engine's ranks: each keeps its quarter of every saved piece
       const nb = Number((ss.pool || {}).number_bytes);
       for (const e of els) e.hidden = !sp;
       if (!sp) return;
@@ -809,7 +831,7 @@ function settingsBox() {
         (rows > 0 ? `${whole.format(Math.round(100 * Number(cp.rows_accepted) / rows))} % of copied rows accepted. ` : '') + `${pl(cp.failing_requests, 'request')} with failing copies.`));
     }
     if (!il) setText(b.right, 'not reported');
-    else setText(b.right, `${il.reading} reading · ${il.queued} waiting`);
+    else setText(b.right, `${il.reading} long ${il.reading === 1 ? 'prompt' : 'prompts'} being processed · ${il.queued} waiting`);
   }
   return { el: b.el, update };
 }
@@ -859,11 +881,13 @@ function overview() {
     const names = ROUTE_NAMES();
     if (names.has('requests')) { const r = await api('requests'); if (alive && r.ok) track(r.body, Date.now()); }
     if (!names.has('series') || (tick % 5 !== 1 && S.chartsDrawn)) return;
-    const [d, p] = await Promise.all(['decode_tps', 'prefill_tps'].map((n) => api('series', `name=${n}&seconds=900&step=10`)));
+    const [d, p, c] = await Promise.all(['decode_tps', 'prefill_tps', 'cache'].map((n) => api('series', `name=${n}&seconds=${SERIES_S[n]}&step=10`)));
     if (!alive) return;
     const at = S.status && S.status.at_ms ? Number(S.status.at_ms) : Date.now();
     if (d.ok) cd.draw(d.body, at);
     if (p.ok) cp.draw(p.body, at);
+    if (c.ok) cc.draw(c.body, at);
+    fitGutters(cd.el.parentNode);
     S.chartsDrawn = true;
     if (names.has('ledger') && (!ledger || tick % 30 === 1)) {
       const l = await api('ledger');
@@ -885,8 +909,10 @@ function overview() {
     lines.update(st, inflight, seen);
     health.update(st, ledger);
     kv.update(st, inflight);
+    cachehits.update(st);
     tier.update(st);
     eg.update(st);
+    store.update(st);
     rate.update(st, recent);
     reading.update(st);
   };
@@ -935,8 +961,8 @@ function strip(label, tip) {
   return { el: h('div', { class: 'htile', 'data-tile': label.toLowerCase().split(' ')[0] }, h('span', { class: 'k', text: label, title: tip || null }), v, q), v, q };
 }
 function headerTiles() {
-  const eng = strip('ENGINE', 'Whether the front-end is connected to rank 0 and for how long the front-end has been up.');
-  const names = strip('SERVED AS', 'The model names the API serves. A request naming the second one runs on the ablated weights path; any other name runs on the plain path.');
+  const eng = strip('ENGINE', 'Whether the front-end is connected to the engine (rank 0), and for how long it has been connected. The engine\'s own start time is not reported to the front-end.');
+  const names = strip('SERVED AS', 'The model names the API serves. A request naming the second one runs on the uncensored model; any other name runs on the standard one.');
   const el = h('div', { class: 'tiles' }, eng.el, names.el);
   // the engine's two rates, centre stage: token generation (decode) and prompt processing (prefill), tokens a second over the last 3 s
   const rate = (cls, label, tip) => {

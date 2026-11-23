@@ -143,6 +143,77 @@ Sel run(const std::vector<uint16_t>& keys, int n, int kmax, bool kNew) {
   return Sel{op.host(), ok.host()};
 }
 
+// index_merge2, row-major and rank-major, against a host merge. P parts of `width` candidates a row: part q's list of row r is
+// ascending positions (q * 1,000,000 + a random walk), keys from a small range (ties) with a fifth of the slots empty (key 0).
+// Candidates for the pool (width 2,048) are the same kind with blocks as positions.
+void merge_layout(int rows, int P) {
+  const int kT = 512, kP = 2048;  // top's and pool's candidate widths and picks
+  std::mt19937 rng(7000 + rows * 31 + P);
+  auto make = [&](int w, std::vector<int>& pos, std::vector<uint16_t>& key) {  // [rows][P][w]
+    pos.assign((size_t)rows * P * w, -1);
+    key.assign((size_t)rows * P * w, 0);
+    for (int r = 0; r < rows; ++r)
+      for (int q = 0; q < P; ++q) {
+        int p = q * 1000000;
+        for (int i = 0; i < w; ++i) {
+          p += 1 + (int)(rng() % 5);
+          const size_t at = ((size_t)r * P + q) * w + i;
+          pos[at] = p;
+          key[at] = rng() % 5 == 0 ? 0 : (uint16_t)(40000 + rng() % 40);  // ties; a fifth empty
+        }
+      }
+  };
+  std::vector<int> tp, pp;
+  std::vector<uint16_t> tk, pk;
+  make(kT, tp, tk);
+  make(kP, pp, pk);
+  // rank-major copies: [P][rows][w]
+  auto rank_major = [&](const auto& v, int w) {
+    std::decay_t<decltype(v)> o(v.size());
+    for (int r = 0; r < rows; ++r)
+      for (int q = 0; q < P; ++q)
+        std::copy(v.begin() + ((size_t)r * P + q) * w, v.begin() + ((size_t)r * P + q + 1) * w,
+                  o.begin() + ((size_t)q * rows + r) * w);
+    return o;
+  };
+  const auto tp_r = rank_major(tp, kT), pp_r = rank_major(pp, kP);
+  const auto tk_r = rank_major(tk, kT), pk_r = rank_major(pk, kP);
+  auto launch_merge = [&](const std::vector<int>& cp, const std::vector<uint16_t>& ck, const std::vector<int>& pcp,
+                          const std::vector<uint16_t>& pck, bool rm, std::vector<int>& otp, std::vector<uint16_t>& otk,
+                          std::vector<int>& opp, std::vector<uint16_t>& opk) {
+    Dev<int> dcp(cp.data(), cp.size()), dpcp(pcp.data(), pcp.size()), dot((size_t)rows * kT), dop((size_t)rows * kP);
+    Dev<uint16_t> dck(ck.data(), ck.size()), dpck(pck.data(), pck.size()), dotk((size_t)rows * kT), dopk((size_t)rows * kP);
+    attn::index_merge2(rows, dcp.p, dck.p, P * kT, attn::IndexSel{kT, dot.p, dotk.p, kT}, dpcp.p, dpck.p, P * kP,
+                       attn::IndexSel{kP, dop.p, dopk.p, kP}, false, g_s, rm ? P : 0);
+    CUDA_CHECK(cudaStreamSynchronize(g_s));
+    otp = dot.host(), otk = dotk.host(), opp = dop.host(), opk = dopk.host();
+  };
+  std::vector<int> a_tp, a_pp, b_tp, b_pp;
+  std::vector<uint16_t> a_tk, a_pk, b_tk, b_pk;
+  launch_merge(tp, tk, pp, pk, false, a_tp, a_tk, a_pp, a_pk);
+  launch_merge(tp_r, tk_r, pp_r, pk_r, true, b_tp, b_tk, b_pp, b_pk);
+  const std::string name = "index_merge2 rank-major rows=" + std::to_string(rows) + " parts=" + std::to_string(P);
+  check(a_tp == b_tp && a_tk == b_tk, "rank-major top == row-major top", rows, name.c_str(), kT);
+  check(a_pp == b_pp && a_pk == b_pk, "rank-major pool == row-major pool", rows, name.c_str(), kP);
+  bool host_ok = true;  // the row-major launch against a host merge (so that the pair is not vacuous)
+  for (int r = 0; r < rows; ++r) {
+    auto one = [&](const std::vector<int>& cp, const std::vector<uint16_t>& ck, int w, int kmax, const std::vector<int>& op,
+                   const std::vector<uint16_t>& ok) {
+      const std::vector<uint16_t> row(ck.begin() + (size_t)r * P * w, ck.begin() + (size_t)(r + 1) * P * w);
+      const Sel want = host_select(row, P * w, kmax);
+      Sel got{std::vector<int>(op.begin() + (size_t)r * kmax, op.begin() + (size_t)(r + 1) * kmax),
+              std::vector<uint16_t>(ok.begin() + (size_t)r * kmax, ok.begin() + (size_t)(r + 1) * kmax)};
+      Sel w2 = want;
+      for (int& p : w2.pos)
+        if (p >= 0) p = cp[(size_t)r * P * w + p];
+      return got == w2;
+    };
+    host_ok = host_ok && one(tp, tk, kT, kT, a_tp, a_tk) && one(pp, pk, kP, kP, a_pp, a_pk);
+  }
+  check(host_ok, "row-major merge == host merge", rows, name.c_str(), kT);
+  check(std::any_of(a_tk.begin(), a_tk.end(), [](uint16_t k) { return k != 0; }), "picks are not empty", rows, name.c_str(), kT);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -172,6 +243,8 @@ int main(int argc, char** argv) {
           check(!(old == want), "control: old selection is wrong past 1M", n, kCases[c], kmax);
         }
       }
+  for (int rows : {1, 6, 16}) merge_layout(rows, 4);
+  merge_layout(6, 2);  // another part count: the layout argument is the part count, not a constant
   std::printf("%d checks, %d failed\n", g_checks, g_bad);
   return g_bad ? 1 : 0;
 }

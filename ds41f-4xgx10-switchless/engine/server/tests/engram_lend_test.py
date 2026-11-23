@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The Engram row cache handed over from the chunk pool (model/lend.cu), from outside, on the four Sparks. The engine is started
+"""The Engram row cache handed over from the chunk pool (model/tenant.cu), from outside, on the four Sparks. The engine is started
 by the caller (rank 0's socket, dsfront stopped); the host tests (lend_test, engram_block_test) cover the rules. Every check
 prints ok / FAIL; the exit status is 0 only when all hold. MemAvailable is read over ssh from /proc/meminfo on each Spark: an
 instrument independent of the engine's own counters.
@@ -34,7 +34,8 @@ instrument independent of the engine's own counters.
              engram_lend_test.py check-log --logs rank0.log rank1.log rank2.log rank3.log [--expect-fail]
   fault    after a change was made to fail by DSGB10_LEND_FAIL=rank:R,step:B|C,skip:1 or rank:R,step:back (a
            -DDSGB10_TEST_FAULTS=ON build, set in the engine's environment; skip:1 leaves the start's hand-over alone, the first
-           CONFIG fails): CONFIG to --mib, then the cache must stay at its old size, failed total +1 (B, C); for back the grow
+           CONFIG fails): CONFIG to --mib, then the engine's refusal is waited for (failed total +1; the change itself stays pending for the
+           engine's back-off, 300 s, and is not waited for) and the cache must stay at its old size (B, C); for back the grow
            lands, the CONFIG back to the starting size is the shrink whose give-back fails, the groups owed and then returned
            within --settle s; the engine serving (a request is answered), and a probe equal to the one before (--before A.json
            from bit_probe.py)
@@ -70,6 +71,7 @@ def check(cond, what):
 
 
 CHANGE_WINDOW = 300  # the longest a change may take to land (wait_landed, load's windows), and the control window's length
+REFUSAL_WINDOW = 60  # the longest the engine may take to refuse a change made to fail (wait_refused)
 ASKED = [None]  # the size the last CONFIG asked for
 
 
@@ -205,8 +207,9 @@ def cmd_load(a):
     last = {r: None for r in rids}
     gaps = []  # (time, gap) of every session's token arrivals
     marks = []  # (label, t_start, t_end)
-    pr = {'rid': None, 't0': 0.0, 'first': None, 'done': False}
+    pr = {'rid': None, 't0': 0.0, 'first': None, 'done': False, 'done_at': None}
     got = {}
+    post = {r: 0 for r in rids}  # each session's token arrivals since the probe's DONE
 
     def handle(t, p):
         now = time.time()
@@ -216,11 +219,14 @@ def cmd_load(a):
                 if last[r] is not None:
                     gaps.append((now, now - last[r]))
                 last[r] = now
+                if pr['done_at'] is not None:
+                    post[r] += 1
             elif r == pr['rid'] and pr['first'] is None:
                 pr['first'] = now - pr['t0']
         elif t == DONE:
             if struct.unpack('<Q', p[:8])[0] == pr['rid']:
                 pr['done'] = True
+                pr['done_at'] = now
         elif t == STATS:
             n = struct.unpack('<II', p[:8])[1]
             v = struct.unpack('<%dQ' % n, p[8:8 + 8 * n])
@@ -338,7 +344,7 @@ def cmd_check_log(a):
         print('   ' + line)
     failed = re.findall(r'store: Engram cache [^\n]*failed[^\n]*', t0)
     check(bool(failed) == a.expect_fail, 'failed hand-overs %s' % ('expected and present' if a.expect_fail else 'none'))
-    # the proof's three readings are inside the engine (lend.cu): a change that landed passed them on every rank
+    # the proof's three readings are inside the engine (tenant.cu): a change that landed passed them on every rank
     check(not re.search(r'did not add up', ''.join(texts)) or a.expect_fail, 'no proof reported a mismatch')
     # the same digest on the same line on every rank
     lines = [re.findall(r'store-check: rank \d lend command \(phase (\d), (\d+) MiB\) status (\d) digest ([0-9a-f]+)', t) for t in texts]
@@ -356,12 +362,14 @@ def cmd_fault(a):
     s0 = stats(e)
     mem0 = meminfo(a.hosts) if a.hosts else None
     config_mib(e, a.mib)
-    sec, s1 = wait_landed(e, s0)
-    print('after the injected %s fault: cache %d MiB (was %d), failed %d -> %d, owed %d, groups %d' %
-          (a.step, s1['cache_bytes'] >> 20, s0['cache_bytes'] >> 20, s0['failed'], s1['failed'], s1['owed'], s1['groups']))
+    # B and C: the engine refuses the change and keeps the old size, and the same size is not tried again for its back-off, so
+    # the change never lands: its refusal is what is waited for. back: the grow lands
+    sec, s1 = wait_refused(e, s0) if a.step in ('B', 'C') else wait_landed(e, s0)
+    print('after the injected %s fault: cache %d MiB (was %d), failed %d -> %d, owed %d, groups %d, pending %d MiB' %
+          (a.step, mib_asked(s1['cache_bytes']), mib_asked(s0['cache_bytes']), s0['failed'], s1['failed'], s1['owed'], s1['groups'], s1['pending_mib']))
     if a.step in ('B', 'C'):
         check(s1['failed'] == s0['failed'] + 1, 'the change failed once (failed total %d -> %d)' % (s0['failed'], s1['failed']))
-        check(s1['cache_bytes'] == s0['cache_bytes'], 'the cache stays at its old size (%d MiB)' % (s0['cache_bytes'] >> 20))
+        check(s1['cache_bytes'] == s0['cache_bytes'], 'the cache stays at its old size (%d MiB)' % mib_asked(s0['cache_bytes']))
         check(s1['groups'] == s0['groups'] or s1['owed'] > 0, 'the groups are back in the pool (or owed)')
     else:
         # the grow made no give-back; the shrink to the starting size is the give-back whose pool grow fails once: the groups

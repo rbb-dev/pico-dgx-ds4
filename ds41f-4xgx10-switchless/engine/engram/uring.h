@@ -5,6 +5,8 @@
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
+
+#include "common/alloc_seal.h"
 #include <unistd.h>
 
 #include <cerrno>
@@ -114,6 +116,7 @@ class Uring {
 
  private:
   void* map(size_t sz, uint64_t off) {
+    const alloc_seal::Scoped seal(alloc_seal::kSide);
     void* p = mmap(nullptr, sz, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd_, off);
     if (p == MAP_FAILED) die("io_uring mmap: %s", strerror(errno));
     return p;

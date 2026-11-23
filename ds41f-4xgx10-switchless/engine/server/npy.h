@@ -10,6 +10,7 @@
 #include <string>
 #include <vector>
 
+#include "common/alloc_seal.h"
 #include "common/check.h"
 
 struct Npy {
@@ -22,6 +23,7 @@ struct Npy {
 
   Npy() = default;
   explicit Npy(const std::string& path) {
+    const alloc_seal::Scoped seal(alloc_seal::kSide);
     const int fd = ::open(path.c_str(), O_RDONLY);
     if (fd < 0) die("npy: cannot open %s", path.c_str());
     struct stat sb{};

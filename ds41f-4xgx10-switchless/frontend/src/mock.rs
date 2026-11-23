@@ -204,7 +204,7 @@ impl MockIl {
 fn stats(cfg: &MockConfig, sessions: &Sessions, il: &MockIl) -> EngineStats {
     let (n, held) = {
         let ss = sessions.lock().unwrap();
-        (ss.len() as u64, ss.values().map(|h| h.0.len() as u64).sum::<u64>())
+        (ss.len() as u64, ss.values().map(|h| h.hist.len() as u64).sum::<u64>())
     };
     let (finished, computed) = (FINISHED.load(Ordering::Relaxed), COMPUTED.load(Ordering::Relaxed));
     let _ = cfg;

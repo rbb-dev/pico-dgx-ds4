@@ -48,6 +48,7 @@ def main():
     ap.add_argument('--fillers', type=int, default=4, help="the engine's lines (--slots)")
     ap.add_argument('--filler-n', type=int, default=300000)
     ap.add_argument('--flush-s', type=int, default=0, help="the server's --ssd-flush-s (0: not checked)")
+    ap.add_argument('--cache', action='store_true', help="the engine runs --kv-split cache: the split's write-behind is quarter images of 786,432 B")
     ap.add_argument('--log', default='')
     a = ap.parse_args()
     T = [int(x) for x in load_npy_i32(a.tokens)]

@@ -10,6 +10,7 @@
 #include "model/chunks.h"
 
 using model::chunks::Alloc;
+using model::chunks::SlotMap;
 
 namespace {
 int g_fail = 0;

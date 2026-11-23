@@ -580,6 +580,7 @@ impl Frame {
                     stop_ids,
                     prompt,
                     images,
+                    prefix,
                 })
             }
             T_CANCEL => Frame::Cancel { req_id: r.u64()? },
@@ -729,6 +730,7 @@ mod tests {
             stop_ids: vec![1, 2],
             prompt: vec![5; 1000],
             images: Some(img.clone()),
+            prefix: None,
         };
         let b = Frame::Submit(s).encode();
         let want = 8 + SUBMIT_FIXED + 4 * 2 + 4 * 1000 + img.len();
@@ -764,6 +766,7 @@ mod tests {
             stop_ids: vec![1],
             prompt,
             images: Some(part.clone()),
+            prefix: None,
         };
         let b = Frame::Submit(s.clone()).encode();
         assert_eq!(Frame::decode(T_SUBMIT, &b[8..], |_| 0).unwrap(), Frame::Submit(s.clone()));
@@ -805,6 +808,7 @@ mod tests {
             stop_ids: vec![1],
             prompt: vec![0, 10, 20],
             images: None,
+            prefix: None,
         };
         let b = Frame::Submit(s.clone()).encode();
         assert_eq!(b.len(), 8 + 72 + 4 + 12); // header, SubmitHeader, stop id, prompt
@@ -820,6 +824,7 @@ mod tests {
             prefill_us: 6,
             decode_us: 7,
             error: "x".into(),
+            tail: None,
         };
         let b = Frame::Done(d.clone()).encode();
         assert_eq!(b.len(), 8 + 56 + 1);
@@ -858,7 +863,7 @@ mod tests {
         assert_eq!(Frame::decode(T_STATS, &long[8..], |_| 0).unwrap(), Frame::Stats(st));
         long[8..12].copy_from_slice(&1u32.to_le_bytes());
         assert!(Frame::decode(T_STATS, &long[8..], |_| 0).is_err(), "another version");
-        // the Engram row cache's fields: the 45-field frame, the new ones last, in the engine's order (frontend_protocol.h)
+        // the Engram row cache's fields and the store's five after them: the 50-field frame, the new ones last, in the engine's order (frontend_protocol.h)
         let en = EngineStats { ranks: 4, image_numbers: 12, engram_cache_bytes: 2032 << 20, engram_groups: 14, engram_pending_mib: 4096,
                                engram_lookups: 1000, engram_hits: 900, engram_lend_ok_total: 3, engram_lend_failed_total: 1,
                                lent_owed_groups: 2, engram_huge_pct: 97, engram_evictions: 55, ..Default::default() };
@@ -877,7 +882,8 @@ mod tests {
         let Frame::Stats(got) = Frame::decode(T_STATS, &old[8..], |_| 0).unwrap() else { panic!() };
         assert_eq!(got, EngineStats { image_numbers: 0, engram_cache_bytes: 0, engram_groups: 0, engram_pending_mib: 0, engram_lookups: 0,
                                       engram_hits: 0, engram_lend_ok_total: 0, engram_lend_failed_total: 0, lent_owed_groups: 0,
-                                      engram_huge_pct: 0, engram_evictions: 0, ..en });
+                                      engram_huge_pct: 0, engram_evictions: 0, store_numbers: 0, mem_avail_min_bytes: 0, mem_avail_low_count: 0, ids_host_bytes: 0,
+                                      ids_file_sessions: 0, mem_avail_bytes: [0; 4], tenant_groups: [0; 8], tenant_models_groups: 0, ..en });
         assert_eq!(got.ranks, 4);
         // CONFIG's 10th field is engram_mib; a frame of 9 fields keeps it (-1)
         let ce = ConfigFrame { engram_mib: 4096, extend: 1, ..Default::default() };

@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "common/alloc_seal.h"
 #include "common/check.h"
 
 namespace model::detail {
@@ -41,6 +42,7 @@ void io_all(bool wr, int fd, uint8_t* buf, size_t n, size_t off, const std::stri
 }  // namespace
 
 SpillFile::SpillFile(const std::string& base, size_t bytes, size_t staging, bool reuse) {
+  const alloc_seal::Scoped seal(alloc_seal::kSide);
   const size_t cut = base.rfind('/');
   const std::string dir = cut == std::string::npos ? "." : base.substr(0, cut);
   mkdirs(dir);
@@ -101,6 +103,54 @@ SpillFile::~SpillFile() {
   if (!keep_) unlink(path_.c_str());
 }
 
+bool SpillFile::grow(size_t bytes) {
+  const alloc_seal::Scoped seal(alloc_seal::kSide);
+  bytes = bytes / kPoolGrain * kPoolGrain;
+  if (bytes <= size_) return true;
+  if (!pending_.empty()) die("spill: a grow with writes not yet flushed");
+  wait(seq_);  // the writer is idle: no write is between the file and staging
+  const int e = posix_fallocate(fd_, (off_t)size_, (off_t)(bytes - size_));
+  if (e == ENOSPC || e == EDQUOT) {
+    if (ftruncate(fd_, (off_t)size_) != 0) die("spill: cutting %s back to %zu: %s", path_.c_str(), size_, std::strerror(errno));
+    return false;
+  }
+  if (e) die("spill: reserving %.1f GiB more for %s: %s", (bytes - size_) / 1073741824.0, path_.c_str(), std::strerror(e));
+  const size_t slots = bytes / kPoolGrain;
+  uint64_t* fresh = nullptr;
+  CUDA_CHECK(cudaHostAlloc(&fresh, 2 * slots * sizeof(uint64_t), cudaHostAllocDefault));
+  std::memset(fresh, 0, 2 * slots * sizeof(uint64_t));
+  std::memcpy(fresh, sums_, slots_ * sizeof(uint64_t));                              // sent
+  std::memcpy(fresh + slots, sums_ + slots_, slots_ * sizeof(uint64_t));             // came back
+  uint64_t* old = sums_;
+  {
+    std::lock_guard<std::mutex> l(mu_);
+    sums_ = fresh, slots_ = slots, size_ = bytes;
+  }
+  cudaFreeHost(old);
+  return true;
+}
+
+bool SpillFile::shrink(size_t bytes) {
+  const alloc_seal::Scoped seal(alloc_seal::kSide);
+  bytes = bytes / kPoolGrain * kPoolGrain;
+  if (bytes >= size_) return true;
+  if (!pending_.empty()) die("spill: a shrink with writes not yet flushed");
+  wait(seq_);  // the writer is idle: no write is between the file and staging
+  if (ftruncate(fd_, (off_t)bytes) != 0) return false;
+  const size_t slots = bytes / kPoolGrain;
+  uint64_t* fresh = nullptr;
+  CUDA_CHECK(cudaHostAlloc(&fresh, 2 * slots * sizeof(uint64_t), cudaHostAllocDefault));
+  std::memcpy(fresh, sums_, slots * sizeof(uint64_t));                              // sent
+  std::memcpy(fresh + slots, sums_ + slots_, slots * sizeof(uint64_t));             // came back
+  uint64_t* old = sums_;
+  {
+    std::lock_guard<std::mutex> l(mu_);
+    sums_ = fresh, slots_ = slots, size_ = bytes;
+  }
+  cudaFreeHost(old);
+  return true;
+}
+
 uint64_t SpillFile::write(const void* src, size_t bytes, size_t off, cudaStream_t st) {
   const size_t n = Pool::round(bytes);
   if (off + n > size_) die("spill: a write of %zu bytes at %zu past the file's %zu", n, off, size_);
@@ -116,6 +166,8 @@ uint64_t SpillFile::write(const void* src, size_t bytes, size_t off, cudaStream_
     cv_.wait(l, [&] { return q_.empty() || stage_pool_.largest() >= n; });
     if (q_.empty() && stage_pool_.largest() < n) die("spill: %zu bytes do not fit the staging buffer", n);
   }
+  if (!pending_.empty() && pend_st_ != st) die("spill: a write on stream %p while writes of stream %p are not flushed", (void*)st, (void*)pend_st_);
+  pend_st_ = st;
   if (pending_.empty()) {  // a flush's first copy: timed from here
     CUDA_CHECK(cudaEventCreate(&start_));
     CUDA_CHECK(cudaEventRecord(start_, st));
@@ -133,8 +185,15 @@ void SpillFile::begin(cudaStream_t st) {
   CUDA_CHECK(cudaEventRecord(pre_, st));
 }
 
+bool SpillFile::room(size_t bytes) {
+  std::lock_guard<std::mutex> l(mu_);
+  return stage_pool_.largest() >= Pool::round(bytes);
+}
+
 void SpillFile::flush(cudaStream_t st) {
   if (pending_.empty()) return;
+  if (pend_st_ != st) die("spill: a flush on stream %p of writes queued on stream %p", (void*)st, (void*)pend_st_);
+  pend_st_ = nullptr;
   cudaEvent_t ev;
   CUDA_CHECK(cudaEventCreate(&ev));
   CUDA_CHECK(cudaEventRecord(ev, st));

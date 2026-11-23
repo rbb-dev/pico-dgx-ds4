@@ -22,11 +22,18 @@ struct Entry {
 
 constexpr Layout L1 = Layout::L1, L2 = Layout::L2, L3 = Layout::L3;
 
+// embed and the Markov embedding: the vocabulary cut (common/embed_shard.h); PICO_OLD_RULES keeps them whole
+#ifdef PICO_OLD_RULES
+constexpr Rule kEmbedRule = Rule::Rep;
+#else
+constexpr Rule kEmbedRule = Rule::Rows;
+#endif
+
 // The partition and the layouts. Keys are normalised names (every numeric component is N). Every
 // tensor in the checkpoint must match exactly one key, so nothing is dropped or duplicated by
 // accident. The tiled layouts are what engine/kernels' GEMVs read (engine/kernels/README.md).
 const Entry kGlobal[] = {
-    {"embed.weight", Rule::Rep},  // replicated: a lookup reads one 10 KiB row, so no collective is needed
+    {"embed.weight", kEmbedRule},  // by vocabulary rows like the head (32,320 a rank): a lookup is one exchange (common/embed_shard.h)
     {"head.weight", Rule::Rows, L2},  // vocab split, 32,320 rows per rank
     {"norm.weight", Rule::Rep},
     {"image_start", Rule::Skip},  // vision is not planned

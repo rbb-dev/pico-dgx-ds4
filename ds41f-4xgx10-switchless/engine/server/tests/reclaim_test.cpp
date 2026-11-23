@@ -9,6 +9,7 @@
 #include <set>
 #include <vector>
 
+#include "../../model/pool_rules.h"
 #include "../reclaim.h"
 
 static int g_bad = 0, g_n = 0;
@@ -48,6 +49,10 @@ int main() {
     eq(reclaim::pick_victim(l, 1), 2, "the consumer's own line is skipped");
     for (auto& x : l) x.idle = false;
     eq(reclaim::pick_victim(l, -1), -1, "no idle line: none");
+    // a line whose conversation is fully split holds no whole number and reserves none, yet its slots stand for numbers: still a victim
+    namespace rules = model::rules;
+    std::vector<reclaim::Line> sp = {{0, 20, 30, rules::line_committed(0, 0, 40), true}, {1, 21, 10, rules::line_committed(0, 0, 0), true}};
+    eq(reclaim::pick_victim(sp, -1), 0, "red: an idle line whose conversation is fully split (40 slots = 10 numbers) is a victim; an empty one (older) is not");
   }
 
   // ---- the loop: lines detach until the consumer is no longer short, one per pass, then it stops
@@ -129,6 +134,11 @@ int main() {
     eq(reclaim::idle_reserves(s), 180 + 0 + 40, "the reservations over the slots: committed beyond mapped");
     std::vector<reclaim::SlotNums> z = {{120, 120}, {200, 200}, {10, 10}};
     eq(reclaim::idle_reserves(z), 0, "nothing reserved once the reservations are zeroed");
+    // an idle line holding nothing and reserving nothing, whose 348 quarter slots stand for 87 numbers (committed): no reservation
+    std::vector<reclaim::SlotNums> sp = {{87, 0, 0}, {16, 0, 0}};
+    eq(reclaim::idle_reserves(sp), 0, "red: an idle split line (committed 87, held 0, reserved 0) is no reservation (the tripwire read 87)");
+    std::vector<reclaim::SlotNums> rs = {{87, 0, 40}, {300, 120, 0}};
+    eq(reclaim::idle_reserves(rs), 40, "a real reservation is one (40), whatever the slots stand for");
   }
 
   // ---- the bookmarks a decode run takes: one at each multiple of snap_every it crosses

@@ -136,7 +136,7 @@ struct Store::Impl {
   bool broken(uint64_t key) const { return key == break_key || (break_layer >= 0 && int(key >> 32) == break_layer); }
   void serve_break(uint64_t key, uint8_t* dest) {
     if (!broken(key)) return;
-    dest[0] ^= 1;
+    dest[0] = break_byte(dest[0]);
     if (!break_logged) std::fprintf(stderr, "engram: test break: row %llx served with a flipped byte\n", (unsigned long long)key), break_logged = true;
   }
 #endif

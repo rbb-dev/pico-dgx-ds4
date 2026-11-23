@@ -1,8 +1,8 @@
 // The chunk pool's rules as pure functions (no engine state; tested by server/tests/pool_rules_test.cpp): which holder
 // of a number blocks a window, in what order the store gives pieces up, what a reservation is worth once its request
 // has finished, and what a restore or a bookmark may take beside the reservations of running requests. Everything in the
-// pool that no running request uses is cache and gives way; these functions are where the model decides that. The pool's
-// size (pool_offer) and the per-rank memory ledger with the start check are here too.
+// pool that no running request uses is cache and gives way; these functions are where the model decides that. The store's
+// size (store_offer) and the per-rank memory ledger with the start check are here too.
 // A session is "running" when a command lists it in `live` (the server passes the running requests' sessions only).
 #pragma once
 
@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace model::rules {
@@ -85,6 +86,18 @@ int64_t unheld_sum(int n, Resv resv, Held held, Img img) {
   return sum;
 }
 
+// The free numbers beside the reservations, signed: where the running requests are owed more than is free (stored conversations back
+// the difference, which the pool can give back), the count is negative, so that what eviction gives is not counted for the reservation
+// a second time. `covers` is the same rule: `spare(free, reserved) + giveable >= n` exactly when `free + giveable >= reserved + n`.
+// Old rules: clamped at 0, which counted the backing numbers again.
+inline int64_t spare(int64_t free, int64_t reserved) {
+#ifdef PICO_OLD_RULES
+  return std::max<int64_t>(0, free - reserved);
+#else
+  return free - reserved;
+#endif
+}
+
 // Whether the pool can spare `n` numbers beside the reservations: free ones, or free plus what evicting stored sessions gives
 // (`giveable()`, asked only when free ones do not cover it). state.cu take_extra.
 template <class Giveable>
@@ -154,13 +167,19 @@ struct LineInfo {
   const char* name;
   Kind kind;
   bool rank0_only;
+  bool own;
 };
 inline constexpr LineInfo kLines[] = {
-    {"glibc heap bound", Kind::Fixed, false},
-    {"Engram cache still to grow", Kind::Counted, false},
-    {"front-end table and request rows", Kind::Fixed, true},
-    {"image encoder (device and host)", Kind::Fixed, true},
-    {"front-end output queue", Kind::Fixed, true},
+    {"glibc heap", Kind::Outside, false, true},
+    {"Engram cache still to grow", Kind::Counted, false, true},
+    {"front-end process", Kind::Outside, true, false},
+    {"image process outside the engine", Kind::Outside, true, false},
+    {"front-end output queue", Kind::Outside, true, true},
+    {"request frames (frame + rows)", Kind::Outside, true, true},
+    {"server token ids", Kind::Outside, true, true},
+    {"state gather buffer", Kind::Outside, false, true},
+    {"kernel drift", Kind::Outside, false, false},
+    {"the split's buffers (--kv-split cache)", Kind::Counted, false, true},
 };
 static_assert(sizeof kLines / sizeof kLines[0] == kLineCount, "one entry in kLines for every Line");
 constexpr int kLedgerSlots = 16;  // the exchanged width of a ledger: room for lines to come
@@ -216,9 +235,20 @@ inline StartCheck start_check(const Ledger* all, uint64_t slack, uint64_t keep, 
   return c;
 }
 
-// What a rank has left once the pool has grown to its size, the Engram cache has filled and the fixed lines are taken.
+// Serve mode needs a cap on the front-end process: without one nothing holds that line and the store cannot be sized
+// beside it. The message that refuses the start, or null.
+inline const char* front_cap_refusal(int front_mib) {
+#ifdef PICO_OLD_RULES
+  (void)front_mib;
+  return nullptr;  // without the rule: an unset cap starts
+#else
+  return front_mib > 0 ? nullptr : "the front-end has no memory cap: set PICO_FRONT_MIB (the engine's --front-mib, dsfront's --front-mib)";
+#endif
+}
+
+// What one rank has left once the store has grown to its size, the Engram cache has filled and the lines are at their caps.
 inline uint64_t projected_available(uint64_t avail, uint64_t pool_growth_bytes, const Ledger& l) {
-  const uint64_t used = pool_growth_bytes + l.bytes[kEngramCache] + fixed_sum(l);
+  const uint64_t used = pool_growth_bytes + l.cap[kEngramCache] + outside_cap_sum(l);
   return avail > used ? avail - used : 0;
 }
 constexpr uint64_t kProjectedFloor = 2ull << 30;  // a rank projected below this much available memory is warned about
@@ -257,6 +287,20 @@ inline std::string ledger_table(const Ledger* all, const uint64_t* projected, ui
                 fixed_sum(all[c.worst]) / gib, slack / gib, keep / gib);
   o += b;
   return o;
+}
+
+// The restart a conversation can still reuse after a join that stopped for want of a number: the largest q <= `planned` with no
+// list entry below it still a quarter slot (`split_below(u)` counts them, never falls as u grows). The store's guard would cut the
+// conversation at its first slot inside the operation, so the reuse never goes past it.
+template <class F>
+int whole_below(int planned, F split_below) {
+  int lo = 0, hi = planned;
+  while (lo < hi) {
+    const int mid = lo + (hi - lo + 1) / 2;
+    if (split_below(mid) == 0) lo = mid;
+    else hi = mid - 1;
+  }
+  return lo;
 }
 
 }  // namespace model::rules

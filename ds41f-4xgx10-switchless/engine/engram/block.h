@@ -12,6 +12,8 @@
 #include <cstring>
 #include <vector>
 
+#include "common/alloc_seal.h"
+
 #ifndef MADV_POPULATE_WRITE
 #define MADV_POPULATE_WRITE 23
 #endif
@@ -31,6 +33,7 @@ class Block {
 
   // Address space for ranges of at most `maxima[i]` bytes (each rounded up to 2 MiB). False when the mapping fails.
   bool reserve(const std::vector<size_t>& maxima) {
+    const alloc_seal::Scoped seal(alloc_seal::kRegion);
     size_t total = 0;
     for (const size_t m : maxima) {
       r_.push_back({total, round(m), 0});
@@ -63,6 +66,7 @@ class Block {
   // The range's prefix committed up to `bytes` (rounded up to 2 MiB, at most the range's maximum): zero pages, readable and
   // writable, huge where the kernel gives them, populated. False, with the prefix as it was, when the kernel refuses.
   bool commit(int r, size_t bytes) {
+    const alloc_seal::Scoped seal(alloc_seal::kRegion);
     R& x = r_[r];
     bytes = round(bytes);
     if (bytes > x.max || bytes <= x.committed) return bytes <= x.committed;

@@ -346,6 +346,14 @@ int main(int argc, char** argv) {
     else if (a == "--iqm") g_iqm = true;
     else if (a == "--table") g_table = true;
     else if (a == "--equal") g_equal = true;
+    else if (a == "--split" && i + 1 < argc) g_split = std::atoi(argv[++i]);
+    else if (a == "--part" && i + 1 < argc) {
+      const std::string v = argv[++i];
+      if (v == "fused") g_part = 0;
+      else if (v == "dense") g_part = 1;
+      else if (v == "both") g_part = 2;
+      else { std::fprintf(stderr, "bench_index: --part dense|fused|both\n"); return 2; }
+    } else if (a == "--sweep") g_sweep = true;
     else if (a == "--dump" && i + 1 < argc) g_dump = argv[++i];
     else if (a == "--keep-all") g_keep_all = true;
     else if (a == "--seed0" && i + 1 < argc) fill::g_seed = (uint32_t)std::atoll(argv[++i]);
@@ -353,6 +361,14 @@ int main(int argc, char** argv) {
     else if (a == "--kinds" && i + 1 < argc) kinds = parse_list(argv[++i]);
     else if (a == "--sessions" && i + 1 < argc) sessions = parse_list(argv[++i]);
     else ctxs.push_back(std::atoi(argv[i]));
+  }
+  const bool kinds_given = [&] { for (int i = 1; i < argc; ++i) if (!std::strcmp(argv[i], "--kinds")) return true; return false; }();
+  const bool rows_given = [&] { for (int i = 1; i < argc; ++i) if (!std::strcmp(argv[i], "--rows")) return true; return false; }();
+  (void)rows_given;
+  if (g_sweep) {
+    if (g_split < 2) g_split = 4;
+    if (!kinds_given) kinds = {1};
+    if (ctxs.empty()) ctxs = {65536, 131072, 262144, 524288, 1048576, 1572864, 2097152, 3145728, 4194304};
   }
   if (ctxs.empty()) ctxs = {1024, 16384, 32768, 65536, 131072, 262144};
   CUDA_CHECK(cudaStreamCreateWithFlags(&g_s, cudaStreamNonBlocking));

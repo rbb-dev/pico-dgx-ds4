@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdio>
 
+#include "common/alloc_seal.h"
 #include "model/impl.h"
 #include "model/lend_ops.h"
 #include "model/prefill.h"
@@ -24,15 +25,14 @@ constexpr size_t kMargin = 32ull << 20;
 double wall() {
   return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
-bool has(const std::vector<int>& v, int k) { return std::find(v.begin(), v.end(), k) != v.end(); }
 uint64_t min_of(comm::Ring& r, uint64_t mine) {
   uint64_t all[4];
-  r.allgather_host(&mine, all, sizeof mine);
+  r.allgather_host(&mine, all, sizeof mine, comm::kCallWindowMin);
   return *std::min_element(all, all + 4);
 }
 uint64_t max_of(comm::Ring& r, uint64_t mine) {
   uint64_t all[4];
-  r.allgather_host(&mine, all, sizeof mine);
+  r.allgather_host(&mine, all, sizeof mine, comm::kCallWindowMax);
   return *std::max_element(all, all + 4);
 }
 size_t free_device() {
@@ -65,7 +65,7 @@ bool Model::Impl::window_top(int f, int g, uint32_t* top) const {
   const size_t cut = (size_t)(lent.groups + g) * kGroupNums;
   const int whole = numbers_for(0, std::min(65536 * f, opt.max_ctx) - 1);
   if (cut + 2 > base || base - cut < (size_t)whole + 2) return false;
-  *top = (uint32_t)(base - cut);
+  *top = (uint32_t)lend::cut_top(n0, (size_t)(lent.groups + g));
   return true;
 }
 
@@ -85,7 +85,7 @@ size_t Model::Impl::pool_chunks_for(size_t nums, size_t* bytes) const {
 void Model::Impl::pool_cut(size_t top) {
   CUDA_CHECK(cudaDeviceSynchronize());
   const size_t was = calloc->numbers();
-  if (!calloc->shrink((uint32_t)top)) die("model: the pool's numbers %zu.. are not all free after vacating them", top);
+  core->alloc_shrink(top);
   size_t bytes[4];
   pool_chunks_for(top, bytes);
   slot_pool->shrink(0, bytes);
@@ -115,7 +115,7 @@ bool Model::Impl::pool_grow_try(size_t more) {
     slot_pool->trim(added);
     return false;
   }
-  calloc->grow((uint32_t)nums);
+  core->alloc_grow(nums);
   return true;
 }
 
@@ -141,14 +141,11 @@ size_t Model::Impl::lend_whole() const {
   return whole;
 }
 
-// The groups the Engram cache may hold at most, `others` (the windows' and any owed) held besides: the pool keeps one
-// conversation of the longest window the options allow, open or not, and the groups of each such window not open yet, so a
-// request past 1M never finds its window refused (kWindowNoRoom) because the cache took the room first.
-int Model::Impl::lend_cache_room(int others) const {
-  const size_t n0 = lent.groups ? lent.n0 : calloc->numbers();
-  const size_t gb = (size_t)kGroupNums * chunk_image();
+// Numbers one conversation of the longest window the options allow needs, open or not: the pool keeps that room whatever its
+// tenants take, so a request past 1M never finds its window refused (kWindowNoRoom) because a tenant took the room first. The
+// groups of the windows still to open (`later`) are the driver's, agreed across the ranks (TenantEnv::later_groups).
+size_t Model::Impl::lend_room_whole() const {
   size_t whole = (size_t)numbers_for(0, std::min(65536 * 16, opt.max_ctx) - 1);
-  int later = 0;
   for (const int f : {32, 64}) {
     if (opt.max_ctx <= 65536 * (f / 2)) continue;  // no request can need factor f
     whole = std::max(whole, (size_t)numbers_for(0, std::min(65536 * f, opt.max_ctx) - 1));
@@ -194,6 +191,7 @@ int Model::Impl::lend_settle() {
 }
 
 bool Model::Impl::win_alloc(int f) {
+  const alloc_seal::Scoped seal(alloc_seal::kRegion);
   Scan& sc = scan_[level_of(f)];
   sc.stride = scan_stride_of(f);
   const size_t stride = (size_t)sc.stride;
@@ -251,6 +249,11 @@ size_t Model::Impl::win_need(int f) const {
 // Opens factor f's window (a no-op for 16, an open window, and an engine whose windows are all made at the start).
 int Model::Impl::window_open(int f) {
   if (!lazy_win || f == 16) return kWindowOk;
+  struct Running {  // a window command runs: no tenant change begins meanwhile (lend::StoreQueue)
+    lend::StoreQueue& q;
+    explicit Running(lend::StoreQueue& x) : q(x) { q.window = true; }
+    ~Running() { q.window = false; }
+  } running(drv.queue);
   Scan& sc = scan_[level_of(f)];
   if (sc.open) return kWindowOk;
   if (!host_ring || !calloc) die("model: window_open(%d) before the chunk pool and the ring exist", f);
@@ -282,8 +285,9 @@ int Model::Impl::window_open(int f) {
                   back_in ? "back in the pool" : "owed to the pool");
     return kWindowFailed;
   }
-  // the graphs
+  // the graphs: the window's own (win_graphs_drop frees them at its close), so the window tenant's body like its buffers
   if (spec) {
+    const alloc_seal::Scoped seal(alloc_seal::kRegion);
     const int sf0 = sf;
     sf = f;
     spec->quiet = true;
@@ -319,6 +323,11 @@ int Model::Impl::window_open(int f) {
 // freed and, when every rank has the memory, its groups are numbers of the pool again.
 int Model::Impl::window_close(int f) {
   if (!host_ring || (!lazy_win && f != 0)) return kWindowOk;  // f 0 settles what any borrower owes, windows or not
+  struct Running {
+    lend::StoreQueue& q;
+    explicit Running(lend::StoreQueue& x) : q(x) { q.window = true; }
+    ~Running() { q.window = false; }
+  } running(drv.queue);
   const double t0 = wall();
   if (f > 16 && scan_[level_of(f)].open) {
     Scan& sc = scan_[level_of(f)];
@@ -366,18 +375,18 @@ int Model::window_busy_groups(int f) const {
 }
 
 // Evicts nothing: the numbers a window of `g` groups for factor f cuts off the pool and who holds them (window_make_room's
-// arithmetic and pool_vacate's holder scan, read only).
+// arithmetic and the core's holder scan, read only).
 Model::WindowPlan Model::window_plan(int f, int g) const {
   WindowPlan p;
   const Impl& m = *d_;
   uint32_t top = 0;
-  if (!m.calloc || !m.store_s || !m.window_top(f, g, &top)) return p;
+  if (!m.calloc || !m.core->has_store() || !m.window_top(f, g, &top)) return p;
   p.top = top;
   if (top >= m.calloc->numbers()) return p;
   p.removed = (int64_t)m.calloc->numbers() - (int64_t)top;
-  for (const auto& [k, x] : m.store_s->sess)
-    if (holds_from(x, top)) p.holders.push_back({k, x.line, k <= 0});
-  p.image_numbers = (int64_t)image_numbers_from(m.store_s->img, top, &p.image_flights);
+  const detail::StoreCore::Holders hs = m.core->holders_from(top);
+  for (const auto& h : hs.holders) p.holders.push_back({h.handle, h.line, h.unit_own});
+  p.image_numbers = hs.image_numbers, p.image_flights = hs.image_flights;
   return p;
 }
 

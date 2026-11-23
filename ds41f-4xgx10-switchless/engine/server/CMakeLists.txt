@@ -1,5 +1,14 @@
-add_executable(dsgb10_rank main.cpp cmd.cpp serve.cpp node_stats.cpp)
+add_executable(dsgb10_rank main.cpp cmd.cpp serve.cpp node_stats.cpp ../common/alloc_wrap.cpp)
 target_link_libraries(dsgb10_rank PRIVATE dsmodel vit_device)
+# The allocation seal (common/alloc_seal.h): a counting function in front of every call of tools/alloc_audit.py's list made by the
+# engine's objects, on this target only (common/alloc_wrap.cpp)
+foreach(sym cudaMalloc cudaMallocHost cudaHostAlloc cudaGraphInstantiate cuMemCreate cuMemAddressReserve mmap posix_memalign ibv_reg_mr)
+  target_link_options(dsgb10_rank PRIVATE "LINKER:--wrap=${sym}")
+endforeach()
+
+# common/alloc_seal.h: before and after the sizing read, the scopes, outside calls printed once a site (host only)
+add_executable(alloc_seal_test tests/alloc_seal_test.cpp)
+target_include_directories(alloc_seal_test PRIVATE ${CMAKE_SOURCE_DIR})
 
 # interleave.h decisions against a table of cases (host only)
 add_executable(interleave_test tests/interleave_test.cpp)
@@ -15,6 +24,10 @@ add_executable(cancel_test tests/cancel_test.cpp)
 
 # the admission arithmetic with and without a finished request's reservation (host only)
 add_executable(resv_test tests/resv_test.cpp)
+
+# the admission count for a request whose conversation is partly in the disk tier, and the read-back's budget (host only)
+add_executable(admit_test tests/admit_test.cpp)
+target_include_directories(admit_test PRIVATE ${CMAKE_SOURCE_DIR})
 
 # model/pool_rules.h: the chunk pool's rules (host only)
 add_executable(pool_rules_test tests/pool_rules_test.cpp)

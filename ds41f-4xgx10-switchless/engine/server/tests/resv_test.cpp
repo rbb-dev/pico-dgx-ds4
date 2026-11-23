@@ -4,7 +4,7 @@
 //   - once finish() zeroes the reservation of each finished line (reclaim::unreserve_at_finish), nothing is reserved while
 //     nothing runs (the dashboard's reserved, the tripwire's sum), and
 //   - mem_ok's count of what an admission can use is the same with the reservations zeroed as without wherever
-//     slot_uncommitted does not clamp, and not larger where it does.
+//     the spare is signed: wherever the reservations exceed the free numbers too.
 // The last block is the instrument's control: an admission that dropped the re-add of the idle lines' committed numbers
 // is told apart from the real one by these same sums. Built with -DPICO_OLD_RULES (a finished line keeps its reservation)
 // the "nothing reserved" cases fail (exit 1). Exit 0 when every case passes.
@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <vector>
 
+#include "../../model/pool_rules.h"
 #include "../reclaim.h"
 
 static int g_bad = 0, g_n = 0;
@@ -32,7 +33,7 @@ static int64_t reserved(const std::vector<Line>& v) {
   for (const Line& l : v) p += std::max<int64_t>(0, l.resv - l.held);
   return p;
 }
-static int64_t uncommitted(int64_t free_nums, const std::vector<Line>& v) { return std::max<int64_t>(0, free_nums - reserved(v)); }
+static int64_t uncommitted(int64_t free_nums, const std::vector<Line>& v) { return model::rules::spare(free_nums, reserved(v)); }
 // mem_ok's `have` for an admission that takes an empty line and counts every idle line (the want is out of reach)
 static int64_t have(int64_t free_nums, const std::vector<Line>& v) {
   int64_t h = uncommitted(free_nums, v);
@@ -72,7 +73,8 @@ int main() {
       if (reclaim::unreserve_at_finish()) check(hb == ha, "outside the clamp: the admission's count is unchanged by the zeroing");
     } else {
       ++inside;
-      if (reclaim::unreserve_at_finish()) check(ha <= hb, "inside the clamp: the count is not larger than without the zeroing");
+      if (reclaim::unreserve_at_finish()) check(ha == hb, "where the reservations exceed the free numbers: the count is unchanged by the zeroing (signed)");
+      check(uncommitted(free_nums, before) == free_nums - reserved(before), "red: the spare is not clamped at 0 where the reservations exceed the free numbers");
     }
     if (have_no_readd(free_nums, before) != hb) ++differs;
     // nothing runs: every line's request has finished

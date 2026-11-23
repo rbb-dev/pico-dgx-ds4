@@ -73,7 +73,7 @@ void apply_state(model::Model& m, const StateOp& o) {
     case kStReserve: m.slot_reserve(o.a, o.b, o.h); break;
     case kStRelease: m.slot_release(o.a); break;
     case kStPin: break;  // apply_ops pinned its session
-    case kStAttach: m.slot_attach(o.a, o.h); break;
+    case kStAttach: m.slot_attach(o.a, o.h, o.b > 0 ? o.b : INT32_MAX); break;
     case kStFlush: m.state_flush(o.h); break;
     case kStDiskSize: m.state_disk_resize((size_t)(uint32_t)o.a << 16); break;
     case kStFactor:
@@ -465,10 +465,10 @@ DecodeEnd decode_loop(model::Model& m, const Cmd& c, Watchdog& wd, const OnSampl
 }
 
 std::vector<BatchEnd> batch_loop(model::Model& m, const Cmd& c, const std::vector<BatchEntry>& e, Watchdog& wd,
-                                 const OnBatch& on) {
+                                 const OnBatch& on, const OnStep& step) {
   g_t_wait.clear(), g_t_late.clear(), g_t_launch.clear();
   const int n = (int)e.size(), slot0 = m.slot();
-  static_assert(model::ops::kMaxSess < 31, "the cancel bits are the entries' (bit 31 is kCtlPause)");
+  static_assert(model::ops::kMaxSess < 29, "the cancel bits are the entries' (bit 29 is kCtlSplit, bit 30 is kCtlWatch, bit 31 is kCtlPause)");
   if (n < 1 || n > model::ops::kMaxSess) die("batch: %d entries (1..%d)", n, model::ops::kMaxSess);
   std::vector<BatchEnd> end(n);
   // per entry: its steps launched, its row in the last step launched, sampling (live) or with its last

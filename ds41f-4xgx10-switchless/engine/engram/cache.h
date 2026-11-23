@@ -10,6 +10,7 @@
 #include <cstring>
 #include <vector>
 
+#include "common/alloc_seal.h"
 #include "common/check.h"
 #include "engram/block.h"
 
@@ -29,6 +30,7 @@ inline uint64_t mix64(uint64_t k) {
 
 inline void* big_alloc(size_t bytes) {
   if (!bytes) return nullptr;
+  const alloc_seal::Scoped seal(alloc_seal::kSide);
   void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (p == MAP_FAILED) die("engram: mmap %zu bytes: %s", bytes, strerror(errno));
   madvise(p, bytes, MADV_HUGEPAGE);

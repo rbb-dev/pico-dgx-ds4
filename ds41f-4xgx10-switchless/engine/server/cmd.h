@@ -12,6 +12,7 @@
 
 #include "comm/ring.h"
 #include "model/model.h"
+#include "server/mem_watch.h"
 
 namespace srv {
 
@@ -40,13 +41,14 @@ enum : int32_t {
   kStDropSnap,     // state_drop_snap(h, a)
   kStSnap,         // state_snap(h, a)
   kStSpill,        // state_spill(h)
-  kStUnspill,      // state_unspill(h)
+  kStUnspill,      // state_unspill(h, a, b): at most a numbers taken (0: no limit; < 0: none left, it cuts); b > 0: one unit of a return, the pieces below
+                   // position b, at most --kv-join-pieces of them (0: the whole conversation)
   kStKeep,         // state_keep(gen): a planned stop's kept sessions (gen = a | b << 32)
   kStReserve,      // slot_reserve(a, b, h): slot a's memory committed for b positions (the request's prompt and every token), and h
                    // numbers reserved to its image rows (0: none); h names no session here
   kStRelease,      // slot_release(a): slot a's session has left (its state saved first): its memory back to the pool
   kStPin,          // nothing: names session h, which the command's operations (and the store, when it gives chunks back) leave alone
-  kStAttach,       // slot_attach(a, h): slot a's unit holds session h from now on (its rows are h's chunk lists, no copy)
+  kStAttach,       // slot_attach(a, h, b): slot a's unit holds session h from now on (its rows are h's chunk lists, no copy); b > 0: only what is split below position b comes back (the restart point), 0: all
   kStFlush,        // state_flush(h): an idle session's pieces in the pool that have no image get one
   kStDiskSize,     // state_disk_resize(a * 64 KiB): the disk tier's file made that long (the dashboard's SSD size)
   kStCheckpoint,   // state_checkpoint(gen): the index a crash comes back to (gen = a | b << 32)
@@ -188,7 +190,11 @@ struct DecodeEnd {
   }
 };
 using OnSample = std::function<void(int i, const model::SampleOut& o, int row)>;  // tok_{i+1} is o.row[row]
-DecodeEnd decode_loop(model::Model& m, const Cmd& c, Watchdog& wd, const OnSample& on);
+// OnStep: once a step, at the end of the loop's turn, after the next step was queued and the ride (a watch or split flip) done: rank 0's own
+// bookkeeping for the run (the server's step_hook) goes here, beside the device's work, not in the token callback that runs for every row. Not
+// called on the loop's return paths. Every loop below takes one as its last argument; the other ranks pass none.
+using OnStep = std::function<void()>;
+DecodeEnd decode_loop(model::Model& m, const Cmd& c, Watchdog& wd, const OnSample& on, const OnStep& step = {});
 // The threshold the loop gives a spec step: c.spec_thresh, or lambda * dC with lambda the tokens per ms
 // of the steps so far (their emitted tokens over their modelled times, spec_cost; the same on every rank).
 // With the other gates, lambda itself, the steps' times modelled by spec_row_ms (kGateRatio ignores it).
@@ -204,7 +210,7 @@ struct SpecRate {
 // before a step ends, with its tokens left to the device, and a session that ends keeps its row in the
 // step already queued, which only adds the KV of its last sampled token.
 // Rank 0's control word: bit k ends entry k (its place in this run, below kMaxSess = 16, never its slot: slots go to 64
-// and bit 31 is kCtlPause) after the step that reads it (a cancel);
+// bit 30 is kCtlWatch and bit 31 is kCtlPause) after the step that reads it (a cancel);
 // kCtlPause ends every session there that its stop ids and max_new do not end (kEndPause), and with
 // kBatchSolo the last session decoding pauses too (for the speculative loop). A paused session's row in
 // the queued step is sampled too, within max_new: its tok_sampled, not fed yet, is the next to feed, at
@@ -230,7 +236,7 @@ struct BatchEnd {
 };
 using OnBatch = std::function<void(int k, const model::SampleOut& o, int row)>;  // entry k's next token: o.row[row]
 std::vector<BatchEnd> batch_loop(model::Model& m, const Cmd& c, const std::vector<BatchEntry>& e, Watchdog& wd,
-                                 const OnBatch& on);
+                                 const OnBatch& on, const OnStep& step = {});
 
 // kCmdBatchTf (docs/batching.md, B4): the entries' rows teacher-forced, in steps of up to c.rows rows of each
 // (1..model::kMaxSessRows; a step of at most kMaxRows rows in all). Entry k feeds tokens[k] (e[k].max_new of
@@ -266,7 +272,7 @@ struct SpecBatchStats {
   int gpu_n[model::kMaxRows + 1] = {};
 };
 std::vector<DecodeEnd> spec_batch_loop(model::Model& m, const Cmd& c, const std::vector<BatchEntry>& e, Watchdog& wd,
-                                       const OnBatch& on, SpecBatchStats* st = nullptr);
+                                       const OnBatch& on, SpecBatchStats* st = nullptr, const OnStep& step = {});
 
 // Host timeline of the last decode loop (diagnostics): per step, when its sample arrived, when the
 // next step's Engram lookups were submitted, and when the step after was launched.

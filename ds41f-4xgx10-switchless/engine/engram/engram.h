@@ -23,6 +23,13 @@ constexpr int kRowBytes = 264;           // 256 e4m3 + 8 ue8m0
 constexpr int kWeightBytes = 256;
 constexpr int kWorld = 4;
 
+#ifdef DSGB10_TEST_FAULTS
+// The byte a test break serves in place of a row's first byte (an e4m3 value). The flip changes the value and never makes a
+// NaN: e4m3 has no infinity, and 0x7f / 0xff is NaN, which one flip of bit 0 reaches from 0x7e / 0xfe (the largest values).
+// A NaN in what the model reads is a different fault from a changed row, so those two bytes flip bit 1 instead.
+inline uint8_t break_byte(uint8_t b) { return uint8_t((b & 0x7f) == 0x7e ? b ^ 2 : b ^ 1); }
+#endif
+
 // ---- hashing --------------------------------------------------------------------------------
 
 // The model constants hashing needs, from engram_hashmap.bin (engine/engram/py/make_hashmap_stdlib.py,

@@ -21,7 +21,7 @@
 
 #include <cuda_runtime.h>
 
-#include "model/state.h"
+#include "model/store_core.h"
 
 namespace model::detail {
 
@@ -87,6 +87,7 @@ class SpillFile {
   cudaEvent_t pre_ = nullptr, start_ = nullptr;  // the pending flush's (the caller's thread only)
   size_t batch_ = 0;
   std::vector<Job> pending_;  // written to staging, not yet flushed (the caller's thread only)
+  cudaStream_t pend_st_ = nullptr;  // their stream
   std::mutex mu_;
   std::condition_variable cv_;
   std::deque<Job> q_;  // flushed, not yet written

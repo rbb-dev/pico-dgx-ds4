@@ -33,9 +33,9 @@ import argparse
 import os
 import re
 import sys
-import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from path_proof import PIECE, Log, NotReached, need  # noqa: E402
 from serve_test import Engine, load_npy_i32, show  # noqa: E402
 from stats_test import stats  # noqa: E402
 
@@ -55,7 +55,8 @@ def turn(e, name, session, prompt, **kw):
 
 
 def filler(e, k, T, keep):
-    """A short request in a session of its own: it takes a line, and its end spills what no line holds."""
+    """A short request in a session of its own: it takes a line, and its end spills what no line holds. Kept (keep=True), its
+    session holds the line afterwards; not kept, the line is free again."""
     off = 100000 + 3000 * k
     return turn(e, 'filler %d' % k, sid(100 + k), T[off:off + 2000], keep=keep)
 
@@ -95,7 +96,7 @@ def run(a):
 
     print('3. fillers until A is spilled')
     for k in range(1, 4):
-        filler(e, k, T, True)
+        filler(e, k, T, False)
         if re.search(r'serve: spill session %016x ' % A, log.text()):
             break
     log.wait_for(r'serve: spill session %016x \(' % A, 'the spill of A')

@@ -87,7 +87,8 @@ void nonzero(const std::string& what, const T* a, size_t n) {
 
 bool g_no_table = false;  // --no-table: the steps without their slot tables, a negative control (must differ)
 
-constexpr int kSlots = 5, kTopk = 512, kPool = 2048, kParts = 4, kMaxCtx = 72064;
+constexpr int kTopk = 512, kPool = 2048, kParts = 4;
+int kSlots = 16, kMaxCtx = 72064;  // session slots, and the positions the buffers cover (--long: 1,048,576 + 4,096, five slots)
 
 // Whether part `part` of a dense scan split in kParts (indexer.cu's dense_range) holds none of the entries of
 // a session whose last row is at `last`: a short session's later parts. Its selections are then all
@@ -623,8 +624,23 @@ void test_fused(const Step& st, int ratio, int part, bool blocks) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  const bool long_run = argc > 1 && !std::strcmp(argv[argc - 1], "--long");
   g_no_table = argc > 1 && !std::strcmp(argv[1], "--no-table");
   CUDA_CHECK(cudaStreamCreate(&g_s));  // blocking: fill.cuh fills on the legacy stream
+  if (long_run) {
+    kSlots = 5, kMaxCtx = 1048576 + 4096;
+    const Step l1({{1, 1048575, 2}});
+    const Step l2({{1, 1048575, 2}, {1, 200, 0}});
+    const Step l4({{1, 1048575, 2}, {2, 70001, 4}, {1, 255, 0}, {1, 300000, 1}});
+    const Step l6({{6, 1048575, 3}});
+    const Step l16({{8, 1048575, 1}, {8, 524288, 3}});
+    for (const Step* st : {&l1, &l2, &l4, &l6, &l16}) {
+      test_parts(*st, 1, true);
+      test_parts(*st, 2, false);
+    }
+    std::printf("long run: %s: %d checks, %d differ\n", g_fail ? "FAILED" : "PASSED", g_checks, g_fail);
+    return g_fail ? 1 : 0;
+  }
   // B2: four one-row sessions, odd and even positions, short and long, in shuffled slots
   const Step b2({{1, 40011, 3}, {1, 517, 0}, {1, 9002, 4}, {1, 37, 1}});
   // B3's shapes: an anchor and drafts per session; a session starting at an odd position right after another
@@ -652,6 +668,17 @@ int main(int argc, char** argv) {
     test_fused(*st, 2, 1, false);
     test_fused(*st, 1, 3, false);
     test_fused(*st, 1, 0, true);
+    test_parts(*st, 2, false);
+    test_parts(*st, 1, true);
+  }
+  // P-scan: 16 one-row sessions (the most slots a step's rows can take), lengths from 40 to 70,000 keys, and 4 of 4 rows
+  const Step sixteen({{1, 40011, 3}, {1, 517, 0}, {1, 9002, 4}, {1, 37, 1}, {1, 70001, 5}, {1, 255, 6}, {1, 256, 7}, {1, 1025, 8},
+                      {1, 33000, 9}, {1, 4, 10}, {1, 60000, 11}, {1, 2049, 12}, {1, 12345, 13}, {1, 700, 14}, {1, 25001, 15},
+                      {1, 64, 2}});
+  const Step four4b({{4, 70001, 0}, {4, 2049, 1}, {4, 255, 2}, {4, 40011, 3}});
+  for (const Step* st : {&sixteen, &four4b}) {
+    test_parts(*st, 2, false);
+    test_parts(*st, 1, true);
   }
   for (const Step* st : {&b2, &two, &two8}) {  // little or no candidate room: the selections' other paths
     test_dense(*st, 1, true, 0);

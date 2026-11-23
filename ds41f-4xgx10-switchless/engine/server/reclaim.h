@@ -41,12 +41,20 @@ inline bool unreserve_at_finish() {
 
 // The numbers the lines are reserved but do not hold, summed over the slots. Zero whenever no request is in flight (the
 // server's tripwire reads it).
+// `reservation` is the line's reservation beyond what it holds (Model::slot_unheld_reservation); -1: not given, and committed beyond mapped stands for it.
+// `committed` counts the whole numbers a split conversation's quarter slots stand for, so on an idle split line it is no reservation.
 struct SlotNums {
-  int64_t committed = 0, mapped = 0;
+  int64_t committed = 0, mapped = 0, reservation = -1;
 };
 inline int64_t idle_reserves(const std::vector<SlotNums>& slots) {
   int64_t n = 0;
-  for (const SlotNums& s : slots) n += s.committed > s.mapped ? s.committed - s.mapped : 0;
+  for (const SlotNums& s : slots) {
+#ifdef PICO_OLD_RULES
+    n += s.committed > s.mapped ? s.committed - s.mapped : 0;
+#else
+    n += s.reservation >= 0 ? s.reservation : (s.committed > s.mapped ? s.committed - s.mapped : 0);
+#endif
+  }
   return n;
 }
 

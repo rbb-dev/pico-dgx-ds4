@@ -3,11 +3,31 @@
 #include <cuda_runtime.h>
 
 #include <atomic>
+#include <algorithm>
 #include <thread>
 
 #include "weights/io.h"
 
 namespace dsw {
+
+namespace {
+// pinned host bytes held now and the most held at once, by this load's staging and verify buffers
+struct HostHold {
+  std::atomic<uint64_t> now{0}, peak{0};
+  void* alloc(uint64_t n) {
+    void* p = nullptr;
+    CUDA_CHECK(cudaHostAlloc(&p, n, cudaHostAllocDefault));
+    const uint64_t v = now.fetch_add(n) + n;
+    uint64_t m = peak.load();
+    while (v > m && !peak.compare_exchange_weak(m, v)) {}
+    return p;
+  }
+  void free(void* p, uint64_t n) {
+    CUDA_CHECK(cudaFreeHost(p));
+    now.fetch_sub(n);
+  }
+};
+}  // namespace
 
 WeightFile::WeightFile(const std::string& path, int rank, int world) : path_(path) {
   fd_ = open_or_die(path, O_RDONLY | O_DIRECT);
@@ -47,6 +67,10 @@ WeightFile::WeightFile(const std::string& path, int rank, int world) : path_(pat
     t.crc32c = e.crc32c;
     if (e.offset < h.data_offset || e.offset % kAlign || e.offset + e.bytes > fsize) die("%s: bad extent", e.name);
     if (!index_.emplace(t.name, i).second) die("%s: tensor %s twice", path.c_str(), e.name);
+    if (old_embed_cut(t.name, h.version))
+      die("%s: version %u holds %s whole, and this engine reads it cut by vocabulary rows (version %u): write the rank files "
+          "again with dsw_convert",
+          path.c_str(), h.version, t.name.c_str(), kEmbedCutVersion);
   }
 }
 
@@ -73,38 +97,58 @@ LoadStats WeightFile::load(const LoadOptions& opt) {
 
   // The chosen tensors, packed in file order (with no selection the arena is the file's data region
   // byte for byte); runs of tensors adjacent in the file are read as one extent.
+  // dst: the caller's address (reads of a `dest` tensor: only `copy` of the `len` read bytes belong to it)
   struct Job {
     uint64_t file, arena, len;
+    uint8_t* dst;
+    uint64_t copy;
   };
   std::vector<Job> ext, jobs;
-  std::vector<size_t> chosen;
+  std::vector<size_t> chosen, dest_idx;
+  std::vector<uint8_t*> dest_ptr;
   uint64_t total = 0;
   for (size_t i = 0; i < tensors_.size(); i++) {
     DeviceTensor& t = tensors_[i];
     if (opt.select && !opt.select(t)) continue;
     const uint64_t padded = align_up(t.bytes);
+    if (void* d = opt.dest ? opt.dest(t) : nullptr) {
+      dest_idx.push_back(i), dest_ptr.push_back(static_cast<uint8_t*>(d));
+      for (uint64_t o = 0; o < t.bytes; o += chunk) {
+        const uint64_t len = std::min(chunk, padded - o);
+        jobs.push_back({t.file_offset + o, 0, len, static_cast<uint8_t*>(d) + o, std::min(len, t.bytes - o)});
+      }
+      continue;
+    }
     if (opt.limit && total + padded > opt.limit) break;
     t.offset = total;
     chosen.push_back(i);
     if (!ext.empty() && ext.back().file + ext.back().len == t.file_offset) ext.back().len += padded;
-    else ext.push_back({t.file_offset, total, padded});
+    else ext.push_back({t.file_offset, total, padded, nullptr, padded});
     total += padded;
   }
-  if (!total) die("%s: no tensor selected", path_.c_str());
+  if (!total && dest_idx.empty()) die("%s: no tensor selected", path_.c_str());
   for (auto& x : ext)
-    for (uint64_t o = 0; o < x.len; o += chunk) jobs.push_back({x.file + o, x.arena + o, std::min(chunk, x.len - o)});
-  CUDA_CHECK(cudaMalloc(&arena_, total));
+    for (uint64_t o = 0; o < x.len; o += chunk) {
+      const uint64_t len = std::min(chunk, x.len - o);
+      jobs.push_back({x.file + o, x.arena + o, len, nullptr, len});
+    }
+  if (total) CUDA_CHECK(cudaMalloc(&arena_, total));
   arena_bytes_ = total;
+  uint64_t stage = 0;  // the longest read: no buffer is longer
+  for (const Job& j : jobs) stage = std::max(stage, j.len);
+  const size_t workers = std::min<size_t>(std::max(1, opt.threads), jobs.size());
+  const int bufs = jobs.size() > workers ? 2 : 1;  // a second buffer only where a thread has a second read to overlap
+  HostHold hold;
 
   double t0 = now_s();
   std::atomic<size_t> next{0};
   auto worker = [&]() {
-    void* buf[2];
+    void* buf[2] = {nullptr, nullptr};
     cudaEvent_t ev[2];
     cudaStream_t st;
     CUDA_CHECK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
-    for (int b = 0; b < 2; b++) {
-      CUDA_CHECK(cudaHostAlloc(&buf[b], chunk, cudaHostAllocDefault));
+    for (int b = 0; b < bufs; b++) {
+      buf[b] = hold.alloc(stage);
       CUDA_CHECK(cudaEventCreateWithFlags(&ev[b], cudaEventDisableTiming));
     }
     bool pending[2] = {false, false};
@@ -113,34 +157,39 @@ LoadStats WeightFile::load(const LoadOptions& opt) {
       const Job& j = jobs[k];
       if (pending[cur]) CUDA_CHECK(cudaEventSynchronize(ev[cur]));
       pread_all(fd_, buf[cur], j.len, j.file);
-      CUDA_CHECK(cudaMemcpyAsync(static_cast<uint8_t*>(arena_) + j.arena, buf[cur], j.len, cudaMemcpyHostToDevice, st));
+      CUDA_CHECK(cudaMemcpyAsync(j.dst ? j.dst : static_cast<uint8_t*>(arena_) + j.arena, buf[cur], j.copy,
+                                 cudaMemcpyHostToDevice, st));
       CUDA_CHECK(cudaEventRecord(ev[cur], st));
       pending[cur] = true;
-      cur ^= 1;
+      cur = (cur + 1) % bufs;
     }
     CUDA_CHECK(cudaStreamSynchronize(st));
-    for (int b = 0; b < 2; b++) {
-      CUDA_CHECK(cudaFreeHost(buf[b]));
+    for (int b = 0; b < bufs; b++) {
+      hold.free(buf[b], stage);
       CUDA_CHECK(cudaEventDestroy(ev[b]));
     }
     CUDA_CHECK(cudaStreamDestroy(st));
   };
   std::vector<std::thread> pool;
-  for (int t = 0; t < std::max(1, opt.threads); t++) pool.emplace_back(worker);
+  for (size_t t = 0; t < workers; t++) pool.emplace_back(worker);
   for (auto& t : pool) t.join();
 
   LoadStats s;
-  s.bytes = total;
+  s.bytes = total;  // the arena's; a `dest` tensor's bytes are not counted
   s.seconds = now_s() - t0;
   s.gbps = total / s.seconds / 1e9;
   for (size_t i : chosen) tensors_[i].data = static_cast<uint8_t*>(arena_) + tensors_[i].offset;
+  std::vector<bool> to_dest(tensors_.size(), false);
+  for (size_t k = 0; k < dest_idx.size(); k++) tensors_[dest_idx[k]].data = dest_ptr[k], to_dest[dest_idx[k]] = true;
 
-  if (opt.verify_crc) {
+  if (opt.verify_crc || opt.verify_dest) {
     double t1 = now_s();
-    void* host;
-    CUDA_CHECK(cudaHostAlloc(&host, chunk, cudaHostAllocDefault));
-    for (auto& t : tensors_) {
-      if (!t.data) continue;
+    uint64_t vbuf = 0;  // the longest piece a CRC check copies back
+    for (const DeviceTensor& t : tensors_) vbuf = std::max(vbuf, std::min(chunk, t.bytes));
+    void* host = hold.alloc(vbuf);
+    for (size_t i = 0; i < tensors_.size(); i++) {
+      DeviceTensor& t = tensors_[i];
+      if (!t.data || !(opt.verify_crc || to_dest[i])) continue;
       uint32_t crc = 0;
       for (uint64_t o = 0; o < t.bytes; o += chunk) {
         uint64_t n = std::min(chunk, t.bytes - o);
@@ -149,9 +198,11 @@ LoadStats WeightFile::load(const LoadOptions& opt) {
       }
       if (crc != t.crc32c) die("%s: %s CRC mismatch after load", path_.c_str(), t.name.c_str());
     }
-    CUDA_CHECK(cudaFreeHost(host));
+    hold.free(host, vbuf);
     s.verify_seconds = now_s() - t1;
   }
+  if (opt.drop_page_cache) posix_fadvise(fd_, 0, 0, POSIX_FADV_DONTNEED);
+  s.staging_peak = hold.peak.load(), s.staging_held = hold.now.load();
   return s;
 }
 

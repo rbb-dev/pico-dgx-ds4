@@ -167,6 +167,8 @@ struct Config {
   int64_t keep_days;     // a conversation unused this many days is dropped (1-3650)
   int64_t extend;        // the context past 1,048,576 tokens: 0 off (the 1,048,576-token window only), 1 on (a factor per request)
   int64_t engram_mib;    // the Engram row cache's slots in MiB, the display reservation's included (0 off; applied at a run boundary)
+  int64_t engram_mib_spark[4];  // reserved: the Engram cache's size of Spark 0-3 (-1 keeps it); not read by this engine
+  int64_t test_tenant_groups;   // fault builds only (DSGB10_TEST_FAULTS): the groups of the dummy tenant 15; a normal build never reads it
 };
 
 // The engine's own counters for the dashboard: version, the number of u64 fields that follow, then the fields in this

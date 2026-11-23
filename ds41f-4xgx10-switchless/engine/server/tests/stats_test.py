@@ -13,7 +13,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from serve_test import Engine, load_npy_i32  # noqa: E402
+from serve_test import DONE, Engine, load_npy_i32  # noqa: E402
 
 STATS_REQ, STATS = 0x05, 0x85
 NAMES = ['pool_numbers', 'pool_free', 'pool_held', 'pool_shared', 'pool_reserved', 'number_bytes', 'pool_positions',

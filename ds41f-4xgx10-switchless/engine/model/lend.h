@@ -1,11 +1,14 @@
-// Memory lent by the chunk pool to a borrower that is not a request: a YaRN window's buffers (window.cu) or the Engram
-// row cache's block (lend.cu). The pool gives whole groups of 64 numbers (the smallest set whose slices of the four arrays
-// are whole 2 MiB chunks), the borrower holds them as device or host memory, and gives them back. This header is the
-// accounting and the decisions, with no GPU and no engine state: the ledger of groups out, the take and give-back
-// sequences over a backend, the proof that a hand-over really moved memory, the cache's sizes, the resize plan and the
-// retry back-off. Built with -DPICO_OLD_RULES each rule is built without its change (a failed give-back kills the process,
-// the proof's tolerance is the null control's spread alone, an oversized setting is refused, a failed size is retried at
-// once): the tests that mark "red" fail there. Host only.
+// Memory lent by the chunk pool to a borrower that is not a request: a tenant of the pool (the table at the end of this
+// header): a YaRN window's buffers (window.cu), the Engram row cache's block (tenant.cu), a work area, a model.
+// The pool gives whole groups of 64 numbers (the smallest set whose slices of the four arrays are whole 2 MiB chunks), the
+// borrower holds them as device or host memory, and gives them back. This header is the accounting and the decisions, with
+// no GPU and no engine state: the ledger of groups out, the tenants' table with every tenant's room and the order they give
+// way in, the one queue of store changes, the take and give-back sequences over a backend, the proof that a hand-over really
+// moved memory, the cache's sizes, the resize plan and the retry back-off. Built with -DPICO_OLD_RULES each rule is built
+// without its change (a failed give-back kills the process, the proof's tolerance is the null control's spread alone, an
+// oversized setting is refused, a failed size is retried at once, a tenant's room is the groups out less its own settled
+// ones, a window runs while a change is in flight, the first tenant in table order gives way): the tests that mark "red"
+// fail there. Host only.
 #pragma once
 #include <algorithm>
 #include <cstddef>
@@ -24,6 +27,18 @@ constexpr double kBackoffS = 300;           // the same size is not tried again 
 enum Status { kOk = 0, kNoRoom, kBusy, kFailed };
 
 // ---- the groups out of the pool ----
+
+// The pool's numbers with `groups` groups out of a pool of `n0` numbers: n0 less 64 a group, so a lend of g groups removes exactly 64 g
+// usable numbers whatever the top (index 0 is the reserved null number, so n0 is one more than the usable count). The cut sits where the
+// chunks above it are whole for every array; a number kept above the last whole group stays mapped with the group below it. The old rules
+// cut at the last whole group boundary below n0, so the first lend took the numbers above it too (one more with the usual pool).
+inline size_t cut_top(size_t n0, size_t groups) {
+#ifdef PICO_OLD_RULES
+  return n0 / kGroupNums * kGroupNums - groups * kGroupNums;
+#else
+  return n0 - groups * kGroupNums;
+#endif
+}
 
 struct Ledger {
   size_t n0 = 0;   // the pool's numbers before the first group left (0: none out)
@@ -63,7 +78,7 @@ class Lender {
     const size_t n0 = l_.groups ? l_.n0 : now;
     const size_t base = n0 / kGroupNums * kGroupNums, cut = (size_t)(l_.groups + g) * kGroupNums;
     if (cut + 2 > base || base - cut < whole + 2) return kNoRoom;
-    const size_t top = base - cut;
+    const size_t top = cut_top(n0, (size_t)(l_.groups + g));
     if (top < now) {
       if (b_.vacate(top)) return kBusy;
       if (!b_.make_room(now - top)) return kBusy;

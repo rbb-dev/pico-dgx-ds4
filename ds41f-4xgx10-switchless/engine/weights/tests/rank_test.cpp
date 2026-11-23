@@ -33,11 +33,12 @@ void expect(bool ok, const std::string& what) {
 }
 
 // A minimal valid rank file: the header, one TOC entry, one 4 KiB F32 tensor.
-void make_file(const std::string& path, uint32_t rank, uint32_t world) {
+void make_file(const std::string& path, uint32_t rank, uint32_t world, const char* tensor = "test.weight",
+               uint32_t version = kVersion) {
   std::vector<uint8_t> f(3 * kAlign, 0);
   Header h{};
   std::memcpy(h.magic, kMagic, 8);
-  h.version = kVersion;
+  h.version = version;
   h.header_bytes = sizeof(Header);
   h.rank = rank;
   h.world = world;
@@ -50,7 +51,7 @@ void make_file(const std::string& path, uint32_t rank, uint32_t world) {
   h.alignment = kAlign;
   std::snprintf(h.model, sizeof h.model, "dsw_rank_test");
   TocEntry e{};
-  std::snprintf(e.name, sizeof e.name, "test.weight");
+  std::snprintf(e.name, sizeof e.name, "%s", tensor);
   e.dtype = uint32_t(DType::F32);
   e.ndim = 1;
   e.shape[0] = kAlign / 4;

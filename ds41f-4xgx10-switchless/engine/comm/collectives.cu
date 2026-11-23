@@ -1,5 +1,6 @@
 // Standalone collectives on the ring (collectives.h), built from the ring_dev.cuh halves.
 #include "comm/collectives.h"
+#include "comm/argmax_row.h"
 #include "comm/ring_dev.cuh"
 #include "common/check.h"
 

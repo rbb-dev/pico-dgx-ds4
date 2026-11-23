@@ -56,6 +56,7 @@ pub struct RowsInFlight {
 pub struct RowsHeld {
     budget: std::sync::Arc<RowsInFlight>,
     rows: std::sync::Mutex<usize>,
+    pixel_bytes: std::sync::atomic::AtomicUsize,
 }
 
 impl RowsInFlight {
@@ -87,7 +88,7 @@ impl RowsInFlight {
             return Err(*held);
         }
         *held += rows;
-        Ok(RowsHeld { budget: self.clone(), rows: std::sync::Mutex::new(rows) })
+        Ok(RowsHeld { budget: self.clone(), rows: std::sync::Mutex::new(rows), pixel_bytes: std::sync::atomic::AtomicUsize::new(0) })
     }
 }
 
@@ -111,6 +112,7 @@ impl Drop for RowsHeld {
     fn drop(&mut self) {
         let mine = *self.rows.lock().unwrap();
         *self.budget.held.lock().unwrap() -= mine;
+        self.budget.pixel_bytes.fetch_sub(self.pixel_bytes.load(std::sync::atomic::Ordering::Relaxed), std::sync::atomic::Ordering::Relaxed);
     }
 }
 

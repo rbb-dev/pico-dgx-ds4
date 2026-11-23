@@ -16,6 +16,8 @@ struct ServeOptions {
   std::string socket;              // the front-end's socket (mode 0600)
   int max_ctx = 65536;             // prompt + output positions per request
   int prefill_rows = 4096;         // rows per prefill chunk
+  int loan_low_groups = 2, loan_high_extra = 8;  // the lent set goes back under this many free groups, is asked for at its own groups plus this many (rows_loan.h)
+  int prefill_rows_max = 0;        // > prefill_rows: chunks of this many rows on the set lent by the pool, while it is whole (0: off)
   int engram_mib = 0;              // the Engram row cache's size (MiB of slots) the server keeps asking the model for (0: no cache hand-over)
   int engram_min_mib = 0;          // the smallest it is made to give way to a request (the set size: it never gives way)
   int engram_max_mib = 16384;      // the largest a CONFIG may set (--engram-cache-max-mib: the block's address space)

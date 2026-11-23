@@ -3,7 +3,7 @@ find_package(CUDAToolkit REQUIRED)
 find_package(Threads REQUIRED)
 
 add_library(engram STATIC hash.cpp store.cpp display.cpp)
-# Fault injection for the identity and hand-over tests (DSGB10_ENGRAM_BREAK here, DSGB10_LEND_FAIL in model/lend.cu)
+# Fault injection for the identity and hand-over tests (DSGB10_ENGRAM_BREAK here, DSGB10_LEND_FAIL in model/tenant.cu)
 option(DSGB10_TEST_FAULTS "fault injection for the Engram cache tests" OFF)
 if(DSGB10_TEST_FAULTS)
   target_compile_definitions(engram PUBLIC DSGB10_TEST_FAULTS)

@@ -1,6 +1,6 @@
 // Loading a rank's weight file into one device arena: O_DIRECT reads by several threads into pinned
-// staging buffers (two per thread), each copied to the device while the next is read. Reads format
-// versions 1 and 2; DeviceTensor::layout says how each tensor's bytes are arranged (dsw.h).
+// staging buffers (two per thread, or one when there are no more reads than threads), each copied to the device while the
+// next is read. Reads format versions 1 to 3; DeviceTensor::layout says how each tensor's bytes are arranged (dsw.h).
 #pragma once
 #include <cstdint>
 #include <functional>
@@ -38,6 +38,10 @@ struct LoadStats {
   uint64_t bytes = 0;
   double seconds = 0, gbps = 0;      // streaming file -> device
   double verify_seconds = 0;         // when verify_crc
+  // pinned host staging: the most held at once during the load (only as many workers as there are reads, each with a
+  // second buffer only when it has a second read to overlap, each buffer as long as the longest read), and what is
+  // still held when load() returns (0: every buffer is freed)
+  uint64_t staging_peak = 0, staging_held = 0;
 };
 
 class WeightFile {

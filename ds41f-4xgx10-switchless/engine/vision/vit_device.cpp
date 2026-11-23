@@ -2,7 +2,11 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
+#include <cstdio>
+
 #include "common/check.h"
+#include "common/heap.h"
 
 namespace vit {
 
@@ -40,8 +44,9 @@ dsw::LoadStats VisionWeights::load(int threads) {
   CUDA_CHECK(cudaMalloc(&pad, prow * kDim));
   dev_.owned.push_back(pad);
   CUDA_CHECK(cudaMemset(pad, 0, prow * kDim));
-  CUDA_CHECK(cudaMemcpy2D(pad, prow, file_->operator[]("vision.patch_embed.proj.weight").data, (size_t)kPatchK * 2,
-                          (size_t)kPatchK * 2, kDim, cudaMemcpyDeviceToDevice));
+  CUDA_CHECK(cudaMemcpy2D(pad, prow, scratch, (size_t)kPatchK * 2, (size_t)kPatchK * 2, kDim, cudaMemcpyDeviceToDevice));
+  CUDA_CHECK(cudaDeviceSynchronize());
+  CUDA_CHECK(cudaFree(scratch));
   dev_.patch_w = static_cast<bf16*>(pad);
   const std::vector<u16> tab = pixel_table();
   void* t = nullptr;

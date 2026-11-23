@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Time-slicing (docs/batching.md, B1) through rank 0's socket, with requests that overlap: each must give
+"""Time-slicing (docs/batching.md) through rank 0's socket, with requests that overlap: each must give
 what it gives alone, bit for bit (greedy and seeded sampling, tokens and log-probabilities); a request that
 comes during another's decode gets its first token after its own prefill, not after the other's decode;
 the decoding requests take turns; a cancel of a paused request, a second request for a session in flight
@@ -59,7 +59,7 @@ class Mux(Engine):
                 (r, reason, pt, cached, comp, q_us, p_us, d_us, el, _) = struct.unpack('<QIIIIQQQII', p[:56])
                 self.recs[r]['done'] = dict(reason=REASONS[reason], prompt=pt, cached=cached, completion=comp,
                                             queue_us=q_us, prefill_us=p_us, decode_us=d_us,
-                                            error=p[56:56 + el].decode(), t=time.time())
+                                            error=p[len(p) - el:].decode(), t=time.time())
 
     def ntok(self, rid):
         return len(self.recs[rid]['ids'])

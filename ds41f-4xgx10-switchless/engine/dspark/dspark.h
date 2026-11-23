@@ -204,10 +204,12 @@ struct Inject {
 class Draft {
  public:
   // table: the RoPE table without YaRN (attn::rope_table_build(.., compressed = false)), positions up to the
-  // last one drafted (anchor + 5) of a factor-16 session. Sessions at the other YaRN factors (32, 64) reach past
-  // it: use_factor(f) switches the launches that follow to the computed rotation (attn::rope_plain_calc, the same
-  // bits), and back to the table at 16; captured graphs bake the choice, so it is set before a capture. slots: the windows of that many sessions side by side (model::Options::slots).
-  Draft(const Weights& w, int rank, Comm* comm, const float2* table, int slots = 1);
+  // last one drafted (anchor + 5) of a factor-16 session, or null: the drafter then computes the plain rotation
+  // (attn::rope_plain_calc, the same bits) at every factor. With a table, sessions at the other YaRN factors (32, 64)
+  // reach past it: use_factor(f) switches the launches that follow to the computed rotation, and back to the table at
+  // 16; captured graphs bake the choice, so it is set before a capture. slots: the windows of that many sessions side
+  // by side (model::Options::slots).
+  Draft(const Weights& w, int rank, Comm* comm, const float2* table = nullptr, int slots = 1);
   ~Draft();
   Draft(const Draft&) = delete;
   Draft& operator=(const Draft&) = delete;

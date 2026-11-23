@@ -5,9 +5,12 @@
 #include <cstddef>
 
 #include "common/check.h"
+#include "common/embed_shard.h"
 #include "model/config.h"
 
 namespace model::ops {
+static_assert(embed_shard::kPart == kVocabPart && embed_shard::kVocab == kVocab && embed_shard::kRanks == kRanks,
+              "the embedding's vocabulary cut is the head's");
 namespace {
 
 __device__ __forceinline__ float bf(bf16 v) { return __bfloat162float(v); }
@@ -30,10 +33,23 @@ __device__ float block_sum(float v, float* red) {
   return s;
 }
 
-__global__ void k_embed(const bf16* table, const int* tokens, bf16* x, float* pre_mix) {
+// One row of the lookup's slot for token id: the shard's row or -0.0 (common/embed_shard.h); a token no rank owns stops
+// the kernel rather than leaving a row of -0.0 in the stream.
+__device__ void embed_part_row(const bf16* shard, int base, int id, uint32_t* dst) {
+  if (!embed_shard::id_ok(id)) __trap();
+  const uint32_t* src = reinterpret_cast<const uint32_t*>(shard);
+  for (int i = threadIdx.x; i < kDim / 2; i += blockDim.x) dst[i] = embed_shard::slot_word(src, base, id, kDim / 2, i);
+}
+
+__global__ void k_embed_part(const bf16* shard, int base, const int* tokens, bf16* slot) {
   const int r = blockIdx.x;
-  const uint4* src = reinterpret_cast<const uint4*>(table + (size_t)tokens[r] * kDim);
-  uint4* dst = reinterpret_cast<uint4*>(x + (size_t)r * kHcDim);
+  embed_part_row(shard, base, tokens[r], reinterpret_cast<uint32_t*>(slot + (size_t)r * kDim));
+}
+
+// Row r of rows [..][5120] into the 4 copies of x's row, and the identity pre mix.
+__device__ void fan_row(const bf16* row, bf16* x, float* pre_mix) {
+  const uint4* src = reinterpret_cast<const uint4*>(row);
+  uint4* dst = reinterpret_cast<uint4*>(x);
   for (int i = threadIdx.x; i < kDim / 8; i += blockDim.x) {
     const uint4 v = src[i];
 #pragma unroll
@@ -197,8 +213,24 @@ void step_in(const StepIn* ring, uint32_t* counter, const int32_t* fb, StepIn* d
   CUDA_CHECK(cudaGetLastError());
 }
 
-void embed(const bf16* table, const int* tokens, int R, bf16* x, float* pre_mix, cudaStream_t s) {
-  k_embed<<<R, 256, 0, s>>>(table, tokens, x, pre_mix);
+void embed_part(const bf16* shard, int rank, const int* tokens, int R, bf16* slot, cudaStream_t s) {
+  k_embed_part<<<R, 256, 0, s>>>(shard, rank * kVocabPart, tokens, slot);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void embed_fan(const bf16* rows, int R, bf16* x, float* pre_mix, cudaStream_t s) {
+  k_embed_fan<<<R, 256, 0, s>>>(rows, x, pre_mix);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void embed_send(const bf16* shard, int rank, const int* tokens, int M, bf16* part, cudaStream_t s) {
+  k_embed_send<<<M, 256, 0, s>>>(shard, rank * kVocabPart, tokens, part);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void embed_pick(const bf16* recv, int rq, const int* tokens, int n, bf16* x, float* pre_mix, cudaStream_t s) {
+  if (n <= 0) return;
+  k_embed_pick<<<n, 256, 0, s>>>(recv, rq, tokens, x, pre_mix);
   CUDA_CHECK(cudaGetLastError());
 }
 

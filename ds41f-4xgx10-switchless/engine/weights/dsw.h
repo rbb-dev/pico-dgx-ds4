@@ -17,8 +17,11 @@
 namespace dsw {
 
 constexpr char kMagic[8] = {'D', 'S', 'G', 'B', '1', '0', 'W', '1'};
-constexpr uint32_t kVersion = 2;     // written by dsw_convert
+constexpr uint32_t kVersion = 3;     // written by dsw_convert
 constexpr uint32_t kMinVersion = 1;  // oldest the loader and verifier read (version 1 is all Natural)
+// Version 3 cuts embed.weight and mtp.N.markov_head.embed.weight by vocabulary rows (plan.cpp); a file of an older version
+// holds them whole, and a rank file of that version is refused (WeightFile, old_embed_cut).
+constexpr uint32_t kEmbedCutVersion = 3;
 constexpr uint64_t kAlign = 4096;
 
 inline uint64_t align_up(uint64_t x, uint64_t a = kAlign) { return (x + a - 1) / a * a; }
@@ -130,6 +133,18 @@ struct TocEntry {
   uint8_t reserved[512 - 128 - 128 - 96 - 4 * 2 - 8 * 4 - 8 * 2 - 4 * 6 - 8 * 4];
 };
 static_assert(sizeof(TocEntry) == 512);
+
+// True for a tensor the vocabulary cut applies to when a file of `version` holds it whole.
+inline bool old_embed_cut(const std::string& name, uint32_t version) {
+  const std::string tail = "markov_head.embed.weight";
+  const bool markov = name.size() >= tail.size() && name.compare(name.size() - tail.size(), tail.size(), tail) == 0;
+#ifdef PICO_OLD_RULES
+  (void)markov, (void)version, (void)name;
+  return false;
+#else
+  return version < kEmbedCutVersion && (name == "embed.weight" || markov);
+#endif
+}
 
 // "" if a file's header says it was cut for `rank` of `world`, else what it says and what was wanted: a
 // rank's file holds that rank's slices, so another rank's would load and compute garbage.

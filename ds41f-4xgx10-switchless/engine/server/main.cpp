@@ -805,7 +805,7 @@ int main(int argc, char** argv) {
     vision = std::make_unique<vit::VisionWeights>(a.vision_weights, a.rank);  // refuses another rank's file, or one that is not the rank's vision weights
     const uint64_t mine = vision->digest();
     uint64_t all[comm::kRanks];
-    ring.allgather_host(&mine, all, sizeof mine);
+    ring.allgather_host(&mine, all, sizeof mine, comm::kCallMain0 + 0);
     for (int r = 0; r < comm::kRanks; ++r)
       if (all[r] != mine)
         die("rank %d: the vision weight files are not one set: digests of ranks 0-3 %016llx %016llx %016llx %016llx "
@@ -842,7 +842,7 @@ int main(int argc, char** argv) {
                                      std::min(want_bytes, (size_t)a.engram_vram_mib << 20));
       const uint64_t mine = ok ? display.size() : 0;
       uint64_t sizes[4];
-      ring.allgather_host(&mine, sizes, sizeof mine);
+      ring.allgather_host(&mine, sizes, sizeof mine, comm::kCallMain0 + 1);
       const uint64_t least = std::min(std::min(sizes[0], sizes[1]), std::min(sizes[2], sizes[3]));
       if (least == 0) {
         const std::string why = ok ? "another rank has none" : display.why();
@@ -935,6 +935,7 @@ int main(int argc, char** argv) {
     // (--pool-free-gib: of device memory and of available host memory, the Engram cache still to grow counted as
     // used) and/or from positions (--pool-tokens: 5 numbers every 16,384), the smaller or the larger of the two
     // (--pool-pick); every rank takes the smallest rank's count. The pool so far (one line) counts in it.
+    m.split_prepare();  // with --kv-split cache: the split's buffers, before the read, so that it is already short by them
     size_t dfree = 0, dtotal = 0;
     CUDA_CHECK(cudaMemGetInfo(&dfree, &dtotal));
     const size_t avail = mem_available();
@@ -980,17 +981,16 @@ int main(int argc, char** argv) {
       for (const auto& r : all) std::printf(" %.2f / %.2f", r.dfree / gib, r.avail / gib);
       std::printf(" GiB, the Engram cache's %.1f to grow)\n", cache / gib);
       if (vision && a.pool_free_gib >= 0) {  // loaded before the reads above, so they are already lower by its bytes
-        const uint64_t vb = vision->device_bytes(), keep = (uint64_t)(a.pool_free_gib * gib);
-        std::printf("vision weights: %llu bytes on every rank (%.2f numbers of %.2f MiB); each rank's own offer is lower than without them, "
-                    "at the same readings, by:", (unsigned long long)vb, vb / (double)img, img / 1048576.0);
-        for (const auto& r : all)
-          std::printf(" %llu", (unsigned long long)(model::rules::pool_offer(have, r.dfree + vb, r.avail, keep, cache, img) -
-                                                   model::rules::pool_offer(have, r.dfree, r.avail, keep, cache, img)));
-        std::printf(" numbers\n");
+        const uint64_t vb = vision->device_bytes();
+        std::printf("vision weights: %llu bytes on every rank (%.2f numbers of %.2f MiB)\n", (unsigned long long)vb,
+                    vb / (double)img, img / 1048576.0);
       }
     }
-    // the ledger and the start check: with --pool-free-gib the fixed lines and the slack must fit in what the pool leaves free
+    // the table and the start check: with --pool-free-gib the store must hold one conversation of --max-ctx, the Engram cache's groups
+    // (as many as the lender can give: a larger cache is cut, never a refusal), one largest image request's rows and the largest window
+    // a request may open; and none of the engine's own lines may hold more than its cap
     rules::Ledger ledgers[rules::kRanks];
+    rules::StoreRead rd;
     uint64_t projected[rules::kRanks];
     for (int r = 0; r < rules::kRanks; ++r) {
       ledgers[r] = all[r].ledger;
@@ -1074,6 +1074,10 @@ int main(int argc, char** argv) {
     so.keep_index = disk_dir + "/server" + disk_tag + ".index";
     so.keep_bytes = std::min(m.state_disk_capacity(), (size_t)(a.keep_gib * 1073741824.0));  // none without a file
     so.keep_age_s = a.keep_days * 86400;
+    so.frame_stage_bytes = (uint64_t)a.frame_stage_mib << 20;
+    so.ids_dir = disk_dir.empty() ? "" : disk_dir + "/ids";
+    so.ids_host_bytes = (uint64_t)a.ids_host_mib << 20;
+    so.store_numbers = store_numbers;
     so.extend = a.extend;
     so.ced = !a.exact;
     so.spec = a.spec;
