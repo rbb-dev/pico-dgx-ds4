@@ -51,7 +51,9 @@ fn usage() -> ! {
                                 below half of what the table held when it went over, and not at all while the
                                 memory does not fall as they go), and image requests are answered 429 with
                                 Retry-After: 5 until it is under
-      --front-image-mib N       the most the image requests in flight count for against --front-table-mib: 400
+      --front-image-mib N       the most the image requests in flight count for against --front-table-mib: 400 (their rows, or
+                                with --vision engine the pixels they hold, counted as the media worker's frames arrive;
+                                one request over it is refused, 413)
       --node-stats HOST:PORT,... each rank's sampler, in rank order (docs/dashboard.md): the dashboard at
                                 /dashboard polls them while it is open; without them its NODE HEALTH is empty
       --dashboard-host NAME     a host name the dashboard also answers (repeat it), e.g. a proxy's; it always
@@ -175,6 +177,10 @@ fn serve(args: &[String]) {
         front_mib: parse_opt(args, "--front-mib", dsfront::server::DEFAULT_FRONT_MIB),
         front_image_mib: parse_opt(args, "--front-image-mib", dsfront::server::DEFAULT_FRONT_IMAGE_MIB),
     };
+    // the one memory cap bounds the table too, unless the table's own bound is given
+    if cfg.front_table_mib == 0 {
+        cfg.front_table_mib = dsfront::server::table_mib_from_front(cfg.front_mib, cfg.front_image_mib);
+    }
     let node_stats: Vec<String> = opt(args, "--node-stats").map_or(Vec::new(), |v| v.split(',').map(|a| a.trim().to_string()).filter(|a| !a.is_empty()).collect());
     let admin = opt(args, "--admin-socket");
     let table = opt(args, "--table-file").map(std::path::PathBuf::from);

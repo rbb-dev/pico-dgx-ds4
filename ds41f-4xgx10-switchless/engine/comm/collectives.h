@@ -90,6 +90,12 @@ struct ArgMax {
 };
 void argmax_rows(const DevChannel& ch, const ArgMax* in, ArgMax* out, int rows, cudaStream_t st);
 
+// argmax_rows with a table row carried by each winner (comm/argmax_row.h): every rank posts, with its candidate in[r], the row
+// of `table` (a vocabulary slice of row_u4 * 16 bytes a row, `table_rows` rows from id `base`) for in[r].id when its slice
+// holds it, and rows_out [rows][row_u4] gets the winner's row. A winner outside [0, vocab) stops the kernel. rows <= 64.
+void argmax_rows_row(const DevChannel& ch, const ArgMax* in, ArgMax* out, int rows, const void* table, int base,
+                     int table_rows, int row_u4, int vocab, void* rows_out, cudaStream_t st);
+
 // Launch shape the collectives use (one 16-byte chunk per thread where possible). All blocks of a
 // kernel that waits must be resident at once, hence at most 48 blocks.
 int grid_for(size_t bytes);

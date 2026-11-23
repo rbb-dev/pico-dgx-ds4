@@ -15,7 +15,24 @@
 // --seed0 N: the fills from seed N (one case alone on another run's data: its seed and the same arguments).
 // --equal: every position of a row scores the same, so the whole scan falls in one histogram bin and the
 // selection is the first positions (ties to the lowest): the case that fills a CTA's packed counters.
-//   bench_index [--iters N] [--iqm] [--rows 1,6] [--sessions 1,4] [--table] [--equal] [--dump DIR] [--seed0 N] ctx...
+// --split P: also the decode scan SPLIT by positions over P ranks, against index_dense (what the runner
+// launches): this rank's part 0 by index_fused (IndexScan part 0 of P), the other P - 1 parts' candidate lists made once
+// (what the all-gather would deliver), then index_merge2 over the P lists. Printed per case: the split's own scan (part), the
+// merge, the two in one stream (split), and whether the merged selections equal the whole scan's (index_dense's: positions and
+// keys, the pool's blocks too). The all-gather itself is not in this bench (a collective stand-in costs what it is set to).
+// --part dense|fused|both (with --split; default fused): what scans each rank's part. fused: index_fused's
+// part; dense: the same index_dense kernel the whole scan uses, on the part (index_dense's part/nparts: the part's keys and
+// block maxima from 0, the selections' positions the whole scan's), then the same index_merge2.
+// --sweep (P ranks, default 4; --split P sets it; --rows default 1,6 (up to 16); --sessions default 1 (the rows split into that many
+// sessions through a slot table: the dense part with a slot table, each session split by its own length); --kinds default 1: ratio 1 with the pool, layer 20, whose
+// scan is the context's length; contexts default 65536 ... 4194304): per context, rows and ties (off: random keys; on: --equal's
+// one score for every key, one histogram bin) the whole scan (index_dense), the split with fused parts and the split with dense
+// parts (part 0 + merge in one stream, as --split's split column), each the median (or --iqm) of launches after an L2 flush,
+// 'whole 1st': the whole scan timed right after the case is built, before the host checks and the split's buffers; 'whole': timed after them.
+// whether each split's merged picks equal the whole scan's (positions and keys, the pool's too; the whole scan against index_fused
+// and a host top-k too), and the fastest of the three whose picks are equal. Exit 1 when any picks differ.
+//   bench_index [--iters N] [--iqm] [--rows 1,6] [--sessions 1,4] [--table] [--equal] [--split P] [--part dense|fused|both]
+//               [--sweep] [--dump DIR] [--seed0 N] ctx...
 #include <algorithm>
 #include <filesystem>
 #include <random>
@@ -38,6 +55,9 @@ cudaStream_t g_s;
 int g_iters = 30, g_bad = 0;
 bool g_iqm = false;  // --iqm: report the interquartile mean (the timer ticks every ~2 us)
 bool g_table = false;  // --table: a slot table for one session too
+int g_split = 0;
+int g_part = 0;        // --part: 0 fused, 1 dense, 2 both (what scans a split's part)
+bool g_sweep = false;  // --sweep       // --split P: the decode scan split by positions over P ranks (P >= 2), timed and compared
 bool g_equal = false;  // --equal: every key of a row scores the same (one bin holds the whole scan: the counters' limit)
 std::string g_dump = ".";  // --dump: where a case that differs keeps its outputs
 bool g_keep_all = false;   // --keep-all: every case keeps them
@@ -151,6 +171,62 @@ struct Case {
     if (pool) ps = attn::IndexSel{kPool, pl.p, pkey.p, kPool};
     attn::index_dense(iq.p, wp.p, pos.p, tab.p, rows, ratio, ik(), max_scan, keys.p, kstride, bkeys.p,
                       kstride / 8, t, ps, scratch.p, false, g_s);
+  }
+  // ---- --split P: part 0 of P on this rank, the others' candidate lists from one earlier launch each, then the merge
+  Dev<int> c_pos, c_ppos, m_top, m_pl;
+  Dev<uint16_t> c_key, c_pkey, m_tkey, m_pkey;
+  int P = 0, part_scan = 0;
+  void split_init(int P_) {
+    P = P_;
+    part_scan = ((max_scan + P - 1) / P + 63) / 64 * 64;
+    c_pos = Dev<int>((size_t)rows * P * kTopk);
+    c_key = Dev<uint16_t>((size_t)rows * P * kTopk);
+    m_top = Dev<int>((size_t)rows * kTopk);
+    m_tkey = Dev<uint16_t>((size_t)rows * kTopk);
+    if (pool) {
+      c_ppos = Dev<int>((size_t)rows * P * kPool);
+      c_pkey = Dev<uint16_t>((size_t)rows * P * kPool);
+      m_pl = Dev<int>((size_t)rows * kPool);
+      m_pkey = Dev<uint16_t>((size_t)rows * kPool);
+    }
+  }
+  void part(int part_i, bool dense_part = false) {  // one part's scan, its candidates into list slot part_i of every row
+    attn::IndexScan sc;
+    sc.part = part_i;
+    sc.nparts = P;
+    attn::IndexSel t{kTopk, c_pos.p + (size_t)part_i * kTopk, c_key.p + (size_t)part_i * kTopk, P * kTopk}, ps{};
+    if (pool) ps = attn::IndexSel{kPool, c_ppos.p + (size_t)part_i * kPool, c_pkey.p + (size_t)part_i * kPool, P * kPool};
+    if (dense_part) {
+      attn::index_dense(iq.p, wp.p, pos.p, tab.p, rows, ratio, ik(), part_scan, keys.p, kstride, bkeys.p, kstride / 8, t, ps,
+                        scratch.p, false, g_s, -1, part_i, P);
+      return;
+    }
+    attn::index_fused(iq.p, wp.p, pos.p, tab.p, rows, ratio, ik(), sc, part_scan, keys.p, kstride, pool ? bkeys.p : nullptr,
+                      kstride / 8, t, ps, counters.p, false, g_s);
+  }
+  void others(bool dense_part = false) {
+    for (int i = 1; i < P; ++i) part(i, dense_part);
+  }
+  void merge() {
+    attn::IndexSel t{kTopk, m_top.p, m_tkey.p, kTopk}, ps{};
+    if (pool) ps = attn::IndexSel{kPool, m_pl.p, m_pkey.p, kPool};
+    attn::index_merge2(rows, c_pos.p, c_key.p, P * kTopk, t, c_ppos.p, c_pkey.p, P * kPool, ps, false, g_s);
+  }
+  // 0: the merged selections equal the whole scan's (d: index_dense's outputs, host copies), else the number of rows that differ
+  int split_diff(const Out& d) const {
+    CUDA_CHECK(cudaStreamSynchronize(g_s));
+    const auto top = m_top.host(), pl = pool ? m_pl.host() : std::vector<int>();
+    const auto tkey = m_tkey.host(), pkey = pool ? m_pkey.host() : std::vector<uint16_t>();
+    int bad = 0;
+    for (int r = 0; r < rows; ++r) {
+      bool same = std::equal(top.begin() + (size_t)r * kTopk, top.begin() + (size_t)(r + 1) * kTopk, d.top.begin() + (size_t)r * kTopk) &&
+                  std::equal(tkey.begin() + (size_t)r * kTopk, tkey.begin() + (size_t)(r + 1) * kTopk, d.tkey.begin() + (size_t)r * kTopk);
+      if (pool)
+        same = same && std::equal(pl.begin() + (size_t)r * kPool, pl.begin() + (size_t)(r + 1) * kPool, d.pl.begin() + (size_t)r * kPool) &&
+               std::equal(pkey.begin() + (size_t)r * kPool, pkey.begin() + (size_t)(r + 1) * kPool, d.pkey.begin() + (size_t)r * kPool);
+      bad += !same;
+    }
+    return bad;
   }
   attn::IndexQ iqd() { return attn::IndexQ{q.p, qsc.p, qw.p}; }
   void q_prep() { attn::index_q_prep(iq.p, wp.p, pos.p, tab.p, iqd(), nullptr, rows, g_s); }
@@ -379,6 +455,51 @@ int main(int argc, char** argv) {
   std::printf("%s: %d SMs, L2 %d MB; %s of %d launches, each after an L2 flush (us)%s\n", prop.name,
               prop.multiProcessorCount, prop.l2CacheSize >> 20, g_iqm ? "interquartile mean" : "median", g_iters,
               g_table ? "; slot tables for one session too" : "");
+  if (g_sweep) {
+    std::printf("sweep: P=%d parts; us = %s of %d launches after an L2 flush; split = part 0 + merge in one stream\n", g_split,
+                g_iqm ? "interquartile mean" : "median", g_iters);
+    std::printf("%8s %4s %4s %5s %-10s | %9s %9s %12s %12s | %-14s %-14s | %s\n", "context", "rows", "sess", "ties", "layer", "whole 1st",
+                "whole", "split,fused", "split,dense", "picks fused", "picks dense", "fastest (picks equal to the whole scan's)");
+    for (int ctx : ctxs)
+      for (int R : rows)
+       for (int S : sessions)
+        for (int tie = 0; tie < 2; ++tie)
+          for (int kind : kinds) {
+            g_equal = tie;
+            if (R > attn::kMaxDecodeRows || kind == 2 || S < 1 || R % S) continue;
+            Case c(R, kind ? 1 : 2, ctx, kind == 1, false, S);
+            c.dense();  // the kernels' one-time setup, then the whole scan timed before anything else is allocated
+            const double tw0 = time_us([&] { c.dense(); });
+            c.fused();
+            int bad = check(c);
+            const Out fo = c.out();
+            c.dense();
+            const int dbad = check(c);
+            const Out dout = c.out();
+            const bool same = fo.keys == dout.keys && (!c.pool || fo.bkeys == dout.bkeys) && fo.top == dout.top && fo.pl == dout.pl;
+            const double tw = time_us([&] { c.dense(); });
+            c.split_init(g_split);
+            double ts[2];
+            int sb[2];
+            for (int dp = 0; dp < 2; ++dp) {
+              c.others(dp);
+              c.part(0, dp);
+              c.merge();
+              sb[dp] = c.split_diff(dout);
+              ts[dp] = time_us([&] { c.part(0, dp); c.merge(); });
+            }
+            const char* best = "whole";
+            double bt = tw;
+            if (!sb[0] && ts[0] < bt) bt = ts[0], best = "split,fused";
+            if (!sb[1] && ts[1] < bt) bt = ts[1], best = "split,dense";
+            std::printf("%8d %4d %4d %5s %-10s | %9.1f %9.1f %12.1f %12.1f | %-14s %-14s | %s %.1f%s\n", ctx, R, S, tie ? "on" : "off",
+                        kind ? "20 (+pool)" : "2, 8, 14", tw0, tw, ts[0], ts[1], sb[0] ? "PICKS DIFFER" : "equal",
+                        sb[1] ? "PICKS DIFFER" : "equal", best, bt,
+                        (bad || dbad || !same) ? "  (whole scan vs fused/host top-k: DIFFERENT)" : "");
+            g_bad += bad + dbad + !same + sb[0] + sb[1];
+          }
+    return g_bad ? 1 : 0;
+  }
   std::printf("%8s %4s %4s %-14s %9s %9s | %8s %8s %8s %8s | %s\n", "context", "rows", "sess", "layer", "fused",
               "dense", "q prep", "scores", "top-k", "pool", "selections vs a host top-k; dense vs fused");
   for (int ctx : ctxs)

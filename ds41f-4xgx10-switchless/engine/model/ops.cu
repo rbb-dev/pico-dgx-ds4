@@ -55,7 +55,31 @@ __device__ void fan_row(const bf16* row, bf16* x, float* pre_mix) {
 #pragma unroll
     for (int c = 0; c < kHc; ++c) dst[c * (kDim / 8) + i] = v;
   }
-  if (threadIdx.x < kHc) pre_mix[r * kHc + threadIdx.x] = threadIdx.x == 0 ? 1.f : 0.f;
+  if (threadIdx.x < kHc) pre_mix[threadIdx.x] = threadIdx.x == 0 ? 1.f : 0.f;
+}
+
+__global__ void k_embed_fan(const bf16* rows, bf16* x, float* pre_mix) {
+  const int r = blockIdx.x;
+  fan_row(rows + (size_t)r * kDim, x + (size_t)r * kHcDim, pre_mix + r * kHc);
+}
+
+// Block i: chunk row i (row t = i % rq of quarter i / rq), written where the all-to-all reads it when this rank's shard holds
+// its token.
+__global__ void k_embed_send(const bf16* shard, int base, const int* tokens, bf16* part) {
+  const int i = blockIdx.x;
+  const int id = tokens[i];
+  if (!embed_shard::id_ok(id)) __trap();
+  if (static_cast<unsigned>(id - base) >= static_cast<unsigned>(kVocabPart)) return;
+  const uint4* src = reinterpret_cast<const uint4*>(shard + (size_t)(id - base) * kDim);
+  uint4* dst = reinterpret_cast<uint4*>(part + (size_t)i * kDim);
+  for (int k = threadIdx.x; k < kDim / 8; k += blockDim.x) dst[k] = src[k];
+}
+
+__global__ void k_embed_pick(const bf16* recv, int rq, const int* tokens, bf16* x, float* pre_mix) {
+  const int t = blockIdx.x;
+  const int id = tokens[t];
+  if (!embed_shard::id_ok(id)) __trap();
+  fan_row(recv + ((size_t)embed_shard::owner(id) * rq + t) * kDim, x + (size_t)t * kHcDim, pre_mix + t * kHc);
 }
 
 __global__ void k_inject_rows(const bf16* rows, bf16* x) {

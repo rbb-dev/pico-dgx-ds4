@@ -174,11 +174,21 @@ int run_window(model::Model& m, const Cmd& c) {
   return st;
 }
 
+int run_vit(model::Model& m, const Cmd& c, const uint8_t* pixels) {
+  return m.vision_run(c.vit_key, c.vit_span, c.vit_row0, c.vit_nh, c.vit_nw, c.vit_b0, c.vit_b1, pixels);
+}
+
 int run_lend(model::Model& m, const Cmd& c) {
-  const int st = m.engram_lend(c.rows, c.pos0);
-  if (store_check())
-    std::printf("store-check: rank %d lend command (phase %d, %d MiB) status %d digest %016llx\n", m.rank(), c.rows, c.pos0, st,
-                (unsigned long long)m.store_digest());
+  const int st = m.tenant_lend(c.tenant, c.rows, c.pos0);
+  if (store_check()) {
+    if (c.tenant == 1)
+      std::printf("store-check: rank %d lend command (phase %d, %d MiB) status %d digest %016llx\n", m.rank(), c.rows, c.pos0, st,
+                  (unsigned long long)m.store_digest());
+    else
+      std::printf("store-check: rank %d lend command of tenant %d (phase %d, %d MiB) status %d digest %016llx\n", m.rank(), c.tenant, c.rows, c.pos0, st,
+                  (unsigned long long)m.store_digest());
+    std::printf("store-check: rank %d tenant table %s\n", m.rank(), m.tenant_table_ok() ? "adds up" : "BROKEN");
+  }
   return st;
 }
 
@@ -930,8 +940,13 @@ void follow(model::Model& m, comm::Ring& ring, Watchdog& wd, int rank) {
             m.image_fill(c.pos0, r0, n, piece.data());
           }
         }
+        if (c.vit_reg) m.vision_register(c.pos0, c.n);
         m.set_images(c.n, lh.data(), lh.data() + c.n, c.pos0);
       }
+    } else if (c.op == kCmdVit) {
+      wd.started = now_s();
+      (void)run_vit(m, c, nullptr);
+      wd.started = 0;
     } else if (c.op == kCmdWindow) {
       wd.started = now_s();  // capturing the graphs takes seconds of CPU
       run_window(m, c);

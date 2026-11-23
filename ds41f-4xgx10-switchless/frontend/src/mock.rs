@@ -12,7 +12,7 @@
 //! quoting it, anything else → a reply quoting the user.
 
 use crate::encoding::{render_tool_calls, ASSISTANT_SP, THINK_END, THINK_START, USER_SP};
-use crate::protocol::{read_frame, ConfigFrame, Done, DoneReason, EngineStats, Frame, HelloEngine, Submit, Tokens, FLAG_ABLIT, FLAG_KEEP, FLAG_LOGPROBS, VERSION};
+use crate::protocol::{read_frame, ConfigFrame, Done, DoneReason, DoneTail, EngineStats, Frame, HelloEngine, Submit, Tokens, FLAG_ABLIT, FLAG_KEEP, FLAG_LOGPROBS, FLAG_PIXELS, VERSION, VERSION_PREFIX};
 use crate::tokenizer::Tokenizer;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -33,6 +33,32 @@ pub struct MockConfig {
     /// simulated prefill speed for uncached prompt tokens
     pub prefill_tok_per_s: f64,
     pub max_context: u32,
+    /// The newest protocol version it speaks: `VERSION_PREFIX` answers a front-end of that version with a second HELLO, takes
+    /// requests that carry only their suffix and ends every request that ran with the tail; `VERSION` is an engine of the older
+    /// version, which closes the connection of a front-end that says another.
+    pub version: u32,
+    /// What it saw, in order (a test's view of the front-end); None: not recorded.
+    pub seen: Option<Arc<Mutex<Vec<Seen>>>>,
+}
+
+/// One thing the mock engine saw a front-end do.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Seen {
+    /// a connection opened, and closed
+    Open,
+    Closed,
+    /// the version a front-end's HELLO said
+    Hello(u32),
+    /// a SUBMIT: the session and its base, the prefix it named (epoch, ids), the ids it carried, and whether it had images
+    Submit { session: u64, base: u64, prefix: Option<(u64, u32)>, n_prompt: usize, images: bool },
+    /// the image part of a SUBMIT that had one, byte for byte, and whether it was pixels (FLAG_PIXELS) or rows
+    Images { pixels: bool, part: Vec<u8> },
+}
+
+fn note(cfg: &MockConfig, what: Seen) {
+    if let Some(s) = &cfg.seen {
+        s.lock().unwrap().push(what);
+    }
 }
 
 /// Requests finished and prompt tokens computed by every mock engine in the process: the STATS counters.
@@ -129,6 +155,10 @@ async fn connection(stream: UnixStream, cfg: MockConfig, sessions: Sessions) {
                 break;
             }
             Frame::Submit(s) => {
+                note(&cfg, Seen::Submit { session: s.session_id, base: s.base_session_id, prefix: s.prefix, n_prompt: s.prompt.len(), images: s.images.is_some() });
+                if let (Some(part), true) = (&s.images, cfg.seen.is_some()) {
+                    note(&cfg, Seen::Images { pixels: s.flags & FLAG_PIXELS != 0, part: part.clone() });
+                }
                 let flag = Arc::new(AtomicBool::new(false));
                 cancels.lock().unwrap().insert(s.req_id, flag.clone());
                 let (tx, cfg, sessions, cancels) = (tx.clone(), cfg.clone(), sessions.clone(), cancels.clone());
@@ -366,6 +396,12 @@ async fn generate(mut s: Submit, cancel: Arc<AtomicBool>, tx: &mpsc::UnboundedSe
     // checked when it was decoded; here, that the spans sit on the prompt's image placeholders). The
     // rows themselves are not used: the mock's answer does not depend on them.
     if let Err(e) = s.image_spans() {
+        done.error = format!("bad request: {e}");
+        let _ = tx.send(Frame::Done(done).encode());
+        return;
+    }
+    // pixels: a well-formed frame the engine will not run (a grid that does not make its span's rows) is answered with an error
+    if let Err(e) = s.pixel_grids() {
         done.error = format!("bad request: {e}");
         let _ = tx.send(Frame::Done(done).encode());
         return;

@@ -1,9 +1,11 @@
-"""CPU tests of what a client is told when a video (or image) input is refused; needs torch (CPU), no
+"""CPU tests of what a client is told when a video (or image) input is refused; no torch, no
 model, no GPU, no network. The decoder tests also need PyAV and are skipped without it.
 
     python3 -m unittest discover -s tools/vision -p test_video_errors.py -v
 """
 import base64
+import hashlib
+import http.server
 import io
 import json
 import os
@@ -13,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import tracemalloc
 import types
 import unittest
 import urllib.error
@@ -112,11 +115,11 @@ class PlainFailureTests(unittest.TestCase):
         return {"subprocess": fake}
 
     def test_a_decoder_that_crashes_or_says_nothing_useful(self):
-        clip_url = {"url": data_url(b"anything")}
+        clip_url = {"url": data_url(b"anything")}  # copied for each try: a record loses its text once taken
         raw = b"av.error.InvalidDataError: [Errno 1094995529] Invalid data found when processing input: '<none>'"
         for rc, out in [(-11, b""), (1, b""), (1, b"Traceback (most recent call last):"), (0, b"[]"), (1, b'{"ok": false}'),
                         (0, b'{"ok": true}'), (2, b'{"ok": false, "error": "[Errno 2] x"}'), (1, b'{"ok": false, "error": 5}')]:
-            self.assertEqual(self.video_error(clip_url, **self.decoder(rc, out, raw)), "not a readable video", (rc, out))
+            self.assertEqual(self.video_error(dict(clip_url), **self.decoder(rc, out, raw)), "not a readable video", (rc, out))
 
     def test_the_decoders_own_words_pass(self):
         out = json.dumps({"ok": False, "error": "the clip has no video stream"}).encode()
@@ -131,7 +134,7 @@ class PlainFailureTests(unittest.TestCase):
 
     def test_fetch_failures(self):
         def fails_with(e):
-            def fetch(record, max_bytes=None, kind="image"):
+            def fetch(record, max_bytes=None, kind="image", into=None):
                 raise e
             return fetch
 
@@ -249,6 +252,115 @@ class DecoderTests(unittest.TestCase):
         for raw, count in ((b"not a video", 3), (self.clip[:40], 3), (self.clip, 0), (self.clip, 101)):
             with self.assertRaises(VideoError):
                 sample(raw, count)
+
+
+@unittest.skipUnless(os.environ.get("VISION_MODULE", "media_worker") == "media_worker", "the media worker's memory")
+class ClipHeldOnceTests(unittest.TestCase):
+    """A clip is held once, in its file: written in pieces, its request text dropped before the frame process
+    starts, and the frame process is given the path."""
+
+    SIZE = 8 << 20
+
+    @classmethod
+    def setUpClass(cls):
+        cls.enc = load_encoder()
+        cls.blob = os.urandom(cls.SIZE)
+        cls.digest = hashlib.sha256(cls.blob).hexdigest()
+
+    def decode(self, record, **patches):
+        """decode_videos with a frame process that only looks at what it is given: (what it saw, peak bytes
+        allocated while the clip was taken)."""
+        seen = {}
+
+        def run(argv, **kw):
+            path = argv[2]
+            h = hashlib.sha256()
+            with open(path, "rb") as f:
+                while piece := f.read(1 << 16):
+                    h.update(piece)
+            seen.update(path=path, argv=argv, sha=h.hexdigest(), size=os.path.getsize(path), record=dict(record))
+            out = json.dumps({"ok": True, "duration": 1.0, "frames": []}).encode()
+            return types.SimpleNamespace(returncode=0, stdout=out, stderr=b"")
+
+        fake = types.SimpleNamespace(run=run, TimeoutExpired=subprocess.TimeoutExpired)
+        saved = {k: getattr(self.enc, k) for k in patches}
+        for k, v in patches.items():
+            setattr(self.enc, k, v)
+        self.enc.subprocess = fake
+        tracemalloc.start()
+        try:
+            self.enc.decode_videos({"videos": [record], "frame_budget": 32})
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+            self.enc.subprocess = subprocess
+            for k, v in saved.items():
+                setattr(self.enc, k, v)
+        return seen, peak
+
+    def test_an_inline_clip_lands_in_the_file_in_pieces_and_its_text_is_dropped(self):
+        text = base64.b64encode(self.blob).decode()
+        for name, make in (("url", lambda: {"url": "data:video/mp4;base64," + text}),
+                           ("data", lambda: {"data": text}),
+                           ("source", lambda: {"source": {"data": text}})):
+            record = make()
+            seen, peak = self.decode(record)
+            self.assertEqual((seen["size"], seen["sha"]), (self.SIZE, self.digest), name)
+            self.assertLess(peak, self.SIZE // 2, "%s: the clip is never held whole (peak %d B)" % (name, peak))
+            self.assertEqual(seen["record"].get("url", ""), "", name)  # the text was dropped before the frame process started
+            self.assertEqual(seen["record"].get("data", ""), "", name)
+            self.assertEqual(seen["record"].get("source", {}).get("data", ""), "", name)
+            self.assertTrue(seen["argv"][2].endswith("/clip"), "the frame process is given the file's path")
+
+    def test_a_clip_by_url_lands_in_the_file_in_pieces(self):
+        blob = self.blob
+
+        class Clip(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(blob)))
+                self.end_headers()
+                try:
+                    self.wfile.write(blob)
+                except OSError:  # the worker stopped reading: it refused the clip
+                    pass
+
+            def log_message(self, *args):
+                pass
+
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Clip)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            record = {"url": "http://127.0.0.1:%d/clip.mp4" % srv.server_address[1]}
+            seen, peak = self.decode(record, _public=lambda host, kind="image": None)
+            self.assertEqual((seen["size"], seen["sha"]), (self.SIZE, self.digest))
+            self.assertLess(peak, self.SIZE // 2, "the fetched bytes are never held whole (peak %d B)" % peak)
+            limit, public = self.enc.a.max_video_bytes, self.enc._public
+            self.enc.a.max_video_bytes, self.enc._public = 1000, lambda host, kind="image": None
+            try:
+                with self.assertRaisesRegex(self.enc.MediaError, "^video larger than 1000 bytes$"):
+                    self.enc.decode_videos({"videos": [dict(record)], "frame_budget": 32})
+            finally:
+                self.enc.a.max_video_bytes, self.enc._public = limit, public
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_base64_text_in_pieces_decodes_as_the_whole_would(self):
+        piece, self.enc._PIECE = self.enc._PIECE, 8
+        try:
+            for size in range(0, 40):
+                raw = bytes(range(size))
+                text = base64.b64encode(raw).decode()
+                for form in (text, "\n".join(text[i:i + 5] for i in range(0, len(text), 5)), text + "\n"):
+                    seen, _ = self.decode({"data": form})
+                    self.assertEqual((seen["size"], seen["sha"]), (size, hashlib.sha256(raw).hexdigest()), (size, form))
+            seen, _ = self.decode({"data": b"already raw"})
+            self.assertEqual(seen["size"], 11)
+            with self.assertRaisesRegex(self.enc.MediaError, "not valid base64"):
+                self.decode({"data": "AAAAA"})
+        finally:
+            self.enc._PIECE = piece
 
 
 if __name__ == "__main__":

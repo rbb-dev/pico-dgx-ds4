@@ -1,6 +1,11 @@
 // The decode selection (select_bins through select_dense) on synthetic keys at 256K, 1M, 2M and 4M keys a row: against a
 // host top-k (ties to the lowest position) for six key distributions; up to 1,048,576 keys also against the 17-bit
-// reference (sel_old.cuh); past 1M the reference must differ on the spread cases ("control"). Exit status 0: every
+// reference (sel_old.cuh); past 1M the reference must differ on the spread cases ("control").
+// index_merge2's rank-major layout (P-scan: the candidates as comm::allgather_multi leaves them, [parts][rows][width], the
+// merge reading them in place): for rows 1 / 6 / 16, 4 parts, the top's 512-wide and the pool's 2,048-wide candidate
+// lists, random keys with ties and empty slots: the merged picks of the rank-major launch equal the row-major launch's
+// (the same candidates laid out [rows][parts * width]) and a host top-k over the row's candidates in part order (ties to
+// the lowest). Needs one GPU (any); the dense-kernel checks above need a GB10 (shared memory). Exit status 0: every
 // check passed. Usage: sel_tests [--quick]
 #include <algorithm>
 #include <cstdio>

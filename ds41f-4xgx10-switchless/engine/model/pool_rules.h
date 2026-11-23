@@ -106,6 +106,142 @@ bool covers(int64_t free, int64_t reserved, int64_t n, Giveable giveable) {
   return free + (int64_t)giveable() >= reserved + n;
 }
 
+// ---- a request on a conversation partly on the disk tier (serve.cpp mem_ok, room_for, unspill) ---------------------------------
+// What a request needs from the pool, in numbers nobody holds yet. The conversation it continues (its own, or a fork's base below
+// the fork point) holds lists in the pool already: they are credited, because the attach that follows the reservation makes them
+// the slot's. The lists that are only on the disk must come back (the turn reads them). So
+//   want = max(chunks_for - credit + cow, back) + image numbers          (cow: the copies a fork makes at its restart point)
+// Window bookmarks on the disk are not in it: they come back only into what is spare. Old rules: the whole list count plus every
+// piece of the record on the disk, lists and bookmarks (the lists counted twice), no credit, no cow.
+// ONE function gives this to mem_ok, room_for / make_room and the give-backs, each reading the credit at its own moment.
+inline int64_t list_credit(int64_t lists_in_pool) {
+#ifdef PICO_OLD_RULES
+  (void)lists_in_pool;
+  return 0;
+#else
+  return lists_in_pool;
+#endif
+}
+
+inline int64_t request_want(int64_t chunks_for, int64_t credit, int64_t back, int64_t bookmarks_on_disk, int64_t cow, int64_t img) {
+#ifdef PICO_OLD_RULES
+  (void)credit, (void)cow;
+  return chunks_for + back + bookmarks_on_disk + img;
+#else
+  (void)bookmarks_on_disk;
+  return std::max<int64_t>(chunks_for - credit + cow, back) + img;
+#endif
+}
+
+// What the reservation still needs from the pool once the read-back is done (room_for, before kStReserve): the positions' lists
+// less those the conversation holds (they are the slot's at the attach), and the image rows. The caller takes off the slot's own
+// commitment.
+inline int64_t room_want(int64_t chunks_for, int64_t credit, int64_t img) { return chunks_for - credit + img; }
+
+// The pool's count of what it can give a request (serve.cpp mem_ok, mem_sums, own, give_back's short_by): the free numbers beside the
+// reservations, the reservations of the lines the request may take (their reservations end with the detach: max(0, reservation - mapped) each),
+// and what eviction can give back for the conversations of those lines counted as if no line held them (the core's giveable_joint:
+// the numbers only those conversations name, once). One sum, so that a number two lines name is counted once. Old rules: the caller
+// adds each idle line's commitment and then the giveable of the conversations no line holds (a shared number is counted by each).
+inline int64_t pool_have(int64_t free_unreserved, int64_t reserves_of_lines, int64_t giveable_joint) {
+  return free_unreserved + reserves_of_lines + giveable_joint;
+}
+
+// What a line holds or has reserved, whichever is more; a conversation split on the line counts the whole numbers its quarter slots
+// stand for (4 slots = 1, rounded up), so that an idle line whose conversation is fully split still has something to give
+// (reclaim::pick_victim reads `committed`). Old rules: the slots are not counted (a fully split line holds and reserves nothing).
+inline int line_committed(int resv, int held, int slots) {
+#ifdef PICO_OLD_RULES
+  (void)slots;
+  return std::max(resv, held);
+#else
+  return std::max(resv, held + (slots + 3) / 4);
+#endif
+}
+
+// The split's buffers (state.cu EngineDev), made at the start with --kv-split cache BEFORE the free-memory read the store is sized from
+// (Model::split_prepare; class Fixed), so the read is already short by them: a Counted line of the start table, kSplit, shown not
+// summed. The buffers: one quarter's scratch, the exchange buffer of 8 pieces' four quarters twice (the all-gather's output and the
+// piece-by-piece layout), 8 pieces' quarters to send, the sums of 8 pieces, and the five recorded sums of every quarter slot at the
+// pool's largest count of numbers.
+constexpr uint64_t kQuarterBytes = 729088, kJoinBatch = 8, kSplitMaxNumbers = 41500;
+inline uint64_t split_buffer_bytes(bool on) {
+  return on ? (1 + kJoinBatch + 2 * 4 * kJoinBatch) * kQuarterBytes + kJoinBatch * 5 * 8 + kSplitMaxNumbers * 4 * 5 * 8 : 0;
+}
+// The imager's scratch (state.cu EngineDev), made with the buffers above: one quarter's image block (a quarter and its
+// trailer: 12 grains), one bookmark's bytes with its image block after them (`gather_bytes` is the rounded size of the larger bookmark, the end
+// bookmark's image block 1,572,864 bytes more), the five sum words. Part of the same start-table line (kSplit); in every mode that has a disk tier.
+constexpr uint64_t kImageBlockBytes = 786432, kEndImageBlockBytes = 1572864;
+inline uint64_t imager_buffer_bytes(bool on, uint64_t gather_bytes) { return on ? kImageBlockBytes + gather_bytes + kEndImageBlockBytes + 5 * 8 : 0; }
+
+// The count a join command (kStJoin) carries, from what is left of the join's budget (restore_budget, read once in the pass that makes the
+// reservation; each command takes some of it): never 0, which on the wire means no limit. -1: nothing is left, no command is sent. The old
+// rules sent 0 every time (the bookmarks' numbers then came out of what admission counted for the reservation).
+inline int64_t join_command_count(int64_t left) {
+#ifdef PICO_OLD_RULES
+  (void)left;
+  return 0;
+#else
+  return left > 0 ? left : -1;
+#endif
+}
+
+// The numbers a read-back may take (kStUnspill's count): the lists that must come back, then what the admission found spare
+// (have - want: mem_ok's own sums), at least 1. Old rules: 0, no limit.
+inline int64_t restore_budget(int64_t back, int64_t have, int64_t want) {
+#ifdef PICO_OLD_RULES
+  (void)back, (void)have, (void)want;
+  return 0;
+#else
+  return std::max<int64_t>(1, back + std::max<int64_t>(0, have - want));  // never 0: that would mean no limit
+#endif
+}
+
+// Whether a read-back was refused a take the count paid for: it had a budget, fewer lists came back than were asked, and the
+// shortfall is not a cut for sums (pieces whose sums differ are cut by the core, and say so in its own lines). Old rules: the
+// last term is missing, so a cut for sums reads as a refused take.
+inline bool readback_refused(int64_t cap, int64_t asked, int64_t back, bool sums_cut) {
+#ifdef PICO_OLD_RULES
+  (void)sums_cut;
+  return cap > 0 && back < asked;
+#else
+  return cap > 0 && back < asked && !sums_cut;
+#endif
+}
+
+// The numbers a join before an operation may take (kStJoin's budget, read once): the lists that are split and the numbers the
+// conversation's bookmarks stand on (the operation reads the restart point's bookmark whole, and a join that stops short of it
+// leaves the core's own join to land inside the operation), then what the admission found spare.
+inline int64_t join_budget(int64_t split, int64_t bookmarks, int64_t have, int64_t want) {
+  return restore_budget(split + std::max<int64_t>(0, bookmarks), have, want);
+}
+
+// The idle engine's rescue, step 1 (serve.cpp rescue): which of the request's own conversation's window bookmarks to drop to
+// make it fit. `numbers` = the numbers each holds in the pool, oldest first (0: only on the disk, so dropping it frees nothing).
+// Only when everything those bookmarks hold would make it fit (have + their sum >= want) is anything dropped; then the oldest
+// that hold numbers, until it fits. Otherwise nothing: a request that ends in an error costs its conversation no restart
+// point. Returns indices into `numbers`. Old rules: oldest first whatever they hold, until it fits or none is left.
+inline std::vector<size_t> rescue_drops(int64_t have, int64_t want, const std::vector<int>& numbers) {
+  std::vector<size_t> drop;
+  if (have >= want) return drop;
+#ifndef PICO_OLD_RULES
+  int64_t all = 0;
+  for (const int n : numbers) all += n;
+  if (have + all < want) return drop;
+#endif
+  for (size_t i = 0; i < numbers.size() && have < want; ++i) {
+#ifndef PICO_OLD_RULES
+    if (numbers[i] <= 0) continue;
+#endif
+    drop.push_back(i);
+    have += numbers[i];
+  }
+  return drop;
+}
+
+// Whether the pool can hold the request now: what is free and what eviction gives back, against what it needs.
+inline bool admissible(int64_t have, int64_t want) { return have >= want; }
+
 // Whether a restore from the disk tier may take `n` numbers for a piece.
 template <class Giveable>
 bool restore_may_take(int64_t free, int64_t reserved, int64_t n, Giveable giveable) {
@@ -209,16 +345,41 @@ static_assert(sizeof kLines / sizeof kLines[0] == kLineCount, "one entry in kLin
 constexpr int kLedgerSlots = 16;  // the exchanged width of a ledger: room for lines to come
 static_assert(kLineCount <= kLedgerSlots, "kLedgerSlots is too small for the lines");
 constexpr int kRanks = 4;
-constexpr uint64_t kLineTol = 64ull << 20;  // two ranks' values of one line may differ by this much
+constexpr uint64_t kLineTol = 64ull << 20;  // two ranks' caps of one line may differ by this much
 
 struct Ledger {
-  uint64_t bytes[kLedgerSlots] = {};
+  uint64_t cap[kLedgerSlots] = {};  // what the line may hold
+  uint64_t now[kLedgerSlots] = {};  // what it holds at the read of free memory
+  uint8_t enforced[kLedgerSlots] = {};
+  uint8_t image_what = 0;  // what the image-process line counts, named in the table (the ledger is exchanged by memory): 0 none, 1 media worker, 2 encoder container
+  void set(int i, uint64_t cap_bytes, uint64_t now_bytes, bool enforce) { cap[i] = cap_bytes, now[i] = now_bytes, enforced[i] = enforce; }
 };
 
-inline uint64_t fixed_sum(const Ledger& l) {
+// The cap of the image process outside the engine (line kEncoder): with the encoder in the engine (--vision-weights) the media worker
+// (tools/vision/media_worker.py), whose container's memory cap is `media_mib`; otherwise the encoder container (`encoder_mib`).
+inline uint64_t image_process_cap(bool engine_encodes, uint64_t encoder_mib, uint64_t media_mib) {
+#ifdef PICO_OLD_RULES
+  return engine_encodes ? 0 : encoder_mib << 20;  // without the rule: the media worker is no line
+#else
+  return (engine_encodes ? media_mib : encoder_mib) << 20;
+#endif
+}
+
+// What the line may still take beyond what it holds at the read (0 for a line over its cap).
+inline uint64_t line_room(const Ledger& l, int i) { return l.cap[i] > l.now[i] ? l.cap[i] - l.now[i] : 0; }
+
+// The bytes the store is shortened by on a rank: every Outside line's room.
+inline uint64_t outside_sum(const Ledger& l) {
   uint64_t s = 0;
   for (int i = 0; i < kLineCount; ++i)
-    if (kLines[i].kind == Kind::Fixed) s += l.bytes[i];
+    if (kLines[i].kind == Kind::Outside) s += line_room(l, i);
+  return s;
+}
+// The same with every line at its cap, whatever it holds (a worst case for the projection).
+inline uint64_t outside_cap_sum(const Ledger& l) {
+  uint64_t s = 0;
+  for (int i = 0; i < kLineCount; ++i)
+    if (kLines[i].kind == Kind::Outside) s += l.cap[i];
   return s;
 }
 
@@ -238,23 +399,37 @@ inline std::vector<int> unequal_lines(const Ledger* all, int n = kRanks) {
   return v;
 }
 
-// The start check: the largest sum of fixed lines over the ranks plus `slack` (page cache the kernel gives back, slab)
-// must fit in `keep`, the free memory the pool was sized to leave. `worst` is the rank with the largest sum.
-struct StartCheck {
-  uint64_t need = 0;
-  int worst = 0;
+// The lines of other processes that hold more than their cap at the read: (rank, line). They take nothing more off the
+// store; the table prints them and the watch repeats them.
+inline std::vector<std::pair<int, int>> over_cap_lines(const Ledger* all, int n = kRanks) {
+  std::vector<std::pair<int, int>> v;
+  for (int r = 0; r < n; ++r)
+    for (int i = 0; i < kLineCount; ++i)
+      if (kLines[i].kind == Kind::Outside && !kLines[i].own && all[r].now[i] > all[r].cap[i]) v.push_back({r, i});
+  return v;
+}
+
+// The start check. Refused: (1) the store holds less than `need_min` numbers (one conversation of --max-ctx, the Engram
+// cache's groups, one largest image request, the largest window a request may open); (2) one of the engine's own lines
+// holds more than its cap at the read. Another process's line over its cap is not a refusal (over_cap_lines).
+enum class Refuse : uint8_t { None, TooSmall, OwnLineOver };
+struct StoreCheck {
   bool refuse = false;
+  Refuse why = Refuse::None;
+  int rank = 0, line = -1;
+  uint64_t store = 0, need = 0;
 };
-inline StartCheck start_check(const Ledger* all, uint64_t slack, uint64_t keep, int n = kRanks) {
-  StartCheck c;
-  uint64_t top = 0;
-  for (int r = 0; r < n; ++r) {
-    const uint64_t s = fixed_sum(all[r]);
-    if (s > top || r == 0) top = s, c.worst = r;
-  }
-  c.need = top + slack;
+inline StoreCheck store_check(const Ledger* all, uint64_t store, uint64_t need_min, int n = kRanks) {
+  StoreCheck c;
+  c.store = store, c.need = need_min;
 #ifndef PICO_OLD_RULES
-  c.refuse = c.need > keep;
+  for (int r = 0; r < n && !c.refuse; ++r)
+    for (int i = 0; i < kLineCount; ++i)
+      if (kLines[i].kind == Kind::Outside && kLines[i].own && all[r].now[i] > all[r].cap[i]) {
+        c.refuse = true, c.why = Refuse::OwnLineOver, c.rank = r, c.line = i;
+        return c;
+      }
+  if (store < need_min) c.refuse = true, c.why = Refuse::TooSmall;
 #endif  // without the rule: every combination starts
   return c;
 }
@@ -277,39 +452,86 @@ inline uint64_t projected_available(uint64_t avail, uint64_t pool_growth_bytes, 
 }
 constexpr uint64_t kProjectedFloor = 2ull << 30;  // a rank projected below this much available memory is warned about
 
-// The table printed once after sizing (GiB), the flagged lines marked, then the check's line.
-inline std::string ledger_table(const Ledger* all, const uint64_t* projected, uint64_t slack, uint64_t keep, const StartCheck& c,
-                                int n = kRanks) {
-  constexpr double gib = 1073741824.0;
-  const std::vector<int> bad = unequal_lines(all, n);
-  std::string o = "memory ledger, GiB per rank (F: fixed, taken after sizing and kept inside the free memory; C: already counted in the pool's offer):\n";
-  char b[256];
-  for (int i = 0; i < kLineCount; ++i) {
-    std::snprintf(b, sizeof b, "  %-34s %c ", kLines[i].name, kLines[i].kind == Kind::Fixed ? 'F' : 'C');
+// What a rank keeps free with the store full and every line at its cap: the smaller of the two reads, less the store's
+// growth and the lines' room.
+inline uint64_t left_free(uint64_t dfree, uint64_t avail, uint64_t counted, uint64_t growth_bytes, const Ledger& l) {
+  const uint64_t room = std::min(dfree, avail > counted ? avail - counted : 0);
+  const uint64_t used = growth_bytes + outside_sum(l);
+  return room > used ? room - used : 0;
+}
+
+// The numbers the store must hold to start: one conversation, the Engram cache's groups, one largest image request's rows
+// and the largest window a request may open (each in numbers; the groups of 64).
+inline uint64_t need_min_numbers(uint64_t conversation, uint64_t engram_groups, uint64_t image_numbers, uint64_t window_groups) {
+  return conversation + (engram_groups + window_groups) * kGroupNums + image_numbers;
+}
+
+// The table printed once after sizing (GiB by rank 0-3), the lines marked, the citizens, then any refusal's reason.
+struct StoreRead {
+  uint64_t dfree[kRanks] = {}, avail[kRanks] = {};
+};
+inline std::string store_table(const Ledger* all, const StoreRead& rd, uint64_t have, uint64_t counted, uint64_t store, uint64_t number_bytes,
+                               uint64_t keep, uint64_t citizens_engram_groups, uint64_t citizens_window_groups, const StoreCheck& c,
+                               int n = kRanks) {
+  constexpr double gib = 1073741824.0, mib = 1048576.0;
+  char b[512];
+  std::string o;
+  std::snprintf(b, sizeof b, "store: %llu numbers of %.2f MiB (%.2f GiB) on every rank, whole groups of %llu (the smallest rank's count), GiB by rank 0-%d:\n",
+                (unsigned long long)store, number_bytes / mib, store * (double)number_bytes / gib, (unsigned long long)kGroupNums, n - 1);
+  o += b;
+  auto row = [&](const char* label, auto f) {
+    std::snprintf(b, sizeof b, "  %-46s", label);
     o += b;
     for (int r = 0; r < n; ++r) {
-      std::snprintf(b, sizeof b, "%6.2f", all[r].bytes[i] / gib);
+      std::snprintf(b, sizeof b, " %7.2f", f(r) / gib);
       o += b;
     }
-    if (kLines[i].rank0_only) o += "  (rank 0 only)";
+    o += "\n";
+  };
+  o += "  free device / available host at the read       ";
+  for (int r = 0; r < n; ++r) {
+    std::snprintf(b, sizeof b, " %.2f / %.2f", rd.dfree[r] / gib, rd.avail[r] / gib);
+    o += b;
+  }
+  o += "\n";
+  row("kept free (--pool-free-gib)", [&](int) { return (double)keep; });
+  row("outside the store (cap - held at the read)", [&](int r) { return (double)outside_sum(all[r]); });
+  const std::vector<int> bad = unequal_lines(all, n);
+  for (int i = 0; i < kLineCount; ++i) {
+    if (i == kEncoder && all[0].cap[i] == 0 && all[0].now[i] == 0) continue;  // no image process beside the engine: the line does not exist
+    std::string nm = kLines[i].name;
+    if (i == kEncoder && all[0].image_what) nm += all[0].image_what == 1 ? " (media worker)" : " (encoder container)";
+    std::snprintf(b, sizeof b, "    %-30s %s", nm.c_str(), kLines[i].kind == Kind::Counted ? "counted in the store's offer" : "outside the store");
+    o += b;
+    // cap - held at the read, as rank 0 reads it (the ranks agree on the caps; a line only rank 0 holds is rank 0's)
+    std::snprintf(b, sizeof b, " [%.2f - %.2f%s]", all[0].cap[i] / gib, all[0].now[i] / gib, all[0].enforced[i] ? ", enforced" : ", not enforced");
+    o += b;
+    if (kLines[i].rank0_only) o += " (rank 0 only)";
     for (int x : bad)
       if (x == i) o += "  <- DIFFERS between ranks by more than 64 MiB";
     o += "\n";
   }
-  o += "  fixed lines summed                   ";
-  for (int r = 0; r < n; ++r) {
-    std::snprintf(b, sizeof b, "%6.2f", fixed_sum(all[r]) / gib);
+  for (const auto& rl : over_cap_lines(all, n)) {
+    std::snprintf(b, sizeof b, "  over its cap at the read: %s holds %.2f GiB, cap %.2f GiB (rank %d; it takes nothing more off the store)\n",
+                  kLines[rl.second].name, all[rl.first].now[rl.second] / gib, all[rl.first].cap[rl.second] / gib, rl.first);
     o += b;
   }
-  o += "\n  projected available memory           ";
-  for (int r = 0; r < n; ++r) {
-    std::snprintf(b, sizeof b, "%6.2f", projected[r] / gib);
-    o += b;
-    if (projected[r] < kProjectedFloor) o += "(!)";
-  }
-  std::snprintf(b, sizeof b, "\n  need %.2f GiB on rank %d (fixed lines %.2f + slack %.2f) against %.2f GiB kept free\n", c.need / gib, c.worst,
-                fixed_sum(all[c.worst]) / gib, slack / gib, keep / gib);
+  row("left free with the store full, every line at its cap", [&](int r) {
+    return (double)left_free(rd.dfree[r], rd.avail[r], counted, (store > have ? store - have : 0) * number_bytes, all[r]);
+  });
+  std::snprintf(b, sizeof b, "store citizens: Engram cache %llu groups (%llu numbers); windows %llu groups at most; KV and image rows the rest\n",
+                (unsigned long long)citizens_engram_groups, (unsigned long long)(citizens_engram_groups * kGroupNums),
+                (unsigned long long)citizens_window_groups);
   o += b;
+  if (c.refuse) {
+    if (c.why == Refuse::OwnLineOver)
+      std::snprintf(b, sizeof b, "refused: rank %d's own line %s holds %.2f GiB at the read, more than its cap %.2f GiB\n", c.rank, kLines[c.line].name,
+                    all[c.rank].now[c.line] / gib, all[c.rank].cap[c.line] / gib);
+    else
+      std::snprintf(b, sizeof b, "refused: the store is %llu numbers, under the %llu one conversation of --max-ctx, the Engram cache, one largest image request and the largest window need\n",
+                    (unsigned long long)c.store, (unsigned long long)c.need);
+    o += b;
+  }
   return o;
 }
 

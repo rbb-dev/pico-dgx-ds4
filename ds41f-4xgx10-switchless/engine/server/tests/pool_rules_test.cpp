@@ -185,44 +185,199 @@ int main() {
           "the Engram cache still to grow counts as used");
   }
 
-  // the ledger of that start: production's lines against keep 10 GiB, slack 2 GiB
-  {
-    using rules::kHeap, rules::kEngramCache, rules::kFront, rules::kEncoder, rules::kOutQueue;
-    const uint64_t slack = 2ull << 30;
-    rules::Ledger all[4];
+  // ---- the store: rounding to whole groups, the lines outside it, the start check ----
+  using rules::kHeap, rules::kEngramCache, rules::kFront, rules::kEncoder, rules::kOutQueue, rules::kFrames, rules::kIds, rules::kGather,
+      rules::kDrift;
+  const uint64_t MiB = 1ull << 20, GiB = 1ull << 30;
+  // the lines at their caps on rank 0, as the serving start sets them (heap 1 GiB, dsfront 840 MiB, the encoder 1,260 MiB, the output
+  // queue 64 MiB, frames 400 MiB, ids 1,024 MiB, the gather buffer 6 MiB, drift 0.75 GiB); the workers hold the heap, the gather
+  // buffer and drift
+  auto caps = [&](rules::Ledger* l, uint64_t front_now, uint64_t heap_now) {
     for (int r = 0; r < 4; ++r) {
-      all[r].bytes[kHeap] = 1ull << 30;
-      all[r].bytes[kEngramCache] = cache2;
+      l[r] = rules::Ledger{};
+      l[r].set(kHeap, GiB, heap_now, true);
+      l[r].set(kEngramCache, 0, 0, true);
+      l[r].set(kGather, 6 * MiB, 0, true);
+      l[r].set(kDrift, 768 * MiB, 0, false);
     }
-    all[0].bytes[kFront] = 3200ull << 20, all[0].bytes[kEncoder] = 1260ull << 20;
-    all[0].bytes[kOutQueue] = 64ull << 20;
-    const rules::StartCheck ok = rules::start_check(all, slack, keep10);
-    check(!ok.refuse && ok.worst == 0 && ok.need == (1ull << 30) + (3200ull << 20) + (1260ull << 20) + (64ull << 20) + slack,
-          "the shipped lines need 7.4 GiB of the 10 kept: the start goes on");
-    check(rules::unequal_lines(all).empty(), "lines only rank 0 holds are named, nothing is flagged");
+    l[0].set(kFront, 840 * MiB, front_now, true);
+    l[0].set(kEncoder, 1260 * MiB, 0, false);
+    l[0].set(kOutQueue, 64 * MiB, 0, true);
+    l[0].set(kFrames, 400 * MiB, 0, true);
+    l[0].set(kIds, 1024 * MiB, 0, true);
+  };
+  const double read7617[4][2] = {{29.85, 29.22}, {31.32, 30.66}, {31.27, 30.64}, {31.28, 30.65}};
+  rules::Ledger L[4];
+  caps(L, 0, 0);
+  uint64_t out0 = rules::outside_sum(L[0]);
+  check(out0 == GiB + 840 * MiB + 1260 * MiB + 64 * MiB + 400 * MiB + 1024 * MiB + 6 * MiB + 768 * MiB, "fixture: rank 0's lines at their caps sum to the lines' caps");
+  {
+    // rounding to whole groups: every rank's count is a multiple of 64
+    int round_ok = 0;
+    uint64_t store = UINT64_MAX;
+    for (int r = 0; r < 4; ++r) {
+      const uint64_t o = rules::store_offer(have, (uint64_t)std::llround(read7617[r][0] * G), (uint64_t)std::llround(read7617[r][1] * G), keep10,
+                                            rules::outside_sum(L[r]), 0, img);
+      round_ok += o % 64 == 0;
+      store = std::min(store, o);
+    }
+    check(round_ok == 4, "red: the store's count is a whole number of groups of 64 on every rank");
+    // "left free": the smallest rank keeps `keep`, within the rounding, with every line at its cap
+    uint64_t lf_min = UINT64_MAX;
+    for (int r = 0; r < 4; ++r)
+      lf_min = std::min(lf_min, rules::left_free((uint64_t)std::llround(read7617[r][0] * G), (uint64_t)std::llround(read7617[r][1] * G), 0,
+                                                 (store - have) * img, L[r]));
+    std::printf("left free with every line at its cap, smallest rank: %.3f GiB of 10 kept\n", lf_min / G);
+    check(lf_min >= keep10, "red: with the store full and every line at its cap no rank keeps less than --pool-free-gib");
+    check(lf_min - std::min(lf_min, keep10) < 64 * img + img, "the smallest rank keeps the 10 GiB within one group of rounding");
+  }
+  {
+    // what a line holds at the read raises the store by exactly that: dsfront holding 1.78 GiB against the same line holding nothing
+    const uint64_t d0 = (uint64_t)std::llround(29.85 * G), a0 = (uint64_t)std::llround(29.22 * G);
+    rules::Ledger A[4], B[4];
+    caps(A, 0, 0);
+    caps(B, 1824 * MiB, 0);  // 1.78 GiB
+    const uint64_t na = rules::offer_numbers(have, d0, a0, keep10, rules::outside_sum(A[0]), 0, img);
+    const uint64_t nb = rules::offer_numbers(have, d0, a0, keep10, rules::outside_sum(B[0]), 0, img);
+    const uint64_t held = 840 * MiB;  // a line holds at most its cap in the sum: only the held part of the cap comes back
+    check(nb - na == held / img || nb - na == held / img + 1, "red: a line holding part of its cap at the read raises the store by exactly what is held");
+    rules::Ledger C[4];
+    caps(C, 400 * MiB, 0);
+    const uint64_t nc = rules::offer_numbers(have, d0, a0, keep10, rules::outside_sum(C[0]), 0, img);
+    check(nc - na == (400 * MiB) / img || nc - na == (400 * MiB) / img + 1, "red: dsfront holding 400 MiB of its 840 raises the store by those 400 MiB");
+    check(rules::store_offer(have, d0, a0, keep10, rules::outside_sum(A[0]), 0, img) <
+              rules::store_offer(have, d0, a0, keep10, 0, 0, img),
+          "red: the lines outside the store shorten it");
+  }
+  // the start check
+  {
+    const uint64_t need = rules::need_min_numbers(1280, 14, 38, 15);
+    check(need == 1280 + 29 * 64 + 38, "one conversation of 4M positions, 14 Engram groups, one image request and a 15-group window");
+    rules::Ledger A[4];
+    caps(A, 0, 0);
+    const rules::StoreCheck ok = rules::store_check(A, need + 1, need);
+    check(!ok.refuse, "a store that holds the minimum starts");
+    const rules::StoreCheck small = rules::store_check(A, need - 1, need);
+    check(small.refuse && small.why == rules::Refuse::TooSmall, "red: a store under conversation + Engram cache + image request + window is refused with the reason");
+    rules::Ledger H[4];
+    caps(H, 0, 0);
+    H[2].now[kHeap] = 2 * GiB;  // a worker's heap over its cap at the read: the engine's own line
+    const rules::StoreCheck own = rules::store_check(H, need + 100, need);
+    check(own.refuse && own.why == rules::Refuse::OwnLineOver && own.rank == 2 && own.line == kHeap,
+          "red: one of the engine's own lines over its cap at the read refuses the start and names the rank and the line");
+    rules::Ledger F[4];
+    caps(F, 3200 * MiB, 0);  // dsfront holding 3.1 GiB against a cap of 840 MiB: a neighbour, not the engine
+    const rules::StoreCheck other = rules::store_check(F, need + 100, need);
+    check(!other.refuse, "control: another process over its cap at the read does not refuse the start (passes on both rule sets)");
+    check(rules::line_room(F[0], kFront) == 0 && rules::over_cap_lines(F).size() == 1 && rules::over_cap_lines(F)[0].second == kFront,
+          "its outside term is 0 and the line is listed as over its cap");
+    rules::StoreRead rd;
+    for (int r = 0; r < 4; ++r) rd.dfree[r] = (uint64_t)std::llround(read7617[r][0] * G), rd.avail[r] = (uint64_t)std::llround(read7617[r][1] * G);
+    const std::string t = rules::store_table(F, rd, have, 0, 6272, img, keep10, 14, 15, other);
+    check(t.find("over its cap at the read: front-end process holds 3.12 GiB, cap 0.82 GiB") != std::string::npos &&
+              t.find("left free with the store full, every line at its cap") != std::string::npos && t.find("(rank 0 only)") != std::string::npos,
+          "the table prints the neighbour's overrun as a warning, the left-free row and the rank 0 lines");
+    const std::string t2 = rules::store_table(H, rd, have, 0, 6272, img, keep10, 14, 15, own);
+    check(t2.find("refused: rank 2's own line glibc heap holds 2.00 GiB at the read, more than its cap 1.00 GiB") != std::string::npos,
+          "the table gives the refusal's reason");
+    const std::string t3 = rules::store_table(A, rd, have, 0, need - 1, img, keep10, 14, 15, small);
+    check(t3.find("refused: the store is") != std::string::npos, "the table gives the too-small reason");
+    check(rules::front_cap_refusal(0) != nullptr && std::string(rules::front_cap_refusal(0)).find("set PICO_FRONT_MIB") != std::string::npos,
+          "red: serve mode with no cap on the front-end is refused with the instruction to set PICO_FRONT_MIB");
+    check(rules::front_cap_refusal(840) == nullptr, "a cap of 840 MiB starts");
     uint64_t proj[4];
-    for (int r = 0; r < 4; ++r) proj[r] = rules::projected_available((uint64_t)(28.75 * G), (7446 - have) * img, all[r]);
+    for (int r = 0; r < 4; ++r) proj[r] = rules::projected_available((uint64_t)(28.75 * G), (7446 - have) * img, A[r]);
     check(proj[0] < proj[1] && proj[1] == proj[3], "projected available memory: rank 0 below the workers by its own lines");
 
-    rules::Ledger big[4];
-    std::copy(all, all + 4, big);
-    big[0].bytes[kFront] = 9ull << 30;  // a front-end table that may take 9 GiB
-    const rules::StartCheck bad = rules::start_check(big, slack, keep10);
-    check(bad.refuse && bad.worst == 0, "red: lines that do not fit in keep refuse the start and name rank 0");
-    const std::string t = rules::ledger_table(big, proj, slack, keep10, bad);
-    check(t.find("need 13.") != std::string::npos && t.find("on rank 0") != std::string::npos && t.find("front-end table") != std::string::npos,
-          "the table names the largest rank, its need and the line");
-
     rules::Ledger skew[4];
-    std::copy(all, all + 4, skew);
-    skew[2].bytes[kHeap] = 2ull << 30;                  // a worker's heap 1 GiB above the others
-    skew[3].bytes[kEngramCache] = 0;                    // a rank with its Engram cache grown already
-    skew[1].bytes[kHeap] = (1ull << 30) + (60ull << 20);  // within 64 MiB: not flagged
+    caps(skew, 0, 0);
+    skew[2].cap[kHeap] = 2 * GiB;                          // a worker's heap cap 1 GiB above the others
+    skew[3].cap[kDrift] = 768 * MiB + 1024 * MiB;          // another line, a worker's drift above the rest
+    skew[1].cap[kHeap] = GiB + 60 * MiB;                   // within 64 MiB: not flagged
     const std::vector<int> bad_lines = rules::unequal_lines(skew);
-    check(bad_lines.size() == 2 && bad_lines[0] == kHeap && bad_lines[1] == kEngramCache,
-          "red: a line that differs by more than 64 MiB between ranks and is not rank 0's own is flagged");
-    const std::string t2 = rules::ledger_table(skew, proj, slack, keep10, rules::start_check(skew, slack, keep10));
-    check(t2.find("DIFFERS") != std::string::npos, "red: the table marks the flagged line");
+    check(bad_lines.size() == 2 && bad_lines[0] == kHeap && bad_lines[1] == kDrift,
+          "red: a line whose cap differs by more than 64 MiB between ranks and is not rank 0's own is flagged");
+    const std::string t4 = rules::store_table(skew, rd, have, 0, 6272, img, keep10, 14, 15, rules::store_check(skew, 6272, need));
+    check(t4.find("DIFFERS") != std::string::npos, "red: the table marks the flagged line");
+    check(t4.find("image process outside the engine") != std::string::npos, "an encoder process beside the engine has its line in the table");
+    rules::Ledger noenc[4];
+    for (int r = 0; r < 4; ++r) noenc[r] = skew[r];
+    noenc[0].set(kEncoder, 0, 0, false);
+    const std::string t5 = rules::store_table(noenc, rd, have, 0, 6272, img, keep10, 14, 15, rules::store_check(noenc, 6272, need));
+    // with the engine encoding (--vision-weights) the media worker is the line: its cap comes off the store
+    {
+      check(rules::image_process_cap(true, 1260, 512) == 512 * MiB, "red: with vision weights the image-process line is the media worker's cap (--media-mib)");
+      check(rules::image_process_cap(false, 1260, 512) == 1260 * MiB, "without vision weights the line is the encoder container's cap");
+      rules::Ledger zero[4], media[4];
+      for (int r = 0; r < 4; ++r) zero[r] = media[r] = skew[r];
+      zero[0].set(kEncoder, rules::image_process_cap(true, 1260, 0), 0, false);
+      media[0].set(kEncoder, rules::image_process_cap(true, 1260, 512), 0, false);
+      media[0].image_what = 1;
+      const uint64_t oz = rules::store_offer(have, (uint64_t)std::llround(read7617[0][0] * G), (uint64_t)std::llround(read7617[0][1] * G), keep10,
+                                             rules::outside_sum(zero[0]), 0, img);
+      const uint64_t om = rules::store_offer(have, (uint64_t)std::llround(read7617[0][0] * G), (uint64_t)std::llround(read7617[0][1] * G), keep10,
+                                             rules::outside_sum(media[0]), 0, img);
+      check(rules::outside_sum(media[0]) - rules::outside_sum(zero[0]) == 512 * MiB && om < oz,
+            "red: with vision weights and --media-mib 512 the lines outside the store are 512 MiB higher and the offer lower than with 0");
+      const std::string t6 = rules::store_table(media, rd, have, 0, 6272, img, keep10, 14, 15, rules::store_check(media, 6272, need));
+      check(t6.find("(media worker)") != std::string::npos, "the table names the media worker");
+    }
+    check(t5.find("image process outside the engine") == std::string::npos, "no image process beside the engine: the table has no such line");
+  }
+
+  // ---- the split (--kv-split cache): the start table's line, the pool's one count, a quarter slot's return ----
+  {
+    namespace R = model::rules;
+    check(R::split_buffer_bytes(false) == 0, "the split's line is 0 without --kv-split cache");
+    const uint64_t kq = 729088, want = (1 + 8 + 2 * 4 * 8) * kq + 8 * 5 * 8 + 41500ull * 4 * 5 * 8;
+    check(R::split_buffer_bytes(true) == want && want > 50000000ull && want < 70000000ull,
+          "the split's buffers: a quarter, the batch's quarters to send, the exchange twice, the sums of a batch and of every slot at the pool's largest count (about 57 MiB)");
+    check(std::string(R::kLines[R::kSplit].name).find("split") != std::string::npos && R::kLines[R::kSplit].kind == R::Kind::Counted &&
+              R::kLines[R::kSplit].own && !R::kLines[R::kSplit].rank0_only,
+          "red: the split's buffers are a line of the start table, a Counted line of the engine's own, on every rank (made before the read)");
+    R::Ledger l;
+    l.set(R::kSplit, R::split_buffer_bytes(true), 0, true);
+    check(R::outside_sum(l) == 0, "the store is not shortened again by the split's buffers: the free-memory read already lacks them (Counted)");
+    check(R::pool_have(10, 4, 7) == 21, "the pool's one count: free beside the reservations, the lines' reservations, and what eviction gives once");
+    // a conversation whose pieces are quarter slots needs a whole number for each to come back (back = on the disk + split)
+    check(R::request_want(10, 0, 0 + 6, 0, 0, 0) == 10 && R::request_want(10, 4, 0 + 6, 0, 0, 0) == 6,
+          "red: a request on a conversation with 6 split lists: the want is the larger of the lists it needs and what must come back");
+#ifndef PICO_OLD_RULES
+    check(R::request_want(10, 0, 12, 0, 0, 0) == 12, "red: more split and disk lists than the request's reservation: the return is the want");
+#endif
+  }
+
+  // ---- the pool's spare count is signed: the server's sum and the core's `covers` are one rule ----
+  {
+    // the moment of the stop: free 0, the running requests owed 8 numbers, stored conversations can give 7, a request wants 7.
+    // The core refuses the read-back's first number (0 + 7 < 8 + 1); the server's count admitted the request (clamped: 0 + 7 >= 7).
+    const int64_t free_n = 0, reserved = 8, giveable = 7, want = 7;
+    check(!rules::covers(free_n, reserved, 1, [&] { return giveable; }), "the core: free 0, reserved 8, giveable 7: not even one number is covered");
+    check(!rules::admissible(rules::spare(free_n, reserved) + giveable, want),
+          "red: the server's count for the same pool: spare + giveable (-1) does not cover a want of 7 (the clamped count said 7)");
+    check(rules::spare(3, 8) == -5 && rules::spare(8, 3) == 5 && rules::spare(4, 4) == 0, "the spare is free less reserved, signed");
+    uint64_t seed = 99;
+    const auto rnd = [&](int64_t n) {
+      seed = seed * 6364136223846793005ull + 1442695040888963407ull;
+      return (int64_t)((seed >> 33) % (uint64_t)n);
+    };
+    long pools = 0, over = 0, bad = 0;
+    for (int i = 0; i < 4000; ++i) {
+      const int64_t f = rnd(60), p = rnd(70), g = rnd(70), n = 1 + rnd(70);
+      ++pools;
+      over += p > f;
+      if ((rules::spare(f, p) + g >= n) != rules::covers(f, p, n, [&] { return g; })) ++bad;
+    }
+    char what[160];
+    std::snprintf(what, sizeof what, "red: over %ld random pools (%ld with reserved > free) spare + giveable >= n exactly when covers (%ld differ)", pools, over, bad);
+    check(bad == 0 && over > 500, what);
+  }
+
+  {  // the read-back tripwire: a refused take, not a cut for sums
+    check(!rules::readback_refused(428, 309, 0, true), "red: a read-back whose pieces were cut for their sums (budget 428, 309 asked, 0 back) is not a refused take");
+    check(rules::readback_refused(7, 7, 0, false), "a refused take (budget 7, 7 asked, 0 back) is reported");
+    check(!rules::readback_refused(428, 309, 309, false), "every list back: nothing to report");
+    check(!rules::readback_refused(0, 309, 0, false), "no budget: nothing to report");
   }
 
   std::printf("%s\n", fails ? "pool_rules_test FAILED" : "pool_rules_test passed");

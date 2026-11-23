@@ -44,3 +44,35 @@ add_executable(heap_test tests/heap_test.cpp)
 # img_hold.h: a flight's image rows in the store, taken once, held across resumes, freed at every end (host only)
 add_executable(img_hold_test tests/img_hold_test.cpp ../model/chunks.cpp)
 target_include_directories(img_hold_test PRIVATE ${CMAKE_SOURCE_DIR})
+
+# ids_file.h: the server's token ids past their cap go to files and come back (host only)
+add_executable(ids_file_test tests/ids_file_test.cpp)
+
+# common/byte_account.h: the byte account at ready: meminfo and status texts, the remainder, its bound (host only)
+add_executable(byte_account_test tests/byte_account_test.cpp)
+target_include_directories(byte_account_test PRIVATE ${CMAKE_SOURCE_DIR})
+
+# What publishing STATS from the decode loops costs on the host (lend_pace.h's publish_due and the frame's host part); prints ns
+add_executable(publish_bench tests/publish_bench.cpp)
+target_include_directories(publish_bench PRIVATE ${CMAKE_SOURCE_DIR})
+
+# mem_watch.h: the reservation's watch: when a reading is a new low worth a line (host only)
+add_executable(mem_watch_test tests/mem_watch_test.cpp)
+
+# rows_loan.h: when the lent prefill row set is asked for and given back (host only)
+add_executable(rows_loan_test tests/rows_loan_test.cpp)
+
+# lend_pace.h: what pauses a decoding run (the memory watch does not: it rides the run) (host only)
+add_executable(lend_pace_test tests/lend_pace_test.cpp)
+
+# prefix.h: a request that carries only its suffix: the prompt built from the server's history, the epoch rule, the kept index's record (host only)
+add_executable(prefix_test tests/prefix_test.cpp)
+
+# pixels.h: a SUBMIT carrying pixels: the layout, the two kinds of wrong frame (host only)
+add_executable(pixels_test tests/pixels_test.cpp)
+
+# vit_sched.h: what an image costs on the four ranks, the next unit of a pixel request (encode piece or rows), the one-image mark (host only)
+add_executable(vit_sched_test tests/vit_sched_test.cpp)
+
+# ride_wire.h: the imager's ride on the wire: one decision on four ranks, readings that must be equal (host only)
+add_executable(ride_wire_test tests/ride_wire_test.cpp)

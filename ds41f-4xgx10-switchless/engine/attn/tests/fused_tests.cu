@@ -259,6 +259,31 @@ struct Ring {
   attn::Window win() const { return attn::Window{kv.p, sc.p}; }
 };
 
+// ---- decode's operand of hc_fn: a rank's own [24][5120] quarter (row stride 5120) against the whole matrix's
+// column range (row stride 20480), the same bits, for every rank ----------------------------------------------
+
+void test_hc_quarter(int rows) {
+  begin("hc_project quarter vs whole rows=" + std::to_string(rows));
+  const int nch = attn::hc_chunks(0, kDim);
+  Dev<uint16_t> x((size_t)rows * kHcDim);
+  Dev<float> fn((size_t)attn::kMix * kHcDim);
+  fill::bf16(x, 1.f);
+  fill::f32(fn, 0.01f);
+  sync();
+  const auto hfn = fn.host();
+  Dev<float> a((size_t)nch * rows * 25), b((size_t)nch * rows * 25);
+  for (int r = 0; r < 4; ++r) {
+    std::vector<float> q((size_t)attn::kMix * kDim);
+    for (int i = 0; i < attn::kMix; ++i)
+      std::memcpy(&q[(size_t)i * kDim], &hfn[(size_t)i * kHcDim + (size_t)r * kDim], kDim * sizeof(float));
+    Dev<float> quarter(q.data(), q.size());
+    attn::hc_project(x.p, rows, fn.p, r * kDim, (r + 1) * kDim, a.p, false, g_s, 0);
+    attn::hc_project(x.p, rows, quarter.p, r * kDim, (r + 1) * kDim, b.p, false, g_s, kDim);
+    same("rank's quarter at stride 5120 = the whole's columns at stride 20480", a, b);
+  }
+  end();
+}
+
 // ---- DSpark's uses: a rank's fn slice, the lagged pre-mix, hc_pre as a PDL launch, kv_write_sets ----------
 
 void test_dspark(int rows) {

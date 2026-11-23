@@ -79,6 +79,11 @@ impl EngineClient {
         self.inner.info.borrow().clone()
     }
 
+    /// The engine's HELLO as it changes: Some on every connection, None while none is open.
+    pub fn watch_info(&self) -> watch::Receiver<Option<HelloEngine>> {
+        self.inner.info.subscribe()
+    }
+
     pub async fn wait_connected(&self, timeout: Duration) -> Option<HelloEngine> {
         let mut rx = self.inner.info.subscribe();
         let _ = tokio::time::timeout(timeout, rx.wait_for(|i| i.is_some())).await;
@@ -235,8 +240,21 @@ async fn connection(inner: &Arc<Inner>, stream: UnixStream) -> Result<(), String
             }
         }
     });
+    let timer = tokio::time::sleep(SECOND_HELLO_WAIT);
+    tokio::pin!(timer);
     let result = loop {
-        let (ty, p) = match read_frame(&mut rd).await {
+        let mut next = std::pin::pin!(read_frame(&mut rd));
+        let read = loop {
+            tokio::select! {
+                r = &mut next => break r,
+                _ = &mut timer, if !published => {
+                    published = true;
+                    eprintln!("engine: no answer to version {say}; sending whole prompts (version {VERSION} frames)");
+                    publish(greeting.clone());
+                }
+            }
+        };
+        let (ty, p) = match read {
             Ok(Some(f)) => f,
             Ok(None) => break Ok(()),
             Err(e) => break Err(e.to_string()),

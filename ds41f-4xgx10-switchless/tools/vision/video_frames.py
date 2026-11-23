@@ -4,6 +4,7 @@ import base64
 import io
 import json
 import math
+import os
 import sys
 
 import av
@@ -14,24 +15,30 @@ class VideoError(ValueError):
     """The clip cannot be used; the message is ours, in plain words, and safe to show to a client."""
 
 
-def sample(raw, max_frames):
-    """Up to max_frames timestamped frames of the clip. Whatever goes wrong, the error is a VideoError:
+def sample(clip, max_frames):
+    """Up to max_frames timestamped frames of the clip: a path (the file is opened and read by PyAV as it
+    decodes, never whole), an open binary file, or the clip's bytes. Whatever goes wrong, the error is a VideoError:
     one of our own messages, or "not a readable video" for anything the decoder or the image library
     raises (their text, such as "[Errno 1094995529] Invalid data found when processing input: '<none>'",
     stays out of the answer; the cause is chained for the log)."""
     try:
-        return _sample(raw, max_frames)
+        return _sample(clip, max_frames)
     except VideoError:
         raise
     except Exception as e:  # noqa: BLE001  (PyAV, Pillow, MemoryError, ...)
         raise VideoError("not a readable video") from e
 
 
-def _sample(raw, max_frames):
+def _sample(clip, max_frames):
     if not 1 <= max_frames <= 100:
         raise VideoError("max_frames must be an integer between 1 and 100")
-    # BytesIO supplies the clip. Nested network/file protocols (e.g. playlists) stay disabled.
-    with av.open(io.BytesIO(raw), options={"protocol_whitelist": ""}) as container:
+    # A file object supplies the clip (PyAV reads it in pieces, and a path given to PyAV itself would need the
+    # file protocol allowed). Nested network/file protocols (e.g. playlists) stay disabled.
+    if isinstance(clip, (str, os.PathLike)):
+        with open(clip, "rb") as f:
+            return _sample(f, max_frames)
+    source = io.BytesIO(clip) if isinstance(clip, (bytes, bytearray)) else clip
+    with av.open(source, options={"protocol_whitelist": ""}) as container:
         if not container.streams.video:
             raise VideoError("the clip has no video stream")
         stream = container.streams.video[0]
@@ -75,8 +82,7 @@ if __name__ == "__main__":
     parser.add_argument("--max-frames", type=int, default=32)
     args = parser.parse_args()
     try:
-        with open(args.input, "rb") as f:
-            result = sample(f.read(), args.max_frames)
+        result = sample(args.input, args.max_frames)
         print(json.dumps({"ok": True, **result}))
     except VideoError as e:
         if e.__cause__ is not None:  # the decoder's own words: for the encoder's log, not for the client

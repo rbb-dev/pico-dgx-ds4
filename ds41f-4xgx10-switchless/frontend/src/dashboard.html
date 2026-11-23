@@ -89,7 +89,8 @@ main#view:focus { outline: none; }
 .bsub, .bright { font-family: var(--mono); font-size: 10px; color: var(--t5); white-space: nowrap; }
 .bright.warn, .bright.warn .bsub { color: var(--warn); }
 main#view.stale .box { opacity: .6; }
-main#view { max-width: 1900px; padding: 12px; gap: 12px; }
+/* ONE gap between boxes and around them, horizontal and vertical: 6 px */
+main#view { max-width: 1900px; padding: 6px; gap: 6px; }
 
 /* the header strip */
 .top { background: #0b0d0e; }
@@ -162,6 +163,7 @@ nav.sections button[aria-current="page"] { background: transparent; color: var(-
 .ntab thead .unit { color: var(--t5); }
 .ntab .gs { border-left: 1px solid var(--line); }
 .ntab td { color: var(--t2); cursor: help; }
+.ntab tbody td { padding-top: 5px; padding-bottom: 5px; }  /* one line a Spark: room between the rows, not a second line */
 .ntab td.who { cursor: default; }
 .ntab td.who > span { display: block; }
 .ntab td .rail { display: inline-block; min-width: 14ch; text-align: right; }
@@ -203,19 +205,30 @@ nav.sections button[aria-current="page"] { background: transparent; color: var(-
 .phead { display: flex; justify-content: space-between; align-items: baseline; }
 .pl { font-family: var(--mono); font-size: 10px; letter-spacing: .13em; color: var(--t5); }
 .pn { font-family: var(--mono); font-size: 11px; color: #f2f4f5; }
-.pbody { display: flex; gap: 5px; }
-.gutter { position: relative; width: 38px; flex: none; font-family: var(--mono); font-size: 9px; color: #5a6165; height: 110px; }
-.gutter .g { position: absolute; right: 0; transform: translateY(-50%); white-space: nowrap; }
+.pbody { display: flex; }
+/* the scale columns: each as wide as the widest label on the three plots, 4 px from the plot (fitGutters sets --gl and --gr); the right one is empty (0 px) unless a plot has a second scale */
+.gutter { position: relative; width: var(--gl, 24px); flex: none; font-family: var(--mono); font-size: 9px; color: #5a6165; height: 110px; font-variant-numeric: tabular-nums; }
+.gutter .g { position: absolute; right: 4px; transform: translateY(-50%); white-space: nowrap; }
+.rgutter { position: relative; width: var(--gr, 0px); flex: none; font-family: var(--mono); font-size: 9px; color: #5a6165; height: 110px; font-variant-numeric: tabular-nums; }
+.rgutter .g { position: absolute; left: 4px; transform: translateY(-50%); white-space: nowrap; }
 .plot { position: relative; flex: 1; height: 110px; background: #0c0f10; cursor: crosshair; touch-action: pan-y; }
 .plot svg { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
 .plot .hair { position: absolute; top: 0; bottom: 0; width: 1px; background: #5b6468; }
 .plot .dot { position: absolute; width: 8px; height: 8px; margin: -4px 0 0 -4px; border-radius: 50%; }
-.plot .tip { position: absolute; top: 4px; transform: translateX(-50%); background: var(--raise); border: 1px solid #2c3438; padding: 5px 9px; font-family: var(--mono); font-size: 11px; white-space: nowrap; pointer-events: none; z-index: 2; }
-.pfoot { display: flex; gap: 5px; }
-.pfoot > span { width: 38px; flex: none; }
+.plot .tip { position: absolute; top: 4px; background: var(--raise); border: 1px solid #2c3438; padding: 5px 9px; font-family: var(--mono); font-size: 11px; white-space: nowrap; pointer-events: none; z-index: 2; }
+.legend { display: flex; gap: 12px; font-family: var(--mono); font-size: 9px; color: #5a6165; white-space: nowrap; flex-wrap: wrap; justify-content: flex-end; row-gap: 1px; }
+.plots .phead:has(.legend) { height: auto; min-height: 13px; }
+@media (max-width: 600px) { .plot .tip { white-space: normal; max-width: calc(100% - 2px); box-sizing: border-box; } }
+.legend i { display: inline-block; width: 8px; height: 2px; margin-right: 4px; vertical-align: middle; }
+.plot .tip .tr { display: flex; gap: 6px; align-items: baseline; }
+.plot .tip .tr i { display: inline-block; width: 8px; height: 2px; flex: none; align-self: center; }
+.pfoot { display: flex; }
+.pfoot > span { width: var(--gl, 24px); flex: none; }
+.pfoot > .rfoot { width: var(--gr, 0px); flex: none; }
 .xlab { flex: 1; display: flex; justify-content: space-between; font-family: var(--mono); font-size: 9px; color: #5a6165; }
 
 @media (max-width: 1099px) { .board { grid-template-columns: minmax(0, 1fr); grid-template-areas: "engine" "lines" "plots" "health" "reading"; } .tiles { margin-left: 0; } }
+@media (max-width: 1099px) { .plots .pbody { min-height: 110px; } }
 @media (max-width: 720px) { .lrow { grid-template-columns: 18px 56px minmax(30px, 1fr) 62px 52px 70px; } .lrow > span:nth-child(n+7) { display: none; } }
 
 /* the served names in the header */
@@ -335,12 +348,32 @@ function smoothPath(pts) {
   return d;
 }
 const plotY = (frac) => 100 - PLOT_PAD - Math.min(1, Math.max(0, frac)) * (100 - 2 * PLOT_PAD);
-function plotShell(label, tip, aria) {
-  const g = [h('span', { class: 'g top' }), h('span', { class: 'g mid' }), h('span', { class: 'g zero', text: '0' })];
-  g[0].style.top = (PLOT_PAD) + '%'; g[1].style.top = '50%'; g[2].style.top = (100 - PLOT_PAD) + '%';
+// the lowest top a chart's scale takes: whole-number ticks when it is idle
+const CHART_FLOOR = { decode_tps: 10, prefill_tps: 100 };
+// a scale's tick: in full under 10,000 (0.5 and 1.5 kept as such), compact on a scale that reaches it (5K, 10K); one style per scale, chosen by its top
+const tickCompact = new Intl.NumberFormat('en-AU', { notation: 'compact', maximumFractionDigits: 1 });
+const tickFmt = (v, top) => (top >= 10000 ? tickCompact.format(v) : loose.format(v));
+// each scale column as wide as the widest label on the three plots, the same on all three (their edges line up) and 4 px from the plot;
+// the right column is 0 px while no plot has labels there. Set after every draw on the box that holds the plots.
+function fitGutters(box) {
+  const widest = (sel) => { let w = 0; for (const g of box.querySelectorAll(sel)) w = Math.max(w, g.getBoundingClientRect().width); return w; };
+  const l = widest('.gutter .g'), r = widest('.rgutter .g');
+  box.style.setProperty('--gl', Math.ceil(l + 4) + 'px');
+  box.style.setProperty('--gr', (r ? Math.ceil(r + 4) : 0) + 'px');
+}
+function plotShell(label, tip, aria, opts) {
+  const o = opts || {};
+  // a scale's three labels (top, middle, 0) at the grid lines; the place is an attribute, never a class the page styles for another element
+  const labels = () => {
+    const g = [h('span', { class: 'g', 'data-at': 'top' }), h('span', { class: 'g', 'data-at': 'mid' }), h('span', { class: 'g', 'data-at': 'zero', text: '0' })];
+    g[0].style.top = (PLOT_PAD) + '%'; g[1].style.top = '50%'; g[2].style.top = (100 - PLOT_PAD) + '%';
+    return g;
+  };
+  const g = labels(), rg = o.right ? labels() : [];
   const gutter = h('div', { class: 'gutter', title: tip || null }, ...g);
+  const rgutter = h('div', { class: 'rgutter', 'aria-hidden': 'true' }, ...rg);
   const plotSvg = svg('svg', { 'aria-hidden': 'true', viewBox: '0 0 600 100', preserveAspectRatio: 'none' });
-  for (const f of [0, 0.5, 1]) plotSvg.append(svg('line', { x1: '0', x2: '600', y1: String(plotY(f)), y2: String(plotY(f)), stroke: f === 0 ? '#2a3033' : '#1a1e1f', 'stroke-width': '1', 'stroke-dasharray': f === 0 ? '' : '3 3', 'vector-effect': 'non-scaling-stroke' }));
+  for (const f of [0, 0.5, 1]) plotSvg.append(svg('line', { x1: '0', x2: '600', y1: String(plotY(f)), y2: String(plotY(f)), stroke: f === 0 ? '#2a3033' : '#1a1e1f', 'stroke-width': '1', 'vector-effect': 'non-scaling-stroke' }));  // solid hairlines: a dashed grid reads as a threshold
   const hair = h('div', { class: 'hair', 'aria-hidden': 'true', hidden: true });
   const tipBox = h('div', { class: 'tip', 'aria-hidden': 'true', hidden: true });
   const plot = h('div', { class: 'plot', role: 'img', 'aria-label': aria }, plotSvg, hair, tipBox);
@@ -418,11 +451,185 @@ function chart(label, tip, color, unit, name) {
       area.setAttribute('d', a);
       const gy = goal ? plotY(goal / top).toFixed(1) : '-10';
       goalLine.setAttribute('y1', gy); goalLine.setAttribute('y2', gy);
-      setText(s.g[0], loose.format(top)); setText(s.g[1], loose.format(top / 2));  // 1.5 and 0.5 as such, never rounded to 2 and 1
-      xlabels(s.xlab, state.t0, body.step_s * 1000, n);
+      setText(s.g[0], tickFmt(top, top)); setText(s.g[1], tickFmt(top / 2, top));
       s.plot.setAttribute('aria-label', `${label}, last ${Math.round(n * body.step_s / 60)} minutes, ${real.length ? 'highest ' + whole.format(Math.max(...real)) + ' ' + unit : 'no readings yet'}`);
     },
+  });
+}
+
+// ---- the CACHE chart: running lines on the left scale (0 to 100 %) and faint bars on the right scale (prompt tokens a 10-second bucket).
+// A line is a ratio of sums over the last 15 minutes of traffic ending at its point (never a mean of buckets' shares): the last 90 buckets
+// that had a prompt for in memory and from SSD (shares of the prompt tokens), the last 90 that had an Engram lookup for Engram (the rows
+// found of the rows looked up, Spark 1). A line changes only when requests arrive: a bucket with none carries the value before it, so an
+// idle engine's lines hold still and never vanish once there has been traffic; before the first traffic there is no line, and where the
+// front-end has no record there is no point. The fill of the context cache is a level, drawn stepped and dashed in its own colour on the
+// same scale. A bar is one bucket's prompt tokens split into memory, SSD and computed; a bucket with no prompt has none.
+const CACHE_WIN = 90;
+const SERIES_S = { decode_tps: 900, prefill_tps: 900, cache: 1800 };
+// the bars' scale: 64K doubled until it holds `x` (the caller passes the tallest bar and a tenth more)
+function tokTop(x) { let t = 65536; while (t < x) t *= 2; return t; }
+// the three running values at each point of `points` (null: no record), each a ratio of the sums of the last `win` buckets that had its
+// traffic, up to that point; `lastReq` is the index of the newest bucket with a prompt up to it (null: none yet). A bucket without
+// traffic changes nothing, so the values hold through it; with no traffic yet they are null.
+function cacheRunning(points, win = CACHE_WIN) {
+  const pw = [], ew = [];
+  let m = 0, s = 0, t = 0, found = 0, r = 0, last = null;
+  return points.map((p, i) => {
+    if (p == null) return { memory: null, ssd: null, engram: null, lastReq: last };
+    const pt = Number(p.prompt_tokens) || 0, rows = Number(p.lookups) || 0;
+    if (pt > 0) {
+      const e = [Number(p.memory_tok) || 0, Number(p.ssd_tok) || 0, pt];
+      pw.push(e); m += e[0]; s += e[1]; t += e[2]; last = i;
+      if (pw.length > win) { const o = pw.shift(); m -= o[0]; s -= o[1]; t -= o[2]; }
+    }
+    if (rows > 0) {
+      const e = [Number(p.hits) || 0, rows];
+      ew.push(e); found += e[0]; r += e[1];
+      if (ew.length > win) { const o = ew.shift(); found -= o[0]; r -= o[1]; }
+    }
+    return { memory: t > 0 ? 100 * m / t : null, ssd: t > 0 ? 100 * s / t : null, engram: r > 0 ? 100 * found / r : null, lastReq: last };
+  });
+}
+// the context cache's fill at each point, the figures of the CONTEXT CACHE tile (per cent, and the bytes taken of the pool's bytes on all the
+// Sparks); a level, so a bucket whose STATS did not see the pool keeps the last one seen; no record is null, breaks the line and starts the level over
+function cacheFill(points) {
+  let keep = null;
+  return points.map((p) => {
+    if (p == null) { keep = null; return null; }
+    const q = p.pool;
+    if (q && Number(q.total) > 0) keep = { pct: Math.min(100, 100 * Number(q.held) / Number(q.total)), taken: Number(q.held) * Number(q.chunk_bytes), total: Number(q.total) * Number(q.chunk_bytes) };
+    return keep;
+  });
+}
+// a level is drawn stepped: it holds its value until the next point
+function stepPath(pts) {
+  const q = (v) => v.toFixed(1);
+  return pts.map((p, i) => (i === 0 ? `M${q(p[0])},${q(p[1])}` : `H${q(p[0])} V${q(p[1])}`)).join(' ');
+}
+// a bucket's bar: its parts stacked from 0 in tokens (none for no record or no prompt)
+function barStack(p) {
+  if (!p || !(Number(p.prompt_tokens) > 0)) return [];
+  let at = 0;
+  const out = [];
+  for (const [k, f] of [['memory', 'memory_tok'], ['ssd', 'ssd_tok'], ['computed', 'computed_tok']]) {
+    const v = Number(p[f]) || 0;
+    if (v > 0) { out.push({ k, from: at, to: at + v }); at += v; }
+  }
+  return out;
+}
+// the hover's rows under the time: the running values and the fill at the bucket (the first four, each with its colour), the note and when the
+// last request was, then the bucket's own bar and read. `fill` is cacheFill's entry and `lastAt` the time of the last request (null: none yet)
+function cacheRows(run, p, fill, lastAt) {
+  const pc = (v) => (v == null ? '-' : `${one.format(v)} %`);
+  const rows = [`in memory ${pc(run.memory)}`, `from SSD ${pc(run.ssd)}`, `Engram ${pc(run.engram)}`,
+    fill ? `context cache ${pc(fill.pct)} · ${gib(fill.taken)} of ${gib(fill.total)} GiB` : 'context cache -',
+    'each over the last 15 min of requests', lastAt ? `last request ${lastAt}` : 'no request yet'];
+  if (!p) { rows.push('no record'); return rows; }
+  if (!(Number(p.prompt_tokens) > 0)) rows.push('no prompt');
+  else rows.push(`${whole.format(Number(p.prompt_tokens))} prompt tok, ${pl(p.prompts, 'prompt')}`, `memory ${whole.format(Number(p.memory_tok))} · SSD ${whole.format(Number(p.ssd_tok))} · computed ${whole.format(Number(p.computed_tok))}`);
+  if (!p.counters_read) rows.push('SSD read not reported');
+  else if (Number(p.read_tokens) > 0 || Number(p.pieces_read) > 0) rows.push(`SSD read: ${pl(p.pieces_read, 'piece')}, waited ${whole.format(Number(p.wait_ns) / 1e6)} ms`);
+  else if (Number(p.revives) > 0) rows.push(`${pl(p.revives, 'piece')} taken back from memory, no read`);
+  else rows.push('nothing read from the SSDs');
+  return rows;
+}
+function cacheChart() {
+  const COLOR = { engram: '#3aa888', memory: '#3f7fc4', ssd: '#c8782c', computed: '#5a6165', fill: '#c4508f' };
+  const key = (c, text) => h('span', null, h('i', { style: `background: ${c}` }), text);
+  const barKey = h('span', null, ...[COLOR.memory, COLOR.ssd, COLOR.computed].map((c, i) => h('i', { style: `width: 3px; height: 8px; margin-right: ${i === 2 ? 4 : 0}px; opacity: .6; background: ${c}` })), 'prompt tok (right)');
+  const fillKey = h('span', null, h('i', { style: `background: repeating-linear-gradient(90deg, ${COLOR.fill} 0 3px, transparent 3px 5px)` }), 'context cache full %');
+  const legend = h('span', { class: 'legend' }, key(COLOR.memory, 'in memory %'), key(COLOR.ssd, 'from SSD %'), key(COLOR.engram, 'Engram %'), fillKey, barKey);
+  const tip = 'Lines (left scale, per cent): the share of the prompt tokens that were already in memory, the share read back from the SSDs, and the Engram cache\'s rows found, each over the last 15 minutes of requests (a quiet time changes nothing, so they hold still until a request arrives). The stepped dashed line is the context cache\'s fill, per cent of its pool, the CONTEXT CACHE tile\'s figure, a level and not a rate. Faint bars (right scale, tokens): the prompt tokens that arrived in each 10 seconds, split into memory (blue), SSD (orange) and computed (grey). A bucket with no prompt has no bar. Times are local time.';
+  const s = plotShell('CACHE', tip, 'CACHE', { foot: true, legend, right: true });
+  setText(s.g[0], '100'); setText(s.g[1], '50');
+  const mk = (stroke, w) => svg('path', { fill: 'none', stroke, 'stroke-width': w, 'stroke-linejoin': 'round', 'stroke-linecap': 'round', 'vector-effect': 'non-scaling-stroke' });
+  const bars = svg('g', { 'fill-opacity': '0.35' });
+  const engLine = mk(COLOR.engram, '2'), engDots = mk(COLOR.engram, '5'), memLine = mk(COLOR.memory, '2'), memDots = mk(COLOR.memory, '5');
+  const ssdLine = mk(COLOR.ssd, '2'), ssdDots = mk(COLOR.ssd, '5');
+  const fillLine = mk(COLOR.fill, '2'), fillDots = mk(COLOR.fill, '5');
+  fillLine.setAttribute('stroke-linejoin', 'miter'); fillLine.setAttribute('stroke-dasharray', '5 3');
+  s.plotSvg.append(bars, fillLine, fillDots, engLine, engDots, ssdLine, ssdDots, memLine, memDots);
+  const state = { pts: [], run: [], fill: [], lastAt: [], t0: 0, step: 10 };
+  const frac = (i, n) => i / Math.max(1, n - 1);
+  // a path of the runs of consecutive points (a null breaks a run), and of the lone points as dots
+  const runs = (vals) => {
+    let line = '', dots = '', run = [];
+    const flush = () => {
+      if (run.length > 1) line += (line ? ' ' : '') + smoothPath(run);
+      else if (run.length === 1) dots += `M${run[0][0].toFixed(1)},${run[0][1].toFixed(1)} L${run[0][0].toFixed(1)},${run[0][1].toFixed(1)} `;
+      run = [];
+    };
+    vals.forEach((p, i) => { if (p == null) { flush(); return; } run.push([frac(i, vals.length) * 600, plotY(p / 100)]); });
+    flush();
+    return { line, dots };
   };
+  // the same for a level: runs drawn stepped, a lone point a dot
+  const steps = (vals) => {
+    let line = '', dots = '', run = [];
+    const flush = () => {
+      if (run.length > 1) line += (line ? ' ' : '') + stepPath(run);
+      else if (run.length === 1) dots += `M${run[0][0].toFixed(1)},${run[0][1].toFixed(1)} L${run[0][0].toFixed(1)},${run[0][1].toFixed(1)} `;
+      run = [];
+    };
+    vals.forEach((p, i) => { if (p == null) { flush(); return; } run.push([frac(i, vals.length) * 600, plotY(p / 100)]); });
+    flush();
+    return { line, dots };
+  };
+  s.plot.addEventListener('pointermove', (e) => {
+    const n = state.pts.length;
+    if (n < 2) return;
+    const i = hoverIndex(s.plot, n, e);
+    const end = state.t0 + i * state.step * 1000;
+    for (const c of CHARTS) c.hairAt(frac(i, n));
+    s.tipBox.hidden = false;
+    const swatch = [COLOR.memory, COLOR.ssd, COLOR.engram, COLOR.fill];
+    clear(s.tipBox).append(h('div', { class: 'dim', text: `${dayTime.format(new Date(end - state.step * 1000))} to ${dayTime.format(new Date(end))}` }),
+      ...cacheRows(state.run[i], state.pts[i], state.fill[i], state.lastAt[i]).map((t, k) => (k < 4 ? h('div', { class: 'tr' }, h('i', { style: `background: ${swatch[k]}` }), h('span', { class: 'num', text: t })) : h('div', { class: k < 6 ? 'num dim' : 'num', text: t }))));
+    placeTip(s.plot, s.tipBox, frac(i, n));
+  });
+  s.plot.addEventListener('pointerleave', () => { for (const c of CHARTS) c.hairAt(null); s.tipBox.hidden = true; });
+  const me = { hairAt: s.hairAt };
+  CHARTS.push(me);
+  return Object.assign(me, {
+    el: s.el, name: 'cache',
+    draw(body, atMs) {
+      // the series comes with the buckets with traffic from before its first point, so each running value has its whole window
+      // however long ago the traffic was; the plot draws the last 15 minutes of the points
+      const before = body.before || [], all = before.concat(body.points);
+      const pts = body.points.slice(-CACHE_WIN);
+      const run = cacheRunning(all).slice(-CACHE_WIN);
+      const n = pts.length;
+      const lastMs = body.last_ms != null ? Number(body.last_ms) : atMs;
+      // when the newest request up to each point arrived: its bucket's start (a point's time is the end of its bucket)
+      const endOf = (j) => (j < before.length ? Number(before[j].end_ms) : lastMs - (body.points.length - 1 - (j - before.length)) * body.step_s * 1000);
+      const lastAt = run.map((r) => (r.lastReq == null ? null : hm.format(new Date(endOf(r.lastReq) - body.step_s * 1000))));
+      const fill = cacheFill(body.points).slice(-CACHE_WIN);
+      Object.assign(state, { pts, run, fill, lastAt, step: body.step_s, t0: lastMs - (n - 1) * body.step_s * 1000 });
+      const mem = runs(run.map((r) => r.memory)), ssd = runs(run.map((r) => r.ssd)), eng = runs(run.map((r) => r.engram));
+      memLine.setAttribute('d', mem.line); memDots.setAttribute('d', mem.dots);
+      ssdLine.setAttribute('d', ssd.line); ssdDots.setAttribute('d', ssd.dots);
+      engLine.setAttribute('d', eng.line); engDots.setAttribute('d', eng.dots);
+      const lev = steps(fill.map((f) => (f ? f.pct : null)));
+      fillLine.setAttribute('d', lev.line); fillDots.setAttribute('d', lev.dots);
+      // the bars: the right scale fits the tallest, one slot a bucket with a 1 px gap, never under 2 px high (a small prompt is still seen)
+      const top = tokTop(Math.max(0, ...pts.map((p) => (p ? Number(p.prompt_tokens) || 0 : 0))) * 1.1);
+      setText(s.rg[0], posFmt(top)); setText(s.rg[1], posFmt(top / 2));
+      const px = 600 / Math.max(1, s.plot.clientWidth), slot = 600 / Math.max(1, n - 1), minH = 2 * 100 / Math.max(1, s.plot.clientHeight), base = plotY(0);
+      clear(bars);
+      pts.forEach((p, i) => {
+        const stack = barStack(p);
+        if (!stack.length) return;
+        const x0 = Math.max(0, frac(i, n) * 600 - slot / 2 + px / 2), x1 = Math.min(600, frac(i, n) * 600 + slot / 2 - px / 2);
+        const rect = (c, from, to) => bars.append(svg('rect', { x: x0.toFixed(2), width: Math.max(0.5, x1 - x0).toFixed(2), y: to.toFixed(2), height: (from - to).toFixed(2), fill: c }));
+        const all = stack[stack.length - 1].to;
+        if (base - plotY(all / top) < minH) rect(COLOR[stack.reduce((a, b) => (b.to - b.from > a.to - a.from ? b : a)).k], base, base - minH);
+        else for (const part of stack) rect(COLOR[part.k], plotY(part.from / top), plotY(part.to / top));
+      });
+      xlabels(s.xlab, state.t0, body.step_s * 1000, n);
+      const last = run[run.length - 1] || {};
+      s.plot.setAttribute('aria-label', `CACHE, last ${Math.round(n * body.step_s / 60)} minutes, running over 15 minutes: in memory ${last.memory == null ? 'none' : one.format(last.memory) + ' %'}, from SSD ${last.ssd == null ? 'none' : one.format(last.ssd) + ' %'}, context cache ${fill[fill.length - 1] ? one.format(fill[fill.length - 1].pct) + ' % full' : 'unknown'}; bars of prompt tokens, up to ${posFmt(top)}`);
+    },
+  });
 }
 
 // ---- temperatures: one fixed colour scale, green at 45 °C or under through yellow (65) and orange (80) to bright red at 90 and over.
@@ -653,16 +860,18 @@ function healthBox() {
   const none_ = h('p', { class: 'dim', text: 'not reported by this engine', hidden: true });
   const wrap = h('div', { class: 'tscroll' }, table);
   const b = box('health', 'NODE HEALTH', 'Each Spark\'s health as its sampler last answered: polled every 2 s while this page is open. Hover a figure for its detail.', wrap, none_);
-  // the columns' widths are fixed (NODE_W), so the table's own width changes only with its rows, the fans columns or the
-  // fonts: the box's width left over is shared equally between every column's sides, measured again only then or when the
-  // box resizes, never on a new reading
+  // the box's width left over is shared equally between every column's sides: measured again whenever the box or the
+  // table itself changes width (a late redraw that narrows the table is caught too); the table's own width is its width
+  // less the padding already given, so a measure that finds the same share changes nothing and the observer settles
   const fit = () => {
-    table.style.setProperty('--npad', '0px');
     const cols = [...table.querySelectorAll('thead tr.col th')].filter((th) => th.offsetParent).length;
     if (!cols || !wrap.clientWidth || table.hidden) return;
-    table.style.setProperty('--npad', Math.max(0, Math.floor((wrap.clientWidth - table.offsetWidth) / (2 * cols) * 10) / 10) + 'px');
+    const cur = parseFloat(table.style.getPropertyValue('--npad')) || 0;
+    const want = Math.max(0, Math.floor((wrap.clientWidth - (table.offsetWidth - 2 * cols * cur)) / (2 * cols) * 100) / 100);
+    if (Math.abs(want - cur) >= 0.01) table.style.setProperty('--npad', want + 'px');
   };
   new ResizeObserver(fit).observe(wrap);
+  new ResizeObserver(fit).observe(table);
   if (document.fonts) document.fonts.ready.then(fit);
   let lastShape = '';
   return {
@@ -706,11 +915,11 @@ function rateTiles() {
     },
   };
 }
-const tokFmt = (v) => posFmt(v).replace(' ', '') + ' tokens';
+const tokFmt = (v) => posFmt(v) + ' tokens';
 function sessionsTiles() {
-  const used = etile('kv', 'CONTEXT CACHE', 'The pool memory the kept conversations hold (their caches and bookmarks), of the memory every conversation\'s caches live in.');
-  const cap = etile('capacity', 'CAPACITY', 'The tokens of conversation the pool holds, on all the engine\'s Sparks together, and the longest context one request may use now (it follows Extend context).');
-  const ctx = etile('contexts', 'CONTEXTS', 'Conversations whose cache is in the pool (running, or waiting for their next turn, which then starts at once), and those kept only on the SSD cache (their next turn reads them back first).');
+  const used = etile('kv', 'CONTEXT CACHE', 'The memory pool the conversations live in, on all the engine\'s Sparks together: the chunks taken of the whole pool, and the tokens they hold of the tokens the pool holds. Taken means held by anything: the conversations (kept and running) and their bookmarks, the images of the requests running now, the lines\' own chunks and the split cache\'s pieces.');
+  const cap = etile('capacity', 'MAX CONTEXT', 'The longest context one request may use now: it follows Extend context in the settings.');
+  const ctx = etile('contexts', 'CONVERSATIONS', 'Conversations whose cache is in the pool (running, or waiting for their next turn, which then starts at once), and those with a piece only on the SSD cache (their next turn reads it back first).');
   const shared = etile('shared', 'SHARED PREFIXES', 'The memory the beginnings that conversations share take, kept once, and how many conversations share one.');
   const els = [used.el, cap.el, ctx.el, shared.el];
   return {
@@ -719,16 +928,27 @@ function sessionsTiles() {
       const ss = st.sessions;
       for (const e of els) e.hidden = !ss;
       if (!ss) return;
-      const p = ss.pool || {}, cv = ss.conversations || {};
+      const p = ss.pool || {}, cv = ss.conversations || {}, sp = ss.split || {};
       const SPARKS = Number(ss.ranks) || 1;  // the engine's ranks: each holds the same pool, so the cluster's is that many times one
-      const n = Number(p.numbers), nb = Number(p.number_bytes), held = Number(p.held), pct = 100 * held / Math.max(1, n);
+      const nb = Number(p.number_bytes);
       const kept = Number(cv.on_lines) + Number(cv.in_memory), sharing = Number(cv.sharing);
-      used.set(gib(SPARKS * held * nb), 'GiB', `${one.format(pct)} % of ${gib(SPARKS * n * nb)} GiB`,
-        `The kept conversations hold ${whole.format(held)} of ${whole.format(n)} chunks a Spark (${one.format(nb / 2 ** 20)} MiB each): ${gib(SPARKS * held * nb)} of ${gib(SPARKS * n * nb)} GiB on the ${SPARKS} Sparks together. Not counted here: the images of the requests running now hold ${whole.format(Number(p.image_numbers) || 0)} chunks a Spark (${gib(SPARKS * (Number(p.image_numbers) || 0) * nb)} GiB on the ${SPARKS} Sparks), freed when each request ends.`);
-      cap.set(posFmt(Number(p.positions)).replace(' ', ''), 'tokens', `max context ${tokFmt(ss.usable_window)}`,
-        `${whole.format(n)} chunks of ${one.format(nb / 2 ** 20)} MiB on each of the ${SPARKS} Sparks (${gib(n * nb)} GiB a Spark, ${gib(SPARKS * n * nb)} GiB in all) hold ${whole.format(Number(p.positions))} tokens of conversation. The longest context one request may use now (it follows Extend context): ${whole.format(ss.usable_window)} tokens.`);
-      ctx.set(whole.format(kept), 'in memory', `${whole.format(Number(cv.on_disk))} on SSD only`,
-        `${whole.format(kept)} conversations have their cache in the pool: running, or waiting for their next turn (a finished one stays on its line until the line is needed; ${whole.format(Number(cv.on_lines))} are on a line now). ${whole.format(Number(cv.on_disk))} are kept only on the SSD cache: their next turn reads them back first.`);
+      const pp = poolParts(p), tokTaken = poolTokens(p);
+      // the pool the engine took at start and what is lent out of it (the memory block), for the first sentence of the tip
+      const mm = st.memory, tg = (mm && mm.tenant_groups) || [], lent = (Number(tg[0]) || 0) + (Number(tg[1]) || 0) + (Number(tg[3]) || 0);
+      const gbytes = mm ? Number(mm.group_numbers) * nb : 0;
+      const poolStart = mm && Number(mm.store_numbers) > 0 ? gib(SPARKS * Number(mm.store_numbers) * nb) : '';
+      used.set(gib(SPARKS * pp.taken * nb), `of ${gib(SPARKS * pp.total * nb)} GiB`, `${one.format(100 * pp.taken / Math.max(1, pp.total))} % · ${posFmt(tokTaken)} of ${posFmt(Number(p.positions))} tok`,
+        (poolStart ? `The pool is ${poolStart} GiB, taken when the engine started. ${gib(SPARKS * lent * gbytes)} GiB is lent out now (LENT OUT), so ${gib(SPARKS * pp.total * nb)} GiB is left for conversations; that total falls and rises as loans change. ` : '') +
+        `${whole.format(pp.taken)} of the pool's ${whole.format(pp.total)} chunks a Spark are taken (${mib2.format(nb / 2 ** 20)} MiB each): ${gib(SPARKS * pp.taken * nb)} of ${gib(SPARKS * pp.total * nb)} GiB on the ${SPARKS} Sparks together, ${gib(SPARKS * pp.free * nb)} GiB free. ` +
+        `They hold ${whole.format(tokTaken)} of the ${whole.format(Number(p.positions))} tokens the pool holds. The images of the requests running now (${whole.format(pp.images)} chunks a Spark, ${gib(SPARKS * pp.images * nb)} GiB on the ${SPARKS} Sparks) are inside the taken figure and freed when each request ends; the split cache's ${whole.format(Number(sp.quarter_slots) || 0)} quarter slots are too. Groups lent out (LENT OUT) are out of the pool. Memory handed back by a saved conversation counts as free here, even while it still holds that conversation's cache. Split cache: ${sp.on ? 'on' : 'off'}.`);
+      cap.set(posFmt(Number(ss.usable_window)), 'tokens', 'longest per request',
+        `The longest context one request may use now: ${whole.format(Number(ss.usable_window))} tokens (it follows Extend context in the settings).`);
+      const m = st.memory, nf = m ? Number(m.ids_file_sessions) : 0, ghosts = Number(sp.ghost_numbers) || 0;
+      const lists = !m ? '' : ` Their token lists take ${one.format(Number(m.ids_host_bytes) / 2 ** 20)} MiB in the server on Spark 1` + (nf > 1 ? `; ${whole.format(nf)} conversations' token lists are in files` : nf === 1 ? '; one conversation\'s token list is in a file' : '') + '.';
+      ctx.set(whole.format(kept), 'in memory', `${whole.format(Number(cv.on_disk))} saved to SSD`,
+        `${pl(kept, 'conversation')} ${kept === 1 ? 'holds its' : 'hold their'} cache in the pool: running, or waiting for their next turn (${whole.format(Number(cv.on_lines))} on a line now). ` +
+        `${pl(cv.on_disk, 'idle conversation')} ${Number(cv.on_disk) === 1 ? 'is' : 'are'} saved on the SSDs (each Spark keeps its quarter) and ${Number(cv.on_disk) === 1 ? 'its' : 'their'} memory is free for others; until it is reused, ${gib(SPARKS * ghosts * nb)} GiB of it still holds ${Number(cv.on_disk) === 1 ? 'its' : 'their'} cache, and a returning conversation takes it back at once, with no read. ` +
+        `A conversation counts as saved from its first saved piece.${lists}`);
       shared.set(gib(SPARKS * Number(p.shared) * nb), 'GiB', `${whole.format(sharing)} sharing a prefix`,
         `The beginnings that ${whole.format(sharing)} ${sharing === 1 ? 'conversation shares' : 'conversations share'} with another, kept once: ${whole.format(Number(p.shared))} chunks a Spark, ${gib(SPARKS * Number(p.shared) * nb)} GiB in all.`);
     },
@@ -743,7 +963,9 @@ function engramTile() {
     update(st) {
       const e = st.engram;
       t.qual.classList.remove('warn');
-      if (!e) { t.set('-', '', 'not reported'); return; }
+      // no Engram figures with the engine's other STATS fields present (the memory block) means the cache is off; with none of them, the engine reports nothing
+      if (!e) { t.set('-', '', st.memory ? 'off' : 'not reported'); return; }
+      const mm = st.memory, groupDef = mm ? ` (a group is ${whole.format(Number(mm.group_numbers))} chunks of ${mib2.format(Number(mm.number_bytes) / 2 ** 20)} MiB: ${whole.format(Number(mm.group_numbers) * Number(mm.number_bytes) / 2 ** 20)} MiB)` : '';
       const rate = e.hit_rate_1m == null ? 'no lookups in the last minute' : `${one.format(100 * Number(e.hit_rate_1m))} % found in the last minute`;
       const going = Number(e.pending_mib) > 0 ? ` · changing to ${whole.format(Number(e.pending_mib))} MiB` : '';
       const failed = Number(e.lend_failed);
@@ -753,7 +975,52 @@ function engramTile() {
         `Since the engine started: ${whole.format(Number(e.lookups))} rows looked up, ${whole.format(Number(e.hits))} found, ${whole.format(Number(e.evictions))} dropped to make room. ` +
         `Size changes: ${whole.format(Number(e.lend_ok))} done, ${whole.format(failed)} failed (a failed change leaves the old size)` +
         (Number(e.pending_mib) > 0 ? `; one to ${whole.format(Number(e.pending_mib))} MiB is under way` : '') + '. ' +
-        `${whole.format(Number(e.owed_groups))} groups are owed back to the pool; ${whole.format(Number(e.huge_pct))} % of the cache is in huge pages.`);
+        `${pl(e.owed_groups, 'group')} ${Number(e.owed_groups) === 1 ? 'is' : 'are'} owed back to the pool; ${whole.format(Number(e.huge_pct))} % of the cache is in huge pages.`);
+    },
+  };
+}
+// LENT OUT (the pool's memory lent to others, by name): a tile of the top strip.
+// the pool's two counts: taken (held by anything, the images' rows and the lines' own chunks among them) and free; the pool is their sum
+function poolParts(p) {
+  const taken = Number(p.held) || 0, free = Number(p.free) || 0;
+  return { taken, free, total: taken + free, images: Number(p.image_numbers) || 0 };
+}
+// the tokens the taken chunks hold: the pool's tokens (positions) in proportion to its taken chunks, all from the pool block
+function poolTokens(p) {
+  const n = Number(p.numbers) || 0;
+  return n > 0 ? Math.round(Number(p.held) * Number(p.positions) / n) : 0;
+}
+// a tile qualifier's GiB: one decimal under 10 (what would round to 10.0 is whole), whole from 10 up (the longest values still fit one line)
+const gibQ = (v) => (v >= 9.95 ? whole.format(v) : one.format(v));
+// LENT OUT's qualifier: what the pool lent to each borrower, on all the Sparks (`gb` bytes a group), on the tile's one line
+// (31 characters fit the tile at 1920 and 1100 px; a phone's two tiles a row may take two lines): one decimal under 10 GiB while it fits, else whole GiB from 1 up
+// and nothing lent as 0, else '<1' for a loan under 1 GiB
+function lentQual(sparks, gb, g) {
+  const ways = [gibQ, (v) => (v >= 0.95 ? whole.format(v) : v > 0 ? one.format(v) : '0'), (v) => (v >= 0.95 ? whole.format(v) : v > 0 ? '<1' : '0')];
+  const line = (f) => { const q = (n) => f(sparks * n * gb / 2 ** 30); return `Engram ${q(g[1])} · images ${q(g[3])}${g[0] > 0 ? ` · long ${q(g[0])}` : ''}`; };
+  const all = ways.map(line);
+  return all.find((s) => s.length <= 31) || all[2];
+}
+// SSD CACHE's qualifier: the GiB the Sparks hold together
+const ssdQual = (sparks, storedBytes) => `${gib(sparks * storedBytes)} GiB on all ${sparks}`;
+function storeTiles() {
+  const ten = etile('store-tenants', 'LENT OUT', 'Memory taken out of the pool and lent to others while the engine runs, by name, on all the engine\'s Sparks together.');
+  const els = [ten.el];
+  return {
+    els, by: { ten: ten.el },
+    update(st) {
+      const ss = st.sessions, m = st.memory;
+      for (const e of els) e.hidden = !m;
+      if (!m) return;
+      const SPARKS = Number(m.ranks) || Number(ss && ss.ranks) || 1, nb = Number(m.number_bytes), gb = Number(m.group_numbers) * nb;
+      const tg = m.tenant_groups || [], gg = (i) => Number(tg[i]) || 0;
+      const lent = gg(0) + gg(1) + gg(3);
+      const one1 = (g) => gib(SPARKS * g * gb);
+      const owed = Number(m.owed_groups);
+      ten.set(one1(lent), Number(m.store_numbers) > 0 ? `of ${gib(SPARKS * Number(m.store_numbers) * nb)} GiB` : 'GiB', lentQual(SPARKS, gb, [gg(0), gg(1), 0, gg(3)]),
+        `Memory taken out of the pool and lent to others while the engine runs${Number(m.store_numbers) > 0 ? `, of the ${gib(SPARKS * Number(m.store_numbers) * nb)} GiB the engine took at start` : ''}, on the ${SPARKS} Sparks together: the Engram cache ${one1(gg(1))} GiB (${pl(gg(1), 'group')} a Spark, ${whole.format(gg(1) * gb / 2 ** 20)} MiB a Spark: whole groups, so a little over the ENGRAM CACHE tile's size for its rows alone), the image work area ${one1(gg(3))} GiB (${pl(gg(3), 'group')}), ` +
+        `the long-context windows ${one1(gg(0))} GiB (${pl(gg(0), 'group')}). ` +
+        `A group is ${whole.format(Number(m.group_numbers))} chunks of ${mib2.format(nb / 2 ** 20)} MiB (${whole.format(gb / 2 ** 20)} MiB). ${pl(owed, 'group')} ${owed === 1 ? 'is' : 'are'} owed back to the pool.`);
     },
   };
 }
@@ -768,16 +1035,41 @@ function tierTiles() {
       const nb = Number((ss.pool || {}).number_bytes);
       for (const e of els) e.hidden = !sp;
       if (!sp) return;
-      const state = sp.state === 'on' ? 'Enabled' : sp.state === 'off' ? 'Disabled' : String(sp.state);
+      const state = sp.state === 'on' ? 'on' : sp.state === 'off' ? 'off' : String(sp.state);  // said on the tile only when it is not on
       ssd.qual.classList.toggle('warn', sp.state !== 'on');
-      if (!t || !pc) { ssd.set('-', '', state); rs.set('-', '', ''); return; }
-      const avgMs = pc.restore_waits > 0 ? pc.restore_wait_ns / pc.restore_waits / 1e6 : null;
-      const wb = SPARKS * Number(t.written_bytes);  // TiB from 1,000 GiB
-      const written = wb >= 1000 * 2 ** 30 ? `${one.format(wb / 2 ** 40)} TiB` : `${gib(wb)} GiB`;
-      ssd.set(gib(SPARKS * Number(t.stored_bytes)), `of ${whole.format(SPARKS * Number(t.cap_bytes) / 2 ** 30)} GiB`, `${state} · written ${written}`,
-        `The saved conversations take ${gib(SPARKS * Number(t.stored_bytes))} GiB on the SSDs of the ${SPARKS} Sparks together (every Spark writes the same copy). Written since the engine started: ${written}, ${whole.format(t.writes_committed)} pieces on each Spark (a cache piece of ${one.format(nb / 2 ** 20)} MiB or a bookmark each).`);
-      rs.set(whole.format(pc.restores_begun), '', `${tokFmt(pc.restored_tokens)} saved · avg wait ${avgMs == null ? '-' : whole.format(avgMs) + ' ms'}`,
-        `${whole.format(pc.restores_begun)} conversations read back from the SSD since the engine started, ${whole.format(pc.restored_tokens)} prompt tokens read back instead of computed; ${whole.format(pc.restore_waits)} read-backs waited on, the longest ${whole.format((pc.restore_wait_max_ns || 0) / 1e6)} ms.`);
+      if (!t || !pc) { ssd.set(sp.state === 'off' ? 'off' : '-', '', sp.state === 'off' ? 'no SSD cache' : state); return; }
+      const bytesFmt = (b) => (b >= 1000 * 2 ** 30 ? `${one.format(b / 2 ** 40)} TiB` : `${gib(b)} GiB`);  // TiB from 1,000 GiB
+      const written = bytesFmt(Number(t.written_bytes)), writtenAll = bytesFmt(SPARKS * Number(t.written_bytes));
+      const capGib = Number(t.cap_bytes) / 2 ** 30;
+      ssd.set(gib(Number(t.stored_bytes)), `of ${whole.format(capGib)} GiB/Spark`, ssdQual(SPARKS, Number(t.stored_bytes)),
+        `Saved conversations take ${gib(Number(t.stored_bytes))} GiB of the ${whole.format(capGib)} GiB this cache may use on each Spark's SSD; the cache is ${state}. Each Spark keeps its own quarter of every saved piece, so the ${SPARKS} together hold ${gib(SPARKS * Number(t.stored_bytes))} of ${whole.format(SPARKS * capGib)} GiB. ` +
+        `Written since the engine started: ${written} a Spark (${writtenAll} on the ${SPARKS} Sparks), ${pl(t.writes_committed, 'piece')} on each Spark (cache pieces of ${mib2.format(nb / 2 ** 20)} MiB, split-cache quarters and bookmarks of any size); that is what wears the drives.`);
+    },
+  };
+}
+// CACHE HITS: of all the prompt tokens that arrived in the chart's 15 minutes, the share found in memory, the share read back from the
+// SSDs and, by difference, the share computed. The sums are the CACHE chart's own, added up by the front-end.
+function cacheFace(c) {
+  if (!c) return { v: '-', u: '', q: 'not reported' };
+  const sh = c.shares, min = Math.round(Number(c.window_s) / 60);
+  if (!sh) return { v: '-', u: '', q: `no prompts, ${min} min` };
+  return { v: `${one.format(sh.hit)} %`, u: `hit, ${min} min`, q: `memory ${one.format(sh.memory)} · SSD ${one.format(sh.ssd)}` };
+}
+function cacheTile() {
+  const TIP = 'Of all the prompt tokens that arrived in the last 15 minutes: the share already in memory, the share read back from the SSDs, and the rest computed. The right ends of the CACHE chart\'s memory and SSD lines are these two figures.';
+  const t = etile('cache', 'CACHE HITS', TIP);
+  return {
+    els: [t.el],
+    update(st) {
+      const w = st.cache, f = cacheFace(w);
+      t.set(f.v, f.u, f.q, TIP);
+      if (!w || !w.shares) { setTip(t.el, `${TIP} ${w ? 'No prompt arrived in that time.' : 'The front-end reports no figures yet.'}`); return; }
+      const sh = w.shares, min = Math.round(Number(w.window_s) / 60), missed = sh.ssd + sh.computed;
+      const sinceStart = w.since_start ? ` Since the front-end started: ${pl(w.since_start.prompts, 'prompt')} of ${whole.format(Number(w.since_start.prompt_tokens))} tokens, ${whole.format(Number(w.since_start.cached_tokens))} of them not computed.` : '';
+      setTip(t.el, `Of the ${whole.format(Number(w.prompt_tokens))} prompt tokens that arrived in the last ${min} minutes (${pl(w.prompts, 'prompt')}): ${one.format(sh.memory)} % were already in memory (the conversation's own cache, a shared beginning, or memory taken back from a saved conversation), ` +
+        `${one.format(sh.ssd)} % were read back from the SSDs, ${one.format(sh.computed)} % were computed. Of what memory did not have, the SSDs had ${missed > 0 ? one.format(100 * sh.ssd / missed) : '0.0'} %. ` +
+        `Read-backs: ${pl(w.pieces_read, 'piece')} read from the SSDs, requests waited ${whole.format(Number(w.wait_ns) / 1e6)} ms in all; ${pl(w.revives, 'piece')} ${Number(w.revives) === 1 ? 'was' : 'were'} taken back from memory with no read.` +
+        (w.counters_read ? '' : ' The engine\'s counters were not read in that time, so the SSD share is missing from these figures.') + sinceStart);
     },
   };
 }
@@ -821,7 +1113,7 @@ function settingsBox() {
     sels[key] = sel;
     return h('label', { class: check ? 'field check' : 'field', title: tip }, h('span', { class: 'k', text: label }), sel);
   }), note, copyLine);
-  const b = box('reading', 'LONG PROMPTS AND SSD', 'How the engine reads long prompts while others decode (interleaved prefill), how much SSD its kept conversations may use and for how long, the size of the Engram cache, and whether a conversation may extend past 1M tokens. Changes apply at once and last until the engine restarts; its start flags set them again.', grid);
+  const b = box('reading', 'ENGINE SETTINGS', 'How the engine processes long prompts while others decode (interleaved prefill), how much SSD its kept conversations may use and for how long, the size of the Engram cache, and whether a conversation may extend past 1M tokens. Changes apply at once and last until the engine restarts; its start flags set them again.', grid);
   function update(st) {
     const il = st && st.interleave;
     for (const [key, sel] of Object.entries(sels)) {

@@ -2,8 +2,16 @@
 // four pool arrays (8,192 entries each), or, for a bookmark, 2 MiB of its KV slice. Host only. Every rank takes and gives
 // the same numbers in the same order, lowest free first; digest() lets rank 0 check that they agree. Number 0 is the
 // guard: never taken, every unlisted list entry names it.
+//
+// A number can be a ghost: given back by a split, free, and still holding the bytes it held (a returning conversation takes
+// it back and nothing crosses the ring). A ghost carries a stamp, a count the caller advances, never a time. The lend zone
+// is the numbers at or above a cut: a window or the Engram lender takes the top of the pool, so a number is handed out from
+// the zone last. Both the stamps and the zone are replicated values, the same on every rank.
 #pragma once
 #include <cstdint>
+#include <map>
+#include <set>
+#include <utility>
 #include <vector>
 
 namespace model::chunks {

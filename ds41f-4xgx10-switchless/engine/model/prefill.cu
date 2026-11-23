@@ -665,7 +665,11 @@ uint64_t Model::Impl::prefill(int a, int M, const Sampling* sp, int handle, cons
   std::vector<std::pair<int, const std::vector<uint32_t>*>> snaps;
   for (int s : snap_pos) {
     if (s <= a || s > a + M || s < kSnapRows) die("model: snapshot at %d outside (%d, %d]", s, a, a + M);
-    if (const std::vector<uint32_t>* b = state_snap_buf(handle, s)) snaps.emplace_back(s, b);  // none: no room
+    if (const std::vector<uint32_t>* b = state_snap_buf(handle, s)) {  // none: no room
+      // a pass of the encoder writes layers 0-19 of it: the rest reads as zero on every rank, whatever its numbers held
+      if (ced && !(sp && s == a + M)) bk_zero(*b, core->snap_bytes());
+      snaps.emplace_back(s, b);
+    }
   }
   p.rq = q_rows(M), p.r0 = rank * p.rq, p.n = std::max(0, std::min(p.rq, M - p.r0));
   const int slot = (int)(n_steps % ops::kOutSlots);

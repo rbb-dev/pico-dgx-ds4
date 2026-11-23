@@ -28,6 +28,78 @@ inline bool counts_as_live(bool in_flight, bool paused) {
 #endif
 }
 
+// A pass of run() took no flight, every flight of it that holds a line waited for an extension, nothing is being imaged, no join runs, no prompt is being prefilled:
+// nothing in flight can move until a request ends. PICO_OLD_RULES: every flight waited for an extension.
+inline bool ext_standstill(int taken, int holders, int holders_ext, bool imager_work, bool join_active, bool reading) {
+#ifdef PICO_OLD_RULES
+  (void)imager_work, (void)join_active, (void)reading;
+  return taken == 0 && holders_ext > 0 && holders_ext == holders;
+#else
+  return taken == 0 && holders > 0 && holders_ext == holders && !imager_work && !join_active && !reading;
+#endif
+}
+// The owner's (b) ("end the longest response"), part (i): a refused extension puts a flight back only when its reservation is used up (`left` = positions left of it); else it runs on with what it holds
+// (both decode paths already end a run at the reservation). PICO_OLD_RULES: always.
+inline bool ext_blocks(int left) {
+#ifdef PICO_OLD_RULES
+  (void)left;
+  return true;
+#else
+  return left < 1;
+#endif
+}
+// Part (ii): the waiter with the longest response (`outs` in rotation order); ties go to the last in the rotation; -1: none.
+inline int ext_pick(const std::vector<int>& outs) {
+  int best = -1;
+  for (int i = 0; i < (int)outs.size(); ++i)
+    if (best < 0 || outs[i] >= outs[best]) best = i;
+  return best;
+}
+// Whether the standstill that has held for `held_s` ends a request now: it has held 2 s and none was ended in the last 2 s. (PICO_OLD_RULES: never.)
+inline bool ext_end_due(double held_s, double since_last_end_s) {
+#ifdef PICO_OLD_RULES
+  (void)held_s, (void)since_last_end_s;
+  return false;
+#else
+  return held_s >= 2.0 && since_last_end_s >= 2.0;
+#endif
+}
+
+// a request that is not running takes nothing from one that is. Whether a line's conversation is idle for ANY taker (a request's
+// admission, a bookmark, a growth, a window): no request is in flight on it, paused or not. PICO_OLD_RULES: a paused request's line is idle for a reservation.
+inline bool idle_for_taker(bool in_flight, bool paused) {
+#ifdef PICO_OLD_RULES
+  return !in_flight || paused;
+#else
+  (void)paused;
+  return !in_flight;
+#endif
+}
+
+// Whether a line's conversation may be detached to give a read-back unit its numbers: no request is in flight on it. A paused request's line
+// is detached only in a pass that makes a reservation (give_back's default), never by a unit: the unit's pieces are idle store until the
+// request begins, and the paused line would come back for them.
+inline bool unit_may_detach(bool in_flight, bool paused) {
+#ifdef PICO_OLD_RULES
+  return !in_flight || paused;
+#else
+  (void)paused;
+  return !in_flight;
+#endif
+}
+
+// Whether a split command names a request's session live. For the split a request runs from its admission to its finish: in
+// flight, on a line or off it, reading, decoding or paused between turns. A split command is always issued between runs, where
+// every decoder is paused, so "not paused" protects nothing there.
+inline bool split_names_live(bool in_flight, bool paused) {
+#ifdef PICO_OLD_RULES
+  return running(in_flight, paused);  // without the rule: a paused request's conversation is split like an idle one
+#else
+  (void)paused;
+  return in_flight;
+#endif
+}
+
 // Whether finish() zeroes a kept session's reservation on its line. The reservation is a reservation for a running request;
 // a finished one has none, and a leftover one (up to --grow-ahead positions) is counted as reserved by every sum that
 // refuses a consumer (Model::slot_uncommitted, take_extra, the window's unheld sum, the dashboard's reserved).

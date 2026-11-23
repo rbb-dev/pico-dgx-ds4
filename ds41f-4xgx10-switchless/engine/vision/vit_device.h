@@ -25,7 +25,10 @@ class VisionWeights {
   // What the four ranks compare (file_set_digest): equal on the four files of one conversion.
   uint64_t digest() const { return digest_; }
 
-  // Streams every tensor into the device arena and builds the kernels' view. Call once.
+  // Streams every tensor into the device arena and builds the kernels' view. Call once. The reads are O_DIRECT through
+  // small pinned staging buffers (kStageChunk, at most two threads), all freed before it returns; the patch
+  // embedding is read into a scratch buffer and padded once, so no tensor is held twice; the file's pages are dropped.
+  // Afterwards the vision path holds device_bytes() on the device and nothing on the host (held()).
   dsw::LoadStats load(int threads = 4);
 
   // The kernels' view of the weights (after load()): pointers into the arena, plus the two small buffers.
@@ -33,6 +36,14 @@ class VisionWeights {
 
   // Device bytes held once loaded: the arena and the two small buffers.
   uint64_t device_bytes() const { return arena_bytes_ + extra_bytes_; }
+  // What the vision path holds beyond the weights' own bytes, as measured around load(): device memory the driver
+  // reports free before and after (cudaMemGetInfo), the host's MemAvailable before and after, and the pinned staging
+  // still held at return. Readings, in bytes; a reading of another process's change is inside them.
+  struct Held {
+    uint64_t staging_peak = 0, staging_held = 0;
+    int64_t device_fell = 0, host_fell = 0;  // free before - free after (positive: it fell)
+  };
+  const Held& held() const { return held_; }
   int tensors() const { return int(file_->tensors().size()); }
   const std::string& path() const { return path_; }
 

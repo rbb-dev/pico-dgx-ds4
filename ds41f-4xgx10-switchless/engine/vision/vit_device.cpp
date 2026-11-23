@@ -44,7 +44,19 @@ VisionWeights::~VisionWeights() {
 dsw::LoadStats VisionWeights::load(int threads) {
   if (arena_bytes_) die("%s: vision weights already loaded", path_.c_str());
   dsw::LoadOptions lo;
-  lo.threads = threads;
+  lo.threads = std::min(threads, kStageThreads);
+  lo.chunk = kStageChunk;
+  lo.drop_page_cache = true;
+  // the patch embedding is padded to 640 columns below: it is read into a scratch buffer, not into the arena, so the
+  // arena does not keep an unpadded copy beside the padded one
+  const int64_t dev0 = (int64_t)device_free(), host0 = (int64_t)mem_available();
+  void* scratch = nullptr;
+  uint64_t scratch_bytes = 0;
+  for (const dsw::DeviceTensor& t : file_->tensors())
+    if (t.name == kPatchW) scratch_bytes = dsw::align_up(t.bytes);
+  if (!scratch_bytes) die("%s: no tensor %s", path_.c_str(), kPatchW);
+  CUDA_CHECK(cudaMalloc(&scratch, scratch_bytes));
+  lo.dest = [&](const dsw::DeviceTensor& t) -> void* { return t.name == kPatchW ? scratch : nullptr; };
   const dsw::LoadStats st = file_->load(lo);
   arena_bytes_ = file_->arena_bytes();
   auto at = [&](const std::string& n) { return static_cast<bf16*>(file_->operator[](n).data); };

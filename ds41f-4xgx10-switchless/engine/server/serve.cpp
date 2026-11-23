@@ -50,7 +50,10 @@
 #include "server/cancel.h"
 #include "server/img_hold.h"
 #include "server/reclaim.h"
+#include "server/rows_loan.h"
+#include "server/split_pace.h"
 #include "server/turns.h"
+#include "server/vit_sched.h"
 
 #include <poll.h>
 #include <signal.h>
@@ -525,6 +528,8 @@ struct Flight {
   int fac = kBaseFactor;             // the factor its next run needs: its prompt's, then what its response has grown to
   bool cross = false;                // its decode reached the window of fac: cross() before its next run
   imghold::Hold img;                 // its image rows in the store: the key the ranks hold them under, and how many rows
+  std::vector<char> enc;             // a pixel request: which spans' rows are written (the images encoded so far)
+  std::string err;                   // the error its DONE carries when it ends in one
 };
 
 // b's drafts and steps added to a's (a request's decode slices)
@@ -1404,7 +1409,21 @@ class Server {
     const std::vector<int32_t>& prompt = resume ? cont : f.rq.prompt;
     const int n = (int)prompt.size();
     forget_evicted();
-    unspill(h, f.fac);
+    // a split conversation's return: back to back with the request's own work when it fits a decode step's gap (or nobody decodes),
+    // else the request is read as a long prompt whose first units are the join commands
+    bool join_now = true;
+    if (o_.kv_split && ja) {
+      const JoinAsk a = join_ask(h.session_id, f.fac, bk(h, f.fac), need_now(f), prompt);
+      if (a.found && il::return_asks(a.back, a.exch, a.disk) && il::join_in_units(a.est_ms, o_.kv_join_whole_ms, run_edge_ms(f), il_.gap_ms, !rot_.empty()) &&
+          (a.disk == 0 || il::return_fits(a.disk, return_room(h.session_id, bk(h, f.fac)))))
+        *ja = a, ja->deferred = true, join_now = false;
+      else if (a.found) *ja = a;
+    }
+    unspill(h, f.fac, need_now(f), {}, prompt, join_now);
+    if (o_.kv_split && ja && join_incomplete_) {  // the back-to-back join stopped for want of a number: the rest are units, whatever the estimate said
+      *ja = join_ask(h.session_id, f.fac, bk(h, f.fac), need_now(f), prompt);
+      ja->deferred = true;
+    }
     const Session* src = find_at(h.session_id, f.fac);
     if (!src && h.base_session_id) src = find_at(h.base_session_id, f.fac);
     if (!src) return n;
@@ -1414,6 +1433,67 @@ class Server {
 
   // The decoders' step (ms) for the piece size: a line through two measured points, by the number of decoding sessions (at most 16)
   double step_ms() const { return rot_.empty() ? 0.0 : 25.77 + 15.9 * (double)(std::min<size_t>(rot_.size(), 16) - 1); }
+
+  // The device time of an image request's read while sessions decode (0: not an image request, or nobody decodes)
+  // What read_whole adds to an image request's read: for a request with pixels the run's edge (measured: il::Edge), else one step
+  double run_edge_ms(const Flight& f) const { return f.rq.pix.empty() ? step_ms() : edge_.value(step_ms()); }
+  // The decoders' silence across the units of requests read in pieces beside them (il::Edge): the last TOKENS before a unit and the first
+  // after it. `tok_at_` is the time of the last token sent; `pend_` the unit whose silence is open.
+  il::Edge edge_;
+  double tok_at_ = 0;
+  struct Pend {
+    uint64_t req = 0;
+    double pre = 0, unit_ms = 0;
+    int kind = -1;  // 0 an encode unit, 1 a row piece; -1 none
+  } pend_;
+  struct UnitStat {
+    int n[2] = {0, 0};
+    double longest_ms[2] = {0, 0}, silence_ms[2] = {0, 0};
+    double edge_sum = 0;
+    int edge_n = 0;
+  };
+  std::map<uint64_t, UnitStat> unit_stats_;
+  // A unit of request `req` of unit_ms ran beside decoders: its silence is read at the next token
+  void note_unit(uint64_t req, int kind, double unit_ms) {
+    if (rot_.empty() || !tok_at_) return;
+    unit_stats_[req].n[kind]++;
+    unit_stats_[req].longest_ms[kind] = std::max(unit_stats_[req].longest_ms[kind], unit_ms);
+    pend_ = {req, tok_at_, unit_ms, kind};
+  }
+  void note_token() {
+    const double now = now_s();
+    if (pend_.kind >= 0) {
+      const double sil = 1e3 * (now - pend_.pre);
+      UnitStat& u = unit_stats_[pend_.req];
+      u.silence_ms[pend_.kind] = std::max(u.silence_ms[pend_.kind], sil);
+      u.edge_sum += std::max(0.0, sil - pend_.unit_ms), u.edge_n++;
+      edge_.observe(sil, pend_.unit_ms);
+      pend_.kind = -1;
+    }
+    tok_at_ = now;
+  }
+  // one line a request that was read in pieces beside decoders (at its end)
+  void unit_line(uint64_t req) {
+    const auto it = unit_stats_.find(req);
+    if (it == unit_stats_.end()) return;
+    const UnitStat& u = it->second;
+    if (u.n[0] + u.n[1] > 0)
+      std::printf("serve: req %llu read in pieces beside decoders: %d encode units (longest %.1f ms, longest silence across one %.1f ms), %d row pieces "
+                  "(longest %.1f ms, longest silence across one %.1f ms), the run edge %.1f ms mean (now %.1f ms)\n", (unsigned long long)req, u.n[0],
+                  u.longest_ms[0], u.silence_ms[0], u.n[1], u.longest_ms[1], u.silence_ms[1], u.edge_n ? u.edge_sum / u.edge_n : 0.0,
+                  edge_.value(step_ms()));
+    unit_stats_.erase(it);
+  }
+  // plus the encode of the images its rows need (a pixel request: the unwritten ones whose spans end after the restart position)
+  double img_ms(const Flight& f, int rows, bool resume = false) const {
+    if (f.img.rows <= 0 || rot_.empty()) return 0.0;
+    double enc = 0;
+    if (!f.rq.pix.empty()) {
+      const int q = (int)(f.rq.prompt.size() + (resume ? f.out.size() : 0)) - rows;
+      enc = vitsched::encode_ms(vit_imgs(f), q, enc_cost_);
+    }
+    return il::img_read_ms(il_cost_, rows, enc);
+  }
 
   // One pass of the scheduler while long prompts exist (il::next): admit one request, begin the front long prompt,
   // read a piece of it, or give the decoders their window
@@ -2021,6 +2101,8 @@ class Server {
       r.cancelled = true;
       return false;
     }
+    if (!f.rq.pix.empty())  // vision: an image the piece reaches is encoded first, as a unit of its own
+      if (const int e = vit_step(r, R)) return e > 0;
     const bool last = pos + R == n;
     if (R > r.cap) die("serve: a piece of %d rows on a set of %d (req %llu)", R, r.cap, (unsigned long long)h.req_id);
     Cmd c{};
@@ -2156,9 +2238,12 @@ class Server {
       c.ops[c.n_ops++] = {kStImgTake, f.img.key, (int32_t)f.img.rows, s};
       img_ask_.taken(sid);
     }
-    c.rows = g.fill ? 1 : 0;
+    const bool px = !rq.pix.empty();  // pixels: the rows are written by the encoder, one image at a time (vit_step), not sent
+    c.rows = g.fill && !px ? 1 : 0;
     c.pos0 = f.img.key;
+    c.vit_reg = g.take && px ? 1 : 0;
     issue(c);
+    if (g.take && px) m_.vision_register(f.img.key, c.n), f.enc.assign(rq.spans.size(), 0);
     if (g.take) digest("image take");
     std::vector<int32_t> lh(2 * rq.spans.size());
     for (size_t i = 0; i < rq.spans.size(); ++i)
@@ -2176,7 +2261,7 @@ class Server {
     }
     m_.set_images(c.n, lh.data(), lh.data() + c.n, f.img.key);
     std::printf("serve: req %llu images: %d spans, %zu rows, %s in %.1f ms (%zu image numbers held)\n",
-                (unsigned long long)rq.h.req_id, c.n, f.img.rows, g.fill ? "taken and sent to every rank" : "held", 1e3 * (now_s() - t0),
+                (unsigned long long)rq.h.req_id, c.n, f.img.rows, g.fill ? (px ? "taken, to be encoded here" : "taken and sent to every rank") : "held", 1e3 * (now_s() - t0),
                 m_.image_numbers());
   }
   int next_img_ = 1;  // the keys the ranks hold flights' image rows under
@@ -2543,10 +2628,16 @@ class Server {
           later.push_back(std::move(f));
           continue;
         }
-        state({{kStReserve, 0, s, need}});
-        std::printf("serve: req %llu grows: its reservation reaches %d positions (was %d)\n", (unsigned long long)f.rq.h.req_id,
-                    need, f.upto);
-        f.upto = need;
+        if (room) {
+          state({{kStReserve, 0, s, need}});
+          std::printf("serve: req %llu grows: its reservation reaches %d positions (was %d)\n", (unsigned long long)f.rq.h.req_id,
+                      need, f.upto);
+          f.upto = need;
+        }
+      }
+      if (!live && vit_gated(f.rq)) {  // a pixel request is not resumed while another's image is between its blocks: paused for this pass
+        later.push_back(std::move(f));
+        continue;
       }
       f.paused_s += now_s() - f.t_paused;
       // a resume with more rows to read than a prompt read whole: read in pieces like a long prompt, between windows
@@ -2922,6 +3013,61 @@ class Server {
     io_.publish_stats(Frame(fe::kStats).add(&sf).take());
   }
   double published_ = 0;
+  bool publish_forced_ = false;  // a tenant's change landed or failed: the next publish is not rate-limited
+
+  // The memory watch (mem_watch.h): every memwatch::kEveryS seconds, between commands, one kStMemWatch on every rank. The lines the
+  // server itself knows to be over their cap are named in its report.
+  void watch_tick() {
+    const double t = now_s();
+    if (!memwatch::due(mem_watch_on(), t, watch_at_)) return;
+    if (memwatch::defer_to_chunk(!pfq_.empty() && pfq_.front()->begun, t, watch_at_)) return;  // the prompt's chunks carry it (kPfWatch)
+    watch_at_ = t;
+    mem_watch_note(watch_over());
+    Cmd c{};  // not state(): no digest line from the server either
+    c.op = kCmdState;
+    c.n_ops = 1;
+    c.ops[0] = StateOp{kStMemWatch, -1, 0, 0};
+    issue(c);
+    watch_line("as a command between turns");
+  }
+  double watch_at_ = 0;
+  // DSGB10_STORE_CHECK=1: one line a reading that does not ride a decoding run, saying where it ran (tests/watch_rides_test.py prompt reads them)
+  void watch_line(const char* where) {
+    static const bool on = std::getenv("DSGB10_STORE_CHECK") && std::atoi(std::getenv("DSGB10_STORE_CHECK")) == 1;
+    if (on) std::printf("serve: memory watch read %s\n", where);
+  }
+  // The lines the server itself knows to be over their cap, named in the watch's report.
+  std::string watch_over() {
+    std::string over;
+    if (o_.ids_dir.size() && ids_bytes() > o_.ids_host_bytes) {
+      char b[128];
+      std::snprintf(b, sizeof b, "rank 0 server token ids %.2f GiB > %.2f GiB", ids_bytes() / 1073741824.0, o_.ids_host_bytes / 1073741824.0);
+      over = b;
+    }
+    return over;
+  }
+  // The watch riding a decoding run (mem_watch.h): from a step callback, when the watch is due and no pause is being asked, rank 0 flips
+  // kCtlWatch in its control word `word`; every rank reads the memory after the step that shows it, and the run goes on. The watch counts as
+  // done when rank 0's reading count moved: only then its time is set and the keeper decides on the reading. A flip no step read (the run
+  // ended first) leaves the watch due, for watch_tick.
+  struct RideWatch {
+    bool flipped = false;
+    uint64_t seq = 0;  // the reading count at the flip
+  };
+  void ride_watch(RideWatch& r, uint32_t& word, bool pausing, double t) {
+    if (!mem_watch_on()) return;
+    ride_watch_end(r, t);
+    if (!memwatch::ride_due(true, t, watch_at_, pausing, r.flipped)) return;
+    mem_watch_note(watch_over());
+    r.flipped = true, r.seq = mem_watch_view().seq;
+    word ^= kCtlWatch;
+    m_.set_ctl(word);
+  }
+  void ride_watch_end(RideWatch& r, double t = -1) {
+    if (!r.flipped || mem_watch_view().seq == r.seq) return;
+    r.flipped = false;
+    watch_at_ = t < 0 ? now_s() : t;
+  }
 
   void sweep() {
     // the requests that wait before they hold a slot (for one, for their session in flight, let go to run): a client that
@@ -2974,6 +3120,21 @@ class Server {
       state({{kStImgFree, f.img.key, 0, 0}});
       f.img.key = 0;
     }
+    enc_mark_.ended(f.rq.h.req_id);
+    unit_line(f.rq.h.req_id);
+    if (pend_.req == f.rq.h.req_id) pend_.kind = -1;
+  }
+
+  // DONE, then the session kept (its snapshots thinned) or freed, and the store held to its budget; the
+  // requests held for the session go on.
+  void finish(Flight& f, uint32_t why) {
+    const fe::SubmitHeader& h = f.rq.h;
+    if (!f.done_sent) {
+      const fe::DoneTail tail = report_of(f, -1);
+      done(f.rq, why, (uint32_t)f.q, (uint32_t)f.out.size(), f.t_start, f.t_first, f.err, &tail);
+    }
+    Io::forget(f.rq);
+    end_images(f);
     const double t_end = now_s();
     flying_.erase(h.session_id);
     const bool released = later_.erase(h.session_id) > 0;  // the front-end let it go meanwhile
@@ -3160,21 +3321,510 @@ class Server {
       if (L->f.fac == factor) return true;
     for (const std::deque<Request>* d : {&wait_, &held_, &ready_})
       for (const Request& r : *d)
-        if (factor_for((int64_t)r.prompt.size()) == factor) return true;
+        if (factor_for((int64_t)r.len()) == factor) return true;
     return false;
   }
-  // The Engram cache's size: the goal (the setting, or lower while the cache gave way) is asked of the model at a run boundary
-  // (kCmdLend begin) and the change finished when every rank's worker has (kCmdLend poll, every 100 ms until then). A refused
-  // or failed size is not asked for again for five minutes unless the setting changes; a request that finds the pool's
-  // runners in the way is asked again in a second. What a closed window or a finished change owes the pool is settled here too.
+  // The pool's tenants change size through one queue (Model::tenant_lend): a tenant's goal is asked of the model at a run boundary
+  // (kCmdLend begin) and the change finished when every rank's body has (kCmdLend poll, every 100 ms until then). The Engram cache's goal
+  // is the setting, or lower while the cache gave way; a test build's dummy tenant 15 has CONFIG's test_tenant_groups. A refused or
+  // failed size is not asked for again for five minutes unless the setting changes; a request that finds the pool's runners in the way
+  // is asked again in a second. What a closed window or a finished change owes the pool is settled here too, whatever the Engram cache
+  // does: while a change is in flight no window command and no settle runs (the window waits, ensure_window).
+  // The tenant whose change the server would begin at time t (-1: none): the Engram cache's size is not its goal, else tenant 15's.
+  int lend_begin_id(double t) {
+    if (!m_.engram_lend_enabled() && !m_.tenant_other_enabled()) return -1;
+    const int64_t cur = m_.engram_lend_enabled() ? (int64_t)m_.engram_lend_info().mib : engram_goal_mib_;
+    if (cur != engram_goal_mib_ && t >= engram_next_ && !engram_backoff_.blocked((uint64_t)engram_goal_mib_, t, engram_gen_))
+      return model::lend::kTenantEngram;
+    loan_policy(t);
+    if (loan_enabled() && loan_goal_ >= 0 && (loan_goal_ == 1) != loan_held() && (loan_goal_ == 1 || !loan_in_use()) && t >= loan_next_ &&
+        !loan_backoff_.blocked(loan_goal_ ? (uint64_t)loan_mib_ : 0, t, loan_gen_))
+      return model::lend::kTenantPrefill;
+    if (tenant_goal_mib_ >= 0 && tenant_size_mib(15) != tenant_goal_mib_ && t >= tenant_next_ &&
+        !tenant_backoff_.blocked((uint64_t)tenant_goal_mib_, t, tenant_gen_))
+      return 15;
+    return -1;
+  }
+  // ---- the split (--kv-split cache; split_pace.h; docs/engine.md) ----
+  // A conversation whose request ended is split by commands of its own between runs, and comes back by commands of its own before
+  // anything reads or writes it. The list holds store handles: a conversation leaves it when a request names it, or when a command
+  // split all it could.
+  std::vector<int> split_pending_;
+  double split_retry_ = 0;
+  bool split_waits_ = false;       // the last split command left pieces whole for want of a number
+  double split_start_ = now_s();   // the server's start
+  splitpace::Marks split_marks_;   // the spare numbers' marks and the ages (init_split_marks)
+  splitpace::Level split_level_;   // the last pass's level (STATS)
+  uint64_t l2_dropped_total_ = 0;  // conversations given back from L2 to the SSD
+  std::deque<std::pair<double, int>> demoted_;  // (time, pieces) of the commands of the last 10 s: the demotion rate (STATS)
+  uint64_t lend_busy_total_ = 0;   // window and tenant changes that answered busy (STATS)
+  // copy drafting's learner (STATS): proposals made and scored, the first token right, rows verified and accepted, requests whose copies
+  // failed, and the shared first-token chance by bucket (1/65535) as the last finished request's last step showed it
+  uint64_t copy_proposals_total_ = 0, copy_scored_total_ = 0, copy_first_right_total_ = 0, copy_rows_verified_total_ = 0;
+  uint64_t copy_rows_accepted_total_ = 0, copy_failing_total_ = 0;
+  uint32_t copy_chance_[4] = {};
+  bool join_incomplete_ = false;  // unspill's join left a list entry below `upto` a slot: the request waits as the units of its read
+  int fork_base_ = -1;  // a fork's base, put back on the pending list when the fork's setup is done
+  il::JoinCost jc_;                // the per-piece times of a return: taken back, exchanged, read from the SSD (interleave.h)
+  JoinAsk join_ask(uint64_t sid, int fac, uint64_t base, int need, const std::vector<int32_t>& prompt) {
+    JoinAsk a;
+    uint64_t id = sid;
+    Session* x = find_at(sid, fac, &id);
+    if (!x && base) id = base, x = find_at(base, fac, &id);
+    if (!x) return a;
+    const RestoreAsk ra = restore_ask(sid, base, need, &prompt);
+    if (!ra.found || ra.src_id != id) return a;
+    a.found = true, a.h = x->h, a.key = id, a.upto = ra.upto, a.disk = ra.on_disk;
+    m_.state_join_plan(x->h, ra.upto, &a.back, &a.exch);
+    if (o_.imager) a.disk = std::max(0, a.disk - a.back);  // the ghosts are in `back` (taken back), not read from the SSD
+    a.est_ms = jc_.est_ms(a.back, a.exch, a.disk);  // the pieces on the SSD are in the estimate, and units of the return like the rest (join_unit)
+    return a;
+  }
+  // a request's join is in flight: no other request is admitted, no tenant change, settle or split command runs until it ends
+  bool join_active() const {
+    for (const auto& L : pfq_)
+      if (L->joining && L->jw.live) return true;  // true only from a unit that made progress to the next
+    return false;
+  }
+  void split_note(int h) {
+    uint64_t key = 0;
+    const Session* x = h > 0 ? session_of(h, &key) : nullptr;
+    if (x && in_flight(key, *x)) return;  // a request holds it: finish() notes it again
+    if (!(o_.kv_split || o_.imager) || h <= 0 || std::find(split_pending_.begin(), split_pending_.end(), h) != split_pending_.end()) return;
+    split_pending_.push_back(h);
+  }
+  void split_forget(int h) {
+    split_pending_.erase(std::remove(split_pending_.begin(), split_pending_.end(), h), split_pending_.end());
+  }
+  Session* session_of(int h, uint64_t* key) {
+    for (auto& [k, x] : sess_)
+      if (x.h == h) return *key = k, &x;
+    return nullptr;
+  }
+  // The marks: --kv-split-high (default the room `off` keeps between requests, in numbers) and --kv-split-low (default half of it).
+  void init_split_marks(int64_t room_numbers) {
+    split_marks_.high = o_.kv_split_high > 0 ? o_.kv_split_high : room_numbers;
+    split_marks_.low = o_.kv_split_low > 0 ? std::min(o_.kv_split_low, split_marks_.high) : split_marks_.high / 2;
+    split_marks_.after_s = o_.kv_split_after_s, split_marks_.pass_ms = o_.kv_split_pass_ms;
+  }
+  // The pass: at the top of the loop, between decoding runs and never inside one. While the pool's pressure and the candidate's idle age
+  // say so (split_pace.h): the least recently used listed conversation no request uses is demoted by one command (at most
+  // --kv-split-budget pieces), or, under the low mark, the least recently used conversation holding quarter slots is given back to the
+  // SSD (the slots have their images: no write). It goes on until the rule says nothing, a deferral holds the list, or the pass's time is
+  // used. A conversation a request runs on leaves the list: finish() puts it back.
+  void split_tick() {
+    if (o_.imager) return imager_tick();
+    if (!o_.kv_split || join_active()) return;
+    const splitpace::Mode mode = (splitpace::Mode)o_.kv_split_mode;
+    const bool flights = !flying_.empty() || !rot_.empty() || !pfq_.empty();
+    splitpace::Level lv = splitpace::level(mode, m_.slot_spare(), split_marks_, flights);
+    split_level_ = lv;
+    if (lv.level == 0 || (lv.level == 1 && split_pending_.empty())) return;
+    const double t0 = now_s();
+    while (true) {
+      const int64_t spare = m_.slot_spare();
+      lv = splitpace::level(mode, spare, split_marks_, flights);
+      split_level_ = lv;
+      if (lv.level == 0) return;
+      // the candidate for a demotion: the list's least recently used conversation no request is in flight on
+      std::vector<splitpace::Cand> cands;
+      for (size_t i = 0; i < split_pending_.size();) {
+        uint64_t key = 0;
+        Session* x = session_of(split_pending_[i], &key);
+        if (!x || in_flight(key, *x)) {
+          split_pending_.erase(split_pending_.begin() + i);
+          continue;
+        }
+        cands.push_back({x->h, x->used, false});
+        ++i;
+      }
+      const int h = splitpace::pick(cands);
+      uint64_t key = 0;
+      Session* x = h >= 0 ? session_of(h, &key) : nullptr;
+      const double idle = x ? now_s() - std::max(x->t_fin, split_start_) : -1;  // a conversation no request finished since the start counts from the start
+      int h2 = -1;  // the level 2 victim: the least recently used conversation holding quarter slots that no request uses
+      if (lv.level == 2) {
+        uint64_t u2 = 0;
+        for (auto& [k, y] : sess_)
+          if (!in_flight(k, y) && (h2 < 0 || y.used < u2) && m_.state_info(y.h).slots > 0) h2 = y.h, u2 = y.used;
+      }
+      const double t = now_s();
+      const bool hold = splitpace::held(split_waits_, split_waits_ && m_.split_can_open(), t, split_retry_);
+      const splitpace::Act act = splitpace::next(lv, h2 >= 0, idle, hold);
+      if (act == splitpace::Act::kNothing) return;
+      if (act == splitpace::Act::kDropL2) {
+        drop_l2(h2, spare);
+      } else {
+        const int budget = std::max(1, o_.kv_split_budget);
+        const model::Model::SplitStats a = m_.split_stats();
+        const bool could_open = m_.split_can_open();
+        {  // a command of its own: every session a request is in flight on is named live, or nothing is sent now
+          Cmd c{};
+          c.op = kCmdState;
+          c.n_ops = 1;
+          c.ops[0] = {kStSplit, h, budget, 0};
+          if (!issue(c, true)) {
+            split_retry_ = t + 5;
+            return;
+          }
+          digest("state");
+        }
+        const model::Model::SplitStats b = m_.split_stats();
+        const int now_split = (int)(b.split_pieces - a.split_pieces), deferred = (int)(b.split_deferred - a.split_deferred);
+        if (now_split > 0) demoted_.push_back({t, now_split});
+        if (now_split > 0 || deferred > 0)
+          std::printf("serve: session %016llx split: %d pieces%s; %llu quarter slots in %llu numbers, %llu ghosts (level %d, pressure %.2f, idle %.0f s of %.0f s)\n",
+                      (unsigned long long)key, now_split,
+                      deferred ? (", " + std::to_string(deferred) + " left whole for want of a quarter number").c_str() : "",
+                      (unsigned long long)b.quarter_slots, (unsigned long long)b.quarter_numbers, (unsigned long long)b.ghost_numbers, lv.level,
+                      lv.pressure, idle, lv.age_s);
+        const splitpace::Outcome o = splitpace::after(now_split, budget, deferred, t);
+        if (o.done) split_pending_.erase(std::remove(split_pending_.begin(), split_pending_.end(), h), split_pending_.end());
+        else split_retry_ = o.retry_at;
+        // a command that deferred pieces waits for a number to open; one sent with a number open that split nothing waits the plain retry
+        split_waits_ = deferred > 0 && !(could_open && now_split == 0);
+      }
+      if (!splitpace::go_on(1e3 * (now_s() - t0), lv.pass_ms)) return;
+    }
+  }
+  // ---- the imager: conversations are imaged to each Spark's SSD as quarters and then marked, never in the way of a request.
+  // Nothing between a prompt's chunks, at an admission, in finish() or in persist_slot: an idle command when nothing is in flight, queued,
+  // waiting or arriving; inside a decoding run, rides (a bit of the step's control word, one host all-gather, the store's bookkeeping between two steps).
+  // Work to do: a conversation with pieces that have no image, or image commands not settled yet (a settle marks).
+  // A conversation is imaged once it has been idle for --kv-split-after-s (default 0, every mode); a request waiting for clean blocks
+  // does not wait for the age.
+  bool imager_aged(const Session& x) const {
+    return splitpace::pool_waiter(!wait_.empty(), pool_waits_, pf_waits_) || o_.kv_split_after_s <= 0 || now_s() - std::max(x.t_fin, split_start_) >= o_.kv_split_after_s;
+  }
+  bool imager_work() {
+    if (m_.image_pending() > 0) return true;
+    for (const int h : split_pending_) {
+      uint64_t key = 0;
+      const Session* x = session_of(h, &key);
+      if (x && !in_flight(key, *x) && imager_aged(*x) && m_.image_todo(h) > 0) return true;
+    }
+    return false;
+  }
+  // The conversation to image next: the least recently used one on the list that no request is in flight on, off its line first; those with nothing
+  // left to queue leave the list (the settle that marks them is the work that remains). -1: none.
+  int imager_pick() {
+    int best = -1;
+    bool best_off_line = false;
+    uint64_t used = 0;
+    for (size_t i = 0; i < split_pending_.size();) {
+      uint64_t key = 0;
+      Session* x = session_of(split_pending_[i], &key);
+      if (!x || m_.image_todo(x->h) == 0) {
+        split_pending_.erase(split_pending_.begin() + i);
+        continue;
+      }
+      if (!in_flight(key, *x) && imager_aged(*x)) {
+        const bool off_line = x->slot < 0;
+        if (best < 0 || (off_line && !best_off_line) || (off_line == best_off_line && x->used < used)) best = x->h, best_off_line = off_line, used = x->used;
+      }
+      ++i;
+    }
+    return best;
+  }
+  // the sessions a request is in flight on, for a ride's `live` (false: they do not all fit in the list)
+  bool imager_live(int32_t* live) const {
+    int n = 0;
+    for (const auto& [k, x] : sess_) {
+      if (!in_flight(k, x)) continue;
+      if (n >= model::kMaxSlots) return false;
+      live[n++] = x.h;
+    }
+    return true;
+  }
+  // The idle pass: at the top of the loop, with nothing in flight, queued, waiting or arriving (splitpace::idle_ok, asked before each command),
+  // ride commands back to back (--kv-split-budget pieces each) for at most 250 ms. Between a prompt's chunks, at an admission, in finish() and in
+  // persist_slot it returns at once.
+  void imager_tick() {
+    if (rot_.empty()) stalled_ = false, pool_waits_ = 0;  // nothing in the rotation: no stall, no flight waits for the pool
+    if (pfq_.empty()) pf_waits_ = false;
+    {  // one line per request that waits at its start while nothing in flight can step; the stall line keeps its text and its own flag
+      const bool aw = splitpace::all_wait(!rot_.empty(), stalled_, !pfq_.empty(), pf_reading(), pf_waits_);
+      if (aw && pf_waits_ && !pfq_.empty() && !join_active() && pf_wait_noted_ != pfq_.front()->f.rq.h.req_id) {
+        pf_wait_noted_ = pfq_.front()->f.rq.h.req_id;
+        size_t convs = 0;
+        for (const int h : split_pending_) convs += m_.image_todo(h) > 0;
+        if (imager_work())
+          std::printf("serve: req %llu waits at its start for the pool and nothing in flight can step (%zu paused, %zu waiting for a slot): the imager makes room (%llu image jobs queued, %zu conversations to image)\n",
+                      (unsigned long long)pf_wait_noted_, rot_.size(), wait_.size(), (unsigned long long)m_.image_pending(), convs);
+        else
+          std::printf("serve: req %llu waits at its start for the pool and nothing in flight can step (%zu paused, %zu waiting for a slot): nothing can be imaged: it waits for a request to end\n",
+                      (unsigned long long)pf_wait_noted_, rot_.size(), wait_.size());
+      }
+    }
+    if (!stalled_) stall_noted_ = false;
+    if (join_active() || !imager_work()) {
+      if (stalled_ && !stall_noted_ && !join_active()) {
+        stall_noted_ = true;
+        std::printf("serve: every request in flight waits for the pool (%zu paused, %zu waiting for a slot): nothing can be imaged: they wait for a request to end\n", rot_.size(), wait_.size());
+      }
+      return;
+    }
+    if (stalled_ && !stall_noted_) {
+      stall_noted_ = true;
+      size_t convs = 0;
+      for (const int h : split_pending_) convs += m_.image_todo(h) > 0;
+      std::printf("serve: every request in flight waits for the pool (%zu paused, %zu waiting for a slot): the imager makes room (%llu image jobs queued, %zu conversations to image)\n",
+                  rot_.size(), wait_.size(), (unsigned long long)m_.image_pending(), convs);
+    }
+    const auto idle = [&] {
+      return splitpace::idle_ok(!flying_.empty(), !rot_.empty(), splitpace::pfq_busy(!pfq_.empty(), pf_reading(), pf_waits_), !ready_.empty(), !wait_.empty(), io_.submit_waiting(), true,
+                                splitpace::all_wait(!rot_.empty(), stalled_, !pfq_.empty(), pf_reading(), pf_waits_));
+    };
+    if (pfq_.empty()) reader_wait_noted_ = false;
+    if (splitpace::reader_wait(!rot_.empty(), pf_reading(), !wait_.empty(), true) && !reader_wait_noted_) {  // a prompt read alone: no decoder in the rotation (flying_ holds the prompt itself)
+      reader_wait_noted_ = true;  // The rule: nothing between a prompt's chunks. The request waits for the reader's end, said once per reader
+      ++reader_waits_total_;
+      std::printf("serve: a request waits for unwritten quarters while a prompt is read alone (%llu image jobs queued, %zu conversations to image): it waits for the reader's end\n",
+                  (unsigned long long)m_.image_pending(), split_pending_.size());
+    }
+    const double t0 = now_s();
+    while (idle() && imager_work()) {
+      const int h = imager_pick();
+      const model::Model::SplitStats a = m_.split_stats();
+      Cmd c{};
+      c.op = kCmdState;
+      c.n_ops = 1;
+      c.ops[0] = {kStRide, h, std::max(1, o_.kv_split_budget), 0};
+      if (!imager_live(c.live)) return;
+      bcast(ring_, c);
+      wd_.started = now_s();  // a ride is watched as a step is: a rank that waits in it for a partner ends with the watchdog's line
+      apply_ops(m_, c);
+      wd_.started = 0;
+      digest("ride");
+      const model::Model::SplitStats b = m_.split_stats();
+      const int imaged = (int)(b.imaged - a.imaged), marked = (int)(b.split_pieces - a.split_pieces);
+      if (imaged > 0 || marked > 0 || h > 0) {
+        if (marked > 0) demoted_.push_back({now_s(), marked});
+        uint64_t key = 0;
+        if (h > 0) session_of(h, &key);
+        // the counts are the settle's of the earlier commands; the conversation is the one this command queued
+        char q[40] = "none";
+        if (h > 0) std::snprintf(q, sizeof q, "%016llx", (unsigned long long)key);
+        std::printf("serve: split: settled: %d marked, %d imaged (idle); queued %s; %llu ghosts\n", marked, imaged, q, (unsigned long long)b.ghost_numbers);
+      }
+      if (1e3 * (now_s() - t0) >= 250) return;
+      if (h < 0 && b.image_pending == a.image_pending && imaged == 0 && marked == 0) {  // a settle that could settle nothing yet: the image streams are still at it
+        if (m_.image_pending() == 0) return;
+      }
+    }
+  }
+  // The ride: from a step callback, when one is due (splitpace::ride_due) and no pause is being asked, rank 0 asks for the request and flips
+  // kCtlSplit in its control word `word`; every rank runs split_ride after the step that shows it, and the run goes on. A flip no step read leaves
+  // the work pending for the next one.
+  struct RideSplit {
+    bool flipped = false;
+    uint64_t count = 0;                 // the ride count at the flip
+    uint64_t rides0 = 0, imaged0 = 0, marked0 = 0;  // at the run's start: the run's end line
+    bool started = false;
+  };
+  double split_ride_at_ = 0, split_check_at_ = 0;
+  int pool_waits_ = 0;        // flights the last pass of run() put back for the pool
+  bool pf_waits_ = false;     // the front of pfq_ has not begun and waits for the pool (splitpace::pf_start_waits)
+  uint64_t pf_wait_noted_ = 0;  // the request whose `waits at its start ... nothing in flight can step` line was printed last
+  // some queued long prompt is being prefilled: begun, or its return's units are in flight (a command, then the decoders' window)
+  bool pf_reading() const {
+    for (const auto& L : pfq_)
+      if (L->begun || L->joining) return true;
+    return false;
+  }
+  bool stalled_ = false;      // the rotation cannot move (splitpace::rot_stalled)
+  bool stall_noted_ = false;
+  uint64_t reader_waits_total_ = 0;
+  bool reader_wait_noted_ = false;
+  void ride_split(RideSplit& r, uint32_t& word, bool pausing, double t) {
+    if (!o_.imager) return;
+    if (!r.started) {
+      const model::Model::SplitStats a = m_.split_stats();
+      r.rides0 = a.rides, r.imaged0 = a.imaged, r.marked0 = a.split_pieces, r.started = true;
+    }
+    ride_split_end(r, t);
+    if (r.flipped || pausing || t - split_ride_at_ < o_.kv_split_ride_ms / 1e3 || t - split_check_at_ < 0.05 || !imager_work()) return;
+    split_check_at_ = t;  // the readings below walk the store's records: at most every 50 ms, not every token row
+    RideReq q;
+    if (!imager_live(q.live)) return;
+    std::vector<int> live;
+    for (const int32_t h : q.live)
+      if (h > 0) live.push_back(h);
+    // the blocks that can be given back without a write: the spare numbers, and the clean pieces of the conversations no request runs on
+    const int64_t ready = m_.slot_spare() + (int64_t)m_.state_giveable(live);
+    const bool waiter = splitpace::pool_waiter(!wait_.empty(), pool_waits_, pf_waits_);
+    if (!splitpace::ride_due((splitpace::Mode)o_.kv_split_mode, ready, split_marks_, true, t, split_ride_at_, pausing, r.flipped, (double)o_.kv_split_ride_ms, waiter)) return;
+    q.h = imager_pick();
+    q.budget = splitpace::ride_pieces(ready, split_marks_, o_.kv_split_ride_pieces, waiter);
+    split_ride_set(q);
+    r.flipped = true, r.count = split_ride_count();
+    word ^= kCtlSplit;
+    m_.set_ctl(word);
+  }
+  void ride_split_end(RideSplit& r, double t = -1) {
+    if (!r.flipped || split_ride_count() == r.count) return;
+    r.flipped = false;
+    split_ride_at_ = t < 0 ? now_s() : t;
+  }
+  // the run's end: one line, when the run carried rides
+  void ride_split_run_end(RideSplit& r) {
+    if (!o_.imager || !r.started) return;
+    ride_split_end(r);
+    const model::Model::SplitStats b = m_.split_stats();
+    if (b.rides > r.rides0) {
+      uint64_t longest = 0;
+      split_ride_take_longest(&longest);
+      std::printf("serve: split rides in the run: %llu rides, %llu imaged, %llu marked, longest %.2f ms\n", (unsigned long long)(b.rides - r.rides0),
+                  (unsigned long long)(b.imaged - r.imaged0), (unsigned long long)(b.split_pieces - r.marked0), longest / 1e6);
+    }
+  }
+  // A conversation holding quarter slots goes to the SSD: what `evict` does for its victim (a line it holds goes first, then kStSpill).
+  void drop_l2(int h, int64_t spare_before) {
+    uint64_t key = 0;
+    Session* x = session_of(h, &key);
+    if (!x) return;
+    if (x->slot >= 0) persist_slot(x->slot, true);
+    state({{kStSpill, h, 0, 0}});
+    split_forget(h);
+    forget_evicted();
+    ++l2_dropped_total_;
+    const int64_t spare = m_.slot_spare();
+    std::printf("serve: session %016llx dropped from L2: %lld numbers back (spare %lld, low %lld)\n", (unsigned long long)key,
+                (long long)(spare - spare_before), (long long)spare, (long long)split_marks_.low);
+  }
+  // pieces demoted a second over the last 10 s
+  uint64_t demote_pps() {
+    const double t = now_s();
+    while (!demoted_.empty() && t - demoted_.front().first > 10) demoted_.pop_front();
+    int n = 0;
+    for (const auto& d : demoted_) n += d.second;
+    return (uint64_t)(n / 10);
+  }
+  // The lists of conversation h below `upto` that are still quarter slots (the bookmarks are pf_begin's own call)
+  int lists_split(int h, int upto) const {
+    int in = 0, disk = 0, sp = 0;
+    m_.state_list_numbers(h, upto, &in, &disk, &sp);
+    return sp;
+  }
+  // One unit of a deferred return: after `give_back` says the pieces' numbers are there (as admission counted them: the idle lines'
+  // reservations are still reserved until it does), one join command carrying exactly the lists still split below `upto`. 0: every list
+  // below `upto` is whole; 1: it made progress; 2: no number yet (the request waits, nothing is cut, nothing else is held up); 3: the pool
+  // does not give the SSD's pieces without a running request's line, so they are not units (the request's begin reads them).
+  int lists_disk(int h, int upto) const {
+    int in = 0, disk = 0, sp = 0;
+    m_.state_list_numbers(h, upto, &in, &disk, &sp);
+    return disk;
+  }
+  int join_unit(const JoinAsk& ja, uint64_t req_id, uint64_t sid, uint64_t base) {
+    const int rest = lists_split(ja.h, ja.upto);
+    const int disk = lists_disk(ja.h, ja.upto);
+    const il::ReturnUnit ru = il::return_unit(disk, rest, o_.kv_join_pieces);
+    if (ru.read > 0) {  // the pieces on the SSD first, at most J in a command: a read-back of lists below `upto` (the bookmarks are pf_begin's)
+      if (!il::return_fits(disk, return_room(sid, base))) return 3;  // asked before every unit: the room is what is left of the lists
+      if (!give_back(ru.read, {}, sid, base, -1, 0, "a conversation read back", false, false)) return 2;
+      const double t0 = now_s();
+      state({{kStUnspill, ja.h, (int32_t)ru.read, ja.upto}});  // the count: the lists this command brings, never 0 (0 is no limit)
+      m_.drain();
+      const int left = lists_disk(ja.h, ja.upto);
+      jc_.learn_disk(1e3 * (now_s() - t0), std::max(0, disk - left));
+      if (left == 0 && lists_split(ja.h, ja.upto) == 0) return 0;
+      return left < disk ? 1 : 2;
+    }
+    if (rest == 0) {
+      std::printf("serve: req %llu: the return of session %016llx to position %d is whole\n", (unsigned long long)req_id, (unsigned long long)ja.key, ja.upto);
+      return 0;
+    }
+    if (!give_back(std::min(rest, o_.kv_join_pieces), {}, sid, base, -1, 0, "a conversation joined", false)) return 2;
+    const model::Model::SplitStats a = m_.split_stats();
+    const double t0 = now_s();
+    const int prev = m_.state_info(ja.h).slots;
+    state({{kStJoin, ja.h, ja.upto, (int32_t)rest}});  // the count: what admission counted, never 0 (0 is no limit)
+    const int cur = m_.state_info(ja.h).slots;
+    const model::Model::SplitStats b = m_.split_stats();
+    jc_.learn_join(1e3 * (now_s() - t0), (int)(b.revives - a.revives), (int)(b.exchanged - a.exchanged));
+    if (lists_split(ja.h, ja.upto) == 0) return 0;
+    return cur < prev ? 1 : 2;
+  }
+  // The conversation's pieces below `upto` that are quarter slots come back whole (kStJoin commands of at most --kv-join-pieces pieces,
+  // each checked on the device and agreed by the four ranks), within `budget` numbers in all (restore_budget, read once: each command
+  // carries what is left, and none is sent with nothing left: 0 on the wire is no limit; PICO_OLD_RULES sends 0). Before anything reads or
+  // writes them: the core's own join inside an operation is a guard that cuts and says so. Returns the quarter slots it still names.
+  int join_back(Session& x, int upto, uint64_t key, int64_t budget) {
+    const model::Model::SplitStats a = m_.split_stats();
+    const double t0 = now_s();
+    int prev = m_.state_info(x.h).slots, commands = 0;
+    int64_t left = budget;
+    for (; commands < 100000 && prev > 0; ++commands) {
+      const int64_t count = model::rules::join_command_count(left);
+      if (count < 0) break;  // nothing left to take: no command (0 on the wire is no limit)
+      state({{kStJoin, x.h, upto, (int32_t)std::min<int64_t>(count, 1 << 30)}});
+      const int cur = m_.state_info(x.h).slots;
+      left = budget - (int64_t)(m_.split_stats().join_taken - a.join_taken);
+      if (cur >= prev) break;  // nothing below `upto`, or no number (join_short): the request is planned from what is whole
+      prev = cur;
+    }
+    const model::Model::SplitStats b = m_.split_stats();
+    if (b.joins > a.joins) {
+      const double ms = 1e3 * (now_s() - t0);
+      const uint64_t pieces = (b.revives - a.revives) + (b.exchanged - a.exchanged);
+      jc_.learn_join(ms, (int)(b.revives - a.revives), (int)(b.exchanged - a.exchanged));
+      std::printf("serve: session %016llx joined to position %d: %llu pieces back (%llu taken back from their ghosts, %llu exchanged) in %d commands, %.1f ms%s\n",
+                  (unsigned long long)key, upto, (unsigned long long)pieces, (unsigned long long)(b.revives - a.revives),
+                  (unsigned long long)(b.exchanged - a.exchanged), commands, ms, b.join_short > a.join_short ? "; stopped for want of a number" : "");
+    }
+    return m_.state_info(x.h).slots;
+  }
+  // A decoding run asks to pause after its step when a CONFIG is waiting or a tenant's change is due to begin or to be polled
+  // (lend_pace.h): the batch of a few long responses is one run for minutes, and the change is a command between runs.
+  bool lend_pause_due(double now = -1, lendpace::Why* why = nullptr) {
+    lendpace::State st;
+    const double t = now < 0 ? now_s() : now;
+    st.config_waiting = io_.config_pending();
+    st.change_active = m_.tenant_active();
+    st.begin_wanted = !st.change_active && lend_begin_id(t) >= 0;
+    // the settle lend_tick would run: the same gate and interval (a pause that no tick answers would repeat)
+    st.settle_due = (m_.engram_lend_enabled() || m_.tenant_other_enabled()) && m_.window_owed() > 0 && t - win_settled_ >= 5 && m_.window_may_run();
+    st.watch_due = memwatch::due(mem_watch_on(), t, watch_at_);
+    st.now = t, st.poll_at = engram_poll_at_;
+    if (why) *why = lendpace::pause_why(st);
+    return lendpace::pause_due(st);  // no split or drop command ends a run: they go between runs (split_tick)
+  }
+  // A decoding run's bookkeeping on rank 0, once a step: cmd.cpp calls it at the end of the loop's turn, after the next step was queued and the
+  // ride done, so it runs while the device computes that step and not in the token callback (which runs for every row). The flips of the watch
+  // and of the imager's ride, the STATS frame at its limit, and the reasons that pause the run (lend_pause_due); one clock read for all of them.
+  // `pausing`: a pause or cancel is already asked. `pause_bit`: the control word's bit this run pauses with (1 for a single run, kCtlPause for a
+  // batch). True when it asked for the pause itself (a reason is kept for pause_note). The control word is read when a step's sample kernel runs,
+  // so a bit set here, after the step was queued, is read by the step that is running or the next one.
+  bool step_hook(RideWatch& rw, RideSplit& rs, uint32_t& word, bool pausing, uint32_t pause_bit) {
+    const double t = now_s();
+    ride_watch(rw, word, pausing, t);
+    ride_split(rs, word, pausing, t);
+    publish(true, t);
+    if (pausing) return false;
+    lendpace::Why why = lendpace::Why::None;
+    if (!lend_pause_due(t, &why)) return false;
+    m_.set_ctl(word |= pause_bit);
+    pause_why_ = why;
+    return true;
+  }
+  // The reason the run that just ended paused, when it was a tenant's change, a setting or owed groups: every such pause costs each decoder a
+  // whole step, so the log names who asked. One line after the run's own, none for a pause an arrival or a burst's end asked.
+  lendpace::Why pause_why_ = lendpace::Why::None;
+  void pause_note() {
+    if (pause_why_ == lendpace::Why::None) return;
+    std::printf("serve: the run was paused for %s\n", lendpace::why_text(pause_why_));
+    pause_why_ = lendpace::Why::None;
+  }
   void lend_tick() {
-    if (!m_.engram_lend_enabled()) return;
+    if (join_active()) return;  // a join in flight is a store change in the tenants' one queue: they wait at most its length
+    if (!m_.engram_lend_enabled() && !m_.tenant_other_enabled()) return;
     const double t = now_s();
     if (m_.window_owed() > 0 && t - win_settled_ >= 5) settle_windows();
-    const model::Model::EngramLendInfo li = m_.engram_lend_info();
     Cmd c{};
     c.op = kCmdLend;
-    if (li.running) {
+    int id = model::lend::kTenantEngram;
+    if (m_.tenant_active()) {
+      id = m_.tenant_change_id();
       if (t < engram_poll_at_) return;
       engram_poll_at_ = t + 0.1;
       c.rows = model::Model::kLendPoll;

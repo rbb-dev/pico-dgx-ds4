@@ -205,6 +205,58 @@ def mem_available(nodes):
     return v
 
 
+def own_rss_gib():
+    """this process's resident memory (VmRSS): the test runs on rank 0's Spark, so what it holds is in that Spark's MemAvailable"""
+    with open('/proc/self/status') as f:
+        for line in f:
+            if line.startswith('VmRSS:'):
+                return int(line.split()[1]) / 1048576.0
+    return 0.0
+
+
+def gpu_apps():
+    """{pid: (MiB used, cgroup)} of every compute app nvidia-smi lists on this box. On a GB10 the device's memory is the host's:
+    it is in MemAvailable, and in no container's or cgroup's own counter"""
+    r = subprocess.run(['nvidia-smi', '--query-compute-apps=pid,used_memory', '--format=csv,noheader,nounits'], capture_output=True, text=True, timeout=30)
+    out = {}
+    for line in r.stdout.splitlines():
+        f = [x.strip() for x in line.split(',')]
+        if len(f) != 2 or not f[0].isdigit() or not f[1].isdigit():
+            continue
+        try:
+            with open('/proc/%s/cgroup' % f[0]) as c:
+                cg = c.read().strip()
+        except OSError:
+            cg = ''
+        out[int(f[0])] = (int(f[1]), cg)
+    return out
+
+
+def gpu_split(apps):
+    """(engine MiB, other MiB): the engine's processes are those in the pico-engine cgroup; every other compute app is the image
+    encoder's container (its caching allocator keeps what it took to encode a request)"""
+    eng = sum(m for m, cg in apps.values() if 'pico-engine' in cg)
+    return eng, sum(m for m, cg in apps.values() if 'pico-engine' not in cg)
+
+
+def let_go():
+    """gives back what the test's own request payload took (a request's rows are hundreds of MiB): the collector runs and the
+    allocator returns its free pages to the system, so the reading that follows is of the engine and the system"""
+    import ctypes
+    import gc
+    gc.collect()
+    try:
+        ctypes.CDLL('libc.so.6').malloc_trim(0)
+    except OSError:
+        pass
+
+
+def leak_ok(node, x, y, spread, own_growth):
+    """a node's MemAvailable fell from x to y GiB: within the spread, once the fall this process's own resident growth explains
+    on the node it runs on ('local') is taken out"""
+    return abs((x - y) - (own_growth if node == 'local' else 0.0)) <= spread
+
+
 def need_s3(e):
     s = stats(e)[2]
     need('image_numbers' in s, 'the engine reports image_numbers: it is the S3 build')
@@ -248,10 +300,53 @@ def big(e, T, session, n_spans=36, seed=9, max_new=8):
     return image_submit(e, session, text, spans, seed, max_new=max_new, keep=False), rows
 
 
+MEMINFO_TERMS = ('MemAvailable', 'MemFree', 'Cached', 'Shmem', 'AnonPages', 'Slab', 'SUnreclaim', 'Mlocked', 'Unevictable',
+                 'HugePages_Total', 'HugePages_Free')
+
+
+def local_snapshot():
+    """this box's terms: the engine's own (its cgroup's memory.current, its processes' VmRSS, its GPU memory: the compute apps in
+    the pico-engine cgroup), the image encoder container's GPU memory (the other compute apps), /proc/meminfo's terms (kB, the
+    huge page counts as numbers) and the client's own VmRSS"""
+    apps = gpu_apps()
+    eng_pids = [p for p, (m, cg) in apps.items() if 'pico-engine' in cg]
+    gpu_eng, gpu_enc = gpu_split(apps)
+    cg_mib = rss_mib = None
+    for p in eng_pids:
+        try:
+            with open('/proc/%d/cgroup' % p) as f:
+                path = f.read().strip().split('::')[-1]
+            with open('/sys/fs/cgroup%s/memory.current' % path) as f:
+                cg_mib = int(f.read()) / 1048576.0
+            with open('/proc/%d/status' % p) as f:
+                rss_mib = sum(int(l.split()[1]) for l in f if l.startswith('VmRSS:')) / 1024.0 + (rss_mib or 0)
+        except OSError:
+            pass
+    mi = {}
+    with open('/proc/meminfo') as f:
+        for line in f:
+            k, v = line.split(':')
+            if k in MEMINFO_TERMS:
+                mi[k] = int(v.split()[0])
+    return dict(cgroup=cg_mib, vmrss=rss_mib, gpu_engine=gpu_eng, gpu_encoder=gpu_enc, meminfo=mi, client=own_rss_gib() * 1024.0)
+
+
+def engine_terms_ok(s0, s1, tol_mib):
+    """the engine's own terms on the test's host did not grow past the tolerance: [(name, before, after, ok)]. A term that could
+    not be read (None) is not a pass"""
+    out = []
+    for k, name in (('cgroup', 'the engine cgroup memory.current'), ('vmrss', 'rank 0 VmRSS'), ('gpu_engine', 'the engine GPU memory')):
+        x, y = s0[k], s1[k]
+        out.append((name, x, y, x is not None and y is not None and y - x <= tol_mib))
+    return out
+
+
 def t_leak(a, e, T):
     nodes = a.nodes.split(',') if a.nodes else []
+    workers = [n for n in nodes if n != 'local']
     s0 = need_s3(e)
     m0 = mem_available(nodes) if nodes else []
+    p0 = local_snapshot() if 'local' in nodes else None
     req, rows = big(e, T, S0 + 10, a.rows_spans)
     want = numbers_for(rows)
     peak = 0

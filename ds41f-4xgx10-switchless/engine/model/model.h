@@ -360,6 +360,15 @@ class Model {
   // barrier and the weights' all-gathers after it, so a rank that cannot allocate stops every rank at
   // the barrier. Returns this rank's free device memory afterwards.
   size_t prefill_init(comm::Ring& ring);
+  // Before the weights load, when prefill_init will follow: allocates the prefill's gathered wq_a, wkv, wo_b (and
+  // their scales), with `engram` the Engram wkv, whole, and the router gate (decode's own whole buffer). gathered_dest(name, bytes) then gives the address in
+  // slot `rank` of the tensor `name` of this rank's weight file (nullptr for any other tensor, or when nothing was
+  // reserved): the loader reads the tensor there (dsw::LoadOptions::dest), decode uses it from there, and
+  // prefill_init gathers only the other ranks' slices into the rest. Without reserve_gathered the weights stay in
+  // the arena. aliased(): the tensors and bytes aimed so far.
+  void reserve_gathered(bool engram);
+  void* gathered_dest(const std::string& name, uint64_t bytes);
+  void aliased(size_t* tensors, size_t* bytes) const;
   // ablit: the chunk's session's Sampling::ablit (every chunk carries it; sp only the one that samples)
   uint64_t prefill(int a, int M, const Sampling* sp = nullptr, int handle = -1, const std::vector<int>& snaps = {},
                    bool ced = false, float ablit = 0.f, int rows_set = 0);

@@ -266,4 +266,127 @@ struct Backoff {
   }
 };
 
+// ---- the tenants ----
+
+// Every borrower of the pool's groups is a tenant of one table. `groups` are the tenant's settled groups; `pending` the groups
+// of a grow in flight (they left the pool at its begin and reach the tenant at its end); a shrink in flight has none (its
+// groups leave the tenant when they are back in the pool). Groups owed to the pool belong to no tenant. At every command's
+// boundary: sum(groups) + sum(pending) + owed == the ledger's groups.
+enum TenantKind : uint8_t { kKindHost = 0, kKindDevice };
+enum Standing : uint8_t { kRequired = 0, kCache, kOnDemand };
+constexpr int kTenantMax = 16;
+// Ids are protocol constants.
+enum : int {
+  kTenantWindows = 0,
+  kTenantEngram = 1,
+  kTenantWork = 3,        // a model's work area
+  kTenantPrefill = 4,     // the second set of the prefill's row-sized buffers (model/rows_lend.cu)
+  kTenantModel0 = 8,      // 8-15: models loaded while the engine runs
+  kTenantModelLast = 15,
+};
+inline const char* tenant_name(int id) {
+  return id == kTenantWindows ? "windows" : id == kTenantEngram ? "Engram cache"
+         : id == kTenantWork ? "work area" : id == kTenantPrefill ? "prefill rows" : id == 15 ? "model 15 (a test build's dummy block)" : id >= kTenantModel0 ? "model" : "tenant";
+}
+struct Tenant {
+  int id = -1;
+  TenantKind kind = kKindHost;
+  Standing standing = kOnDemand;
+  int groups = 0, pending = 0;
+  int floor_groups = 0;   // a Cache tenant gives way down to here
+  bool idle = true;       // an OnDemand tenant nothing is using now
+  uint64_t size = 0;      // the body's own size (bytes) the groups hold; the table does not read it
+};
+
+class Tenants {
+ public:
+  bool add(int id, TenantKind kind, Standing standing, int floor_groups = 0) {
+    if (id < 0 || id >= kTenantMax || n_ >= kTenantMax || find(id)) return false;
+    Tenant t;
+    t.id = id, t.kind = kind, t.standing = standing, t.floor_groups = floor_groups;
+    t_[n_++] = t;
+    std::sort(t_, t_ + n_, [](const Tenant& a, const Tenant& b) { return a.id < b.id; });
+    return true;
+  }
+  Tenant* find(int id) {
+    for (int i = 0; i < n_; ++i)
+      if (t_[i].id == id) return &t_[i];
+    return nullptr;
+  }
+  const Tenant* find(int id) const { return const_cast<Tenants*>(this)->find(id); }
+  int size() const { return n_; }
+  const Tenant& at(int i) const { return t_[i]; }  // in id order
+  int groups_of(int id) const { const Tenant* t = find(id); return t ? t->groups : 0; }
+  int pending_of(int id) const { const Tenant* t = find(id); return t ? t->pending : 0; }
+  int sum_groups() const { int s = 0; for (int i = 0; i < n_; ++i) s += t_[i].groups; return s; }
+  int sum_pending() const { int s = 0; for (int i = 0; i < n_; ++i) s += t_[i].pending; return s; }
+
+  // The groups the other tenants hold or have in flight. The old rule: the ledger's groups less this tenant's settled ones
+  // (a grow of its own in flight, and any other tenant's, count against it).
+  int others(int id, const Ledger& l) const {
+#ifdef PICO_OLD_RULES
+    return l.groups - groups_of(id);
+#else
+    (void)l;
+    return sum_groups() + sum_pending() - groups_of(id) - pending_of(id);
+#endif
+  }
+  // The most groups tenant `id` may hold: what the pool can lend in all, less the other tenants' groups and pending, the
+  // groups owed to the pool and `later` (the groups of the windows the options allow that are not open). The caller
+  // takes the smallest of the ranks' values.
+  int room(int id, const Ledger& l, size_t numbers, size_t whole, int later) const {
+#ifdef PICO_OLD_RULES
+    return std::max(0, max_total_groups(numbers, whole) - others(id, l) - later);  // its others already include what is owed
+#else
+    return std::max(0, max_total_groups(numbers, whole) - others(id, l) - l.owed - later);
+#endif
+  }
+  // The invariant above, against the ledger.
+  bool consistent(const Ledger& l) const { return sum_groups() + sum_pending() + l.owed == l.groups; }
+
+  // The tenant asked for one group when the reclaim's first tiers are spent: idle OnDemand tenants first, then Cache tenants
+  // above their floor; never a Required tenant. -1: none. The old rule names the first tenant
+  // in table order that holds a group above its floor.
+  int next_victim() const {
+#ifdef PICO_OLD_RULES
+    for (int i = 0; i < n_; ++i)
+      if (t_[i].standing != kRequired && t_[i].groups > t_[i].floor_groups) return t_[i].id;
+    return -1;
+#else
+    for (int i = 0; i < n_; ++i)
+      if (t_[i].standing == kOnDemand && t_[i].idle && t_[i].groups > t_[i].floor_groups && !t_[i].pending) return t_[i].id;
+    for (int i = 0; i < n_; ++i)
+      if (t_[i].standing == kCache && t_[i].groups > t_[i].floor_groups && !t_[i].pending) return t_[i].id;
+    return -1;
+#endif
+  }
+
+ private:
+  Tenant t_[kTenantMax];
+  int n_ = 0;
+};
+
+// ---- the one queue of store changes ----
+
+// A tenant's change (begin, polls) and a window's open or close or a settle of owed groups never interleave: the proof's
+// readings of a change are never mixed with another change's allocation. While a tenant change is in flight no window
+// command and no settle runs; a tenant change does not begin while a window command runs.
+struct StoreQueue {
+  bool change = false, window = false;
+  bool window_may_run() const {
+#ifdef PICO_OLD_RULES
+    return true;
+#else
+    return !change;
+#endif
+  }
+  bool change_may_begin() const {
+#ifdef PICO_OLD_RULES
+    return true;
+#else
+    return !window && !change;
+#endif
+  }
+};
+
 }  // namespace model::lend

@@ -368,6 +368,38 @@ __global__ void __launch_bounds__(256) argmax_kernel(DevChannel ch, const ArgMax
   finish_grid(ch, s);
 }
 
+__global__ void __launch_bounds__(256) argmax_row_kernel(DevChannel ch, const ArgMax* in, ArgMax* out, int rows,
+                                                         const uint4* table, int base, int table_rows, int row_u4,
+                                                         int vocab, uint4* rows_out) {
+  __shared__ int win[64];
+  const uint64_t s = next_seq(ch);
+  const size_t hdr = row_block_header(rows, sizeof(ArgMax)), row_bytes = (size_t)row_u4 * 16;
+  uint8_t* sb = (uint8_t*)send_buf(ch, s);
+  for (int r = threadIdx.x; r < rows; r += blockDim.x) ((ArgMax*)sb)[r] = in[r];
+  for (int i = threadIdx.x; i < rows * row_u4; i += blockDim.x) {
+    const int id = in[i / row_u4].i;
+    ((uint4*)(sb + hdr))[i] = slice_holds(id, base, table_rows) ? table[(size_t)(id - base) * row_u4 + i % row_u4]
+                                                                : make_uint4(0, 0, 0, 0);
+  }
+  post_grid(ch, s, hdr + (size_t)rows * row_bytes);
+  wait_all(ch, s);
+  for (int r = threadIdx.x; r < rows; r += blockDim.x) {
+    ArgMax c[4];
+    for (int k = 0; k < kRanks; k++) {
+      const uint2 w = __ldcv((const uint2*)(src(ch, s, k)) + r);
+      c[k] = ArgMax{__uint_as_float(w.x), (int)w.y};
+    }
+    const int k = winning_rank(c);
+    if (c[k].i < 0 || c[k].i >= vocab) __trap();
+    out[r] = c[k];
+    win[r] = k;
+  }
+  __syncthreads();
+  for (int i = threadIdx.x; i < rows * row_u4; i += blockDim.x)
+    rows_out[i] = ld_cv16(src(ch, s, win[i / row_u4]) + hdr + (size_t)i * 16);
+  finish_grid(ch, s);
+}
+
 void check_size(const DevChannel& ch, size_t bytes, size_t align = 16) {
   if (bytes % align || bytes > ch.cap || !bytes)
     die("comm: collective of %zu bytes (a multiple of %zu, at most %u)", bytes, align, ch.cap);
@@ -518,6 +550,14 @@ void test_stall(uint32_t ns, int block, int piece, cudaStream_t st) {
 void argmax_rows(const DevChannel& ch, const ArgMax* in, ArgMax* out, int rows, cudaStream_t st) {
   check_size(ch, rows * sizeof(ArgMax));
   argmax_kernel<<<1, 256, 0, st>>>(ch, in, out, rows);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void argmax_rows_row(const DevChannel& ch, const ArgMax* in, ArgMax* out, int rows, const void* table, int base,
+                     int table_rows, int row_u4, int vocab, void* rows_out, cudaStream_t st) {
+  if (rows < 1 || rows > 64 || row_u4 < 1) die("comm: argmax of %d rows carrying %d x 16 bytes", rows, row_u4);
+  check_size(ch, row_block_bytes(rows, sizeof(ArgMax), (size_t)row_u4 * 16));
+  argmax_row_kernel<<<1, 256, 0, st>>>(ch, in, out, rows, (const uint4*)table, base, table_rows, row_u4, vocab, (uint4*)rows_out);
   CUDA_CHECK(cudaGetLastError());
 }
 

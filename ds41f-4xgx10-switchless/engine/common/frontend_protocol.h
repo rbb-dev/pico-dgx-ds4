@@ -50,6 +50,22 @@ enum SubmitFlags : uint32_t {
   // ablated weights path: the request runs with the ablation direction applied. Sessions are kept per flag: the
   // front-end never continues or forks a session with a request of the other flag.
   kFlagAblit = 16,
+  // vision, pixels (server/pixels.h): the image part carries the images' u8 pixels and their grids instead of rows. Never with kFlagImages
+  // (both: malformed). On a connection of either version, with or without kFlagPrefix; it changes no frame the engine sends.
+  kFlagPixels = 32,
+  // The request carries only its prompt's suffix: n_prompt counts the suffix, a SubmitPrefix
+  // sits directly after the header (before the stop ids), and the engine builds the prompt from its own copy of the conversation's
+  // history: ids [0, n_prefix) of the entry named by the epoch, then the suffix. A request the engine cannot build answers DONE
+  // kPrefixGone and the front-end sends the whole prompt.
+  kFlagPrefix = 64,
+};
+
+// With kFlagPrefix, directly after the SubmitHeader: the history entry's epoch (the DONE that taught it) and how many of its ids
+// the prompt begins with. The entry is the session's, or with a base_session_id the base's, at the factor of the built prompt.
+struct SubmitPrefix {
+  uint64_t epoch;
+  uint32_t n_prefix;
+  uint32_t reserved;  // 0
 };
 
 // An image's span of the prompt: positions [start, start + rows), every id 129264 (<｜deepseek_image｜>);

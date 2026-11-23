@@ -1,4 +1,5 @@
 // Collectives for the four-box ring: bootstrap, RDMA setup and the proxy thread (see ring.h).
+#include "comm/host_gather.h"
 #include "comm/ring.h"
 
 #include <arpa/inet.h>

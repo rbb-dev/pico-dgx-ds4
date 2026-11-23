@@ -41,6 +41,26 @@ int main() {
     check(w.run(3), "a queued long prompt (in flight, in no turns) is running");
   }
 
+  // ---- the split: a request runs from its admission to its finish
+  {
+    check(reclaim::split_names_live(true, false), "split: a decoding request's session is named live");
+    check(reclaim::split_names_live(true, true), "split: a paused request's session is named live (a split command runs where every decoder is paused)");
+    check(!reclaim::split_names_live(false, false) && !reclaim::split_names_live(false, true), "split: a conversation no request is in flight on is split");
+  }
+
+  // ---- a unit of a return detaches only lines no request is in flight on
+  {
+    check(!reclaim::unit_may_detach(true, true), "red: a paused request's line is not detached by a read-back unit");
+    check(!reclaim::unit_may_detach(true, false), "a running request's line is not detached");
+    check(reclaim::unit_may_detach(false, false) && reclaim::unit_may_detach(false, true), "a line no request is in flight on may be");
+    // detach_until over lines marked by it leaves the paused request's line: slot 1 is paused, slots 0 and 2 idle
+    std::vector<reclaim::Line> l = {{0, 10, 30, 5, reclaim::unit_may_detach(false, false)}, {1, 11, 10, 5, reclaim::unit_may_detach(true, true)},
+                                    {2, 12, 20, 5, reclaim::unit_may_detach(false, false)}};
+    std::vector<int> gone;
+    reclaim::detach_until(l, -1, [] { return true; }, [&](int t) { gone.push_back(t); });
+    check(gone == std::vector<int>({2, 0}), "red: with the shortage never ending, the idle lines go (least recently used first) and the paused request's line stays");
+  }
+
   // ---- the victim: least recently used idle line with something to give, ties to the lowest slot
   {
     std::vector<reclaim::Line> l = {{0, 10, 50, 5, true}, {1, 11, 20, 5, true}, {2, 12, 20, 5, true}, {3, 13, 5, 5, false},
@@ -159,6 +179,37 @@ int main() {
     const reclaim::WindowActions a = reclaim::window_actions(holders, [&](uint64_t id) { return !w.run(id); });
     eq((long long)a.detach.size(), 32, "32 idle lines holding the tail: 32 detaches planned");
     check(a.running.empty(), "and nobody to wait for");
+  }
+
+  // a request that is not running takes nothing from one that is. The only room is a paused request's line: give_back gives 0 of it, the newcomer waits.
+  {
+    check(!reclaim::idle_for_taker(true, true), "red: a paused request's line is not idle for any taker (the old rule took it: idle for a reservation)");
+    check(!reclaim::idle_for_taker(true, false) && reclaim::idle_for_taker(false, false) && reclaim::idle_for_taker(false, true), "a running request's line is not, a line no request is in flight on is");
+    // scenario: a pool whose only room is slot 0's line, a paused decoder's (the oldest); slot 1 is a running one's. A taker asks for the room.
+    std::vector<reclaim::Line> lines = {{0, 11, 5, 40, reclaim::idle_for_taker(true, true)}, {1, 12, 9, 40, reclaim::idle_for_taker(true, false)}};
+    int gave = 0;
+    int short_ = 40;
+    reclaim::detach_until(lines, -1, [&] { return short_ > 0; }, [&](int t) { ++gave, short_ -= 40; (void)t; });
+    eq(gave, 0, "red: give_back gives 0 of a running or paused request's line: the newcomer waits (the old rule took the paused decoder's)");
+    lines[0].idle = true;  // an idle conversation's line beside them: it, and only it, goes
+    gave = 0, short_ = 40;
+    reclaim::detach_until(lines, -1, [&] { return short_ > 0; }, [&](int t) { ++gave, short_ -= 40; eq(t, 0, "the idle line is the one detached"); });
+    eq(gave, 1, "an idle line completes the room: one detach");
+  }
+
+  // the standstill
+  {
+    check(!reclaim::ext_standstill(0, 1, 1, true, false, false), "red (control: today's rule prints): one waiter alone with image work pending: no standstill");
+    check(reclaim::ext_standstill(0, 5, 5, false, false, false), "red (control: today's rule is silent when a line-less flight waits too): five holders all waiting for an extension, nothing to image: standstill");
+    check(!reclaim::ext_standstill(1, 5, 4, false, false, false), "a holder that was taken: no standstill");
+    check(!reclaim::ext_standstill(0, 5, 5, false, true, false) && !reclaim::ext_standstill(0, 5, 5, false, false, true), "a join running, or a prompt being read: no standstill");
+    check(!reclaim::ext_standstill(0, 0, 0, false, false, false), "no holder at all: no standstill");
+    check(reclaim::ext_blocks(0) && reclaim::ext_blocks(-3) && !reclaim::ext_blocks(1) && !reclaim::ext_blocks(500), "red (control: old rules always true): a refused extension blocks only when the reservation is used up");
+    check(reclaim::ext_pick({10, 40, 25, 7}) == 1, "the pick: the waiter with the longest reply");
+    check(reclaim::ext_pick({10, 40, 40, 7}) == 2, "ties go to the last in the rotation");
+    check(reclaim::ext_pick({}) == -1, "none: -1");
+    check(!reclaim::ext_end_due(1.9, 10) && reclaim::ext_end_due(2.0, 10), "red (control: never under old rules): not before 2 s, then due");
+    check(!reclaim::ext_end_due(5, 1.9) && reclaim::ext_end_due(5, 2.0), "at most one every 2 s");
   }
 
   std::printf("%d cases, %d failed\n", g_n, g_bad);

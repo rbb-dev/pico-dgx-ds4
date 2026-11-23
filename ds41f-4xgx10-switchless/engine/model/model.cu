@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -182,10 +183,12 @@ Model::Impl::Impl(int r, const Options& op) : rank(r), opt(op) {
     route_f = fopen(rd, "wb");
     if (!route_f) die("model: DSGB10_ROUTE_DUMP %s", rd);
   }
-  // factor 16's rotations are tables; 32 and 64 are computed by the kernels from (position, factor) (attn.h Rope)
-  rope_plain_rows = attn::rope_table_rows(opt.max_ctx);
-  rope_plain = dalloc<float2>((size_t)rope_plain_rows * 32);
-  attn::rope_table_build(rope_plain, rope_plain_rows, false, st);
+  // The YaRN layers' rotation at factor 16 is a table; at 32 and 64 it is computed by the kernels from (position, factor).
+  // The plain rotation (layers 0-1 and the drafter) is always computed (attn.h Rope: the same bits as a table), so no
+  // table is taken for it.
+  if (rank == 0)
+    std::printf("model: plain RoPE computed, no table: %.2f GiB a rank not taken\n",
+                (double)attn::rope_table_rows(opt.max_ctx, 8) * 32 * sizeof(float2) / (1024.0 * 1024.0 * 1024.0));
   rope_y16_rows = attn::rope_table_rows(opt.max_ctx);
   rope_y16 = dalloc<float2>((size_t)rope_y16_rows * 32);
   attn::rope_table_build(rope_y16, rope_y16_rows, true, 16, st);
@@ -241,6 +244,12 @@ Model::Impl::Impl(int r, const Options& op) : rank(r), opt(op) {
   }
   pool = dalloc<int>((size_t)R * kPoolBlocks);
   poolkey = dalloc<uint16_t>((size_t)R * kPoolBlocks);
+  if (opt.pscan != PScan::Off) {  // the candidates of the four ranks' parts (one set serves the four layers: they run in turn)
+    cand_pos = dalloc<int>((size_t)kRanks * kDecodeRows * kIdxTopk);
+    cand_key = dalloc<uint16_t>((size_t)kRanks * kDecodeRows * kIdxTopk);
+    pcand_pos = dalloc<int>((size_t)kRanks * kDecodeRows * kPoolBlocks);
+    pcand_key = dalloc<uint16_t>((size_t)kRanks * kDecodeRows * kPoolBlocks);
+  }
   moe_ws = dalloc<uint8_t>(dsk::moe_workspace_bytes());
   moe_pws = dalloc<uint8_t>(dsk::moe_prefill_workspace_bytes(kMaxRows, kExperts));  // wide64: moe_prefill's
   in_h = halloc<ops::StepIn>(ops::kInSlots);
@@ -298,6 +307,65 @@ void Model::Impl::inject(Sink* sink, int L, const char* name, int pos0, int R, v
 }
 
 // ---- weights ----------------------------------------------------------------------------------
+
+// The slices of wq_a, wkv, wo_b (and their scales) and Engram's wkv concatenate rank by rank (the L1 tiles of 8 rows
+// and the scale rows of 32 are whole per rank), so slot r of a gathered buffer holds rank r's tensor byte for byte.
+// Slot offsets are multiples of 64 bytes (the scales' 1,600, 640, 10,240 and 38,400 B slots are the smallest steps);
+// the GEMVs need 4 (scales) and 16 (weights) of them (gemv_fp8.cu: seg.S, seg.W).
+namespace {
+constexpr size_t kSlotQa = (size_t)kQaPart * kDim, kSlotQaS = (size_t)kQaPart / 32 * (kDim / 32);
+constexpr size_t kSlotKv = (size_t)kKvPart * kDim, kSlotKvS = (size_t)kKvPart / 32 * (kDim / 32);
+constexpr size_t kSlotOb = (size_t)kDim * kOPart, kSlotObS = (size_t)(kDim / 32) * (kOPart / 32);
+constexpr size_t kSlotGate = (size_t)kGatePart * kDim * 2;
+constexpr size_t kSlotEw = (size_t)kEngramN * kEngramK, kSlotEwS = (size_t)kEngramN / 32 * (kEngramK / 32);
+static_assert(kSlotQa % 64 == 0 && kSlotQaS % 64 == 0 && kSlotKv % 64 == 0 && kSlotKvS % 64 == 0 &&
+                  kSlotOb % 64 == 0 && kSlotObS % 64 == 0 && kSlotGate % 64 == 0 && kSlotEw % 64 == 0 && kSlotEwS % 64 == 0,
+              "a slot of a gathered weight must keep every rank's slice 64-byte aligned");
+}  // namespace
+
+void Model::Impl::reserve_gathered(bool engram) {
+  if (!pgw.empty()) die("reserve_gathered: twice");
+  pgw.assign(kLayers, GatheredW{});
+  for (int L = opt.first_layer; L < opt.n_layers; ++L) {
+    GatheredW& g = pgw[L];
+    g.wqa = dalloc<uint8_t>(kRanks * kSlotQa), g.sqa = dalloc<uint8_t>(kRanks * kSlotQaS);
+    g.wkv = dalloc<uint8_t>(kRanks * kSlotKv), g.skv = dalloc<uint8_t>(kRanks * kSlotKvS);
+    g.wob = dalloc<uint8_t>(kRanks * kSlotOb), g.sob = dalloc<uint8_t>(kRanks * kSlotObS);
+    pgw_bytes += kRanks * (kSlotQa + kSlotQaS + kSlotKv + kSlotKvS + kSlotOb + kSlotObS);
+    g.gate = dalloc<uint8_t>(kRanks * kSlotGate);  // not in pgw_bytes: bind's buffer of decode, whatever prefill does
+    if (engram && engram_layer(L)) {
+      g.ewkv = dalloc<uint8_t>(kRanks * kSlotEw), g.eskv = dalloc<uint8_t>(kRanks * kSlotEwS);
+      pgw_bytes += kRanks * (kSlotEw + kSlotEwS);
+    }
+  }
+}
+
+void* Model::Impl::gathered_dest(const std::string& name, uint64_t bytes) {
+  if (pgw.empty() || name.rfind("layers.", 0) != 0) return nullptr;
+  char* end = nullptr;
+  const long L = std::strtol(name.c_str() + 7, &end, 10);
+  if (end == name.c_str() + 7 || *end != '.' || L < opt.first_layer || L >= opt.n_layers) return nullptr;
+  const std::string what = end + 1;
+  const GatheredW& g = pgw[L];
+  struct Row {
+    const char* name;
+    uint8_t* GatheredW::*buf;
+    size_t slot;
+  };
+  static const Row rows[] = {
+      {"attn.wq_a.weight", &GatheredW::wqa, kSlotQa},   {"attn.wq_a.scale", &GatheredW::sqa, kSlotQaS},
+      {"attn.wkv.weight", &GatheredW::wkv, kSlotKv},    {"attn.wkv.scale", &GatheredW::skv, kSlotKvS},
+      {"attn.wo_b.weight", &GatheredW::wob, kSlotOb},   {"attn.wo_b.scale", &GatheredW::sob, kSlotObS},
+      {"ffn.gate.weight", &GatheredW::gate, kSlotGate}, {"engram.wkv.weight", &GatheredW::ewkv, kSlotEw}, {"engram.wkv.scale", &GatheredW::eskv, kSlotEwS}};
+  for (const Row& r : rows) {
+    if (what != r.name || !(g.*r.buf) || bytes != r.slot) continue;
+    uint8_t* at = g.*r.buf + (size_t)rank * r.slot;
+    if (reinterpret_cast<uintptr_t>(at) % 64) die("gathered weights: %s would sit at %p, not 64-byte aligned", name.c_str(), (void*)at);
+    ++alias_n, alias_bytes += r.slot;
+    return at;
+  }
+  return nullptr;
+}
 
 void Model::Impl::bind(dsw::WeightFile& wf, comm::Ring& ring) {
   ch = ring.dev();
@@ -438,8 +506,9 @@ void Model::Impl::bind(dsw::WeightFile& wf, comm::Ring& ring) {
       f8("ffn.shared_experts.w3", kInterPart, kDim, &m.sh_w3, &m.sh_s3);
       f8("ffn.shared_experts.w2", kDim, kInterPart, &m.sh_w2, &m.sh_s2);
     }
-    // mHC: version 1 splits hc_fn by rows (6 of 24), version 2 by columns (rank r: [5120r, +5120));
-    // either way every rank gets the whole projection.
+    // mHC: version 1 splits hc_fn by rows (6 of 24), version 2 by columns (rank r: [5120r, +5120)). Decode reads only
+    // this rank's columns, so a version 2 file keeps its quarter as the operand (the whole is made by prefill_alloc, for
+    // the prefill's parts only); a version 1 file's rows are all-gathered into the whole, which decode reads.
     for (int h = 0; h < 2; ++h) {
       const std::string n = p + (h ? "hc_ffn_" : "hc_attn_");
       const dsw::DeviceTensor& t = wf[n + "fn"];
@@ -667,7 +736,9 @@ void Model::Impl::engram_apply(int L, int R) {
 
 // The index scores and top-k (layer 20: also the candidate pool) in one launch, from the indexer's
 // wq_b output iqpre and head weights wproj (both made by attention()). Every rank scans everything: the
-// dense scans with index_dense, the Reindex layers' (layer 20's pool) with index_dense_blocks.
+// dense scans with index_dense, the Reindex layers' (layer 20's pool) with index_dense_blocks. With pscan_split each rank
+// scans its quarter of every session's keys (index_dense's part), one all-gather brings the four quarters' candidates, and
+// index_merge2 merges them in place into the picks the whole scan would write (the same bits: attn/indexer.cu).
 // wide64: a step of more than kDecodeRows rows scans in groups of kDecodeRows rows, in row order (each row's
 // selection is what it is in any call: attn.h).
 void Model::Impl::indexer(int L, int R, int ctx) {
@@ -688,6 +759,24 @@ void Model::Impl::indexer(int L, int R, int ctx) {
     const attn::IndexSel ps = L == 20 ? attn::IndexSel{kPoolBlocks, pool + (size_t)r0 * kPoolBlocks,
                                                        poolkey + (size_t)r0 * kPoolBlocks, kPoolBlocks}
                                       : attn::IndexSel{};
+    if (pscan_split(R)) {  // one group: R <= kDecodeRows
+      const size_t t = (size_t)R * kIdxTopk, p = (size_t)R * kPoolBlocks;
+      const attn::IndexSel ctop{kIdxTopk, cand_pos + rank * t, cand_key + rank * t, kIdxTopk};
+      const attn::IndexSel cpool = L == 20 ? attn::IndexSel{kPoolBlocks, pcand_pos + rank * p, pcand_key + rank * p, kPoolBlocks}
+                                           : attn::IndexSel{};
+      attn::index_dense(iq, wp, pos_d, yarn(), R, ratio, ik, ctx / ratio, scan().keys, scan().stride, scan().bkeys,
+                        scan().stride / 8, ctop, cpool, dense_scratch, true, st, -1, rank, kRanks);
+      // each rank's own quarter is in place: segment bytes a rank are R rows of 512 positions (4 B) and keys (2 B) and, on layer 20,
+      // of 2,048 pool blocks (4 B) and keys (2 B): all multiples of 16
+      comm::AgSeg seg[4] = {{cand_pos + rank * t, cand_pos, t * sizeof(int)},
+                            {cand_key + rank * t, cand_key, t * sizeof(uint16_t)},
+                            {pcand_pos + rank * p, pcand_pos, p * sizeof(int)},
+                            {pcand_key + rank * p, pcand_key, p * sizeof(uint16_t)}};
+      comm::allgather_multi(ch, seg, L == 20 ? 4 : 2, st);
+      attn::index_merge2(R, cand_pos, cand_key, kRanks * kIdxTopk, top, L == 20 ? pcand_pos : nullptr,
+                         L == 20 ? pcand_key : nullptr, kRanks * kPoolBlocks, ps, true, st, kRanks);
+      continue;
+    }
     attn::index_dense(iq, wp, pos_d + r0, yarn(), m, ratio, ik, ctx / ratio, scan().keys, scan().stride, scan().bkeys,
                       scan().stride / 8, top, ps, dense_scratch, true, st);
   }
@@ -1102,6 +1191,10 @@ cudaGraphExec_t Model::Impl::graph(int R, int ctx) {
   const auto key = std::make_tuple(R, ctx, sf);  // the captured kernels' parameters bake the factor
   const auto it = graphs.find(key);
   if (it != graphs.end()) return it->second;
+  // a plain step graph of a factor above 16 is its window's (win_graphs_drop frees it at the close): the window's class; a graph
+  // of factor 16 keeps the scope the caller is in
+  std::optional<alloc_seal::Scoped> seal;
+  if (sf > 16) seal.emplace(alloc_seal::kRegion);
   cudaGraph_t g;
   CUDA_CHECK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
   forward(R, ctx, 0, nullptr, 0);
@@ -1537,6 +1630,20 @@ float Model::last_gpu_ms() const {
 void Model::prefill_split(float ms[4]) const {
   CUDA_CHECK(cudaEventSynchronize(d_->ev_pf[4]));
   for (int i = 0; i < 4; ++i) CUDA_CHECK(cudaEventElapsedTime(&ms[i], d_->ev_pf[i], d_->ev_pf[i + 1]));
+}
+bool Model::prefill_joins(float ms[3], int* pairs) const {
+  const detail::Prefill* p = d_->pf.get();
+  if (!p || !p->stall) return false;
+  CUDA_CHECK(cudaEventSynchronize(d_->ev_pf[4]));
+  ms[0] = ms[1] = 0.f;
+  for (int i = 0; i < p->jn_n; ++i) {
+    float t = 0.f;
+    CUDA_CHECK(cudaEventElapsedTime(&t, p->ev_jn[i][0], p->ev_jn[i][1]));
+    ms[p->jn_kind[i]] += t;
+  }
+  CUDA_CHECK(cudaEventElapsedTime(&ms[2], p->ev_fl[0], p->ev_fl[1]));
+  *pairs = p->jn_n;
+  return true;
 }
 void Model::mark(int i) { CUDA_CHECK(cudaEventRecord(d_->ev_mark[i], d_->st)); }
 float Model::mark_ms(int i, int j) const {

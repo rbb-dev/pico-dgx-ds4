@@ -344,7 +344,10 @@ void index_fused(const uint16_t* iq_pre, const float* wproj, const int* pos, Rop
 // pos, so the launch is the same for every context; max_scan only checks the strides. bkeys: required, the block maxima
 // are written for every scan (the top's selection starts from them). scratch: index_dense_scratch() bytes,
 // zero before and left zero. cand: the most candidates a selection gathers in shared memory (-1: all it has
-// room for).
+// room for). part of nparts (nparts > 1): only that part of each session's scan, the one index_fused's IndexScan{part,
+// nparts} scans (the quarter of the session's own keys, in 64-key units: a short session's later parts hold none, and
+// the selections write their padding): the keys and block maxima are written from 0 and the selections hold the whole
+// scan's positions, for index_merge2 over the parts. With a slot table, each session is split by its own length.
 size_t index_dense_scratch();
 void index_dense(const uint16_t* iq_pre, const float* wproj, const int* pos, Rope table, int rows, int ratio,
                  IndexKeys ik, int max_scan, uint16_t* keys, int keys_stride, uint16_t* bkeys, int bkeys_stride,
@@ -356,8 +359,11 @@ void index_dense_blocks(const uint16_t* iq_pre, const float* wproj, const int* p
                         int ratio, IndexKeys ik, const int* blocks, int nblocks, uint16_t* keys, int keys_stride,
                         IndexSel top, uint32_t* scratch, bool pdl, cudaStream_t s, int cand = -1);
 // index_merge of the gathered candidates, and of the gathered pool candidates when pool.pos is given, in
-// one launch.
+// one launch. rank_major_parts (> 0): the candidates are as comm::allgather_multi leaves them, [parts][rows][n / parts]
+// (part q of row r at q * rows * (n / parts) + r * (n / parts)), not [rows][n]; the picks are the same. Each part's
+// width is a multiple of 16. Only merge_kernel's second instance reads that layout: no other selection changes by it.
 void index_merge2(int rows, const int* cand_pos, const uint16_t* cand_key, int n, IndexSel top, const int* pcand_pos,
-                  const uint16_t* pcand_key, int pn, IndexSel pool, bool pdl, cudaStream_t s);
+                  const uint16_t* pcand_key, int pn, IndexSel pool, bool pdl, cudaStream_t s,
+                  int rank_major_parts = 0);
 
 }  // namespace attn

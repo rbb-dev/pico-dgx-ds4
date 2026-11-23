@@ -11,3 +11,13 @@ target_link_libraries(dsgb10_comm_test PUBLIC ibverbs CUDA::cuda_driver pthread)
 
 add_executable(ring_test tests/ring_test.cu)
 target_link_libraries(ring_test PRIVATE dsgb10_comm_test)
+
+# argmax_rows_row's block layout, winner rule and carried row against the whole table (host only: tests/argmax_row_test.cpp);
+# built with -DPICO_OLD_RULES ties go the other way and it fails
+add_executable(argmax_row_test tests/argmax_row_test.cpp)
+target_include_directories(argmax_row_test PRIVATE ${CMAKE_SOURCE_DIR})
+
+# comm/host_gather.h on four threads over socket pairs (host only): the framing of the host all-gather (call id and size on every hop)
+add_executable(host_gather_test tests/host_gather_test.cpp)
+target_include_directories(host_gather_test PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(host_gather_test PRIVATE pthread)

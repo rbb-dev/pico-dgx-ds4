@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "comm/ring.h"
+#include "model/copy.h"
 #include "model/model.h"
 #include "server/mem_watch.h"
 
@@ -91,7 +92,7 @@ MemWatchView mem_watch_view();
 // What rank 0 tells every rank to do next (Ring::allgather_host on the bootstrap sockets, ~0.1-2 ms:
 // once per request or chunk, never per decode step).
 constexpr int kMaxStop = 32;
-constexpr int kMaxSnaps = 8;
+constexpr int kMaxSnaps = 16;
 constexpr int kMaxOps = 12;
 enum : int32_t {
   kCmdStop = 0,     // leave the command loop
@@ -102,10 +103,10 @@ enum : int32_t {
   kCmdState = 5,    // nothing but the state operations (every command applies ops[0 .. n_ops) first)
   kCmdRows = 6,     // a step of `rows` rows with explicit tokens, sampled with sp, then snaps[] from the ring
   kCmdBatch = 7,    // batch_loop: n sessions decoding together, their BatchEntry's follow as a payload
-  // batch_tf_loop: n sessions' teacher-forced rows, `rows` of each per step (B4's checks and bench); the
+  // batch_tf_loop: n sessions' teacher-forced rows, `rows` of each per step (the checks and the bench); the
   // BatchEntry's and then their tokens follow as payloads. (20: clear of the batch commands added beside it.)
   kCmdBatchTf = 20,
-  kCmdSpecBatch = 8,  // spec_batch_loop (B3): the same with drafts; the Cmd's spec_* fields as kCmdDecode's
+  kCmdSpecBatch = 8,  // spec_batch_loop: the same with drafts; the Cmd's spec_* fields as kCmdDecode's
   // vision (docs/vision.md): n image spans for the prefill chunks that follow, whose rows are flight pos0's in the store
   // (Model::set_images; n = 0 clears the view and leaves the rows); their bounds (int32 lo[n], hi[n]) follow as a payload,
   // and, when rows = 1 (the flight's first go, after its kStImgTake), the rows (bf16 [sum][5120]) in pieces of at most
@@ -114,11 +115,18 @@ enum : int32_t {
   // a factor's window (Model::window_open / window_close): rows = the YaRN factor (0: only settle what a closed window
   // owes the pool), pos0 = 0 to open it, 1 to close it. Every rank runs run_window and gets the same status
   kCmdWindow = 22,
-  // the Engram row cache's hand-over (Model::engram_lend): rows = Model::kLendBegin (pos0 = the size to go to, MiB) or
-  // Model::kLendPoll (finishes a change once every rank's worker has). Every rank runs run_lend and gets the same status
+  // a tenant's hand-over of the pool's groups (Model::tenant_lend; the Engram row cache is tenant 1, the default): rows =
+  // Model::kLendBegin (pos0 = the size to go to, MiB) or Model::kLendPoll (finishes a change once every rank's body has),
+  // `tenant` = the tenant's id. Every rank runs run_lend and gets the same status. Windows are never a kCmdLend: they are kCmdWindow
   kCmdLend = 23,
+  // the image encoder (Model::vision_run): blocks [vit_b0, vit_b1) of image vit_span of flight vit_key (vit_nh x vit_nw patches; its
+  // span's first row among the flight's rows is vit_row0); rank 0 reads the image's pixels from the request's frame (run_vit's
+  // argument). Every rank runs run_vit and gets the same status (Model::VitStatus). Nothing follows as a payload.
+  kCmdVit = 24,
 };
-enum : uint32_t { kPfSample = 1, kPfCed = 2 };  // kPfCed: a CED chunk (Model::prefill's ced, docs/ced.md)
+// kPfCed: a CED chunk (Model::prefill's ced, docs/ced.md). kPfWatch: after queuing the chunk every rank runs the memory watch's reading and
+// joins its one host all-gather while the device computes (run_prefill; rank 0 asks for it when the period has passed: mem_watch.h chunk_ride_due).
+enum : uint32_t { kPfSample = 1, kPfCed = 2, kPfWatch = 4 };
 struct Cmd {
   int32_t op = kCmdStop;
   int32_t rows = 0, pos0 = 0;  // kCmdStep, kCmdRows, kCmdPrefill: the rows; kCmdDecode: the first position
@@ -138,6 +146,9 @@ struct Cmd {
   int32_t ahead = 1;       // kCmdDecode: queue the next step before the current one ends (0: diagnostics)
   int32_t n = 0;           // kCmdTokens; kCmdBatch: the entries
   int32_t next = 0;        // kCmdPrefill: rows of the chunk after this one (its Engram lookups start now)
+  // kCmdPrefill: the set of row-sized buffers the chunk and its look-ahead run on: 0 the standing set (--prefill-rows), 1 the
+  // set lent by the pool (--prefill-rows-max). One value for a request's every piece, the same on every rank.
+  int32_t rows_set = 0;
   int32_t handle = -1;     // the session whose window snapshots are taken
   int32_t snap_every = 0;  // kCmdDecode: a window snapshot at every multiple of this position (0: none)
   int32_t n_snaps = 0;     // kCmdPrefill: snapshots inside the chunk; kCmdRows: after the step
@@ -158,6 +169,10 @@ struct Cmd {
   // kCmdDecode: the drafts' rate (SpecRate) to start from: a request decoded in slices goes on with the
   // last slice's (DecodeEnd::spec_tok, spec_ms)
   double spec_tok = 1, spec_ms = 0;
+  // kCmdLend: the tenant's id (lend.h: 1 the Engram cache, 15 a test build's dummy block)
+  int32_t tenant = 1;
+  // kCmdVit: the image (see kCmdVit); kCmdImages: vit_reg 1 = the flight's n spans are pixel images, their rows still to be written
+  int32_t vit_key = 0, vit_span = 0, vit_row0 = 0, vit_nh = 0, vit_nw = 0, vit_b0 = 0, vit_b1 = 0, vit_reg = 0;
 };
 
 Cmd bcast(comm::Ring& ring, const Cmd& mine);
@@ -173,6 +188,8 @@ model::Ctl to_ctl(const Cmd& c);
 int run_window(model::Model& m, const Cmd& c);
 // kCmdLend on this rank: Model::engram_lend's status (the same on every rank), once the command's state operations were applied.
 int run_lend(model::Model& m, const Cmd& c);
+// kCmdVit on this rank: Model::vision_run's status (the same on every rank). Rank 0 passes the image's pixels, the others null.
+int run_vit(model::Model& m, const Cmd& c, const uint8_t* pixels);
 
 // A prefill chunk on this rank (every rank alike): positions [pos0, pos0 + rows) of the tokens set
 // before; with kPfSample the last row is sampled (the step's number), else ~0.
@@ -207,6 +224,21 @@ struct DecodeEnd {
   float gate_min = 0, gate_max = 0;
   int gate_n = 0;
   double spec_tok = 1, spec_ms = 0;  // the drafts' rate (SpecRate) at the end: the next slice's start
+  // copy drafting's learner (copy::kAdapt), from the gate's record of each step: proposals made, proposals scored, of them the first
+  // copy token right, copy rows verified and accepted, the conversation's ratio at its last step (1/256) and the shared first-token
+  // chances (1/65535) as the last step left them
+  int copy_proposals = 0, copy_scored = 0, copy_first_right = 0, copy_rows_verified = 0, copy_rows_accepted = 0, copy_rho256 = 0;
+  uint32_t copy_chance[4] = {};
+  void copy_obs(uint32_t word, const uint32_t* chance) {
+    const model::copy::Obs b = model::copy::unpack_obs(word);
+    copy_proposals += b.proposed ? 1 : 0;
+    if (b.taken) {
+      ++copy_scored, copy_first_right += b.landed >= 1 || b.fr == 1 ? 1 : 0;
+      copy_rows_verified += b.verified, copy_rows_accepted += b.landed;
+    }
+    copy_rho256 = (int)(word >> 16);
+    for (int i = 0; i < 4; ++i) copy_chance[i] = chance[i];
+  }
   void gate(float t) {
     gate_min = gate_n ? std::min(gate_min, t) : t, gate_max = gate_n ? std::max(gate_max, t) : t;
     gate_sum += t, ++gate_n;
@@ -227,7 +259,7 @@ struct SpecRate {
   float thresh(const Cmd& c) const;
 };
 
-// kCmdBatch (docs/batching.md, B2): sessions decoding together, each in its own session slot with its own
+// kCmdBatch (docs/batching.md): sessions decoding together, each in its own session slot with its own
 // stop ids, sampling and snapshots, one row each per step (Model::launch_batch). Entry k's step j feeds
 // tok_j at pos0 + j (tok_0 = token) and samples tok_{j+1}; as in decode_loop, the next step is queued
 // before a step ends, with its tokens left to the device, and a session that ends keeps its row in the
@@ -281,7 +313,7 @@ using OnBatch = std::function<void(int k, const model::SampleOut& o, int row)>; 
 std::vector<BatchEnd> batch_loop(model::Model& m, const Cmd& c, const std::vector<BatchEntry>& e, Watchdog& wd,
                                  const OnBatch& on, const OnStep& step = {});
 
-// kCmdBatchTf (docs/batching.md, B4): the entries' rows teacher-forced, in steps of up to c.rows rows of each
+// kCmdBatchTf (docs/batching.md): the entries' rows teacher-forced, in steps of up to c.rows rows of each
 // (1..model::kMaxSessRows; a step of at most kMaxRows rows in all). Entry k feeds tokens[k] (e[k].max_new of
 // them) at positions e[k].pos0 .., its next c.rows per step in slot e[k].slot, sampled with e[k].sp; a step
 // holds the entries with tokens left, in entry order (Model::launch_batch). Every rank runs it alike: the
@@ -295,7 +327,7 @@ std::vector<float> batch_tf_loop(model::Model& m, const Cmd& c, const std::vecto
 // order; rank 0 sends them, the others receive them.
 void bcast_tf(comm::Ring& ring, const Cmd& c, std::vector<BatchEntry>& e, std::vector<std::vector<int32_t>>& tokens,
               int rank);
-// kCmdSpecBatch (docs/batching.md, B3): the sessions decoding together with drafts, a batch spec step
+// kCmdSpecBatch (docs/batching.md): the sessions decoding together with drafts, a batch spec step
 // each step (Model::launch_spec_batch, launch_verify_batch). Entry k's rows of a step are its bonus
 // token and the drafts the step before chose for it, at most cap = min(spec_drafts, (kMaxRows - S) / S)
 // with S entries on, so that the step fits kMaxRows; each entry emits, verifies and ends as a session

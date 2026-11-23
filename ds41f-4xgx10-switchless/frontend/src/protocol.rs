@@ -36,8 +36,14 @@ pub const FLAG_KEEP: u32 = 2;
 pub const FLAG_LOGPROBS: u32 = 4;
 /// vision: the image part (vision::payload) follows prompt[]
 pub const FLAG_IMAGES: u32 = 8;
+/// vision: the image part follows prompt[] as pixels (vision::encode_pixels), not rows; never with FLAG_IMAGES (the engine closes the
+/// connection on a frame that has both)
+pub const FLAG_PIXELS: u32 = 32;
 /// the ablated weights path: the request runs with the ablation direction applied
 pub const FLAG_ABLIT: u32 = 16;
+/// The request carries only the suffix of its prompt (`Submit::prefix` names the rest); only on a connection of `VERSION_PREFIX`.
+/// Set by the encoder from `Submit::prefix`, never by a caller.
+pub const FLAG_PREFIX: u32 = 64;
 
 pub const TOK_LOGPROBS: u32 = 1;
 pub const TOK_TOP: u32 = 2;
@@ -84,9 +90,12 @@ pub struct Submit {
     pub n_top_logprobs: u32,
     pub prefix_hint: u32,
     pub stop_ids: Vec<u32>,
+    /// the whole prompt's ids, or with `prefix` its suffix's
     pub prompt: Vec<u32>,
-    /// vision: the image part after prompt[] (with FLAG_IMAGES); None for text
+    /// vision: the image part after prompt[] (with FLAG_IMAGES or FLAG_PIXELS); None for text
     pub images: Option<Vec<u8>>,
+    /// The request continues an entry the engine holds: (epoch the last DONE taught, ids of that entry's history before `prompt`).
+    pub prefix: Option<(u64, u32)>,
 }
 
 impl Submit {
@@ -110,6 +119,30 @@ impl Submit {
             spans.push((start, rows, hash));
         }
         Ok(spans)
+    }
+}
+
+impl Submit {
+    /// A pixel part's grids (n_h, n_w patches) per image, as the engine reads them (engine/server/pixels.h): each with the span's
+    /// rows it makes and the engine's limits checked. Empty without FLAG_PIXELS.
+    pub fn pixel_grids(&self) -> Result<Vec<(u16, u16)>, String> {
+        let Some(part) = self.images.as_ref().filter(|_| self.flags & FLAG_PIXELS != 0) else { return Ok(Vec::new()) };
+        let n = u32::from_le_bytes(part[..4].try_into().unwrap()) as usize;
+        let spans = self.image_spans()?;
+        let mut out = Vec::with_capacity(n);
+        for (i, &(_, rows, _)) in spans.iter().enumerate() {
+            let at = 4 + 16 * n + 4 * i;
+            let (h, w) = (u16::from_le_bytes(part[at..at + 2].try_into().unwrap()), u16::from_le_bytes(part[at + 2..at + 4].try_into().unwrap()));
+            if h < 1 || w < 1 || h as usize * w as usize > crate::vision::MAX_PATCHES {
+                return Err(format!("image {i}: a grid of {h} x {w} patches"));
+            }
+            let made = crate::vision::rows_of_grid(h as u64, w as u64);
+            if made != rows as u64 || made as usize > crate::vision::MAX_PIXEL_ROWS {
+                return Err(format!("image {i}: a grid of {h} x {w} patches makes {made} rows, its span has {rows}"));
+            }
+            out.push((h, w));
+        }
+        Ok(out)
     }
 }
 
@@ -742,7 +775,10 @@ impl Frame {
                 let prompt = r.u32s(n_prompt)?;
                 // vision: the image part, taken only when it is laid out as rank 0 requires it
                 // (engine/server/serve.cpp): u32 n, n spans, then exactly the spans' rows
-                let images = if flags & FLAG_IMAGES != 0 {
+                if flags & FLAG_IMAGES != 0 && flags & FLAG_PIXELS != 0 {
+                    return Err("SUBMIT with both rows and pixels".to_string());
+                }
+                let images = if flags & (FLAG_IMAGES | FLAG_PIXELS) != 0 {
                     let part = &r.p[r.i..];
                     let n = r.u32()? as usize;
                     if !(1..=crate::vision::MAX_IMAGES).contains(&n) {
@@ -758,7 +794,18 @@ impl Frame {
                         }
                         rows += span;
                     }
-                    r.bytes(rows * crate::vision::IMAGE_DIM * 2).map_err(|_| "SUBMIT: the image rows do not match the spans".to_string())?;
+                    if flags & FLAG_PIXELS != 0 {
+                        // the grids, then each image's bytes, each padded to 8; the count must be exact
+                        let grids = r.bytes(crate::vision::pad8(4 * n)).map_err(|_| "SUBMIT: the pixel grids are cut short".to_string())?;
+                        let mut bytes = 0usize;
+                        for g in grids[..4 * n].chunks_exact(4) {
+                            let (h, w) = (u16::from_le_bytes([g[0], g[1]]) as usize, u16::from_le_bytes([g[2], g[3]]) as usize);
+                            bytes += crate::vision::pad8(crate::vision::PATCH_BYTES * h * w);
+                        }
+                        r.bytes(bytes).map_err(|_| "SUBMIT: the pixels do not match the grids".to_string())?;
+                    } else {
+                        r.bytes(rows * crate::vision::IMAGE_DIM * 2).map_err(|_| "SUBMIT: the image rows do not match the spans".to_string())?;
+                    }
                     Some(part[..part.len() - (r.p.len() - r.i)].to_vec())
                 } else {
                     None
@@ -945,6 +992,68 @@ mod tests {
         assert!(b[want - img.len()..] == img[..], "the image part follows prompt[] unchanged");
     }
 
+    /// A pixel SUBMIT: the same span table, the grids, the padded pixels; read back under the checks engine/server/pixels.h makes:
+    /// both flags and a byte count that is not the layout's are not frames; a grid that is not its span's rows is a frame the mock
+    /// answers with an error.
+    #[test]
+    fn pixel_part_roundtrip_and_checks() {
+        use crate::vision::{pad8, rows_of_grid, IMAGE_TOKEN_ID};
+        let grids = [(3u16, 3u16), (5, 7)];
+        let rows: Vec<u32> = grids.iter().map(|&(h, w)| rows_of_grid(h as u64, w as u64) as u32).collect();
+        let mut part = 2u32.to_le_bytes().to_vec();
+        for (i, (start, r)) in [(1u32, rows[0]), (6, rows[1])].into_iter().enumerate() {
+            part.extend(start.to_le_bytes());
+            part.extend(r.to_le_bytes());
+            part.extend((0x11u64 * (i as u64 + 1)).to_le_bytes());
+        }
+        for &(h, w) in &grids {
+            part.extend(h.to_le_bytes());
+            part.extend(w.to_le_bytes());
+        }
+        part.extend(vec![0u8; pad8(8) - 8]);
+        for (i, &(h, w)) in grids.iter().enumerate() {
+            let mut px = vec![i as u8 + 1; 588 * h as usize * w as usize];
+            px.resize(pad8(px.len()), 0);
+            part.extend(px);
+        }
+        let mut prompt = vec![0u32; 20];
+        prompt[1..5].fill(IMAGE_TOKEN_ID);
+        prompt[6..16].fill(IMAGE_TOKEN_ID);
+        let s = Submit {
+            req_id: 1,
+            session_id: 2,
+            base_session_id: 0,
+            seed: 0,
+            temperature: 1.0,
+            top_p: 1.0,
+            top_k: 0,
+            max_new_tokens: 8,
+            flags: FLAG_KEEP | FLAG_PIXELS,
+            n_top_logprobs: 0,
+            prefix_hint: 0,
+            stop_ids: vec![1],
+            prompt,
+            images: Some(part.clone()),
+            prefix: None,
+        };
+        let b = Frame::Submit(s.clone()).encode();
+        assert_eq!(u32::from_le_bytes(b[8 + 48..8 + 52].try_into().unwrap()) & (FLAG_PIXELS | FLAG_IMAGES), FLAG_PIXELS, "the flag is on the wire, rows' is not");
+        assert_eq!(Frame::decode(T_SUBMIT, &b[8..], |_| 0).unwrap(), Frame::Submit(s.clone()));
+        assert_eq!(s.image_spans().unwrap(), vec![(1, 4, 0x11), (6, 10, 0x22)]);
+        assert_eq!(s.pixel_grids().unwrap(), vec![(3, 3), (5, 7)]);
+        let with = |part: Vec<u8>, flags: u32| Frame::decode(T_SUBMIT, &Frame::Submit(Submit { images: Some(part), flags, ..s.clone() }).encode()[8..], |_| 0);
+        assert!(with(part[..part.len() - 1].to_vec(), s.flags).is_err(), "a byte short");
+        assert!(with([part.clone(), vec![0]].concat(), s.flags).is_err(), "a byte over");
+        assert!(with(part.clone(), FLAG_PIXELS | FLAG_IMAGES).is_err(), "both flags");
+        // a grid that does not make its span's rows decodes (the engine answers it) and the mock refuses it
+        let mut wrong = part.clone();
+        let at = 4 + 16 * 2 + 4; // the second grid, 5 x 7 made 7 x 5: the same bytes, another count of rows
+        wrong[at..at + 2].copy_from_slice(&7u16.to_le_bytes());
+        wrong[at + 2..at + 4].copy_from_slice(&5u16.to_le_bytes());
+        let Frame::Submit(w) = with(wrong, s.flags).unwrap() else { unreachable!() };
+        assert!(w.pixel_grids().unwrap_err().contains("makes"));
+    }
+
     /// The mock engine takes a SUBMIT's image part under the checks rank 0 applies (serve.cpp).
     #[test]
     fn image_part_roundtrip_and_checks() {
@@ -1081,6 +1190,34 @@ mod tests {
         assert_eq!((at(33), at(34), at(35), at(36), at(37)), (4, 12, 2032 << 20, 14, 4096), "ranks, image_numbers, cache bytes, groups, pending");
         assert_eq!((at(38), at(39), at(40), at(41), at(42), at(43), at(44)), (1000, 900, 3, 1, 2, 97, 55), "lookups .. evictions");
         assert_eq!(Frame::decode(T_STATS, &be[8..], |_| 0).unwrap(), Frame::Stats(en));
+        // the store's fields: store_numbers .. ids_file_sessions are fields 45-49
+        let sn = EngineStats { store_numbers: 6272, mem_avail_min_bytes: 10 << 30, mem_avail_low_count: 2, ids_host_bytes: 1 << 20, ids_file_sessions: 7,
+                           mem_avail_bytes: [10 << 30, 16 << 30, 17 << 30, 18 << 30], ..en };
+        let bs = Frame::Stats(sn).encode();
+        let at2 = |i: usize| u64::from_le_bytes(bs[16 + 8 * i..16 + 8 * (i + 1)].try_into().unwrap());
+        assert_eq!((at2(44), at2(45), at2(46), at2(47), at2(48), at2(49)), (55, 6272, 10 << 30, 2, 1 << 20, 7), "evictions, then the five");
+        assert_eq!((at2(50), at2(51), at2(52), at2(53)), (10 << 30, 16 << 30, 17 << 30, 18 << 30), "then the four ranks' readings");
+        assert_eq!(Frame::decode(T_STATS, &bs[8..], |_| 0).unwrap(), Frame::Stats(sn));
+        // the tenants' fields are 54-62; a 54-field frame (the engine before them) decodes with them 0
+        let tn = EngineStats { tenant_groups: [3, 14, 0, 2, 0, 0, 0, 0], tenant_models_groups: 12, ..sn };
+        let bt = Frame::Stats(tn).encode();
+        let at3 = |i: usize| u64::from_le_bytes(bt[16 + 8 * i..16 + 8 * (i + 1)].try_into().unwrap());
+        assert_eq!((at3(54), at3(55), at3(56), at3(57), at3(61), at3(62)), (3, 14, 0, 2, 0, 12), "the windows' groups, the Engram cache's, .., the models'");
+        assert_eq!(Frame::decode(T_STATS, &bt[8..], |_| 0).unwrap(), Frame::Stats(tn));
+        let mut f54 = bt.clone();
+        f54.truncate(8 + 8 + 8 * 54);
+        f54[12..16].copy_from_slice(&54u32.to_le_bytes());
+        let Frame::Stats(got54) = Frame::decode(T_STATS, &f54[8..], |_| 0).unwrap() else { panic!() };
+        assert_eq!((got54.mem_avail_bytes[3], got54.tenant_groups, got54.tenant_models_groups), (18 << 30, [0; 8], 0));
+        // the engine's 45-field frame (before them) still decodes: the five are 0
+        let mut f45 = Frame::Stats(sn).encode();
+        f45.truncate(8 + 8 + 8 * 45);
+        f45[12..16].copy_from_slice(&45u32.to_le_bytes());
+        let Frame::Stats(got45) = Frame::decode(T_STATS, &f45[8..], |_| 0).unwrap() else { panic!() };
+        assert_eq!((got45.engram_evictions, got45.store_numbers, got45.ids_file_sessions), (55, 0, 0));
+        // DONE's too-large reason
+        assert_eq!(DoneReason::from_u32(5), DoneReason::TooLarge);
+        assert_eq!(DoneReason::from_u32(9), DoneReason::Error, "an unknown reason is an error");
         // an older engine's 34-field frame still decodes: the new fields are 0
         let mut old = Frame::Stats(en).encode();
         old.truncate(8 + 8 + 8 * 34);
@@ -1137,5 +1274,116 @@ mod tests {
         let t = Tokens { req_id: 2, ids: vec![5, 6], logprobs: Some(vec![-0.5, -1.0]), top: Some(vec![(5, -0.5), (6, -1.0)]) };
         let b = Frame::Tokens(t.clone()).encode();
         assert_eq!(Frame::decode(T_TOKENS, &b[8..], |_| 1).unwrap(), Frame::Tokens(t));
+    }
+
+    fn submit_of(prompt: Vec<u32>, prefix: Option<(u64, u32)>) -> Submit {
+        Submit {
+            req_id: 3,
+            session_id: 4,
+            base_session_id: 0,
+            seed: 0,
+            temperature: 1.0,
+            top_p: 1.0,
+            top_k: 0,
+            max_new_tokens: 8,
+            flags: FLAG_KEEP,
+            n_top_logprobs: 0,
+            prefix_hint: 0,
+            stop_ids: vec![1, 2],
+            prompt,
+            images: None,
+            prefix,
+        }
+    }
+
+    /// A SUBMIT that names a prefix: FLAG_PREFIX in the header, the 16-byte block right after the 72 bytes and before the stop ids,
+    /// n_prompt the suffix's count; without a prefix the frame has no block.
+    #[test]
+    fn a_submit_with_a_prefix_has_the_flag_and_the_block_after_the_header() {
+        let with = submit_of(vec![7, 8, 9], Some((0xAABB_CCDD_1122_3344, 5000)));
+        let b = Frame::Submit(with.clone()).encode();
+        assert_eq!(b.len(), 8 + 72 + 16 + 4 * 2 + 4 * 3);
+        let at = |o: usize| u32::from_le_bytes(b[8 + o..8 + o + 4].try_into().unwrap());
+        assert_eq!(at(48) & FLAG_PREFIX, FLAG_PREFIX, "the flag is set by the encoder");
+        assert_eq!((at(60), at(64)), (2, 3), "n_stop_ids and n_prompt (the suffix's count)");
+        assert_eq!(u64::from_le_bytes(b[8 + 72..8 + 80].try_into().unwrap()), 0xAABB_CCDD_1122_3344, "epoch");
+        assert_eq!(at(80), 5000, "n_prefix");
+        assert_eq!(at(84), 0);
+        assert_eq!(at(88), 1, "the stop ids follow the block");
+        assert_eq!(Frame::decode(T_SUBMIT, &b[8..], |_| 0).unwrap(), Frame::Submit(with));
+        let plain = Frame::Submit(submit_of(vec![7, 8, 9], None)).encode();
+        assert_eq!(plain.len(), 8 + 72 + 4 * 2 + 4 * 3);
+        assert_eq!(u32::from_le_bytes(plain[8 + 48..8 + 52].try_into().unwrap()) & FLAG_PREFIX, 0);
+        // a frame whose flag is set and whose block is cut short is refused
+        assert!(Frame::decode(T_SUBMIT, &b[8..8 + 72 + 8], |_| 0).is_err());
+    }
+
+    /// A DONE of a request that ran, on a connection of version 5, has the 16-byte tail after its 56 bytes and before the error text;
+    /// one without it is the 56 bytes and the error text; a prefix-gone DONE carries no tail and its reason.
+    #[test]
+    fn a_done_tail_sits_between_the_header_and_the_error_text() {
+        let d = Done { req_id: 1, reason: DoneReason::Stop, prompt_tokens: 10, cached_tokens: 4, completion_tokens: 3, queue_us: 1, prefill_us: 2,
+                       decode_us: 3, error: "e".into(), tail: Some(DoneTail { epoch: 77, n_hist: 12 }) };
+        let b = Frame::Done(d.clone()).encode();
+        assert_eq!(b.len(), 8 + 56 + 16 + 1);
+        assert_eq!(u64::from_le_bytes(b[8 + 56..8 + 64].try_into().unwrap()), 77);
+        assert_eq!(u32::from_le_bytes(b[8 + 64..8 + 68].try_into().unwrap()), 12);
+        assert_eq!(&b[8 + 72..], b"e");
+        assert_eq!(Frame::decode(T_DONE, &b[8..], |_| 0).unwrap(), Frame::Done(d.clone()));
+        let none = Done { tail: None, ..d.clone() };
+        let b = Frame::Done(none.clone()).encode();
+        assert_eq!(b.len(), 8 + 56 + 1);
+        assert_eq!(Frame::decode(T_DONE, &b[8..], |_| 0).unwrap(), Frame::Done(none));
+        let gone = Done { reason: DoneReason::PrefixGone, tail: None, error: "no such entry".into(), ..d };
+        assert_eq!(DoneReason::from_u32(6), DoneReason::PrefixGone);
+        let b = Frame::Done(gone.clone()).encode();
+        assert_eq!(Frame::decode(T_DONE, &b[8..], |_| 0).unwrap(), Frame::Done(gone));
+        // a payload that is neither is refused
+        let mut odd = Frame::Done(Done { tail: None, ..Done { req_id: 1, reason: DoneReason::Stop, prompt_tokens: 0, cached_tokens: 0, completion_tokens: 0,
+                                    queue_us: 0, prefill_us: 0, decode_us: 0, error: String::new(), tail: None } }).encode();
+        odd.extend_from_slice(&[0; 3]);
+        assert!(Frame::decode(T_DONE, &odd[8..], |_| 0).is_err());
+    }
+
+    #[test]
+    fn the_stats_fields_90_to_100_are_the_copy_learners_in_the_engines_order() {
+        // the eleven fields after split_reader_waits_total (frontend_protocol.h)
+        let st = EngineStats { copy_adapt: 1, copy_proposals_total: 3500, copy_scored_total: 3188, copy_first_right_total: 2950,
+                               copy_rows_verified_total: 5000, copy_rows_accepted_total: 4560, copy_chance_pm: [880, 920, 940, 980],
+                               copy_failing_requests_total: 2, ..Default::default() };
+        let b = Frame::Stats(st).encode();
+        let at = |i: usize| u64::from_le_bytes(b[16 + 8 * i..16 + 8 * (i + 1)].try_into().unwrap());
+        assert_eq!((0..11).map(|k| at(89 + k)).collect::<Vec<_>>(), vec![1, 3500, 3188, 2950, 5000, 4560, 880, 920, 940, 980, 2], "fields 90 to 100 in wire order");
+        assert_eq!(Frame::decode(T_STATS, &b[8..], |_| 0).unwrap(), Frame::Stats(st));
+        // an engine that sends 89 fields: the eleven read as 0
+        let mut f89 = b.clone();
+        f89.truncate(8 + 8 + 8 * 89);
+        f89[12..16].copy_from_slice(&89u32.to_le_bytes());
+        let Frame::Stats(got) = Frame::decode(T_STATS, &f89[8..], |_| 0).unwrap() else { panic!() };
+        assert_eq!((got.copy_adapt, got.copy_scored_total, got.copy_chance_pm), (0, 0, [0; 4]));
+    }
+
+    #[test]
+    fn the_prefix_version_follows_the_engines() {
+        assert_eq!((VERSION, VERSION_PREFIX), (4, 5));
+    }
+
+    #[test]
+    fn the_stats_fields_78_to_89_are_read_in_the_engines_order() {
+        // the twelve fields after join_short_total (frontend_protocol.h: the split cache's tiers, then the imager's)
+        let st = EngineStats { split_level: 2, split_pressure_pm: 640, split_age_now_s: 90, split_demote_pps: 7, l2_numbers: 33, l2_dropped_total: 4,
+                               clean_numbers: 500, image_pending: 6, split_rides_total: 70, returns_read_total: 345, image_waits_total: 0,
+                               split_reader_waits_total: 9, ..Default::default() };
+        let b = Frame::Stats(st).encode();
+        assert_eq!(b.len(), 8 + 8 + 8 * 100, "100 fields");
+        let at = |i: usize| u64::from_le_bytes(b[16 + 8 * i..16 + 8 * (i + 1)].try_into().unwrap());
+        assert_eq!((0..12).map(|k| at(77 + k)).collect::<Vec<_>>(), vec![2, 640, 90, 7, 33, 4, 500, 6, 70, 345, 0, 9], "fields 78 to 89 in wire order");
+        assert_eq!(Frame::decode(T_STATS, &b[8..], |_| 0).unwrap(), Frame::Stats(st));
+        // an engine that sends 77 fields: the twelve read as 0
+        let mut f77 = b.clone();
+        f77.truncate(8 + 8 + 8 * 77);
+        f77[12..16].copy_from_slice(&77u32.to_le_bytes());
+        let Frame::Stats(got) = Frame::decode(T_STATS, &f77[8..], |_| 0).unwrap() else { panic!() };
+        assert_eq!((got.returns_read_total, got.split_reader_waits_total), (0, 0));
     }
 }

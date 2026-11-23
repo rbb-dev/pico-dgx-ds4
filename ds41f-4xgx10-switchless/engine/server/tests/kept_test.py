@@ -14,6 +14,11 @@ The reference runs both phases against one engine; the test runs "before", a pla
 the ring), then "after". --compare REF TEST checks the after-turns equal, bit for bit: tokens,
 logprobs, the prefix each reused.
 
+  With the imager the same phases are the warm start of the quarter images (layout K5): the planned
+  stop images and settles every piece, spills the clean ones and writes a K5 index naming each Spark's quarter images (a bookmark's slice too);
+  the next start reads them back through the exchange and every turn is bit-equal to the reference's. A K3 or K4 file (the installed build's and
+  the earlier split's) is another layout: a clean start (the first turn is cold, nothing is wrong), the install's one cold start. A file moved
+  to another rank is refused (the index names its rank).
   python3 engine/server/tests/kept_test.py --socket S --phase before --state st.json
   python3 engine/server/tests/kept_test.py --socket S --phase after --state st.json --out test.json
   python3 engine/server/tests/kept_test.py --compare ref.json test.json

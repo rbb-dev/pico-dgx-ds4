@@ -222,7 +222,7 @@ def main():
     if len(sys.argv) > 3:
         time.sleep(0.2)
         plans = [l for l in open(sys.argv[3]).read().splitlines() if " plan: " in l]
-        check(len(plans) >= 2 and ", new: " in plans[-2] and ", a fork of " in plans[-1] and " ids in common" in plans[-1],
+        check(len(plans) >= 2 and ", new: " in plans[-2] and ", a fork of " in plans[-1] and " bytes" in plans[-1] and "in common" not in plans[-1],
               f"the log says where each started: {plans[-2:]}")
 
     # concurrency

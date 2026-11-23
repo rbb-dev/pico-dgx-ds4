@@ -150,3 +150,65 @@ async fn closed_streaming_client_cancels_its_request() {
 async fn closed_non_streaming_client_cancels_its_request() {
     client_leaves("chat", false, CHAT_BOUND).await;
 }
+
+/// The engine answers a request whose frame went over its limit with DONE too-large: the front-end answers 413 with the engine's text (the limit),
+/// whether or not the client streams; any other engine error stays 500. Control: the same rig with DONE error answers 500.
+async fn answer_of(tag: &str, stream: bool, reason: DoneReason) -> String {
+    let (_app, addr, _fake, server) = rig_with(tag, Some((reason, "the request is 500 MiB, over the 400 MiB the engine reads in one frame (--frame-stage-mib)".into())),
+                                                 super::tests::cfg()).await;
+    let mut client = post(addr, stream).await;
+    let mut got = Vec::new();
+    let mut buf = [0u8; 4096];
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match client.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    got.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&got);
+                    if text.contains("[DONE]") || (text.contains("\r\n\r\n") && !stream && text.contains("}}")) {
+                        break;
+                    }
+                }
+            }
+        }
+    })
+    .await;
+    server.abort();
+    String::from_utf8_lossy(&got).to_string()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_frame_over_the_engines_limit_is_413() {
+    let plain = answer_of("big-chat", false, DoneReason::TooLarge).await;
+    assert!(plain.starts_with("HTTP/1.1 413"), "{plain}");
+    assert!(plain.contains("--frame-stage-mib") && plain.contains("400 MiB"), "the limit is in the text: {plain}");
+    let sse = answer_of("big-stream", true, DoneReason::TooLarge).await;
+    assert!(sse.contains("\"code\":413") && sse.contains("400 MiB"), "{sse}");
+    let control = answer_of("err-chat", false, DoneReason::Error).await;
+    assert!(control.starts_with("HTTP/1.1 500"), "an engine error stays 500: {control}");
+}
+
+/// The front-end's governor is switched on by --front-mib and by nothing else: with the flag a process over its limit refuses image
+/// requests within a tick; with 0 (no flag) it never runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_governor_runs_when_front_mib_is_set() {
+    let mut on = super::tests::cfg();
+    on.front_mib = 1; // 1 MiB: this process is over it
+    let (app, _addr, _fake, server) = rig_with("gov-on", None, on).await;
+    app.spawn_front_governor(Duration::from_millis(50));
+    for _ in 0..100 {
+        if app.image_rows.refusing() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(app.image_rows.refusing(), "front-end over --front-mib: image requests are refused");
+    server.abort();
+    let (off, _addr, _fake, server) = rig_with("gov-off", None, super::tests::cfg()).await;
+    assert_eq!(off.cfg.front_mib, 0, "the default is off");
+    off.spawn_front_governor(Duration::from_millis(50));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!off.image_rows.refusing(), "without the flag the governor never runs");
+    server.abort();
+}

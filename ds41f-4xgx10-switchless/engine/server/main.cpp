@@ -45,9 +45,17 @@
 //                --pool-free-gib G (leave G GiB of device memory and of available host memory free on every
 //                Spark) and/or --pool-tokens N (a pool that holds N positions of conversation), with both
 //                --pool-pick smaller (default) or larger; every rank takes the smallest rank's count. After
-//                sizing every rank's memory ledger is printed (model/pool_rules.h): with --pool-free-gib the
-//                start is refused when the largest rank's fixed lines plus --pool-slack-gib (default 2) pass G;
-//                rank 0's lines of processes beside the engine are --front-mib (3200) and --encoder-mib (1260);
+//                sizing the store's table is printed (model/pool_rules.h): with --pool-free-gib the store is
+//                shortened on every rank by what the lines outside it may still take (cap less what they hold at the read:
+//                the glibc heap, rank 0's front-end --front-mib (no default: a --pool-free-gib start refuses without it), the
+//                image process outside the engine (the encoder container, --encoder-mib 1260; with --vision-weights the media
+//                worker, --media-mib 512), the output queue, request frames --frame-stage-mib (400: a larger
+//                frame is answered DONE too-large and not read), the server's token ids --ids-host-mib (1024: past it
+//                idle conversations' ids go to <disk-dir>/ids), kernel drift --pool-slack-gib (0.75)), so that G GiB stay
+//                free; --front-now-mib and --encoder-now-mib are what the two processes hold at the read (default 0: the
+//                whole cap comes off the store). The store is a whole number of groups of 64 numbers; the start is refused
+//                when it cannot hold a conversation of --max-ctx, the Engram cache's groups, the largest image request and
+//                the largest window, or when one of the engine's own lines holds more than its cap at the read;
 //                LRU,
 //                the evicted spilled to a file of --disk-gib (default 32; 0: none) in --disk-dir (default the
 //                fleet file's RANK<r>_SPILL), prefill in
@@ -75,8 +83,26 @@
 //                --engram-cache-min-mib N (default: the set size, so the cache never gives way): the smallest the cache is
 //                made when the pool is short for a request and no window can be closed. --lend-null-mib N: the null control's
 //                spread of MemAvailable in MiB, the hand-over proof's tolerance when above its floor of 256.
-//                --ssd-flush-s S: a conversation idle for S seconds gets its pieces written to the disk tier (its tail
-//                chunk and bookmarks; full chunks are written at their turn's save; default 30, 0: never).
+//                --pscan off|ext|all (default off: the ordinary graphs and buffers): the decode index scan split by positions over the four
+//                ranks (each scans its quarter of every session's keys, one all-gather and one merge give the whole scan's picks, bit
+//                for bit): ext splits the step graphs of factors 32 and 64 (windows past 1,048,576 positions), all factor 16's too (a
+//                measuring arm); a step of more than 16 rows scans whole. Adds 0.94 MiB of candidate buffers a rank.
+//                --kv-split off|tiered|max (default off; cache is read as max): every write to the disk tier, in every mode, is each Spark's own
+//                quarter of a piece (a bookmark's slice), made in the background on a second stream and never waited for. tiered and max
+//                then mark a conversation that is on no line and has no request in flight: its blocks are free where they lie (ghosts),
+//                host bookkeeping only; a return takes them back when nobody used them, else the four Sparks read their quarters and
+//                exchange them. off marks nothing (a conversation holds its blocks until a take evicts them, clean). Images are queued when
+//                nothing is in flight (--kv-split-budget P (16) pieces a command) and inside a decoding run by rides at most every
+//                --kv-split-ride-ms (250), --kv-split-ride-pieces (4) pieces each (tiered and off only while the ready blocks are under
+//                --kv-split-high, default the room off keeps between requests; --kv-split-low, default half of it, raises a ride to 64
+//                pieces); never between a prompt's chunks. --kv-split-after-s S (0): the idle age before a conversation is imaged, not asked while a request waits for clean blocks;
+//                --kv-split-pass-ms N (50): the longest a pass of split commands runs before the loop goes on, with requests in flight at the
+//                highest pressure (down to a fifth of it as the pressure falls; with nothing in flight, 250 ms);
+//                --kv-join-pieces J (64): the pieces one return command brings back;
+//                --kv-join-whole-ms M (250): a return estimated at most M ms (or with nobody decoding) goes back to back, above it the
+//                request's first units are its return's commands, each followed by the decoders' window (0: always units beside decoders).
+//                --ssd-flush-s S (30): the least time between two checkpoints while nothing runs and the store's images changed; without the imager also the
+//                idle age at which a conversation's pieces are written to the disk tier (0: none; with the imager, which writes in the background, none).
 //                --window-idle-s S: with --max-ctx past 1,048,576 the graphs and score buffers of factors 32 and 64 are made when a
 //                request first needs them, out of the chunk pool. A window is freed when a consumer of the pool is short and no
 //                request needs it; with S > 0 also after S seconds in which no request of its factor existed (default 0:
@@ -351,9 +377,14 @@ struct Args {
   uint32_t seed = 1;
   std::string socket = "/tmp/dsgb10-engine.sock";
   double pool_free_gib = -1;    // serve: the chunk pool leaves this many GiB free on every Spark (< 0: not given)
-  double pool_slack_gib = 2.0;  // serve: the start check's margin beside the ledger's fixed lines (page cache the kernel gives back, slab)
-  int front_mib = 3200;         // serve, rank 0: what the front-end process may hold (its table and request rows), a ledger line
-  int encoder_mib = 1260;       // serve, rank 0: what the image encoder process holds (device and host), a ledger line
+  double pool_slack_gib = 0.75;  // serve: kernel drift, a line outside the store that nothing enforces (slab the engine does not own)
+  int front_mib = 0;            // serve, rank 0: what the front-end process may hold (dsfront's --front-mib: PICO_FRONT_MIB), a line outside the store; 0 refuses the start
+  int front_now_mib = 0;        // serve, rank 0: what it holds at the start (its cgroup's memory.current); 0: unread, the whole cap comes off the store
+  int encoder_mib = 1260;       // serve, rank 0: what the image encoder process holds (device and host), a line outside the store
+  int media_mib = 512;          // serve, rank 0, with --vision-weights: the media worker's container cap, a line outside the store
+  int encoder_now_mib = 0;      // serve, rank 0: what it holds at the start; 0: unread
+  int frame_stage_mib = 400;    // serve, rank 0: a frame larger than this is not read (DONE too-large); the request frames line is twice this (payload and the request's rows)
+  int ids_host_mib = 1024;      // serve, rank 0: the server's token ids in memory; past it idle conversations' ids go to files under the disk directory
   int64_t pool_tokens = -1;      // serve: the chunk pool holds this many positions of conversation (< 0: not given)
   std::string pool_pick = "smaller";  // serve: with both, the smaller pool or the larger
   double disk_gib = 32;  // serve: the store's disk tier (0: none)
@@ -371,6 +402,14 @@ struct Args {
   int slice = 64;  // serve: time-slicing's turns, in tokens (0: none)
   int grow_ahead = 131072;  // serve: positions of response a reservation reaches past where it is
   int ssd_flush_s = 30;     // serve: seconds between checkpoints while idle; without the imager also the idle age for writing a conversation's pieces
+  bool kv_split = false;    // serve: --kv-split tiered|max: a stored conversation is split into quarter slots (docs/engine.md)
+  int kv_split_mode = 0;    // splitpace::Mode
+  double kv_split_after_s = 0;  // --kv-split-after-s: the idle age before a conversation is imaged (default 0, every mode)
+  int64_t kv_split_high = 0, kv_split_low = 0;
+  int kv_split_pass_ms = 50;  // --kv-split-pass-ms: the longest a pass of split commands runs with requests in flight
+  model::PScan pscan = model::PScan::Off;  // --pscan off|ext|all (model::Options::pscan)
+  int kv_split_budget = 16, kv_join_pieces = 64, kv_join_whole_ms = 250;
+  int kv_split_ride_ms = 250, kv_split_ride_pieces = 4;  // the imager's rides inside a decoding run (split_pace.h)  // the split command's size, the join command's size
   int window_idle_s = reclaim::kWindowIdleS;  // serve past 1M: a factor's window freed after this many seconds with no request of it (0: not by time)
   il::Settings il;  // serve: interleaved prefill's settings (--interleave-*)
   bool snap_all = false;
@@ -468,7 +507,12 @@ Args parse(int argc, char** argv) {
     else if (s == "--pool-free-gib") a.pool_free_gib = std::atof(val().c_str());
     else if (s == "--pool-slack-gib") a.pool_slack_gib = std::atof(val().c_str());
     else if (s == "--front-mib") a.front_mib = std::atoi(val().c_str());
+    else if (s == "--front-now-mib") a.front_now_mib = std::atoi(val().c_str());
+    else if (s == "--encoder-now-mib") a.encoder_now_mib = std::atoi(val().c_str());
+    else if (s == "--frame-stage-mib") a.frame_stage_mib = std::atoi(val().c_str());
+    else if (s == "--ids-host-mib") a.ids_host_mib = std::atoi(val().c_str());
     else if (s == "--encoder-mib") a.encoder_mib = std::atoi(val().c_str());
+    else if (s == "--media-mib") a.media_mib = std::atoi(val().c_str());
     else if (s == "--pool-tokens") a.pool_tokens = std::atoll(val().c_str());
     else if (s == "--pool-pick") a.pool_pick = val();
     else if (s == "--slot-gib" || s == "--session-gib" || s == "--session-margin-gib" || s == "--no-vmm")
@@ -628,8 +672,13 @@ Args parse(int argc, char** argv) {
   if (a.mode == "serve" && a.pool_free_gib < 0 && a.pool_tokens < 0)
     die("serve: the chunk pool's size: --pool-free-gib G (leave G GiB free on every Spark) and/or --pool-tokens N "
         "(a pool of N positions of conversation)");
-  if (a.pool_slack_gib < 0 || a.front_mib < 0 || a.encoder_mib < 0)
-    die("--pool-slack-gib, --front-mib and --encoder-mib must be >= 0");
+  if (a.pool_slack_gib < 0 || a.front_mib < 0 || a.encoder_mib < 0 || a.media_mib < 0 || a.front_now_mib < 0 || a.encoder_now_mib < 0 || a.ids_host_mib < 0 ||
+      a.frame_stage_mib < 1)
+    die("--pool-slack-gib, --front-mib, --encoder-mib, --media-mib, --front-now-mib, --encoder-now-mib and --ids-host-mib must be >= 0, --frame-stage-mib >= 1");
+  // the memory left to the host (--pool-free-gib) is sized beside the front-end's cap: without one the store cannot be sized (a start
+  // by --pool-tokens alone leaves nothing aside and needs none)
+  if (a.mode == "serve" && a.pool_free_gib >= 0)
+    if (const char* why = model::rules::front_cap_refusal(a.front_mib)) die("serve: %s", why);
   if (a.pool_pick != "smaller" && a.pool_pick != "larger") die("--pool-pick smaller or larger");
   if (a.mode == "spectf") a.spec = true;
   if ((!a.tree_probe.empty() || a.tree_sib) && (a.mode != "spectf" || a.tree_probe.empty() || a.tree_sib < 0))
@@ -974,6 +1023,31 @@ int main(int argc, char** argv) {
     const size_t cache = a.no_engram || carved ? 0 : ((size_t)a.engram_cache_mib << 20) - (store ? store->cache_display_bytes() : 0);
     const model::Model::PoolStats p0 = m.pool_stats();
     const uint64_t img = p0.number_bytes, have = p0.numbers;
+    // this rank's ledger (pool_rules.h): the lines it holds or may grow to outside the store, each with its cap and what it holds at
+    // this read; those only rank 0 holds are rank 0's, from the options naming their sizes. The store is sized beside them.
+    namespace rules = model::rules;
+    rules::Ledger ledger;
+    ledger.set(rules::kHeap, heap::kCap, heap::in_use(), true);
+    ledger.set(rules::kEngramCache, cache, 0, true);
+    // state_reserve's gather buffer (model/state.cu), made after this read: its size as the allocation computes it (the larger of one
+    // number's image and the end and window snapshot blocks with the draft module's, in 64 KiB grains)
+    const uint64_t gather_bytes = model::detail::Pool::round(std::max<size_t>({(size_t)img, model::detail::kEndBytes + model::detail::kSpecEndBytes, model::detail::kSnapBytes + model::detail::kSpecSnapBytes}));
+    ledger.set(rules::kGather, gather_bytes, 0, true);
+    const uint64_t split_bytes = rules::split_buffer_bytes(a.kv_split || mo.imager) + rules::imager_buffer_bytes(mo.imager, gather_bytes);
+    ledger.set(rules::kSplit, split_bytes, split_bytes, true);  // made before the read below (split_prepare)
+    ledger.set(rules::kDrift, (uint64_t)(a.pool_slack_gib * gib), 0, false);
+    if (a.rank == 0) {
+      ledger.set(rules::kFront, (uint64_t)a.front_mib << 20, (uint64_t)a.front_now_mib << 20, true);
+      // the image process beside the engine: with --vision-weights the engine encodes images itself (tenant 3 holds its memory
+      // inside the store) and the process is the media worker, capped by its container at --media-mib; without them it is the
+      // encoder container, capped at --encoder-mib
+      ledger.set(rules::kEncoder, rules::image_process_cap(vision != nullptr, a.encoder_mib, a.media_mib), (uint64_t)a.encoder_now_mib << 20, false);  // host part by its container, device part not
+      ledger.image_what = vision ? 1 : 2;
+      ledger.set(rules::kOutQueue, bounds::kOutCap, 0, true);
+      ledger.set(rules::kFrames, 2 * ((uint64_t)a.frame_stage_mib << 20), 0, true);  // a frame's payload and the request's copy of its rows
+      ledger.set(rules::kIds, (uint64_t)a.ids_host_mib << 20, 0, !disk_dir.empty());  // empty at the start: nothing held yet
+    }
+    const uint64_t outside = rules::outside_sum(ledger);
     uint64_t by_free = UINT64_MAX, by_tokens = UINT64_MAX;
     if (a.pool_free_gib >= 0) {
       const size_t keep = (size_t)(a.pool_free_gib * gib);

@@ -11,11 +11,13 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
-#include <unordered_map>
-#include <iterator>
-#include <set>
 
-#include "common/keepfile.h"
+#include <sys/statvfs.h>
+
+#include "comm/host_gather.h"
+#include "common/alloc_seal.h"
+#include "model/pool_rules.h"
+#include "model/quarter_map.h"
 #include "model/spec.h"
 #include "model/spill.h"
 
@@ -88,353 +90,540 @@ void sum_block(const void* p, size_t bytes, uint64_t* out, cudaStream_t st) {
   block_sum<<<kSumCtas, 1024, 0, st>>>((const uint64_t*)p, Pool::round(bytes) / 8, out);
 }
 
+// the byte offset of array a's slice in a cache entry's image
+size_t img_slice(int a) {
+  size_t o = 0;
+  for (int j = 0; j < a; ++j) o += (size_t)attn::kChunkEntries * kArr[j];
+  return o;
+}
+
 }  // namespace
 
-size_t Pool::take_off(size_t bytes) {
-  const size_t n = round(bytes);
-  auto best = free.end();
-  for (auto it = free.begin(); it != free.end(); ++it)
-    if (it->second >= n && (best == free.end() || it->second < best->second)) best = it;
-  if (best == free.end()) return kNone;
-  const size_t off = best->first, len = best->second;
-  free.erase(best);
-  if (len > n) free.emplace(off + n, len - n);
-  return off;
-}
+// ---- the engine's StoreDev -------------------------------------------------------------------------------------------
+//
+// The device work the store does in the middle of an operation. The disk tier's file and its staging are made at the first disk_open; `gather` is the one image
+// at a time between the pool and the file (state_reserve).
 
-size_t Pool::take_fit(size_t bytes, const std::function<bool(size_t, size_t)>& ok) {
-  const size_t n = round(bytes);
-  for (auto it = free.begin(); it != free.end(); ++it) {
-    if (it->second < n || !ok(it->first, n)) continue;
-    const size_t off = it->first, len = it->second;
-    free.erase(it);
-    if (len > n) free.emplace(off + n, len - n);
-    return off;
+static_assert(kSiteKeep == comm::kCallKeepIndex && kSiteCheckpoint == comm::kCallCheckpointIndex && kSiteDiskRoom == comm::kCallDiskRoom && kSiteUnspill == comm::kCallUnspill &&
+                  kSiteJoin == comm::kCallJoin, "the store's sites are the host all-gather's ids");
+
+class EngineDev : public StoreDev {
+ public:
+  explicit EngineDev(Model::Impl& impl) : m(impl) {}
+  Model::Impl& m;
+  uint8_t* gather = nullptr;
+  std::unique_ptr<SpillFile> file;
+
+  void fill(uint32_t c, int byte) override {
+    for (int a = 0; a < 4; ++a)
+      CUDA_CHECK(cudaMemsetAsync(m.pool_arr[a] + ((size_t)c << attn::kChunkShift) * kKvEntryBytes[a], byte,
+                                 (size_t)attn::kChunkEntries * kKvEntryBytes[a], m.st));
   }
-  return kNone;
-}
-
-uint8_t* Pool::take(size_t bytes) {
-  const size_t off = take_off(bytes);
-  return off == kNone ? nullptr : base + off;
-}
-
-void Pool::give(uint8_t* p, size_t bytes) { give_off((size_t)(p - base), bytes); }
-
-bool Pool::take_at(size_t off, size_t bytes) {
-  const size_t n = round(bytes);
-  auto it = free.upper_bound(off);
-  if (it == free.begin()) return false;
-  --it;
-  const size_t fo = it->first, fl = it->second;
-  if (off + n > fo + fl) return false;
-  free.erase(it);
-  if (off > fo) free.emplace(fo, off - fo);
-  if (off + n < fo + fl) free.emplace(off + n, fo + fl - off - n);
-  return true;
-}
-
-size_t Pool::largest() const {
-  size_t n = 0;
-  for (const auto& f : free) n = std::max(n, f.second);
-  return n;
-}
-
-void Pool::give_off(size_t off, size_t bytes) {
-  size_t len = round(bytes);
-  auto next = free.lower_bound(off);
-  if (next != free.end() && next->first == off + len) {
-    len += next->second;
-    next = free.erase(next);
+  // entries [0, n) of number `from` into number `to`, all four arrays (a fork's partial number; copy on write)
+  void copy_entries(uint32_t to, uint32_t from, int n) override {
+    for (int a = 0; a < 4; ++a)
+      CUDA_CHECK(cudaMemcpyAsync(m.pool_arr[a] + ((size_t)to << attn::kChunkShift) * kKvEntryBytes[a],
+                                 m.pool_arr[a] + ((size_t)from << attn::kChunkShift) * kKvEntryBytes[a], (size_t)n * kKvEntryBytes[a],
+                                 cudaMemcpyDeviceToDevice, m.st));
   }
-  if (next != free.begin()) {
-    const auto prev = std::prev(next);
-    if (prev->first + prev->second == off) {
-      off = prev->first;
-      len += prev->second;
-      free.erase(prev);
+  // unit u's rows from the lists (the guard past their ends); the stream waits first, so no queued copy of the mirror reads an
+  // entry being rewritten
+  void rows_set(int u, const Nums* lists) override {
+    CUDA_CHECK(cudaStreamSynchronize(m.st));
+    for (int k = 0; k < kKvSlots; ++k) {
+      uint32_t* row = m.lists_h + ((size_t)k * m.nunits + u) * m.list_len;
+      std::fill(row, row + m.list_len, 0u);
+      if (lists) std::copy(lists[k].begin(), lists[k].end(), row);
+      CUDA_CHECK(cudaMemcpyAsync(m.lists_d + ((size_t)k * m.nunits + u) * m.list_len, row, m.list_len * sizeof(uint32_t),
+                                 cudaMemcpyHostToDevice, m.st));
     }
   }
-  free.emplace(off, len);
-}
+  void rows_append(int u, int k, size_t i0, const uint32_t* numbers, size_t n) override {
+    const size_t row = ((size_t)k * m.nunits + u) * m.list_len;
+    for (size_t i = 0; i < n; ++i) m.lists_h[row + i0 + i] = numbers[i];  // an entry no queued copy reads yet (rewrites wait: rows_set)
+    CUDA_CHECK(cudaMemcpyAsync(m.lists_d + row + i0, m.lists_h + row + i0, n * sizeof(uint32_t), cudaMemcpyHostToDevice, m.st));
+  }
+  uint64_t image_out(uint32_t c, size_t off) override {
+    const size_t bytes = m.chunk_image();
+    for (int a = 0; a < 4; ++a)
+      CUDA_CHECK(cudaMemcpyAsync(gather + img_slice(a), m.pool_arr[a] + ((size_t)c << attn::kChunkShift) * kArr[a],
+                                 (size_t)attn::kChunkEntries * kArr[a], cudaMemcpyDeviceToDevice, m.st));
+    sum_block(gather, bytes, file->sum(off, false), m.st);
+    return file->write(gather, bytes, off, m.st);
+  }
+  uint64_t bk_out(const Nums& numbers, size_t bytes, size_t off) override {
+    m.bk_copy(numbers, 0, gather, bytes, false);
+    sum_block(gather, bytes, file->sum(off, false), m.st);
+    return file->write(gather, bytes, off, m.st);
+  }
+  void image_in(size_t off, uint32_t c) override {
+    file->read(gather, m.chunk_image(), off, m.st);
+    sum_block(gather, m.chunk_image(), file->sum(off, true), m.st);
+    for (int a = 0; a < 4; ++a)
+      CUDA_CHECK(cudaMemcpyAsync(m.pool_arr[a] + ((size_t)c << attn::kChunkShift) * kArr[a], gather + img_slice(a),
+                                 (size_t)attn::kChunkEntries * kArr[a], cudaMemcpyDeviceToDevice, m.st));
+  }
+  void bk_in(size_t off, const Nums& numbers, size_t bytes) override {
+    file->read(gather, bytes, off, m.st);
+    sum_block(gather, bytes, file->sum(off, true), m.st);
+    m.bk_copy(numbers, 0, gather, bytes, true);
+  }
+  // the writes not yet flushed leave on the stream they were queued on (the image stream's, or the model's under PICO_OLD_RULES)
+  void flush_pending() { file->flush(file->pending_stream() ? file->pending_stream() : m.st); }
+  void disk_flush() override { flush_pending(); }
+  void disk_settle(uint64_t seq) override {
+    flush_pending();
+    file->wait(seq);
+  }
+  void sync() override { CUDA_CHECK(cudaStreamSynchronize(m.st)); }
+  void disk_sync() override { file->sync(); }
+  void disk_keep() override { file->keep(); }
+  size_t disk_open(const std::string& base, size_t bytes, size_t staging, bool reuse) override {
+    file = std::make_unique<SpillFile>(base, bytes, staging, reuse);
+    return file->size();
+  }
+  size_t disk_size() override { return file->size(); }
+  // free space of the file's directory less the 32 GiB margin the start keeps (server/main.cpp)
+  size_t disk_room() override {
+    const std::string p = file->path();
+    const size_t cut = p.rfind('/');
+    struct statvfs v;
+    if (statvfs(cut == std::string::npos ? "." : p.substr(0, cut).c_str(), &v) != 0) return 0;
+    const uint64_t fr = (uint64_t)v.f_bavail * v.f_frsize, margin = 32ull << 30;
+    return fr > margin ? (size_t)(fr - margin) : 0;
+  }
+  // the staged writes are in the file and the stream holds no checksum or read of the slots the grow moves
+  bool disk_grow(size_t bytes) override {
+    flush_pending();
+    CUDA_CHECK(cudaStreamSynchronize(m.st));
+    if (sg) CUDA_CHECK(cudaStreamSynchronize(sg));
+    return file->grow(bytes);
+  }
+  // the staged writes are in the file and the stream holds no checksum or read of the slots the shrink moves
+  bool disk_shrink(size_t bytes) override {
+    flush_pending();
+    CUDA_CHECK(cudaStreamSynchronize(m.st));
+    if (sg) CUDA_CHECK(cudaStreamSynchronize(sg));
+    return file->shrink(bytes);
+  }
+  std::string disk_path() override { return file->path(); }
+  uint64_t sum(size_t off, bool back) override { return *file->sum(off, back); }
+  void sum_set(size_t off, uint64_t value) override { *file->sum(off, false) = value; }
+  // every rank cuts at the smallest first bad position (each reaches this in the same command)
+  int agree_min(int pos, uint32_t site) override {
+    int32_t all[4];
+    const int32_t mine = pos;
+    m.host_ring->allgather_host(&mine, all, sizeof mine, site);
+    for (const int32_t b : all) pos = std::min<int>(pos, b);
+    return pos;
+  }
+  void agree_all(int v, uint32_t site, int all[4]) override {
+    int32_t a[4];
+    const int32_t mine = v;
+    m.host_ring->allgather_host(&mine, a, sizeof mine, site);
+    for (int r = 0; r < 4; ++r) all[r] = a[r];
+  }
+  void agree_words(const uint64_t mine[4], uint32_t site, uint64_t all[16]) override { m.host_ring->allgather_host(mine, all, 4 * sizeof(uint64_t), site); }
+  std::time_t now() override { return std::time(nullptr); }
 
-Store::~Store() = default;
+  // ---- the split: a piece's quarters. Slot s = (number << 2) | quarter lives in the quarter number's four slices, at
+  // quarter * 2,048 entries of each array; the sums recorded at a split (five words a slot) are in a device array sized for the pool's
+  // largest count of numbers. The buffers are made at the start (state_reserve, with --kv-split cache), itemised on the start table
+  // as pool_rules.h's kSplit, never at first use.
+  uint64_t* d_sums = nullptr;
+  size_t sums_slots = 0;
+  uint8_t* qbuf = nullptr;    // one quarter, as quarter() makes it
+  uint8_t* qpack = nullptr;   // this rank's quarters of up to kBatch pieces, to send
+  uint8_t* exbuf = nullptr;   // the four ranks' quarters of up to kBatch pieces, piece by piece (what unquarter reads)
+  uint8_t* gat = nullptr;     // the all-gather's output: rank by rank
+  uint64_t* d_tmp = nullptr;
 
-Store& Model::Impl::store_of() {
-  if (!store_s) store_s = std::make_unique<Store>();
-  return *store_s;
-}
+  static constexpr int kBatch = (int)model::rules::kJoinBatch;  // pieces a join exchanges at once
 
-// ---- kept sessions ---------------------------------------------------------------------------------
-//
-// A planned stop's index of the disk tier's file (base.index beside base.spill; keepfile.h: mode 0600
-// in a 0700 directory, whole or not at all): a header, then every session in the file with its blocks'
-// offsets and their checksums as they went out. Every rank writes its own with the same gen; the next
-// start reuses the files only when every rank's index is whole, of this run's id, young enough, and of
-// the same gen (main.cpp).
+  // ---- the imager: a second stream that is not the model's, its own scratch, and one event per image command. Nothing on it waits
+  // for the model's stream except the first read of a command (one way: it waits for the work queued before the command, so the bytes it
+  // reads are the ones the steps wrote), and nothing on the model's stream waits for it.
+  cudaStream_t sg = nullptr;
+  cudaEvent_t ev_m = nullptr;        // recorded on the model's stream at the first call of a command; sg waits for it
+  uint8_t* gq = nullptr;             // a quarter and its trailer: kDiskBytes
+  uint8_t* gather_g = nullptr;       // a bookmark's bytes, then its image block
+  size_t gather_g_bytes = 0;
+  uint64_t* d_five = nullptr;        // the five sum words of the image being made
+  bool cmd_open = false;             // the model's stream has been waited for in this command
+  struct End {
+    uint64_t seq;
+    cudaEvent_t ev;
+    std::chrono::steady_clock::time_point t;
+  };
+  std::deque<End> ends;  // image_end's events, oldest first
+  uint64_t done_seq = 0;
 
-namespace {
+  void begin_cmd() {
+    if (cmd_open) return;
+    CUDA_CHECK(cudaEventRecord(ev_m, m.st));
+    CUDA_CHECK(cudaStreamWaitEvent(sg, ev_m, 0));
+    cmd_open = true;
+  }
 
-constexpr char kKeptMagic[8] = {'D', 'S', 'G', 'B', '1', '0', 'K', '3'};  // the last byte is the index layout's version; another version is "not a kept index"
+  void prepare() {
+    if (qbuf) return;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&sg, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaEventCreateWithFlags(&ev_m, cudaEventDisableTiming));
+    CUDA_CHECK(cudaMalloc(&gq, qm::kDiskBytes));
+    CUDA_CHECK(cudaMalloc(&d_five, 5 * sizeof(uint64_t)));
+    gather_g_bytes = Pool::round(std::max(end_bytes(true), snap_bytes(true))) + sgeom::kEndImageBytes;
+    CUDA_CHECK(cudaMalloc(&gather_g, gather_g_bytes));
+    CUDA_CHECK(cudaMalloc(&qbuf, qm::kQuarterBytes));
+    CUDA_CHECK(cudaMalloc(&qpack, (size_t)kBatch * qm::kQuarterBytes));
+    CUDA_CHECK(cudaMalloc(&exbuf, (size_t)kBatch * 4 * qm::kQuarterBytes));
+    CUDA_CHECK(cudaMalloc(&gat, (size_t)kBatch * 4 * qm::kQuarterBytes));
+    CUDA_CHECK(cudaMalloc(&d_tmp, (size_t)kBatch * 5 * sizeof(uint64_t)));
+    sums_slots = (size_t)model::rules::kSplitMaxNumbers * 4;
+    CUDA_CHECK(cudaMalloc(&d_sums, sums_slots * 5 * sizeof(uint64_t)));
+    CUDA_CHECK(cudaMemset(d_sums, 0, sums_slots * 5 * sizeof(uint64_t)));
+    warm_kernels();
+  }
+  // every kernel the imager and the read-back use is launched once here, at the start, with the model's stream empty, on scratch held already (a piece laid over
+  // gather_g, gq, exbuf, d_five, d_tmp: no pool block, nothing written to the file). An image kernel's first launch inside a decoding run does not return on any rank,
+  // so no store kernel has its first launch there. The names of the kernels are the tables' (quarter.cu warm(), and "block_sum" below).
+  void warm_kernels() {
+    const double t0 = wall_s();
+    qm::Piece p;
+    qm::PieceOut po;
+    for (int a = 0; a < 4; ++a) p.a[a] = gather_g + qm::image_off(a), po.a[a] = gather_g + qm::image_off(a);
+    int n = qm::warm(p, po, gq, exbuf, d_five, d_tmp, sg, m.st);
+    sum_block(gq, qm::kDiskBytes, d_tmp + 5, sg), ++n;  // "block_sum"
+    uint8_t* host = nullptr;
+    CUDA_CHECK(cudaHostAlloc(&host, 4096, cudaHostAllocDefault));
+    CUDA_CHECK(cudaMemcpyAsync(host, gq, 4096, cudaMemcpyDeviceToHost, sg));
+    CUDA_CHECK(cudaStreamSynchronize(sg));
+    CUDA_CHECK(cudaStreamSynchronize(m.st));
+    cudaFreeHost(host);
+    std::printf("rank %d: the store's kernels ran once (%d kernels, %.1f ms)\n", m.rank, n, 1e3 * (wall_s() - t0));
+  }
+  void need_scratch() {
+    if (!qbuf) prepare();  // a test that never reserved the store
+    if ((size_t)m.core->calloc->numbers() * 4 > sums_slots)
+      die("state: the pool has %u numbers, more than the split's sums cover (%zu)", m.core->calloc->numbers(), sums_slots / 4);
+  }
+  qm::Piece piece_of(uint32_t c) const {
+    qm::Piece p;
+    for (int a = 0; a < 4; ++a) p.a[a] = m.pool_arr[a] + ((size_t)c << attn::kChunkShift) * kArr[a];
+    return p;
+  }
+  qm::PieceOut piece_out(uint32_t c) const {
+    qm::PieceOut p;
+    for (int a = 0; a < 4; ++a) p.a[a] = m.pool_arr[a] + ((size_t)c << attn::kChunkShift) * kArr[a];
+    return p;
+  }
+  uint8_t* slot_slice(uint32_t slot, int a) const {
+    return m.pool_arr[a] + ((size_t)(slot >> 2) << attn::kChunkShift) * kArr[a] + (size_t)(slot & 3) * qm::kQuarterEntries * kArr[a];
+  }
+  void quarter(uint32_t c, uint32_t slot, int written) override {
+    need_scratch();
+    qm::quarter(piece_of(c), qbuf, m.rank, written, m.st);
+    for (int a = 0; a < 4; ++a)
+      CUDA_CHECK(cudaMemcpyAsync(slot_slice(slot, a), qbuf + qm::quarter_off(a), (size_t)qm::kQuarterEntries * kArr[a],
+                                 cudaMemcpyDeviceToDevice, m.st));
+    qm::piece_sums(piece_of(c), written, d_sums + (size_t)slot * 5, m.st);
+  }
+  // The quarters of `slots` (this rank's, in its slots) to every rank and the other ranks' to this one: one all-gather of the batch,
+  // then each piece's four quarters side by side for unquarter. Every rank calls with the same slots in the same command.
+  void exchange(const std::vector<uint32_t>& slots) override {
+    need_scratch();
+    const size_t B = slots.size();
+    if (!B || B > (size_t)kBatch) die("state: an exchange of %zu pieces (at most %d)", B, kBatch);
+    for (size_t i = 0; i < B; ++i)
+      for (int a = 0; a < 4; ++a)
+        CUDA_CHECK(cudaMemcpyAsync(qpack + i * qm::kQuarterBytes + qm::quarter_off(a), slot_slice(slots[i], a),
+                                   (size_t)qm::kQuarterEntries * kArr[a], cudaMemcpyDeviceToDevice, m.st));
+    gather_batch(B);
+  }
+  // the batch in qpack (this rank's quarters) to every rank, and every rank's quarters piece by piece into exbuf
+  void gather_batch(size_t B) {
+    comm::allgather(m.ch, qpack, gat, B * qm::kQuarterBytes, m.st);
+    for (int r = 0; r < 4; ++r)
+      for (size_t i = 0; i < B; ++i)
+        CUDA_CHECK(cudaMemcpyAsync(exbuf + (i * 4 + r) * qm::kQuarterBytes, gat + ((size_t)r * B + i) * qm::kQuarterBytes, qm::kQuarterBytes,
+                                   cudaMemcpyDeviceToDevice, m.st));
+  }
+  // ---- a quarter's image on the disk tier: the quarter (laid out as a slot holds it) and the trailer, kDiskBytes in all
+  uint64_t slot_out(uint32_t slot, size_t off, int handle, int list, int piece, int written) override {
+    need_scratch();
+    slot_get(slot, gather);
+    uint64_t rec[5];
+    qm::sums_read(d_sums + (size_t)slot * 5, rec, m.st);  // on the stream: the sums kernel was queued there, and the stream is non-blocking
+    qm::Trailer t;
+    for (int q = 0; q < 4; ++q) t.qsum[q] = rec[q];
+    t.wsum = rec[4], t.rank = (uint32_t)m.rank, t.handle = (uint32_t)handle, t.list = (uint32_t)list, t.piece = (uint32_t)piece, t.written = (uint32_t)written;
+    uint8_t tb[qm::kTrailerBytes];
+    qm::trailer_pack(t, tb);
+    CUDA_CHECK(cudaMemcpyAsync(gather + qm::kQuarterBytes, tb, qm::kTrailerBytes, cudaMemcpyHostToDevice, m.st));
+    sum_block(gather, qm::kDiskBytes, file->sum(off, false), m.st);
+    return file->write(gather, qm::kDiskBytes, off, m.st);
+  }
+  bool quarter_read(size_t off, int idx, qm::Trailer* t) override {
+    need_scratch();
+    file->read(gather, qm::kDiskBytes, off, m.st);
+    sum_block(gather, qm::kDiskBytes, file->sum(off, true), m.st);
+    CUDA_CHECK(cudaMemcpyAsync(qpack + (size_t)idx * qm::kQuarterBytes, gather, qm::kQuarterBytes, cudaMemcpyDeviceToDevice, m.st));
+    uint8_t tb[qm::kTrailerBytes];
+    CUDA_CHECK(cudaMemcpyAsync(tb, gather + qm::kQuarterBytes, qm::kTrailerBytes, cudaMemcpyDeviceToHost, m.st));
+    CUDA_CHECK(cudaStreamSynchronize(m.st));
+    return qm::trailer_unpack(tb, t);
+  }
+  void exchange_staged(int n) override {
+    need_scratch();
+    gather_batch((size_t)n);
+  }
+  void compare_sums(const std::vector<uint32_t>& numbers, const std::vector<qm::Trailer>& trailers, std::vector<uint8_t>* bad) override {
+    need_scratch();
+    bad->assign(numbers.size(), 0);
+    for (size_t i = 0; i < numbers.size(); ++i) qm::piece_sums(piece_of(numbers[i]), (int)attn::kChunkEntries, d_tmp + i * 5, m.st);
+    std::vector<uint64_t> now(numbers.size() * 5);
+    CUDA_CHECK(cudaMemcpyAsync(now.data(), d_tmp, now.size() * sizeof(uint64_t), cudaMemcpyDeviceToHost, m.st));
+    CUDA_CHECK(cudaStreamSynchronize(m.st));
+    for (size_t i = 0; i < numbers.size(); ++i) {
+      bool eq = now[i * 5 + 4] == trailers[i].wsum;
+      for (int q = 0; q < 4; ++q) eq = eq && now[i * 5 + q] == trailers[i].qsum[q];
+      (*bad)[i] = !eq;
+    }
+  }
+  void unquarter(const std::vector<uint32_t>& numbers) override {
+    need_scratch();
+    for (size_t i = 0; i < numbers.size(); ++i)
+      qm::unquarter(exbuf + i * 4 * qm::kQuarterBytes, piece_out(numbers[i]), m.st);
+  }
+  // the sums of piece `c` against the five words recorded for `slot`
+  bool sums_match(const uint64_t* now, uint32_t slot, bool whole_only) {
+    uint64_t rec[5];
+    qm::sums_read(d_sums + (size_t)slot * 5, rec, m.st);
+    for (int i = whole_only ? 4 : 0; i < 5; ++i)
+      if (now[i] != rec[i]) return false;
+    return true;
+  }
+  void compare(const std::vector<uint32_t>& slots, const std::vector<uint32_t>& numbers, std::vector<uint8_t>* bad) override {
+    need_scratch();
+    bad->assign(slots.size(), 0);
+    for (size_t i = 0; i < numbers.size(); ++i) qm::piece_sums(piece_of(numbers[i]), (int)attn::kChunkEntries, d_tmp + i * 5, m.st);
+    std::vector<uint64_t> now(numbers.size() * 5);
+    CUDA_CHECK(cudaMemcpyAsync(now.data(), d_tmp, now.size() * sizeof(uint64_t), cudaMemcpyDeviceToHost, m.st));
+    CUDA_CHECK(cudaStreamSynchronize(m.st));  // one sync for the batch
+    for (size_t i = 0; i < slots.size(); ++i) (*bad)[i] = !sums_match(&now[i * 5], slots[i], false);
+  }
+  // A bookmark's quarters. A bookmark is replicated (every rank holds the same bytes), so rank r keeps the
+  // bytes [r * Q, (r + 1) * Q) of it, Q = a quarter of its bytes rounded up to 16, laid in its slots one slot's capacity at a time
+  // (a window bookmark one slot, the end bookmark three). The bookmark's own bytes are read through the gather buffer (bk_copy), the
+  // sum of the whole bookmark is recorded in the first slot's word 4. A slot holds its bytes in the four arrays' slices at the
+  // positions a piece's quarter does (quarter_off), so the slot map and the exchange treat both alike.
+  size_t bk_len(size_t nslots) const {
+    const StoreCore& c = *m.core;
+    return nslots == c.bk_slots(c.snap_bytes()) ? c.snap_bytes() : c.end_bytes();
+  }
+  static size_t bk_q(size_t bytes) { return (bytes / 4 + 15) / 16 * 16; }
+  void slot_put(uint32_t slot, const uint8_t* src) {  // one slot's bytes (kQuarterBytes) from a contiguous buffer
+    for (int a = 0; a < 4; ++a)
+      CUDA_CHECK(cudaMemcpyAsync(slot_slice(slot, a), src + qm::quarter_off(a), (size_t)qm::kQuarterEntries * kArr[a], cudaMemcpyDeviceToDevice, m.st));
+  }
+  void slot_get(uint32_t slot, uint8_t* dst) {
+    for (int a = 0; a < 4; ++a)
+      CUDA_CHECK(cudaMemcpyAsync(dst + qm::quarter_off(a), slot_slice(slot, a), (size_t)qm::kQuarterEntries * kArr[a], cudaMemcpyDeviceToDevice, m.st));
+  }
+  void quarter_bk(const Nums& numbers, const std::vector<uint32_t>& slots) override {
+    need_scratch();
+    const size_t bytes = bk_len(slots.size()), Q = bk_q(bytes);
+    if (Q > slots.size() * qm::kQuarterBytes) die("state: a bookmark's quarter of %zu bytes does not fit %zu slots", Q, slots.size());
+    m.bk_copy(numbers, 0, gather, bytes, false);
+    const size_t mine = (size_t)m.rank * Q;
+    for (size_t j = 0; j < slots.size(); ++j) {
+      const size_t from = mine + j * qm::kQuarterBytes, rem = Q > j * qm::kQuarterBytes ? Q - j * qm::kQuarterBytes : 0;
+      CUDA_CHECK(cudaMemsetAsync(qbuf, 0, qm::kQuarterBytes, m.st));
+      if (from < bytes && rem) CUDA_CHECK(cudaMemcpyAsync(qbuf, gather + from, std::min({qm::kQuarterBytes, rem, bytes - from}), cudaMemcpyDeviceToDevice, m.st));
+      slot_put(slots[j], qbuf);
+    }
+    qm::sum_exact(gather, bytes & ~(size_t)7, qm::kWholeSeed, d_sums + (size_t)slots[0] * 5 + 4, m.st);
+  }
+  bool join_bk(const Nums& numbers, const std::vector<uint32_t>& slots) override {
+    need_scratch();
+    const size_t n = slots.size(), bytes = bk_len(n), Q = bk_q(bytes);
+    if (n > (size_t)kBatch) die("state: a bookmark of %zu slots (at most %d)", n, kBatch);
+    for (size_t j = 0; j < n; ++j) slot_get(slots[j], qpack + j * qm::kQuarterBytes);
+    comm::allgather(m.ch, qpack, gat, n * qm::kQuarterBytes, m.st);  // every rank's quarter, rank by rank, slot after slot
+    for (int r = 0; r < 4; ++r) {
+      const size_t from = (size_t)r * Q;
+      if (from < bytes)
+        CUDA_CHECK(cudaMemcpyAsync(gather + from, gat + (size_t)r * n * qm::kQuarterBytes, std::min(Q, bytes - from), cudaMemcpyDeviceToDevice, m.st));
+    }
+    m.bk_copy(numbers, 0, gather, bytes, true);
+    qm::sum_exact(gather, bytes & ~(size_t)7, qm::kWholeSeed, d_tmp, m.st);
+    uint64_t now = 0, rec = 0;
+    CUDA_CHECK(cudaMemcpyAsync(&now, d_tmp, sizeof now, cudaMemcpyDeviceToHost, m.st));
+    CUDA_CHECK(cudaMemcpyAsync(&rec, d_sums + (size_t)slots[0] * 5 + 4, sizeof rec, cudaMemcpyDeviceToHost, m.st));
+    CUDA_CHECK(cudaStreamSynchronize(m.st));  // one sync a bookmark
+    return now == rec;
+  }
+  bool sum_exact(uint32_t c, uint32_t slot, int written) override {
+    need_scratch();
+    qm::piece_sums(piece_of(c), written, d_tmp, m.st);
+    uint64_t now[5];
+    CUDA_CHECK(cudaMemcpyAsync(now, d_tmp, sizeof now, cudaMemcpyDeviceToHost, m.st));
+    CUDA_CHECK(cudaStreamSynchronize(m.st));
+    return sums_match(now, slot, true);
+  }
 
-struct KeptHeader {
-  char magic[8];
-  uint64_t gen, run_id, file_bytes;
-  int64_t written;  // unix time, seconds
-  int32_t rank, n_sess;
-  uint64_t clock;                              // the store's
-  uint64_t image_bytes, snap_bytes, end_bytes;  // its layout
-  uint64_t body_bytes, body_hash;
+  // ---- the imager's calls (store_core.h): every one is queued on sg
+  bool image_room(size_t bytes) override { return file->room(bytes); }
+  // piece c's quarter (the layout a slot holds), its five sums, and the trailer built on the device from them: no read of the sums by the host
+  uint64_t image_quarter(uint32_t c, size_t off, int handle, int list, int piece, int written) override {
+    need_scratch();
+    begin_cmd();
+    qm::quarter(piece_of(c), gq, m.rank, written, sg);
+    qm::piece_sums(piece_of(c), written, d_five, sg);
+    qm::trailer_device(d_five, (uint32_t)m.rank, (uint32_t)handle, (uint32_t)list, (uint32_t)piece, (uint32_t)written, gq + qm::kQuarterBytes,
+                       qm::kTrailerBytes, sg);
+    sum_block(gq, qm::kDiskBytes, file->sum(off, false), sg);
+    return file->write(gq, qm::kDiskBytes, off, sg);
+  }
+  // a bookmark's bytes through gather_g; this rank's slice [r * Q, (r + 1) * Q) and the trailer's words after it, in one image block
+  uint64_t image_bookmark(const Nums& numbers, size_t bytes, size_t off, int handle, int list, int piece) override {
+    need_scratch();
+    begin_cmd();
+    const size_t Q = qm::bk_slice(bytes), imgb = list == Store::kBkEnd ? sgeom::kEndImageBytes : sgeom::kBookmarkImageBytes;
+    uint8_t* img = gather_g + Pool::round(bytes);
+    if (qm::bk_trailer_off(bytes) + qm::kTrailerUsed > imgb || Pool::round(bytes) + imgb > gather_g_bytes)
+      die("state: a bookmark of %zu bytes does not fit its image block", bytes);
+    m.bk_copy(numbers, 0, gather_g, bytes, false, sg);
+    for (int r = 0; r < 4; ++r) {  // the four slices' sums (the slice's owner is the seed), then the whole's
+      const size_t from = (size_t)r * Q, len = from < bytes ? std::min(Q, bytes - from) & ~(size_t)7 : 0;
+      if (len) qm::sum_exact(gather_g + from, len, (uint64_t)r, d_five + r, sg);
+      else CUDA_CHECK(cudaMemsetAsync(d_five + r, 0, sizeof(uint64_t), sg));
+    }
+    qm::sum_exact(gather_g, bytes & ~(size_t)7, qm::kWholeSeed, d_five + 4, sg);
+    CUDA_CHECK(cudaMemsetAsync(img, 0, imgb, sg));
+    const size_t mine = (size_t)m.rank * Q, len = mine < bytes ? std::min(Q, bytes - mine) : 0;
+    if (len) CUDA_CHECK(cudaMemcpyAsync(img, gather_g + mine, len, cudaMemcpyDeviceToDevice, sg));
+    qm::trailer_device(d_five, (uint32_t)m.rank, (uint32_t)handle, (uint32_t)list, (uint32_t)piece, (uint32_t)bytes, img + qm::bk_trailer_off(bytes), 0, sg);
+    sum_block(img, imgb, file->sum(off, false), sg);
+    return file->write(img, imgb, off, sg);
+  }
+  void image_end(uint64_t seq) override {
+    cmd_open = false;
+    flush_pending();
+    cudaEvent_t e;
+    CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventRecord(e, sg));
+    ends.push_back({seq, e, std::chrono::steady_clock::now()});
+  }
+  uint64_t image_done() override {
+#ifdef DSGB10_TEST_FAULTS
+    // Fault seam (DSGB10_IMAGE_SLOW=rank:R,ms:N, a fault build): rank R reads a command as done only N ms after its image_end, as if its stream
+    // were slow. The ranks' settle is the smallest reading: nothing is marked anywhere before rank R's stream ends.
+    if (const char* e = std::getenv("DSGB10_IMAGE_SLOW")) {
+      int rk = -1, ms = 0;
+      std::sscanf(e, "rank:%d,ms:%d", &rk, &ms);
+      if (rk == m.rank && !ends.empty() && std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ends.front().t).count() < ms)
+        return done_seq;
+    }
+#endif
+    while (!ends.empty()) {
+      const cudaError_t r = cudaEventQuery(ends.front().ev);
+      if (r == cudaErrorNotReady) break;
+      CUDA_CHECK(r);
+      done_seq = ends.front().seq;
+      CUDA_CHECK(cudaEventDestroy(ends.front().ev));
+      ends.pop_front();
+    }
+    return done_seq;
+  }
+  void image_wait() override {
+    if (sg) CUDA_CHECK(cudaStreamSynchronize(sg));
+  }
+  // a bookmark's slice image read into the batch at unit idx (the units are consecutive quarters of the batch buffer)
+  bool bookmark_read(size_t off, size_t bytes, int idx, qm::Trailer* t) override {
+    need_scratch();
+    const size_t Q = qm::bk_slice(bytes), imgb = bytes == m.core->end_bytes() ? sgeom::kEndImageBytes : sgeom::kBookmarkImageBytes;
+    const int units = (int)((Q + qm::kQuarterBytes - 1) / qm::kQuarterBytes);
+    if (idx + units > kBatch) die("state: a bookmark of %d units at %d of a batch of %d", units, idx, kBatch);
+    file->read(gather, imgb, off, m.st);
+    sum_block(gather, imgb, file->sum(off, true), m.st);
+    CUDA_CHECK(cudaMemsetAsync(qpack + (size_t)idx * qm::kQuarterBytes, 0, (size_t)units * qm::kQuarterBytes, m.st));
+    CUDA_CHECK(cudaMemcpyAsync(qpack + (size_t)idx * qm::kQuarterBytes, gather, Q, cudaMemcpyDeviceToDevice, m.st));
+    uint8_t tb[qm::kTrailerUsed];
+    CUDA_CHECK(cudaMemcpyAsync(tb, gather + qm::bk_trailer_off(bytes), sizeof tb, cudaMemcpyDeviceToHost, m.st));
+    CUDA_CHECK(cudaStreamSynchronize(m.st));
+    uint8_t full[qm::kTrailerBytes] = {};
+    std::memcpy(full, tb, sizeof tb);
+    return qm::trailer_unpack(full, t);
+  }
+  // the four ranks' slices (units idx.. of the exchanged batch, rank by rank) laid end to end, put into `numbers`, and checked against the
+  // trailer's four slice sums and the whole's
+  bool bookmark_put(const Nums& numbers, size_t bytes, int idx, const qm::Trailer& t) override {
+    need_scratch();
+    const size_t Q = qm::bk_slice(bytes);
+    const int units = (int)((Q + qm::kQuarterBytes - 1) / qm::kQuarterBytes);
+    for (int r = 0; r < 4; ++r) {
+      const size_t from = (size_t)r * Q;
+      if (from >= bytes) continue;
+      const size_t len = std::min(Q, bytes - from);
+      for (int j = 0; j < units; ++j) {
+        const size_t o = (size_t)j * qm::kQuarterBytes;
+        if (o >= len) break;
+        CUDA_CHECK(cudaMemcpyAsync(gather + from + o, exbuf + ((size_t)(idx + j) * 4 + r) * qm::kQuarterBytes, std::min(qm::kQuarterBytes, len - o),
+                                   cudaMemcpyDeviceToDevice, m.st));
+      }
+    }
+    m.bk_copy(numbers, 0, gather, bytes, true);
+    uint64_t* five = d_tmp;
+    for (int r = 0; r < 4; ++r) {
+      const size_t from = (size_t)r * Q, len = from < bytes ? std::min(Q, bytes - from) & ~(size_t)7 : 0;
+      if (len) qm::sum_exact(gather + from, len, (uint64_t)r, five + r, m.st);
+      else CUDA_CHECK(cudaMemsetAsync(five + r, 0, sizeof(uint64_t), m.st));
+    }
+    qm::sum_exact(gather, bytes & ~(size_t)7, qm::kWholeSeed, five + 4, m.st);
+    uint64_t now[5];
+    CUDA_CHECK(cudaMemcpyAsync(now, five, sizeof now, cudaMemcpyDeviceToHost, m.st));
+    CUDA_CHECK(cudaStreamSynchronize(m.st));
+    bool ok = now[4] == t.wsum;
+    for (int r = 0; r < 4; ++r) ok = ok && now[r] == t.qsum[r];
+    return ok;
+  }
 };
 
-}  // namespace
-
-uint64_t Model::Impl::state_kept_check(const std::string& base, uint64_t run_id, double max_age_s, size_t* bytes,
-                                       std::string* why) {
-  Store& s = store_of();
-  s.kept.clear();
-  s.kept_gen = s.kept_clock = 0;
-  *bytes = 0;
-  std::vector<uint8_t> f;
-  if (!keepfile::read_private(base + ".index", 256u << 20, &f, why)) return 0;
-  auto bad = [&](const std::string& w) {
-    *why = base + ".index: " + w;
-    s.kept.clear();
-    return (uint64_t)0;
+// The core over the device's side, once the allocator exists (model.cu).
+void Model::Impl::make_store() {
+  sgeom::StoreGeom g;
+  g.rank = rank, g.nslots = nslots, g.nunits = nunits, g.list_len = list_len, g.max_ctx = opt.max_ctx;
+  std::copy(unit_of, unit_of + kMaxSlots, g.unit_of);
+  std::copy(slot_ctx_, slot_ctx_ + kMaxSlots, g.slot_ctx);
+  g.image_bytes = chunk_image(), g.snap_bytes = snap_bytes(false), g.end_bytes = end_bytes(false);
+  g.poison = pool_poison;
+  g.split = opt.kv_split;
+#ifndef PICO_OLD_RULES
+  g.imager = opt.imager, g.mark = opt.imager && opt.kv_split;  // every write is a quarter in the background; a split mode also marks
+#endif
+  store_dev = std::make_unique<EngineDev>(*this);
+  core = std::make_unique<StoreCore>(g, *store_dev, calloc.get());
+#ifdef DSGB10_TEST_FAULTS
+  if (const char* e = std::getenv("DSGB10_JOIN_SHORT")) core->fault_join_take = std::atoi(e);  // the N-th take of a join is refused once
+#endif
+  core->outside = [this] {  // the pool's lending, for the digest
+    StoreCore::Outside o;
+    o.groups = (uint64_t)(uint32_t)lent.groups, o.owed = (uint64_t)(uint32_t)lent.owed, o.n0 = (uint64_t)lent.n0;
+    o.cur_groups = (uint64_t)(uint32_t)tenants.groups_of(lend::kTenantEngram);
+    o.phase = (uint64_t)(uint32_t)(drv.active() && drv.change().id == lend::kTenantEngram ? drv.change().phase : 0);
+    for (int i = 0; i < tenants.size(); ++i) {  // the other tenants' groups and groups in flight (ids 0 and 1 are in the terms above)
+      const lend::Tenant& t = tenants.at(i);
+      if (t.id >= 2) o.tenant_groups[t.id] = (uint32_t)t.groups, o.tenant_pending[t.id] = (uint32_t)t.pending;
+    }
+    return o;
   };
-  KeptHeader hd;
-  if (f.size() < sizeof hd) return bad("too short");
-  std::memcpy(&hd, f.data(), sizeof hd);
-  const bool sp = spec != nullptr;
-  const double age = (double)std::time(nullptr) - (double)hd.written;
-  if (std::memcmp(hd.magic, kKeptMagic, sizeof kKeptMagic) != 0) return bad("not a kept index");
-  if (hd.run_id != run_id) return bad("of another engine binary, weights or options");
-  if (hd.rank != rank) return bad("of another rank");
-  if (age > max_age_s || age < -600) return bad("written " + std::to_string((long long)age) + " s ago");
-  if (hd.image_bytes != chunk_image() || hd.snap_bytes != snap_bytes(sp) || hd.end_bytes != end_bytes(sp))
-    return bad("of another layout");
-  if (!hd.gen || hd.body_bytes != f.size() - sizeof hd || keepfile::fnv(f.data() + sizeof hd, hd.body_bytes) != hd.body_hash)
-    return bad("incomplete or damaged");
-  if (!hd.file_bytes || hd.file_bytes % kPoolGrain || hd.n_sess < 0) return bad("a bad header");
-  // every block on the grain and inside the file, none overlapping another
-  std::vector<std::pair<size_t, size_t>> blocks;
-  auto block = [&](size_t off, size_t n) {
-    blocks.emplace_back(off, Pool::round(n));
-    return off % kPoolGrain == 0 && off < hd.file_bytes && Pool::round(n) <= hd.file_bytes - off;
-  };
-  keepfile::Reader r{f.data() + sizeof hd, (size_t)hd.body_bytes};
-  std::set<int> hs;
-  const int max_ents = (opt.max_ctx + 64) / attn::kChunkEntries + 2;
-  for (int i = 0; i < hd.n_sess && r.ok; ++i) {
-    Store::Kept k;
-    k.h = r.get<int32_t>(), k.saved = r.get<int32_t>(), k.end_pos = r.get<int32_t>();
-    const int ns = r.get<int32_t>(), he = r.get<int32_t>();
-    k.used = r.get<uint64_t>();
-    k.factor = r.get<int32_t>();
-    if (!r.ok || (k.factor != 16 && k.factor != 32 && k.factor != 64) || k.h <= 0 || !hs.insert(k.h).second || ns < 0 || ns > 4096 || (he != 0 && he != 1) || k.saved < 0 ||
-        k.saved > opt.max_ctx || k.end_pos < -1 || k.end_pos > opt.max_ctx)
-      return bad("a bad session record");
-    for (int kk = 0; kk < kKvSlots; ++kk) {
-      const int ne = r.get<int32_t>();
-      if (!r.ok || ne < 0 || ne > max_ents) return bad("a bad session record");
-      for (int j = 0; j < ne; ++j) {
-        const size_t off = r.get<uint64_t>();
-        const uint64_t sum = r.get<uint64_t>();
-        if (!block(off, chunk_image())) return bad("an image outside the file");
-        k.ents[kk].emplace_back(off, sum);
-      }
-    }
-    for (int j = 0; j < ns; ++j) {
-      const int pos = r.get<int32_t>();
-      (void)r.get<int32_t>();
-      const size_t off = r.get<uint64_t>();
-      const uint64_t sum = r.get<uint64_t>();
-      if (pos < kSnapRows || pos > opt.max_ctx || !k.snaps.emplace(pos, std::make_pair(off, sum)).second ||
-          !block(off, snap_bytes(sp)))
-        return bad("a bad snapshot record");
-    }
-    if (he) {
-      k.dend = r.get<uint64_t>(), k.dend_sum = r.get<uint64_t>();
-      if (!block(k.dend, end_bytes(sp))) return bad("a block outside the file");
-    }
-    s.kept.push_back(std::move(k));
-  }
-  if (!r.ok || r.at != r.n) return bad("a bad body");
-  std::sort(blocks.begin(), blocks.end());
-  blocks.erase(std::unique(blocks.begin(), blocks.end()), blocks.end());  // a shared image is named by every holder
-  for (size_t i = 1; i < blocks.size(); ++i)
-    if (blocks[i - 1].first + blocks[i - 1].second > blocks[i].first) return bad("overlapping blocks");
-  struct stat st;  // the file beside it: ours, 0600, of the size the index names
-  if (lstat((base + ".spill").c_str(), &st) != 0 || !S_ISREG(st.st_mode) || st.st_uid != getuid() ||
-      (st.st_mode & 0777) != 0600 || (uint64_t)st.st_size != hd.file_bytes)
-    return bad("its file " + base + ".spill is missing or changed");
-  s.kept_gen = hd.gen, s.kept_clock = hd.clock;
-  *bytes = hd.file_bytes;
-  why->clear();
-  return hd.gen;
 }
 
-void Model::Impl::state_disk(const std::string& base, size_t bytes, size_t staging, bool reuse, uint64_t run_id) {
-  Store& s = store_of();
-  if (s.disk) die("state: the disk tier is opened once");
-  if (reuse && !s.kept_gen) die("state: reusing a kept file that was not checked");
-  bytes = bytes / kPoolGrain * kPoolGrain;
-  s.base = base, s.run_id = run_id;
-  if (!bytes) return;
-  const double t0 = wall_s();
-  s.disk = std::make_unique<SpillFile>(base, bytes, staging, reuse);
-  s.dpool.size = s.disk->size();
-  s.dpool.free.emplace(0, s.dpool.size);
-  if (!reuse) unlink((base + ".index").c_str());  // a reused index stays the latest checkpoint (its images held)
-  unlink((base + ".index.new").c_str());
-  if (reuse) {  // the kept sessions, every piece only on the disk: back on demand, each checked (state_unspill)
-    s.disk->keep();
-    const bool sp = spec != nullptr;
-    auto take = [&](size_t off, size_t n, uint64_t sum) {  // an image named again (a shared one) is taken once
-      if (s.drefs[off]++) return;
-      s.named.insert(off);
-      if (!s.dpool.take_at(off, n)) die("state: a kept image at %zu is not free", off);
-      s.dbytes += Pool::round(n);
-      *s.disk->sum(off, false) = sum;
-    };
-    s.clock = s.kept_clock;
-    for (const Store::Kept& k : s.kept) {
-      Store::Sess& ss = s.sess[k.h];
-      ss.kept = true;
-      ss.saved = k.saved, ss.end_pos = k.end_pos, ss.used = k.used, ss.factor = k.factor;
-      for (int kk = 0; kk < kKvSlots; ++kk)
-        for (const auto& [off, sum] : k.ents[kk]) take(off, chunk_image(), sum), ss.lists[kk].push_back(0), ss.dl[kk].push_back(off);
-      for (const auto& [pos, os] : k.snaps) take(os.first, snap_bytes(sp), os.second), ss.dsnaps.emplace(pos, os.first), ss.snaps[pos];
-      if (k.dend != Pool::kNone) take(k.dend, end_bytes(sp), k.dend_sum), ss.dend = k.dend;
-      s.clock = std::max(s.clock, k.used);
-    }
-    s.loaded_gen = s.kept_gen;
-    if (rank == 0)
-      std::printf("state: %zu kept sessions in %s (%.2f of %.2f GiB), in the store in %.1f ms\n", s.kept.size(),
-                  s.disk->path().c_str(), s.dbytes / 1073741824.0, s.dpool.size / 1073741824.0, 1e3 * (wall_s() - t0));
-  }
-  s.kept.clear();
-  s.kept.shrink_to_fit();
-}
-
-// An index body of gen (its KeptHeader first). A planned stop (all false): every session no line holds whose pieces all
-// have an image and are only on the disk. A checkpoint (all true): every session as far as its pieces from position 0 on
-// have images (its length cut to its first entry without one, the bookmarks inside that). *hs: the sessions named; *names: the images.
-std::vector<uint8_t> Model::Impl::kept_index(uint64_t gen, bool all, std::vector<int>* hs, std::set<size_t>* names) {
-  Store& s = store_of();
-  const bool sp = spec != nullptr;
-  std::vector<uint8_t> f(sizeof(KeptHeader));
-  using keepfile::put;
-  int n = 0;
-  for (const auto& [h, ss] : s.sess) {
-    if (h <= 0) continue;
-    int saved = ss.saved;
-    for (int k = 0; k < kKvSlots; ++k)
-      for (size_t i = 0; i < ss.lists[k].size(); ++i)
-        if (i >= ss.dl[k].size() || ss.dl[k][i] == Pool::kNone) {
-          saved = std::min(saved, ent_pos(k, (int)i));
-          break;
-        }
-    std::vector<std::pair<int, size_t>> bks;  // the window bookmarks it keeps
-    for (const auto& sn : ss.snaps) {
-      const auto d = ss.dsnaps.find(sn.first);
-      if (d != ss.dsnaps.end() && snap_q(sn.first) <= saved) bks.emplace_back(sn.first, d->second);
-    }
-    const bool end = ss.end_pos >= 0 && ss.end_pos <= saved && ss.dend != Pool::kNone;
-    if (all) {
-      if (saved <= 0 || (bks.empty() && !end)) continue;
-    } else {
-      bool whole = ss.line < 0 && saved == ss.saved && bks.size() == ss.snaps.size() && (ss.end_pos < 0 || end) && ss.out();
-      for (int k = 0; k < kKvSlots && whole; ++k)
-        for (size_t i = 0; i < ss.lists[k].size() && whole; ++i) whole = i < ss.dl[k].size() && ss.dl[k][i] != Pool::kNone;
-      if (!whole) continue;
-    }
-    ++n;
-    hs->push_back(h);
-    put<int32_t>(f, h), put<int32_t>(f, saved), put<int32_t>(f, end ? ss.end_pos : -1);
-    put<int32_t>(f, (int32_t)bks.size()), put<int32_t>(f, end), put<uint64_t>(f, ss.used), put<int32_t>(f, ss.factor);
-    for (int k = 0; k < kKvSlots; ++k) {
-      int ne = 0;  // a checkpoint lists the entries below its saved length; a planned stop every one
-      while (ne < (int)ss.lists[k].size() && (!all || ent_pos(k, ne) < saved)) ++ne;
-      put<int32_t>(f, ne);
-      for (int i = 0; i < ne; ++i) {
-        put<uint64_t>(f, ss.dl[k][i]), put<uint64_t>(f, *s.disk->sum(ss.dl[k][i], false));
-        names->insert(ss.dl[k][i]);
-      }
-    }
-    for (const auto& [pos, o] : bks) {
-      put<int32_t>(f, pos), put<int32_t>(f, 0), put<uint64_t>(f, o), put<uint64_t>(f, *s.disk->sum(o, false));
-      names->insert(o);
-    }
-    if (end) {
-      put<uint64_t>(f, ss.dend), put<uint64_t>(f, *s.disk->sum(ss.dend, false));
-      names->insert(ss.dend);
-    }
-  }
-  KeptHeader hd{};
-  std::memcpy(hd.magic, kKeptMagic, sizeof kKeptMagic);
-  hd.gen = gen, hd.run_id = s.run_id, hd.file_bytes = s.disk->size(), hd.written = (int64_t)std::time(nullptr);
-  hd.rank = rank, hd.n_sess = n, hd.clock = s.clock;
-  hd.image_bytes = chunk_image(), hd.snap_bytes = snap_bytes(sp), hd.end_bytes = end_bytes(sp);
-  hd.body_bytes = f.size() - sizeof hd;
-  hd.body_hash = keepfile::fnv(f.data() + sizeof hd, hd.body_bytes);
-  std::memcpy(f.data(), &hd, sizeof hd);
-  return f;
-}
-
-// A planned stop (every rank alike, after the server spilled what it keeps): the file synced, then its
-// index, and the file stays at exit. A rank whose index cannot be written keeps nothing (the next
-// start's gens differ: every rank starts clean).
-void Model::Impl::state_keep(uint64_t gen) {
-  Store& s = store_of();
-  if (!s.disk || !gen) return;
-  const double t0 = wall_s();
-  CUDA_CHECK(cudaStreamSynchronize(st));  // the checksums of what went out are in
-  s.disk->sync();
-  const double t1 = wall_s();
-  std::vector<int> hs;
-  std::set<size_t> names;
-  const std::vector<uint8_t> f = kept_index(gen, false, &hs, &names);
-  std::string why;
-  if (!keepfile::write_atomic(s.base + ".index", f.data(), f.size(), &why)) {
-    std::printf("state: rank %d keeps nothing: %s\n", rank, why.c_str());
-    return;
-  }
-  s.disk->keep();
-  if (rank == 0)
-    std::printf("state: %zu sessions kept for the next start (%.2f GiB of the file): synced in %.1f ms, index of %.1f KiB "
-                "in %.1f ms\n", hs.size(), s.dbytes / 1073741824.0, 1e3 * (t1 - t0), f.size() / 1024.0, 1e3 * (wall_s() - t1));
-}
-
-// A checkpoint while serving (rank 0's server, when nothing runs; every rank alike): the file synced, then the index of
-// every session as far as its pieces have images, written whole or not at all; images the previous index named that were
-// dropped since are freed once this one is durable. A rank whose index cannot be written keeps the previous one.
-void Model::Impl::state_checkpoint(uint64_t gen) {
-  Store& s = store_of();
-  s.ckpt_sess.clear();
-  if (!s.disk || !gen) return;
-  const double t0 = wall_s();
-  CUDA_CHECK(cudaStreamSynchronize(st));
-  s.disk->sync();
-  const double t1 = wall_s();
-  std::vector<int> hs;
-  std::set<size_t> names;
-  const std::vector<uint8_t> f = kept_index(gen, true, &hs, &names);
-  std::string why;
-  if (!keepfile::write_atomic(s.base + ".index", f.data(), f.size(), &why)) {
-    std::printf("state: rank %d: no checkpoint: %s\n", rank, why.c_str());
-    return;
-  }
-  s.disk->keep();
-  s.named = std::move(names);
-  size_t freed = 0;
-  for (const auto& [off, bytes] : s.retired) space_free(off, bytes), freed += Pool::round(bytes);
-  s.retired.clear();
-  s.ckpt_sess = std::move(hs);
-  if (rank == 0)
-    std::printf("state: checkpoint: %zu sessions (%zu images), the file synced in %.1f ms, index of %.1f KiB in %.1f ms; "
-                "%.1f MiB of dropped images freed\n", s.ckpt_sess.size(), s.named.size(), 1e3 * (t1 - t0), f.size() / 1024.0,
-                1e3 * (wall_s() - t1), freed / 1048576.0);
+// What is bound after the core exists: the host ring, and the draft module with its windows in every bookmark.
+void Model::Impl::store_notes() {
+  core->g.has_ring = host_ring != nullptr;
+  core->g.spec = spec != nullptr;
+  core->g.snap_bytes = snap_bytes(spec != nullptr), core->g.end_bytes = end_bytes(spec != nullptr);
 }
 
 void Model::Impl::state_reserve(size_t bytes) {

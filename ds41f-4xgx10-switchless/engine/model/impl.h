@@ -64,6 +64,14 @@ T* halloc(size_t n) {  // pinned, mapped host memory (the GPU reads it in place)
 constexpr int kMaxSplits = 2 + kIdxTopk / 64;  // sparse_attn split-K: 2 window blocks + 8 selected blocks
 constexpr size_t kEngramSegMax = (size_t)kMaxRows * kEngramCols * kEngramRow;  // one rank owning every cell
 
+// The prefill's gathered weights that are made before the weights load (Model::reserve_gathered): this rank's own
+// slice of each is the decode weight itself, loaded straight into slot `rank`.
+struct GatheredW {
+  uint8_t *wqa = nullptr, *sqa = nullptr, *wkv = nullptr, *skv = nullptr, *wob = nullptr, *sob = nullptr;
+  uint8_t *ewkv = nullptr, *eskv = nullptr;
+  uint8_t* gate = nullptr;  // the router's whole [384][5120] bf16 (the decode weight itself, not prefill's)
+};
+
 struct LayerW {
   const uint8_t *wqa, *sqa, *wkv, *skv, *wqb, *sqb, *woa, *soa, *wob, *sob;
   const bf16 *q_norm, *kv_norm, *attn_norm, *ffn_norm;
@@ -261,31 +269,75 @@ struct Model::Impl {
   size_t pool_chunks_for(size_t nums, size_t* bytes = nullptr) const;
   // numbers one conversation of the longest open window needs: what the pool keeps whatever it lends
   size_t lend_whole() const;
-  int lend_cache_room(int others) const;  // the groups the Engram cache may hold: the longest allowed window keeps its room
+  size_t lend_room_whole() const;  // numbers one conversation of the longest window the options allow needs, open or not
   int lend_settle();  // what is owed, asked for again (every rank)
-  // lend.cu: the Engram cache's hand-over. Replicated: every rank holds the same phase, sizes and groups.
+  // The tenants of the pool (lend.h's table, tenant.cu): the windows' groups are booked under id 0 from window_open / window_close,
+  // the Engram cache's under id 1, a test build's dummy device block under id 15. One driver runs every tenant's change.
+  lend::Tenants tenants;
+  struct TenantEnv {  // the pool's side and the ranks' agreement for the driver (tenant.cu)
+    Impl& m;
+    size_t numbers() const;
+    bool vacate(size_t top);
+    bool make_room(size_t removed);
+    bool release(size_t top, int g);
+    bool grow_all(size_t more);
+    uint64_t handles() const;
+    uint64_t avail() const;
+    uint64_t chunks_for(size_t numbers) const;
+    uint64_t chunk_bytes() const;
+    size_t whole() const;
+    size_t room_whole() const;
+    int later_groups();
+    uint64_t null_bytes() const;
+    bool fault(tenant::Step s);
+    uint64_t agree_min(uint64_t v, tenant::Step s);
+    bool agree_all(bool ok, tenant::Step s);
+    bool agree_any(bool bad, tenant::Step s);
+  };
+  TenantEnv tenv{*this};
+  tenant::Driver<TenantEnv> drv{tenv, lent, tenants};
+  void book_windows() { if (lend::Tenant* t = tenants.find(lend::kTenantWindows)) t->groups = scan_[0].groups + scan_[1].groups + scan_[2].groups; }
+  // tenant.cu: the Engram cache's body and a test build's dummy device block, and the one command both go through
   struct EngramLend {
     bool enabled = false;
-    uint64_t cur_mib = 0;
-    int cur_groups = 0;
-    int phase = 0;  // 0 idle, 1 growing, 2 shrinking, 3 going back after a failed grow
-    uint64_t target_mib = 0, from_mib = 0;
-    int target_groups = 0, from_groups = 0;
-    lend::Reading a, b;  // the readings before the groups left and after
-    uint64_t block_before = 0, tol = 0;
-    bool local_fail = false;
-    uint64_t ok_total = 0, failed_total = 0, proof_failed_total = 0;
-    int last_status = 0;
-    const char* reason = "";
+    const char* reason = "";  // why the last change failed
   } el;
+  int tenant_lend(int id, int phase, int64_t mib, bool capped = true);  // capped: one command moves at most tenant::kStepGroups
   int engram_lend(int phase, int64_t mib);
-  int lend_begin(uint64_t want_mib);
-  int lend_poll();
-  void lend_fail(const char* why);
+  int fault_tenant = 1;  // the tenant a command is running for: DSGB10_LEND_FAIL's `tenant:N` is matched against it
 #ifdef DSGB10_TEST_FAULTS
   bool lend_fault(const char* step) const;  // DSGB10_LEND_FAIL names this rank and step: it answers true once
+  struct DummyBlock;
+  std::shared_ptr<DummyBlock> dummy;  // shared_ptr: the type is complete only in tenant.cu
 #endif
+  // The image encoder (vit_area.cu: tenant 3's body and the hand-over; vit_cmd.cu: the command on a rank). `area` is the block the
+  // start's hand-over made: the body's thread allocates it, zeroes it and synchronises before it reports Done, and it is never given
+  // back. `mid_*`: the one image that is between its blocks (key 0: none); a mark whose flight's rows are gone is stale and ignored.
+  // `written[key][span]`: pixel flights' spans whose rows are written; a flight with no entry (rows sent by image_fill) is complete.
+  struct Vit {
+    const vit::DevWeights* w = nullptr;
+    uint8_t* stage = nullptr;       // pinned, kVitStageBytes: rank 0's pixels pass through it (made by set_vision)
+    cudaEvent_t stage_ev = nullptr;  // the last copy out of it: the next image's copy waits for it
+    void* area = nullptr;
+    uint64_t area_bytes = 0;
+    std::thread th;                  // the body's thread
+    std::atomic<int> st{0};          // 0 idle, 1 running, 2 done, 3 failed
+    std::atomic<uint64_t> cur{0}, before{0};
+    int device = 0;
+    int mid_key = 0, mid_span = -1, mid_next = 0;
+    std::map<int, std::vector<uint8_t>> written;
+    ~Vit() {
+      if (th.joinable()) th.join();
+    }
+  } vit;
+  int rows_tenant_lend(int phase, int64_t mib);  // rows_lend.cu: tenant lend::kTenantPrefill
+  bool pf_big_ready() const;  // the lent set of prefill row buffers is whole and its tenant has no change in flight
+  int vit_tenant_lend(int phase, int64_t mib, bool capped);  // tenant.cu's tenant_lend for id 3
+  int vit_run(int key, int span, int row0, int nh, int nw, int b0, int b1, const uint8_t* pixels);
+  bool vit_span_written(int key, size_t span) const;
+  void vit_prune();  // forgets the records of flights whose rows are gone
   int window_open(int f);
+  void split_zone_update();  // Model::split_zone_update
   int window_close(int f);
 
   // step buffers
@@ -491,6 +543,12 @@ struct Model::Impl {
   void project(const bf16* stream, int L, int h, int R);
   void attention(int L, int R, int ctx, bool dumps, bool sub_in, Sink* sink, int pos0);
   void indexer(int L, int R, int ctx);
+  // Whether this step's dense index scans are split over the ranks (Options::pscan): a function of the option, the step's YaRN
+  // factor and its row count only, so the four ranks make the same collectives in the same order, captured or eager. A step of
+  // more than kDecodeRows rows (wide64) scans in groups.
+  bool pscan_split(int R) const {
+    return (opt.pscan == PScan::All || (opt.pscan == PScan::Ext && sf > 16)) && R <= kDecodeRows;
+  }
   void ffn(int L, int R, bool dumps, Sink* sink, int pos0);
   void l2pf(int w, int L, int R);  // Options::l2pf: window w's prefetch of layer L's weights, on sc
   // The step's device work, from the StepIn ring onwards: eager (flags: dumps, injection, logits) or captured.
@@ -518,6 +576,7 @@ struct Model::Impl {
 
   // ---- chunks of many rows (prefill.cu) -----------------------------------------------------
   void prefill_alloc(comm::Ring* ring = nullptr);
+  void prefill_use(int rows_set);  // the set of row-sized buffers the next command runs on (stops when this rank holds none)
   void prefill_engram(int a, int M, int set);  // the Engram lookups of positions [a, a + M) (hist's tokens)
   void engram_apply_p(int L, int M, int set);
   void boundary_p(int M, const bf16* sub, const bf16* res, const float* post, const float* comb, const float* pre,

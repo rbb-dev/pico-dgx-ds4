@@ -2,6 +2,12 @@
 import base64
 from fractions import Fraction
 import io
+import json
+import os
+import struct
+import subprocess
+import sys
+import tempfile
 import unittest
 import wave
 
@@ -61,6 +67,45 @@ class SamplingTests(unittest.TestCase):
             output.writeframes(b'\x00' * 16000)
         with self.assertRaisesRegex(ValueError, 'no video stream'):
             sample(buf.getvalue(), 3)
+
+
+class PathTests(unittest.TestCase):
+    """The clip is a file that PyAV reads as it decodes."""
+
+    def padded_clip(self):
+        # a free box after the clip: the file is far larger than any one read
+        return clip() + struct.pack('>I4s', 8 + (2 << 20), b'free') + b'\0' * (2 << 20)
+
+    def test_a_path_is_opened_and_read_in_pieces(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'clip')
+            with open(path, 'wb') as f:
+                f.write(self.padded_clip())
+            result = sample(path, 3)
+            self.assertEqual([f['timestamp'] for f in result['frames']], [0.0, 1.0, 2.0])
+            reads = []
+
+            class Counting(io.FileIO):
+                def readinto(self, b):
+                    reads.append(len(b))
+                    return super().readinto(b)
+
+            with io.BufferedReader(Counting(path, 'rb'), buffer_size=1 << 15) as f:
+                self.assertEqual(len(sample(f, 3)['frames']), 3)
+            self.assertTrue(reads)
+            self.assertLess(max(reads), 1 << 20, 'no read takes the file whole')
+
+    def test_the_command_line_takes_a_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'clip')
+            with open(path, 'wb') as f:
+                f.write(clip())
+            r = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'video_frames.py'),
+                                path, '--max-frames', '2'], capture_output=True, timeout=60)
+            self.assertEqual((r.returncode, len(json.loads(r.stdout)['frames'])), (0, 2), r.stderr)
+
+    def test_bytes_are_still_taken(self):
+        self.assertEqual(len(sample(clip(), 3)['frames']), 3)
 
 
 if __name__ == '__main__':

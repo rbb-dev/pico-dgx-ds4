@@ -32,6 +32,13 @@ struct LoadOptions {
   bool verify_crc = false;       // afterwards copy every loaded tensor back and check its CRC
   // load only the tensors this accepts (in file order, packed into a smaller arena); empty = all
   std::function<bool(const DeviceTensor&)> select;
+  // where a selected tensor goes: a caller-supplied device address with room for its `bytes` (the tensor is then
+  // read straight there, takes no space in the arena, and its `data` is that address), or nullptr for the arena
+  std::function<void*(const DeviceTensor&)> dest;
+  bool verify_dest = false;      // afterwards check the CRC of the tensors that went to a `dest` (not the arena's)
+  // afterwards tell the kernel the file's pages are not wanted (O_DIRECT reads leave none; this drops any that another
+  // reader or writer of the file left in the page cache)
+  bool drop_page_cache = false;
 };
 
 struct LoadStats {

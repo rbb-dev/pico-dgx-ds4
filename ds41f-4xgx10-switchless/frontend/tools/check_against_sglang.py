@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Render requests the way the kit's SGLang does and compare with the front-end's prompts.
 
-Input: the files `dsfront serve --dump-dir DIR` writes ({"request", "prompt", "ids"} per request).
+Input: the files `dsfront serve --dump-dir DIR` writes ({"request", "prompt", "ids", "prefix_ids"} per request).
 Runs in the canary-roce image, which has the SGLang the kit serves with:
 
     docker run --rm -v DIR:/dumps:ro -v $PWD/frontend:/work:ro \\
@@ -83,6 +83,8 @@ def main():
         else:
             k = next((i for i, (a, b) in enumerate(zip(want, d["prompt"])) if a != b), min(len(want), len(d["prompt"])))
             print(f"{os.path.basename(f)}: prompt differs at char {k}:\n  sglang {want[max(0, k - 40):k + 40]!r}\n  ours   {d['prompt'][max(0, k - 40):k + 40]!r}")
+        if d.get("prefix_ids", 0):
+            continue  # the request carried only the text after the engine's own ids: there is no whole prompt's ids to compare
         ids = tok.encode(want)
         if ids == d["ids"]:
             same_ids += 1

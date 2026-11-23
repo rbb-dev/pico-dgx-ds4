@@ -16,6 +16,7 @@
 // turns GPU doorbells into RDMA writes and relays neighbours' data; GPUs only touch memory, so a
 // whole step, collectives included, can be one CUDA graph.
 #pragma once
+#include "comm/host_gather.h"
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -127,7 +128,8 @@ class Ring {
 
   // Host-side helpers over the bootstrap sockets (setup and tests only, ~100 µs).
   void barrier();
-  void allgather_host(const void* mine, void* all, size_t n);  // all = 4 × n bytes, rank order
+  // all = 4 × n bytes, rank order. `call`: the call's id (host_gather.h HostCall): every hop carries it and its size, and a rank that meets another call stops naming both
+  void allgather_host(const void* mine, void* all, size_t n, uint32_t call = 0);
 
  private:
   struct Impl;

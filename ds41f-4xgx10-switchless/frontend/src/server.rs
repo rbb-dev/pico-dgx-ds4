@@ -12,7 +12,7 @@ use crate::gate::{Gate, Pass, Refused, RETRY_AFTER_S};
 use crate::guard::{LoopGuard, StopMatcher, LINE_WINDOW_TOKENS};
 use crate::protocol::{DoneReason, Submit, FLAG_ABLIT, FLAG_KEEP, FLAG_SEED};
 use crate::pyjson::truthy;
-use crate::session::{ImageKey, SessionTable};
+use crate::session::{Cut, ImageKey, Resume, SessionTable, Turn};
 use crate::tokenizer::{StreamDecoder, Tokenizer};
 use axum::body::Bytes;
 use axum::extract::State;
@@ -74,8 +74,19 @@ pub struct ServerConfig {
     /// The most memory the process may hold, in MiB, as the kernel counts it (--front-mib; 0, the default: not watched): over it, idle
     /// sessions are dropped and no image request is taken.
     pub front_mib: usize,
-    /// The most memory the image rows in flight count for against `front_table_mib` (--front-image-mib).
+    /// The most memory the image rows in flight count for against `front_table_mib` (--front-image-mib). With `VisionKind::Engine`
+    /// it is also what one request's pixels may take, counted as the media worker's frames arrive: past it the request is refused (413).
     pub front_image_mib: usize,
+}
+
+impl ServerConfig {
+    /// The address image and video requests go to: the container's, or with `VisionKind::Engine` the media worker's.
+    pub fn image_addr(&self) -> Option<&str> {
+        match self.vision {
+            crate::vision::VisionKind::Container => self.vision_addr.as_deref(),
+            crate::vision::VisionKind::Engine => self.media_addr.as_deref(),
+        }
+    }
 }
 
 pub const DEFAULT_FRONT_TABLE_MIB: usize = 0;
@@ -963,8 +974,14 @@ impl Gen {
                         Some(te) if self.parser_was_thinking() => kept.iter().position(|&x| x == te).unwrap_or(kept.len()),
                         _ => 0,
                     };
-                    self.app.sessions.lock().unwrap().finish_images(self.session_id, &self.prompt_text, &self.prompt_ids, &self.ids, &self.app.tok, &self.images);
-                    let usage = Usage { prompt: self.prompt_ids.len(), cached: d.cached_tokens, completion: self.kept, reasoning };
+                    if self.expects_tail && d.tail.is_none() {
+                        // the engine did not run it (cancelled in its queue): the session is as it was
+                        self.give_up();
+                    } else {
+                        let turn = Turn { text: &self.prompt_text, from: self.from, state: &self.state, suffix: &self.suffix, images: &self.images };
+                        self.app.sessions.lock().unwrap().finish(self.session_id, &turn, &self.ids, d.tail, &self.app.tok);
+                    }
+                    let usage = Usage { prompt: self.n_prompt, cached: d.cached_tokens, completion: self.kept, reasoning };
                     let total = self.t0.elapsed().as_secs_f64();
                     let ttft = self.first_token.map_or(total, |t| (t - self.t0).as_secs_f64());
                     if let Some(dir) = &self.app.cfg.dump_dir {
@@ -1029,6 +1046,11 @@ async fn start(app: &Arc<App>, p: &Prepared, pass: Pass) -> Result<Gen, ApiError
         return start_images(app, p, pass, info).await;
     }
     let ablit = p.ablit.unwrap_or(false);
+    {
+        let mut t = app.sessions.lock().unwrap();
+        t.keep_for(info.keep_positions, info.max_context);
+        t.set_image_bytes(app.image_rows.image_bytes());
+    }
     let (plan, released) = {
         let app2 = app.clone();
         let text = p.prompt.clone();
@@ -1186,7 +1208,7 @@ async fn start_images(app: &Arc<App>, p: &Prepared, pass: Pass, info: crate::pro
         top_k: p.top_k,
         max_new_tokens: max_new,
         flags: FLAG_KEEP
-            | crate::protocol::FLAG_IMAGES
+            | if enc.pixels { crate::protocol::FLAG_PIXELS } else { crate::protocol::FLAG_IMAGES }
             | if p.seed.is_some() { FLAG_SEED } else { 0 }
             | if ablit { FLAG_ABLIT } else { 0 },
         n_top_logprobs: 0,
@@ -2047,3 +2069,11 @@ pub(crate) mod tests {
 #[cfg(test)]
 #[path = "server_cancel_test.rs"]
 mod cancel_test;
+
+#[cfg(test)]
+#[path = "server_prefix_test.rs"]
+mod prefix_test;
+
+#[cfg(test)]
+#[path = "server_pixels_test.rs"]
+mod pixels_test;

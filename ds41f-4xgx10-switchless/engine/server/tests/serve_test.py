@@ -24,8 +24,8 @@ import time
 
 HELLO, SUBMIT, CANCEL, RELEASE = 0x01, 0x02, 0x03, 0x04
 HELLO_E, TOKENS, DONE, PROGRESS = 0x81, 0x82, 0x83, 0x84
-F_SEED, F_KEEP, F_LOGPROBS = 1, 2, 4
-REASONS = ['stop', 'length', 'cancelled', 'context', 'error']
+F_SEED, F_KEEP, F_LOGPROBS, F_PREFIX = 1, 2, 4, 64
+REASONS = ['stop', 'length', 'cancelled', 'context', 'error', 'too_large', 'prefix_gone']
 
 
 def load_npy_i32(fn):
@@ -85,6 +85,8 @@ class Engine:
         rid = self.next_id
         self.next_id += 1
         flags = (F_KEEP if keep else 0) | (F_SEED if seed is not None else 0) | (F_LOGPROBS if n_top is not None else 0)
+        if prefix is not None:
+            flags |= F_PREFIX
         hdr = struct.pack('<QQQQffIIIIIIII', rid, session, base, seed or 0, temp, top_p, top_k, max_new, flags,
                           n_top or 0, 0, len(stop), len(prompt), 0)
         assert len(hdr) == 72

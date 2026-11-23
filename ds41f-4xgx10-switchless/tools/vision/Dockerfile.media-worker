@@ -1,0 +1,21 @@
+# The media worker's image (tools/vision/media_worker.py): Python, Pillow, numpy and PyAV, no PyTorch and no GPU.
+# The worker reads untrusted images and clips and answers pixels; nothing here holds the model.
+#
+# Base: python:3.12-slim, the multi-arch index pinned by digest (the linux/arm64 manifest it resolves to is
+# sha256:c61cffc3bacb94ed026ff8b45d5114b7693dd0420baca0a1ace0e3d0ce9035fd). Wheels: pinned by version and sha256
+# (PyPI, cp312 aarch64 manylinux files); pip refuses any other file, and --no-deps because each has no
+# runtime dependency of its own.
+#
+#   docker build -f Dockerfile.media-worker -t pico-media:<tag> .   (from tools/vision)
+FROM python:3.12-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b
+RUN printf '%s\n' \
+      'pillow==12.3.0 --hash=sha256:d9c7f76c0673154f044e9d78c8655fb4213f6ca31a836df48b40fe5d187717b9' \
+      'numpy==2.1.0 --hash=sha256:a0756a179afa766ad7cb6f036de622e8a8f16ffdd55aa31f296c870b5679d745' \
+      'av==19.0.2 --hash=sha256:04c8e412642c652cb2b1997a9cb2114546ee7d894600c631f4be8ceb26a0d0d2' > /tmp/req.txt && \
+    pip install --no-cache-dir --no-deps --only-binary=:all: --require-hashes -r /tmp/req.txt && rm /tmp/req.txt && \
+    python3 -c "import PIL, numpy, av; print('Pillow', PIL.__version__, 'numpy', numpy.__version__, 'PyAV', av.__version__)"
+WORKDIR /app
+COPY media_worker.py video_frames.py /app/
+USER 65534:65534
+ENTRYPOINT ["python3", "/app/media_worker.py"]
+CMD ["--host", "127.0.0.1", "--port", "18951", "--max-images", "100"]

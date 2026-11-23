@@ -75,6 +75,12 @@ REFUSAL_WINDOW = 60  # the longest the engine may take to refuse a change made t
 ASKED = [None]  # the size the last CONFIG asked for
 
 
+def mib_asked(cache_bytes):
+    """the MiB a cache of this many bytes was asked for: the cache is whole slots of one row (264 bytes), the slots a size of M
+    MiB holds are floor(M MiB / 264), so its bytes are up to 263 under M MiB and a shift by 20 reads M - 1"""
+    return int(round(cache_bytes / 1048576.0))
+
+
 def config_mib(e, mib):
     ASKED[0] = mib
     e.send(CONFIG, struct.pack('<II', 3, 10) + struct.pack('<10q', *([-1] * 9 + [mib])))

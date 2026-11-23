@@ -1,8 +1,12 @@
 // The image encoder on the GPU: every kernel and the tower, four ranks against the unsplit run, in bytes.
-//   vit_test [--kernels] [--tower] [--repeat] [--wrong NAME|all] [--model DIR] [--blocks N] [--grid HxW ...]
-// With no selection it runs all four parts. The weights are the checkpoint's under --model DIR, else a
+//   vit_test [--kernels] [--tower] [--repeat] [--lockstep] [--wrong NAME|all] [--model DIR] [--blocks N] [--grid HxW ...]
+// With no selection it runs the five parts kernels, tower, repeat, lockstep (a rank's phase machine, vit::RankRun,
+// stepped four at a time on this one GPU) and wrong. The weights are the checkpoint's under --model DIR, else a
 // reproducible random set. --blocks N runs the first N blocks only (default 4; 32 is the whole tower).
 // --wrong runs the split tower with one deliberate error: it must give other bytes than the unsplit run.
+// --lockstep: four RankRuns with the copy gather give run_split's bytes (spans, x after every block, the number of
+// gathers), also run as two calls with every buffer but x and the rotary table poisoned between them; a driver that skips
+// one gather and the swap-shard weights must give other bytes.
 // Run it with the engine stopped (it takes about 2 GiB of device memory and the whole GPU).
 #include <cstdio>
 #include <cstdlib>
@@ -12,6 +16,7 @@
 
 #include "common/check.h"
 #include "vision/vit.h"
+#include "vision/vit_rank.h"
 #include "vision/vit_ref.h"
 
 using namespace vit;
@@ -476,6 +481,82 @@ void test_tower(Setup& S, const std::vector<std::pair<int, int>>& grids) {
   }
 }
 
+// The same image through four RankRuns stepped in lockstep. ranges: each [b0, b1) in turn (b1 < 0: through the last
+// block), a new set of RankRuns for each, with every buffer but x and the rotary table poisoned between two calls.
+Result run_lock(Setup& S, int nh, int nw, Wrong wrong, uint64_t seed, const std::vector<std::pair<int, int>>& ranges,
+                int skip_gather = -1, int* gathers = nullptr) {
+  const Grid gr = make_grid(nh, nw);
+  const std::vector<uint8_t> px = noise_image(nh, nw, seed);
+  uint8_t* dpx = dev(px);
+  Image img{gr, dpx};
+  const size_t rows = (size_t)gr.rows() * kLm;
+  bf16* span[4];
+  for (auto& p : span) CUDA_CHECK(cudaMalloc(&p, rows * 2));
+  void* works[4];
+  for (auto& w : works) CUDA_CHECK(cudaMalloc(&w, rank_work_bytes(gr.patches(), gr.merged())));
+  DevWeights wr[4];
+  const DevWeights* use = S.dr;
+  if (wrong != Wrong::None) {
+    for (int r = 0; r < 4; r++) wr[r] = upload(wrong_slice(S.whole, r, wrong));
+    use = wr;
+  }
+  Result res;
+  for (size_t k = 0; k < ranges.size(); k++) {
+    if (k)
+      for (auto& w : works) RankRun::poison_all_but_state(w, gr, st);
+    LockstepOpts o;
+    o.b0 = ranges[k].first, o.b1 = ranges[k].second, o.skip_gather = skip_gather, o.trace = &res.trace, o.gathers = gathers;
+    run_lockstep(use, img, works, span, wrong, o, st);
+  }
+  if (wrong != Wrong::None)
+    for (auto& w : wr) release(w);
+  for (auto& w : works) cudaFree(w);
+  for (int r = 0; r < 4; r++) res.span[r] = down(span[r], rows);
+  for (auto& p : span) cudaFree(p);
+  cudaFree(dpx);
+  return res;
+}
+
+bool spans_equal(const Result& a, const Result& b) {
+  for (int r = 0; r < 4; r++)
+    if (a.span[r] != b.span[r]) return false;
+  return true;
+}
+
+void test_lockstep(Setup& S, const std::vector<std::pair<int, int>>& grids) {
+  const int nb = (int)S.whole.blocks.size();
+  for (auto g : grids) {
+    const uint64_t seed = 100 + g.first;
+    const std::string tag = "lockstep " + std::to_string(g.first) + "x" + std::to_string(g.second) + " (" + std::to_string(nb) + " blocks)";
+    const Result ref = run_one(S, g.first, g.second, true, Wrong::None, seed);
+    int gathers = 0;
+    const Result a = run_lock(S, g.first, g.second, Wrong::None, seed, {{0, -1}}, -1, &gathers);
+    expect(spans_equal(a, ref), tag + ": the four RankRuns' span rows equal run_split's, bytes, every rank");
+    expect(a.trace == ref.trace && a.trace.size() == (size_t)nb, tag + ": x after every block equals run_split's");
+    expect(gathers == RankRun::gather_count(0, -1, nb) && gathers == 1 + 4 * nb + 2,
+           tag + ": " + std::to_string(gathers) + " gathers (1 pixel + 4 a block + 2 aligner)");
+    if (nb >= 2) {
+      const int k = nb / 2;
+      const Result b = run_lock(S, g.first, g.second, Wrong::None, seed, {{0, k}, {k, -1}});
+      expect(spans_equal(b, ref) && b.trace == ref.trace,
+             tag + ": blocks [0, " + std::to_string(k) + ") then [" + std::to_string(k) + ", " + std::to_string(nb) +
+                 ") with all but x and the rotary table poisoned between: run_split's bytes");
+      const Result c = run_lock(S, g.first, g.second, Wrong::None, seed, {{0, 1}, {1, nb}});
+      expect(spans_equal(c, ref), tag + ": blocks [0, 1) then [1, " + std::to_string(nb) + "): run_split's bytes");
+    }
+    // negative controls: each must differ from run_split's bytes
+    for (int skip : {0, 3, 1 + 4 * nb}) {  // the pixel gather, a block's h gather, the first aligner gather
+      const Result d = run_lock(S, g.first, g.second, Wrong::None, seed, {{0, -1}}, skip);
+      expect(!spans_equal(d, ref), tag + ": a driver that skips gather " + std::to_string(skip) + " gives other bytes (control)");
+    }
+  }
+  const Result u = run_one(S, 49, 65, false, Wrong::None, 9);
+  const Result rs = run_one(S, 49, 65, true, Wrong::SwapShard, 9);
+  const Result ls = run_lock(S, 49, 65, Wrong::SwapShard, 9, {{0, -1}});
+  expect(spans_equal(ls, rs), "lockstep 49x65 swap-shard: the same bytes as run_split's swap-shard build");
+  expect(ls.span[0] != u.span[0], "lockstep 49x65 swap-shard: differs from the unsplit run (control)");
+}
+
 void test_repeat(Setup& S, int nh, int nw) {
   const Result a = run_one(S, nh, nw, false, Wrong::None, 5), b = run_one(S, nh, nw, false, Wrong::None, 5);
   expect(a.span[0] == b.span[0] && a.trace == b.trace, "unsplit run twice: the same bytes");
@@ -498,7 +579,7 @@ void test_wrong(Setup& S, const std::vector<Wrong>& which, int nh, int nw) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  bool kernels = false, tower = false, repeat = false;
+  bool kernels = false, tower = false, repeat = false, lockstep = false;
   std::vector<Wrong> wrong;
   std::string model;
   int blocks = 4;
@@ -512,6 +593,7 @@ int main(int argc, char** argv) {
     if (a == "--kernels") kernels = true;
     else if (a == "--tower") tower = true;
     else if (a == "--repeat") repeat = true;
+    else if (a == "--lockstep") lockstep = true;
     else if (a == "--model") model = next();
     else if (a == "--blocks") blocks = std::atoi(next().c_str());
     else if (a == "--grid") {
@@ -527,16 +609,17 @@ int main(int argc, char** argv) {
           if (v == name_of(w)) wrong.push_back(w), found = true;
         if (!found) die("unknown wrong build %s", v.c_str());
       }
-    } else die("usage: vit_test [--kernels] [--tower] [--repeat] [--wrong NAME|all] [--model DIR] [--blocks N] [--grid HxW]");
+    } else die("usage: vit_test [--kernels] [--tower] [--repeat] [--lockstep] [--wrong NAME|all] [--model DIR] [--blocks N] [--grid HxW]");
   }
-  if (!kernels && !tower && !repeat && wrong.empty()) kernels = tower = repeat = true, wrong = all_wrong();
+  if (!kernels && !tower && !repeat && !lockstep && wrong.empty()) kernels = tower = repeat = lockstep = true, wrong = all_wrong();
   if (grids.empty()) grids = {{39, 39}, {49, 65}, {55, 55}, {3, 3063}};
   CUDA_CHECK(cudaSetDevice(0));
   if (kernels) test_gemm(), test_attention(), test_norm_pointwise(), test_rope(), test_copies();
-  if (tower || repeat || !wrong.empty()) {
+  if (tower || repeat || lockstep || !wrong.empty()) {
     Setup S(model, blocks);
     if (tower) test_tower(S, grids);
     if (repeat) test_repeat(S, 39, 39);
+    if (lockstep) test_lockstep(S, grids);
     if (!wrong.empty()) test_wrong(S, wrong, 49, 65);
   }
   std::printf("%s\n", fails ? "FAILED" : "all ok");

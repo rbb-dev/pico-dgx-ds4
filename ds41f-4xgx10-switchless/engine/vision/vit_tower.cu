@@ -7,6 +7,7 @@
 
 #include "common/check.h"
 #include "vision/vit.h"
+#include "vision/vit_layout.h"
 
 namespace vit {
 namespace {

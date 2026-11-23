@@ -122,6 +122,190 @@ int main() {
     check(replay(-1) == d0 && replay(-1) == d0 && replay(-1) == d0, "four ranks replaying one stream agree");
     check(replay(12345) != d0, "a rank that skips one operation differs (negative control)");
   }
+  {  // ghosts and the take order with a lend zone: the zone is the numbers from 10 up in a pool of 14
+    Alloc a(14);
+    std::vector<uint32_t> v;
+    check(a.take(13, &v), "all 13 taken");
+    a.give_ghost(3, 5), a.give_ghost(12, 2), a.give_ghost(4, 9);  // oldest first: 12 (stamp 2), 3 (5), 4 (9)
+    a.give(11);
+    check(a.free() == 4 && a.ghosts() == 3 && a.free_plain() == 1, "free() counts ghosts; free_plain() does not");
+    check(a.is_ghost(3) && !a.taken(3) && a.stamp(12) == 2 && a.stamp(11) == 0 && !a.is_ghost(11), "ghost, stamp");
+    a.set_zone(10);
+    check(a.free_below_zone() == 2, "free_below_zone counts ghosts below the zone (3 and 4)");
+    check(a.take() == 3, "step 2: the oldest ghost below the zone (3, stamp 5) before a plain free number in the zone");
+    check(a.take() == 4, "then the next ghost below the zone (4, stamp 9)");
+    uint32_t c = 0;
+    check(!a.take_below_zone(&c), "take_below_zone: none below the zone");
+    check(a.take() == 11, "step 3: the lowest plain free number in the zone before a ghost in the zone");
+    check(a.take() == 12 && a.free() == 0, "step 4: the ghost in the zone");
+    // no zone: step 1 then 2
+    Alloc b(10);
+    check(b.take(9, &v), "b: 9 taken");
+    v.clear();
+    b.give_ghost(2, 1), b.give(5);
+    check(b.take() == 5 && b.take() == 2, "without a zone: a plain free number first, then the oldest ghost");
+  }
+  {  // revive: a ghost taken back by name; digest() is the taken set's, a ghost is not in it
+    Alloc a(20);
+    std::vector<uint32_t> v;
+    a.take(10, &v);
+    const uint64_t d_all = a.digest();
+    a.give_ghost(5, 7);
+    check(a.digest() == d_all - model::chunks::mix(5), "a ghost is free for the digest()");
+    check(a.split_digest() != 0, "split_digest sees the ghost");
+    a.revive(5);
+    check(a.taken(5) && a.digest() == d_all && a.free() == 9 && a.ghosts() == 0 && a.split_digest() == 0, "revive: taken again, no ghost, digest as before");
+    check(a.take() == 11, "revive leaves the lowest-free bound right: the next take is the lowest free number");
+    a.give_ghost(6, 8), a.give(7);
+    check(a.take() == 7 && a.take() == 12 && a.take() == 13, "a ghost waits behind every plain free number");
+    check(a.is_ghost(6), "and is still a ghost");
+    a.give_ghost(8, 9);
+    a.revive(8);
+    a.give(9);
+    check(a.take() == 9, "a revived number above a lower free one does not hide it");
+  }
+  {  // shrink cuts the ghosts it covers, and what is left is as if it had never been there
+    Alloc a(100);
+    std::vector<uint32_t> v;
+    a.take(60, &v);
+    a.give_ghost(40, 1), a.give_ghost(50, 2), a.give_ghost(55, 3);
+    check(a.ghosts() == 3 && a.ghosts_from(50) == std::vector<uint32_t>({50, 55}), "three ghosts; ghosts_from lists those at or above");
+    check(!a.shrink(52) && a.numbers() == 100 && a.ghosts() == 3, "RED: a shrink over taken numbers changes nothing, ghosts included");
+    for (uint32_t x = 52; x <= 60; ++x)
+      if (x != 55) a.give(x);
+    check(a.shrink(52) && a.numbers() == 52 && a.ghosts() == 2 && !a.is_ghost(55) && a.is_ghost(50), "the ghost over the cut leaves with its number");
+    Alloc r(52);
+    std::vector<uint32_t> w;
+    r.take(51, &w);
+    r.give_ghost(40, 1), r.give_ghost(50, 2);
+    check(a.free() == 2 && a.split_digest() == r.split_digest() && a.digest() == r.digest(),
+          "the ghost digest and the taken digest are as if the cut ghost had never been");
+    check(a.take() == 40 && a.take() == 50 && a.free() == 0, "what is left of the free set is the two ghosts, oldest first");
+  }
+  {  // the model-based check with ghosts and a zone: a plain-set / ghost-map reference with the four steps spelled out
+    const uint32_t n = 400, zone = 300;
+    Alloc a(n);
+    a.set_zone(zone);
+    std::set<uint32_t> plain, held;
+    std::map<uint32_t, uint64_t> ghost;  // number -> stamp
+    for (uint32_t c = 1; c < n; ++c) plain.insert(c);
+    std::mt19937_64 rng(23);
+    uint64_t seq = 0;
+    int bad = 0;
+    auto want = [&]() -> uint32_t {
+      auto low = plain.begin();
+      if (low != plain.end() && *low < zone) return *low;
+      uint32_t best = 0;
+      for (const auto& g : ghost)
+        if (g.first < zone && (!best || g.second < ghost[best] || (g.second == ghost[best] && g.first < best))) best = g.first;
+      if (best) return best;
+      if (low != plain.end()) return *low;
+      for (const auto& g : ghost)
+        if (!best || g.second < ghost[best] || (g.second == ghost[best] && g.first < best)) best = g.first;
+      return best;
+    };
+    for (int i = 0; i < 200000 && !bad; ++i) {
+      const int op = (int)(rng() % 10);
+      if (op < 4 && (!plain.empty() || !ghost.empty())) {
+        const uint32_t w = want(), got = a.take();
+        if (got != w) ++bad;
+        plain.erase(got), ghost.erase(got), held.insert(got);
+      } else if (op < 6 && !held.empty()) {
+        auto it = held.begin();
+        std::advance(it, rng() % held.size());
+        const uint32_t c = *it;
+        a.give_ghost(c, ++seq);
+        held.erase(c), ghost[c] = seq;
+      } else if (op < 8 && !held.empty()) {
+        auto it = held.begin();
+        std::advance(it, rng() % held.size());
+        const uint32_t c = *it;
+        a.give(c);
+        held.erase(c), plain.insert(c);
+      } else if (op < 9 && !ghost.empty()) {
+        auto it = ghost.begin();
+        std::advance(it, rng() % ghost.size());
+        const uint32_t c = it->first;
+        a.revive(c);
+        ghost.erase(c), held.insert(c);
+      }
+      if (a.free() != plain.size() + ghost.size() || a.ghosts() != ghost.size() || a.free_plain() != plain.size()) ++bad;
+      if (i % 500 == 0) {
+        if (a.digest() != digest_of(held)) ++bad;
+        uint32_t below = 0;
+        for (const uint32_t c : plain) below += c < zone;
+        for (const auto& g : ghost) below += g.first < zone;
+        if (a.free_below_zone() != below) ++bad;
+      }
+    }
+    check(!bad, "200,000 operations with ghosts and a zone equal the reference (four steps, counts, digest)");
+  }
+  {  // the stamp is a count: two cores given the same commands hold the same stamps and hand out the same numbers
+    auto run = [](bool clock_stamps, uint64_t clock_skew) {
+      Alloc a(41);
+      std::vector<uint32_t> v, got;
+      a.take(40, &v);  // every number is taken: only the ghosts are free
+      uint64_t seq = 0, clock = clock_skew;
+      const uint32_t order[] = {9, 31, 4, 17, 22};  // a split gives these back in this order
+      for (const uint32_t c : order) {
+        clock = clock * 7 % 11 + 1;  // a clock that moves with unrelated work, and differs between the cores
+        a.give_ghost(c, clock_stamps ? clock : ++seq);
+      }
+      for (int i = 0; i < 5; ++i) got.push_back(a.take());
+      return std::make_pair(got, a.split_digest());
+    };
+    const auto x = run(false, 0), y = run(false, 5);
+    check(x.first == y.first && x.second == y.second, "two cores given the same commands hold the same stamps and hand out the same numbers");
+    check(x.first == std::vector<uint32_t>({9, 31, 4, 17, 22}), "the stamps order the ghosts as the split gave them back");
+    const auto cx = run(true, 0), cy = run(true, 5);
+    check(cx.first != cy.first, "control: a stamp taken from a clock that differs between the cores makes the two cores differ");
+  }
+  {  // unghost: a ghost whose link is cut is a plain free number, handed out before a ghost that can still be revived
+    Alloc a(20);
+    std::vector<uint32_t> v;
+    a.take(10, &v);
+    a.give_ghost(4, 1), a.give_ghost(5, 2);
+    a.unghost(5);
+    check(a.ghosts() == 1 && !a.is_ghost(5) && a.is_ghost(4) && a.free() == 11, "unghost: one ghost left, the number still free");
+    check(a.take() == 5 && a.take() == 11, "the plain numbers first, lowest first: 5, then 11 (not the ghost 4)");
+    check(a.take() == 12, "a take of 12 follows");
+    a.unghost(4);
+    check(a.ghosts() == 0 && a.split_digest() == 0, "no ghost, the ghost digest is 0 again");
+  }
+  {  // the quarter slots
+    SlotMap m;
+    uint32_t freed = 9;
+    check(!m.has_room() && m.digest() == 0, "an empty map");
+    m.open(7), m.open(3);
+    check(m.has_room() && m.open_numbers() == 2 && m.used() == 0, "two numbers open, no slot used");
+    check(m.take_slot() == (3u << 2 | 0) && m.take_slot() == (3u << 2 | 1), "the lowest open number's lowest free quarter first");
+    check(m.take_slot() == (3u << 2 | 2) && m.take_slot() == (3u << 2 | 3) && m.take_slot() == (7u << 2 | 0), "a full number is left for the next");
+    check(m.used() == 5 && m.refs(3u << 2 | 1) == 1, "five slots used, one holder each");
+    m.ref(3u << 2 | 1);
+    check(m.refs(3u << 2 | 1) == 2 && m.unref(3u << 2 | 1, &freed) == 1 && freed == 0, "a second holder: one reference left, the slot stays");
+    check(m.unref(3u << 2 | 1, &freed) == 0 && freed == 0 && m.used() == 4, "the last holder: the slot is free, its number stays (three used)");
+    check(m.take_slot() == (3u << 2 | 1), "a freed slot is taken again before a higher number's");
+    const uint64_t d = m.digest();
+    for (int q : {0, 1, 2}) m.unref(3u << 2 | q, &freed), check(freed == 0, "a number with a used slot is not freed");
+    check(m.unref(3u << 2 | 3, &freed) == 0 && freed == 3 && !m.is_open(3), "the last used slot of a number frees the number");
+    check(m.digest() != d && m.open_numbers() == 1 && m.open_from(0) == std::vector<uint32_t>({7}) && m.open_from(8).empty(), "open_from, digest moves");
+    m.unref(7u << 2 | 0, &freed);
+    check(freed == 7 && m.digest() == 0 && m.used() == 0, "all gone: the digest is 0");
+    // two maps given the same commands agree, one that skips a command does not
+    auto run = [](int skip) {
+      SlotMap x;
+      uint32_t f;
+      x.open(5), x.open(2);
+      for (int i = 0; i < 6; ++i) {
+        if (i == skip) continue;
+        x.take_slot();
+      }
+      x.ref(2u << 2 | 1);
+      x.unref(2u << 2 | 0, &f);
+      return x.digest();
+    };
+    check(run(-1) == run(-1) && run(3) != run(-1), "slot digests: equal on equal commands, different when a command is skipped");
+  }
   std::printf("chunks_test: %s\n", g_fail ? "FAILED" : "PASSED");
   return g_fail ? 1 : 0;
 }

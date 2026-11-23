@@ -53,13 +53,63 @@ fn images_agree(a: &[ImageKey], b: &[ImageKey], n: usize) -> bool {
     a.iter().filter(|k| k.at < n).eq(b.iter().filter(|k| k.at < n))
 }
 
+/// A place in a conversation where tokenisation restarts: the bytes of text before it, the ids the engine holds for that text, and
+/// the hash of the text: the first 128 bits of its SHA-256. A session is continued on a match of this hash alone, so it must be one whose
+/// collisions nobody can compute. Two texts that have a cut of the same bytes and hash share everything before it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cut {
+    pub bytes: usize,
+    pub ids: u32,
+    pub hash: u128,
+}
+
+impl Cut {
+    /// Before everything: no text, no ids (the hash is never compared: no edge sits at byte 0).
+    pub const START: Cut = Cut { bytes: 0, ids: 0, hash: 0 };
+}
+
+/// The SHA-256 state after the text up to a cut: what hashing the text after it goes on from.
+#[derive(Clone)]
+pub struct Resume(Sha256);
+
+impl Resume {
+    /// Before any text.
+    pub fn start() -> Resume {
+        Resume(Sha256::new())
+    }
+}
+
+impl std::fmt::Debug for Resume {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Resume")
+    }
+}
+
+/// The first 128 bits of the digest of what `h` has been fed.
+fn digest128(h: &Sha256) -> u128 {
+    let d = h.clone().finalize();
+    u128::from_le_bytes(d[..16].try_into().unwrap())
+}
+
+/// Whether byte `p` of a prompt lies strictly inside one image's run of placeholders: no cut sits there.
+fn in_image_run(images: &[ImageKey], p: usize) -> bool {
+    images.iter().any(|k| p > k.at && p < k.at + k.rows as usize * crate::encoding::IMAGE_PLACEHOLDER.len())
+}
+
+/// A cut of a prompt that has no ids yet: where an added token starts or ends, and the hash of the text up to there.
+#[derive(Clone)]
+struct Edge {
+    bytes: usize,
+    hash: u128,
+    /// the hash's state there, to go on from it at the request's DONE
+    state: Sha256,
+}
+
+#[derive(Clone)]
 struct Session {
-    text: String,
-    ids: Vec<u32>,
-    /// marks[j] = byte length of the text of ids[..32 * (j + 1)]: where every 32nd token ends, so that the end of
-    /// any token is found by a search of the marks and at most 31 token lengths (`token_end`). Empty when the text
-    /// is longer than u32::MAX bytes.
-    marks: Vec<u32>,
+    /// Ascending in bytes and in ids; the last is where the history the engine reported ends, or before it.
+    cuts: Vec<Cut>,
+    /// The bytes of the prompt of its last turn (where the output began).
     prompt_len: usize,
     busy: bool,
     last_used: u64,
@@ -101,6 +151,25 @@ impl Session {
     }
 }
 
+/// A prompt as the table needs it, made outside the table's lock: one pass over its text finds the hash at every edge of an added
+/// token and at every index level.
+pub struct Prompt<'a> {
+    text: &'a str,
+    ablit: bool,
+    images: &'a [ImageKey],
+    edges: Vec<Edge>,
+    keys: Vec<u128>,
+}
+
+impl<'a> Prompt<'a> {
+    pub fn new(text: &'a str, tok: &Tokenizer, ablit: bool, images: &'a [ImageKey]) -> Prompt<'a> {
+        let (mut edges, keys) = scan(text, &Resume::start(), 0, tok);
+        edges.retain(|e| !in_image_run(images, e.bytes));
+        Prompt { text, ablit, images, edges, keys }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct Plan {
     pub session_id: u64,
     /// The session a new session may fork from (0 = none).
@@ -148,6 +217,19 @@ impl Plan {
     }
 }
 
+/// What a finished (or dropped) request tells the table of its prompt.
+pub struct Turn<'a> {
+    /// The prompt's whole text.
+    pub text: &'a str,
+    /// The cut the request was planned from; `Cut::START` when it carried its whole prompt.
+    pub from: Cut,
+    /// The hash state at `from`.
+    pub state: &'a Resume,
+    /// The ids the request carried: the text after `from`, or the whole prompt's.
+    pub suffix: &'a [u32],
+    pub images: &'a [ImageKey],
+}
+
 pub struct SessionTable {
     sessions: HashMap<u64, Session>,
     /// The sessions by the hashes of their text's prefixes (`prefix_keys`): a prompt finds its best match among those
@@ -159,6 +241,9 @@ pub struct SessionTable {
     /// dropped, a table loaded): what tells a periodic save that there is something new.
     changes: u64,
     max_sessions: usize,
+    /// False until the engine's limits are applied (`keep_for`) on a table that `defer_limits` marked: the session and id counts
+    /// bound nothing meanwhile, so a saved table loaded before the engine's HELLO keeps every session.
+    limits_known: bool,
     max_tokens: usize,
     /// The most memory the sessions may hold (`Session::bytes`, with `image_bytes`).
     max_bytes: usize,
@@ -166,6 +251,9 @@ pub struct SessionTable {
     image_cap: usize,
     /// What the image rows in flight count for now (at most `image_cap`).
     image_bytes: usize,
+    /// Test control: `finish` appends the new cuts without first dropping those above the cut the request continued from.
+    #[cfg(test)]
+    append_without_truncating: bool,
 }
 
 /// The prefix lengths a text is indexed at: MIN_SHARED bytes, then four times longer each (64, 256, 1 KiB, ... 4 MiB at
@@ -174,29 +262,47 @@ fn level_len(level: usize) -> usize {
     MIN_SHARED << (2 * level)
 }
 
-/// The hash of `text`'s first `level_len(i)` bytes, with the level in it, for every level the text reaches: one pass.
-fn prefix_keys(text: &[u8]) -> Vec<u64> {
-    let mut out = Vec::new();
-    let mut h = 1469598103934665603u64;
-    for (i, &b) in text.iter().enumerate() {
-        h = (h ^ b as u64).wrapping_mul(1099511628211);
-        if i + 1 == level_len(out.len()) {
-            out.push(h ^ (out.len() as u64 + 1).wrapping_mul(0x9e3779b97f4a7c15));
-        }
-    }
-    out
+/// The prefix key of index level `level` for a text whose first `level_len(level)` bytes hash to `h`.
+fn level_key(level: usize, h: u128) -> u128 {
+    h ^ (level as u128 + 1).wrapping_mul(0x9e3779b97f4a7c15f39cc0605cedc835)
 }
 
-fn common_prefix(a: &[u8], b: &[u8]) -> usize {
-    let n = a.len().min(b.len());
-    let mut i = 0;
-    while i + 64 <= n && a[i..i + 64] == b[i..i + 64] {
-        i += 64;
+/// One pass over `region`, the text that follows a cut of `start_bytes` bytes whose hash state is `start`: the edges of its added
+/// tokens, as (bytes from the text's beginning, hash of the text up to there, the state there), and the prefix keys of the index levels
+/// it reaches beyond the cut, in level order.
+fn scan(region: &str, start: &Resume, start_bytes: usize, tok: &Tokenizer) -> (Vec<Edge>, Vec<u128>) {
+    let mut at_edges: Vec<usize> = tok.added_spans(region).into_iter().flat_map(|(a, e)| [a, e]).filter(|&p| p > 0).collect();
+    at_edges.sort_unstable();
+    at_edges.dedup();
+    let mut levels: Vec<(usize, usize)> = Vec::new(); // (bytes into the region, level)
+    let mut level = (0..).find(|&l| level_len(l) > start_bytes).unwrap();
+    while level_len(level) <= start_bytes + region.len() {
+        levels.push((level_len(level) - start_bytes, level));
+        level += 1;
     }
-    while i < n && a[i] == b[i] {
-        i += 1;
+    let bytes = region.as_bytes();
+    let (mut edges, mut keys) = (Vec::with_capacity(at_edges.len()), Vec::with_capacity(levels.len()));
+    let (mut h, mut at, mut i, mut j) = (start.0.clone(), 0usize, 0usize, 0usize);
+    loop {
+        let next = match (at_edges.get(i), levels.get(j)) {
+            (Some(&a), Some(&(b, _))) => a.min(b),
+            (Some(&a), None) => a,
+            (None, Some(&(b, _))) => b,
+            (None, None) => break,
+        };
+        h.update(&bytes[at..next]);
+        at = next;
+        let d = digest128(&h);
+        while at_edges.get(i) == Some(&next) {
+            edges.push(Edge { bytes: start_bytes + next, hash: d, state: h.clone() });
+            i += 1;
+        }
+        while j < levels.len() && levels[j].0 == next {
+            keys.push(level_key(levels[j].1, d));
+            j += 1;
+        }
     }
-    i
+    (edges, keys)
 }
 
 fn unix_now() -> u64 {
@@ -311,6 +417,9 @@ struct Bytes<'a> {
 }
 
 impl<'a> Bytes<'a> {
+    fn u128(&mut self) -> Result<u128, String> {
+        Ok(u128::from_le_bytes(self.take(16)?.try_into().unwrap()))
+    }
     fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
         if self.b.len() - self.at < n {
             return Err("cut short".into());
@@ -378,6 +487,80 @@ fn write_session(body: &mut Vec<u8>, id: u64, s: &Session) {
             }
         }
     }
+}
+
+/// The images of a record: u64 count, then (at, rows, hash) as three u64 each.
+fn read_images(r: &mut Bytes) -> Result<Vec<ImageKey>, String> {
+    let n = r.u64()? as usize;
+    if n.checked_mul(24).is_none_or(|b| b > r.b.len() - r.at) {
+        return Err("a bad count".into());
+    }
+    let mut images = Vec::with_capacity(n);
+    for _ in 0..n {
+        let (at, rows, hash) = (r.u64()? as usize, r.u64()?, r.u64()?);
+        images.push(ImageKey { at, rows: rows as u32, hash });
+    }
+    Ok(images)
+}
+
+/// One `DSFT0004` record (`write_session`); None when the session is not taken (too old, no history, a bad shape).
+fn read_session(r: &mut Bytes, now: u64, max_age_s: u64) -> Result<Option<(u64, Session)>, String> {
+    let (id, last_used, t_used, prompt_len, flags) = (r.u64()?, r.u64()?, r.u64()?, r.u64()? as usize, r.u64()?);
+    let (factor, epoch, n_hist, n_keys, n_cuts) = (r.u64()?, r.u64()?, r.u64()?, r.u64()? as usize, r.u64()? as usize);
+    if !matches!(factor, 16 | 32 | 64) {
+        return Err("a bad factor".into());
+    }
+    if n_keys > 64 || n_hist > u32::MAX as u64 || n_cuts.checked_mul(32).is_none_or(|b| b > r.b.len() - r.at) {
+        return Err("a bad count".into());
+    }
+    let keys = (0..n_keys).map(|_| r.u128()).collect::<Result<Vec<_>, _>>()?;
+    let mut cuts = Vec::with_capacity(n_cuts);
+    for _ in 0..n_cuts {
+        let (bytes, ids, hash) = (r.u64()? as usize, r.u64()?, r.u128()?);
+        cuts.push(Cut { bytes, ids: u32::try_from(ids).map_err(|_| "a bad cut")?, hash });
+    }
+    let images = if flags & TABLE_FLAG_IMAGES != 0 { read_images(r)? } else { Vec::new() };
+    let shaped = id != 0 && n_hist > 0 && cuts.windows(2).all(|w| w[0].bytes < w[1].bytes && w[0].ids <= w[1].ids) && cuts.iter().all(|c| c.bytes > 0 && c.ids as u64 <= n_hist);
+    if !shaped || now.saturating_sub(t_used) > max_age_s || images.iter().any(|k| k.rows < 3) {
+        return Ok(None);
+    }
+    let ablit = flags & TABLE_FLAG_ABLIT != 0;
+    Ok(Some((id, Session { cuts, prompt_len, busy: false, last_used, t_used, ablit, factor: factor as u32, images, keys, epoch, n_hist: n_hist as u32 })))
+}
+
+/// One record of a layout before `DSFT0004` (text and ids): its conversation's cuts are found in the text, which is then let go. The
+/// epoch is not known (0): the session's first request carries its whole prompt, and the DONE teaches the epoch.
+fn read_old_session(r: &mut Bytes, with_flags: bool, with_factor: bool, tok: &Tokenizer, now: u64, max_age_s: u64) -> Result<Option<(u64, Session)>, String> {
+    let (id, last_used, t_used, prompt_len, text_len) = (r.u64()?, r.u64()?, r.u64()?, r.u64()? as usize, r.u64()? as usize);
+    let flags = if with_flags { r.u64()? } else { 0 };
+    let factor = if with_factor { r.u64()? } else { 16 };
+    if !matches!(factor, 16 | 32 | 64) {
+        return Err("a bad factor".into());
+    }
+    let text = r.take(text_len)?;
+    let n_ids = r.u64()? as usize;
+    let raw = r.take(n_ids.checked_mul(4).ok_or("a bad count")?)?;
+    let ids: Vec<u32> = raw.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+    let images = if flags & TABLE_FLAG_IMAGES != 0 { read_images(r)? } else { Vec::new() };
+    let Ok(text) = std::str::from_utf8(text) else { return Ok(None) };
+    let vocab = tok.vocab_size() as u32;
+    if id == 0 || ids.is_empty() || now.saturating_sub(t_used) > max_age_s || prompt_len > text.len() || ids.iter().any(|&x| x >= vocab) {
+        return Ok(None);
+    }
+    let (marks, at) = mark_ids(&ids, |x| tok.token_bytes(x).len());
+    if at != text.len() || tok.decode_bytes(&ids) != text.as_bytes() {
+        return Ok(None); // another tokenizer's ids
+    }
+    if images.iter().any(|k| k.at >= text.len() || k.rows < 3) {
+        return Ok(None);
+    }
+    let (edges, keys) = scan(text, &Resume::start(), 0, tok);
+    let cuts = edges
+        .iter()
+        .filter_map(|e| token_end_in(&marks, &ids, text.len(), e.bytes, |x| tok.token_bytes(x).len()).map(|n| Cut { bytes: e.bytes, ids: n as u32, hash: e.hash }))
+        .collect();
+    let ablit = flags & TABLE_FLAG_ABLIT != 0;
+    Ok(Some((id, Session { cuts, prompt_len, busy: false, last_used, t_used, ablit, factor: factor as u32, images, keys, epoch: 0, n_hist: ids.len() as u32 })))
 }
 
 /// The 56 bytes that open a saved table.
@@ -597,6 +780,86 @@ pub fn front_status(bytes: usize, sessions: usize, tokens: usize, rss: Option<us
     format!("session table: {} MiB counted, {sessions} sessions, {tokens} tokens, {per:.1} B/token; RSS {} MiB, high-water {} MiB", bytes >> 20, mib(rss), mib(hwm))
 }
 
+/// The latest cut that session `s` and the prompt `p` have in common (the same bytes and the same hash) with the same images
+/// inside it. Cuts are a chain: once the hashes differ at one place, no later cut is shared.
+fn shared_cut(s: &Session, p: &Prompt) -> Option<Cut> {
+    let (mut i, mut j, mut best) = (0, 0, None);
+    while i < s.cuts.len() && j < p.edges.len() {
+        let (c, e) = (s.cuts[i], &p.edges[j]);
+        match c.bytes.cmp(&e.bytes) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                if c.hash != e.hash || !images_agree(&s.images, p.images, c.bytes) {
+                    break;
+                }
+                best = Some(c);
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    best
+}
+
+/// The session a prompt continues or forks, as `SessionTable::pick` found it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Best {
+    sid: u64,
+    /// The latest cut it shares with the prompt (`Cut::START`: none).
+    cut: Cut,
+    /// The bytes of text it shares with the prompt, at least.
+    shared: usize,
+    in_place: bool,
+    epoch: u64,
+    /// The factor of that session.
+    factor: u32,
+}
+
+/// What `SessionTable::pick` found: the session that shares the most with the prompt, whatever that is (for the log), and the one
+/// worth continuing or forking (it shares at least `MIN_SHARED` bytes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Found {
+    top: Option<(u64, usize)>,
+    best: Option<Best>,
+}
+
+/// `SessionTable::plan` for the table behind a lock, which is held only while the table is read and written, never while text is
+/// tokenised: the prompt is scanned first, the table picks a session under the lock, the text after its cut is tokenised outside it,
+/// and the choice is made again under the lock to commit. A choice the table has since changed is made over (after a few times,
+/// under the lock). Returns the plan and the sessions to RELEASE on the engine.
+pub fn plan_shared(table: &Mutex<SessionTable>, text: &str, tok: &Tokenizer, threads: usize, ablit: bool, images: &[ImageKey]) -> (Plan, Vec<u64>) {
+    plan_shared_with(table, text, tok, threads, ablit, images, &mut || {})
+}
+
+/// `plan_shared`, with `between` called after each choice is tokenised and before the table is locked again to commit it: the moment
+/// another request may take the session (a test's hook).
+fn plan_shared_with(table: &Mutex<SessionTable>, text: &str, tok: &Tokenizer, threads: usize, ablit: bool, images: &[ImageKey], between: &mut dyn FnMut()) -> (Plan, Vec<u64>) {
+    let p = Prompt::new(text, tok, ablit, images);
+    let (mut only, mut tries) = (None, 0);
+    let mut tokenised: Option<(usize, Vec<u32>)> = None;
+    for _ in 0..4 {
+        let found = table.lock().unwrap().pick(&p, only);
+        let from = found.best.map_or(Cut::START, |b| b.cut);
+        if tokenised.as_ref().is_none_or(|(at, _)| *at != from.bytes) {
+            tokenised = Some((from.bytes, tok.encode_parallel(&p.text[from.bytes..], threads)));
+        }
+        let f = factor_for(from.ids as usize + tokenised.as_ref().map_or(0, |t| t.1.len()));
+        if !(found.best.is_none_or(|b| b.factor == f) || only == Some(0)) {
+            tries += 1;
+            only = Some(if tries >= 2 { 0 } else { f });
+            continue;
+        }
+        between();
+        let mut t = table.lock().unwrap();
+        if t.pick(&p, only) == found {
+            let suffix = tokenised.take().map(|t| t.1).unwrap_or_default();
+            return t.commit(&found, &p, suffix, f);
+        }
+    }
+    table.lock().unwrap().plan_locked(&p, tok, threads)
+}
+
 impl SessionTable {
     /// Holds up to `max_sessions` sessions and `max_tokens` ids in total. Ids start from the clock,
     /// so that a table begun afresh never reuses an earlier one's ids, whose sessions the engine may
@@ -788,68 +1051,55 @@ impl SessionTable {
         (plan, released)
     }
 
-    /// The plan for a prompt against the sessions of factor `only` (None: of any factor; Some(0): none), and the
-    /// factor of the session it continues or forks (None when it starts fresh).
-    fn build(&mut self, text: &str, tok: &Tokenizer, threads: usize, ablit: bool, only: Option<u32>, images: &[ImageKey]) -> (Plan, Option<u32>) {
-        let top = self.best(text, ablit, only, images);
-        let best = top.filter(|&(_, n)| n >= MIN_SHARED);
-        let (mut plan, cut) = match best {
-            None => (Plan { session_id: self.new_id(), base_session_id: 0, reused: 0, ids: Vec::new(), matched: 0, shared: 0, common: 0 }, 0),
-            Some((sid, mut shared)) => {
-                while !text.is_char_boundary(shared) {
-                    shared -= 1;
-                }
-                let s = &self.sessions[&sid];
-                // The last cut point within the shared text that is a token boundary of the session
-                // and an edge of an added token in the new text.
-                let mut cut = (0, 0); // (byte position, ids before it)
-                for (a, e) in tok.added_spans(text) {
-                    if a > shared {
-                        break;
-                    }
-                    for p in [a, e] {
-                        if p <= shared && p > cut.0 {
-                            if let Some(n) = s.token_end(p, tok) {
-                                cut = (p, n);
-                            }
-                        }
-                    }
-                }
-                let ids = s.ids[..cut.1].to_vec();
-                let in_place = !s.busy && shared + PROMPT_SLACK >= s.prompt_len;
-                let plan = if in_place {
-                    Plan { session_id: sid, base_session_id: 0, reused: cut.1, ids, matched: 0, shared: 0, common: 0 }
-                } else {
-                    Plan { session_id: self.new_id(), base_session_id: sid, reused: cut.1, ids, matched: 0, shared: 0, common: 0 }
-                };
-                (plan, cut.0)
+    /// `plan_shared` with the table held throughout (tokenising under the caller's lock).
+    fn plan_locked(&mut self, p: &Prompt, tok: &Tokenizer, threads: usize) -> (Plan, Vec<u64>) {
+        // The request's factor follows from its ids, which follow from the session it continues: try the best
+        // match at any factor, then the best of the factor the ids came to; if that moves the factor again,
+        // start fresh (a prompt tokenised whole has one length and so one factor).
+        let mut only = None;
+        let mut tries = 0;
+        loop {
+            let found = self.pick(p, only);
+            let from = found.best.map_or(Cut::START, |b| b.cut);
+            let suffix = tok.encode_parallel(&p.text[from.bytes..], threads);
+            let f = factor_for(from.ids as usize + suffix.len());
+            if found.best.is_none_or(|b| b.factor == f) || only == Some(0) {
+                return self.commit(&found, p, suffix, f);
             }
-        };
-        plan.ids.extend(tok.encode_parallel(&text[cut..], threads));
-        if let Some((sid, n)) = top {
-            plan.matched = sid;
-            plan.shared = n;
-            let s = &self.sessions[&sid].ids;
-            plan.common = s.iter().zip(&plan.ids).take_while(|(a, b)| a == b).count();
+            tries += 1;
+            only = Some(if tries >= 2 { 0 } else { f });
         }
-        (plan, best.map(|(sid, _)| self.sessions[&sid].factor))
     }
 
-    /// Record what the session holds after a request: the prompt and the generated ids.
-    pub fn finish(&mut self, session_id: u64, prompt_text: &str, prompt_ids: &[u32], generated: &[u32], tok: &Tokenizer) {
-        self.finish_images(session_id, prompt_text, prompt_ids, generated, tok, &[]);
+    /// Choose the session and the ids for a prompt of the weights path `ablit`: only sessions of
+    /// that path are candidates. The chosen session is busy until `finish`, `give_up` or `abandon`. Returns the
+    /// plan and the sessions to RELEASE on the engine.
+    pub fn plan(&mut self, text: &str, tok: &Tokenizer, threads: usize, ablit: bool) -> (Plan, Vec<u64>) {
+        self.plan_images(text, tok, threads, ablit, &[])
     }
 
-    /// `finish` for a prompt with images (`plan_images`' text and keys).
-    pub fn finish_images(&mut self, session_id: u64, prompt_text: &str, prompt_ids: &[u32], generated: &[u32], tok: &Tokenizer, images: &[ImageKey]) {
+    /// `plan` for a prompt with images: `text` has each image's placeholder written once per row, and
+    /// `images` says where each run starts in it, how long it is and what the image is. A session whose
+    /// images inside the shared text are not these (see the module comment) is no candidate.
+    pub fn plan_images(&mut self, text: &str, tok: &Tokenizer, threads: usize, ablit: bool, images: &[ImageKey]) -> (Plan, Vec<u64>) {
+        let p = Prompt::new(text, tok, ablit, images);
+        self.plan_locked(&p, tok, threads)
+    }
+
+    /// Record what the session holds after a request that ended in a DONE: the cuts of the prompt's new text and of the output, and
+    /// the epoch and size of the history the engine reports (`tail`; none from an engine of the older protocol: the session then
+    /// names no epoch, and its next request carries its whole prompt).
+    pub fn finish(&mut self, session_id: u64, turn: &Turn, generated: &[u32], tail: Option<DoneTail>, tok: &Tokenizer) {
         self.changes += 1;
-        let Some(s) = self.sessions.get_mut(&session_id) else { return };
+        if !self.sessions.contains_key(&session_id) {
+            return;
+        }
         let gen_bytes = tok.decode_bytes(generated);
-        let mut text = prompt_text.to_string();
-        let mut ids = prompt_ids.to_vec();
+        let mut region = turn.text[turn.from.bytes..].to_string();
+        let mut ids = turn.suffix.to_vec();
         // Generated text that is not valid UTF-8 cannot come back verbatim; keep the prompt only.
         if let Ok(g) = std::str::from_utf8(&gen_bytes) {
-            text.push_str(g);
+            region.push_str(g);
             ids.extend_from_slice(generated);
         }
         let (marks, at) = mark_ids(&ids, |id| tok.token_bytes(id).len());
@@ -1044,10 +1294,26 @@ mod tests {
 
     const TOKENIZER: &str = "/data/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8/tokenizer.json";
 
-    /// A session of `text` straight into the table and its index (no tokenizer: the index reads only the text).
+    fn syn() -> Tokenizer {
+        crate::tokenizer::synthetic::tokenizer()
+    }
+
+    /// The longest common prefix of two byte strings.
+    fn common_prefix(a: &[u8], b: &[u8]) -> usize {
+        a.iter().zip(b).take_while(|(x, y)| x == y).count()
+    }
+
+    /// A finished session of `text` straight into the table and its index: the cuts, keys and counts a request that ran would have left.
     fn put(t: &mut SessionTable, id: u64, text: &str, ablit: bool) {
-        t.sessions.insert(id, Session { text: text.into(), ids: Vec::new(), marks: Vec::new(), prompt_len: text.len(), busy: false,
-                                        last_used: 0, t_used: 0, ablit, factor: 16, images: Vec::new(), keys: Vec::new() });
+        let tok = syn();
+        let ids = tok.encode(text);
+        let (marks, _) = mark_ids(&ids, |x| tok.token_bytes(x).len());
+        let (edges, keys) = scan(text, &Resume::start(), 0, &tok);
+        let cuts = edges
+            .iter()
+            .filter_map(|e| token_end_in(&marks, &ids, text.len(), e.bytes, |x| tok.token_bytes(x).len()).map(|n| Cut { bytes: e.bytes, ids: n as u32, hash: e.hash }))
+            .collect();
+        t.sessions.insert(id, Session { cuts, keys, prompt_len: text.len(), n_hist: ids.len() as u32, epoch: 5, ..Session::empty(ablit, 16, 0) });
         t.enter(id);
     }
 
@@ -1064,28 +1330,578 @@ mod tests {
         t.sessions.get_mut(&id).unwrap().t_used = unix_now();
     }
 
-    /// A saved table of an older layout holding one session of `text` (`DSFT0002` has the flags word, `DSFT0001` not).
-    fn old_table(magic: &[u8; 8], id: u64, text: &str, ids: &[u32]) -> Vec<u8> {
-        let now = unix_now();
-        let mut body = Vec::new();
-        let mut head = vec![id, 5, now, text.len() as u64, text.len() as u64];
-        if magic == TABLE_MAGIC_V2 {
-            head.push(0);
+    /// The tail an engine reports for a request that ran: its history is the prompt and the output but the output's last id.
+    fn tail_of(total: usize, generated: &[u32]) -> DoneTail {
+        DoneTail { epoch: 5, n_hist: (total + generated.len().saturating_sub(1)) as u32 }
+    }
+
+    /// What a request carries to the engine: its suffix after `plan.from` when it names the entry (`prefix`), else the whole prompt.
+    fn carried(plan: &Plan, tok: &Tokenizer, text: &str, prefix: bool) -> (Cut, Resume, Vec<u32>) {
+        if prefix || plan.from == Cut::START {
+            (plan.from, plan.state.clone(), plan.suffix.clone())
+        } else {
+            (Cut::START, Resume::start(), tok.encode(text))
         }
-        for v in head {
-            body.extend(v.to_le_bytes());
+    }
+
+    /// The table's finish for a planned request whose output was `reply`, with the tail an engine would report.
+    fn finish_plan(t: &mut SessionTable, tok: &Tokenizer, plan: &Plan, text: &str, reply: &[u32], images: &[ImageKey]) {
+        let (from, state, suffix) = carried(plan, tok, text, images.is_empty());
+        let total = from.ids as usize + suffix.len();
+        t.finish(plan.session_id, &Turn { text, from, state: &state, suffix: &suffix, images }, reply, Some(tail_of(total, reply)), tok);
+    }
+
+    /// One turn through the table's own steps: plan, then finish.
+    fn serve(t: &mut SessionTable, tok: &Tokenizer, text: &str, reply: &[u32], ablit: bool) -> Plan {
+        serve_images(t, tok, text, reply, ablit, &[])
+    }
+
+    fn serve_images(t: &mut SessionTable, tok: &Tokenizer, text: &str, reply: &[u32], ablit: bool, images: &[ImageKey]) -> Plan {
+        let (plan, _) = t.plan_images(text, tok, 1, ablit, images);
+        finish_plan(t, tok, &plan, text, reply, images);
+        plan
+    }
+
+    /// The best match of `text` as a session id (None: none shares enough).
+    fn best_of(t: &SessionTable, tok: &Tokenizer, text: &str, ablit: bool, only: Option<u32>, images: &[ImageKey]) -> Option<u64> {
+        t.pick(&Prompt::new(text, tok, ablit, images), only).best.map(|b| b.sid)
+    }
+
+    // ---------------------------------------------------------------- the engine's side, as a model
+
+    /// What rank 0 keeps per session (engine/server/prefix.h): the history, the epoch a request that continues it must name, and how many
+    /// ids the last DONE reported. The epoch is new when a run starts below what the last DONE reported.
+    #[derive(Clone)]
+    struct EEntry {
+        hist: Vec<u32>,
+        epoch: u64,
+        reported: usize,
+    }
+
+    #[derive(Default)]
+    struct Eng {
+        entries: HashMap<u64, EEntry>,
+        epochs: u64,
+    }
+
+    impl Eng {
+        /// The prompt rank 0 builds from a request: None is `PrefixGone`. The entry is the base's when the request names one.
+        fn build(&self, session: u64, base: u64, prefix: Option<(u64, u32)>, ids: &[u32]) -> Option<Vec<u32>> {
+            let Some((epoch, n)) = prefix else { return Some(ids.to_vec()) };
+            let e = self.entries.get(&if base != 0 { base } else { session })?;
+            if e.epoch != epoch || n as usize > e.reported || n as usize > e.hist.len() {
+                return None;
+            }
+            let mut p = e.hist[..n as usize].to_vec();
+            p.extend_from_slice(ids);
+            Some(p)
         }
-        body.extend(text.as_bytes());
-        body.extend((ids.len() as u64).to_le_bytes());
-        for x in ids {
-            body.extend(x.to_le_bytes());
+
+        /// The run: the history becomes the prompt and the output but its last id. `back` is how far below the shared ids the run restarts
+        /// (the engine may restart at a snapshot).
+        fn run(&mut self, session: u64, prompt: &[u32], generated: &[u32], back: usize) -> DoneTail {
+            let q = self.entries.get(&session).map(|e| common_prefix_ids(&e.hist, prompt).saturating_sub(back));
+            let epoch = match (self.entries.get(&session), q) {
+                (Some(e), Some(q)) if q >= e.reported => e.epoch,
+                _ => {
+                    self.epochs += 1;
+                    self.epochs
+                }
+            };
+            let mut hist = prompt.to_vec();
+            hist.extend_from_slice(&generated[..generated.len().saturating_sub(1)]);
+            let reported = hist.len();
+            self.entries.insert(session, EEntry { hist, epoch, reported });
+            DoneTail { epoch, n_hist: reported as u32 }
         }
-        let mut f = magic.to_vec();
-        for v in [now, id + 1, 9, 1, body.len() as u64, fnv(&body)] {
-            f.extend(v.to_le_bytes());
+    }
+
+    fn common_prefix_ids(a: &[u32], b: &[u32]) -> usize {
+        a.iter().zip(b).take_while(|(x, y)| x == y).count()
+    }
+
+    /// The table and the engine's model, driven as the server drives them.
+    struct Rig<'a> {
+        t: SessionTable,
+        tok: &'a Tokenizer,
+        e: Eng,
+        /// The protocol version the connection says: 4 never carries a prefix.
+        version: u32,
+        /// The engine restarts below the shared ids now and then and drops a session now and then.
+        wild: bool,
+        rng: u64,
+    }
+
+    /// One request as it went to the engine.
+    struct Sent {
+        plan: Plan,
+        built: Vec<u32>,
+        prefix: bool,
+        gone: bool,
+    }
+
+    impl<'a> Rig<'a> {
+        fn new(tok: &'a Tokenizer, version: u32, wild: bool, seed: u64) -> Rig<'a> {
+            Rig { t: SessionTable::new(1 << 20, 1 << 40), tok, e: Eng::default(), version, wild, rng: seed }
         }
-        f.extend(body);
-        f
+
+        fn turn(&mut self, text: &str, ablit: bool, images: &[ImageKey], reply: &[u32]) -> Sent {
+            let (plan, released) = self.t.plan_images(text, self.tok, 1, ablit, images);
+            for r in released {
+                self.e.entries.remove(&r);
+            }
+            // never across the weights path or the factor
+            let src = if plan.base_session_id != 0 { plan.base_session_id } else { plan.session_id };
+            if let Some(s) = self.t.sessions.get(&src).filter(|s| s.ready()) {
+                assert_eq!(s.ablit, ablit, "a session of the other weights path was continued");
+                assert_eq!(s.factor, factor_for(plan.total()), "a session of another factor was continued");
+            }
+            let prefix = plan.prefix_mode(self.version, !images.is_empty());
+            let (from, state, ids) = carried(&plan, self.tok, text, prefix);
+            if self.wild && lcg(&mut self.rng).is_multiple_of(9) {
+                self.e.entries.remove(&src);
+            }
+            let mut built = self.e.build(plan.session_id, plan.base_session_id, prefix.then_some((plan.epoch, from.ids)), &ids);
+            let (mut from, mut state, mut ids, mut gone) = (from, state, ids, false);
+            if built.is_none() {
+                // PrefixGone: tokenise everything, send whole
+                (from, state, ids, gone) = (Cut::START, Resume::start(), self.tok.encode(text), true);
+                built = Some(ids.clone());
+            }
+            let built = built.unwrap();
+            let back = if self.wild && lcg(&mut self.rng).is_multiple_of(4) { (lcg(&mut self.rng) % 40) as usize } else { 0 };
+            let tail = self.e.run(plan.session_id, &built, reply, back);
+            let sent_prefix = prefix && !gone;
+            // a connection of version 4 has no tail
+            let tail = (self.version >= 5).then_some(tail);
+            self.t.finish(plan.session_id, &Turn { text, from, state: &state, suffix: &ids, images }, reply, tail, self.tok);
+            Sent { plan, built, prefix: sent_prefix, gone }
+        }
+    }
+
+    // ---------------------------------------------------------------- the plan that reads every session's text and ids, kept as the reference
+
+    struct RefSession {
+        text: String,
+        ids: Vec<u32>,
+        prompt_len: usize,
+        ablit: bool,
+        factor: u32,
+        images: Vec<ImageKey>,
+    }
+
+    struct RefPlan {
+        session: u64,
+        base: u64,
+        reused: usize,
+        ids: Vec<u32>,
+        factor: u32,
+    }
+
+    /// A table that keeps every session's text and ids, read whole by brute force.
+    #[derive(Default)]
+    struct RefTable {
+        s: Vec<(u64, RefSession)>,
+        next: u64,
+    }
+
+    impl RefTable {
+        fn best(&self, text: &str, ablit: bool, only: Option<u32>, images: &[ImageKey]) -> Option<(usize, usize)> {
+            let mut top: Option<(usize, usize)> = None;
+            for (i, (_, s)) in self.s.iter().enumerate() {
+                if s.ablit != ablit || only.is_some_and(|f| s.factor != f) {
+                    continue;
+                }
+                let n = common_prefix(text.as_bytes(), s.text.as_bytes());
+                if !images_agree(&s.images, images, n) {
+                    continue;
+                }
+                if top.is_none_or(|(_, bn)| n > bn) {
+                    top = Some((i, n));
+                }
+            }
+            top
+        }
+
+        fn build(&mut self, text: &str, tok: &Tokenizer, ablit: bool, only: Option<u32>, images: &[ImageKey]) -> (RefPlan, Option<u32>) {
+            let top = self.best(text, ablit, only, images);
+            let best = top.filter(|&(_, n)| n >= MIN_SHARED);
+            let (mut plan, cut) = match best {
+                None => {
+                    self.next += 1;
+                    (RefPlan { session: self.next, base: 0, reused: 0, ids: Vec::new(), factor: 16 }, 0)
+                }
+                Some((i, mut shared)) => {
+                    while !text.is_char_boundary(shared) {
+                        shared -= 1;
+                    }
+                    let (sid, s) = &self.s[i];
+                    let (marks, _) = mark_ids(&s.ids, |x| tok.token_bytes(x).len());
+                    let mut cut = (0, 0);
+                    for (a, e) in tok.added_spans(text) {
+                        if a > shared {
+                            break;
+                        }
+                        for p in [a, e] {
+                            if p <= shared && p > cut.0 {
+                                if let Some(n) = token_end_in(&marks, &s.ids, s.text.len(), p, |x| tok.token_bytes(x).len()) {
+                                    cut = (p, n);
+                                }
+                            }
+                        }
+                    }
+                    let ids = s.ids[..cut.1].to_vec();
+                    let sid = *sid;
+                    let in_place = shared + PROMPT_SLACK >= s.prompt_len;
+                    if in_place {
+                        (RefPlan { session: sid, base: 0, reused: cut.1, ids, factor: 16 }, cut.0)
+                    } else {
+                        self.next += 1;
+                        (RefPlan { session: self.next, base: sid, reused: cut.1, ids, factor: 16 }, cut.0)
+                    }
+                }
+            };
+            plan.ids.extend(tok.encode(&text[cut..]));
+            (plan, best.map(|(i, _)| self.s[i].1.factor))
+        }
+
+        fn plan(&mut self, text: &str, tok: &Tokenizer, ablit: bool, images: &[ImageKey]) -> RefPlan {
+            let (mut only, mut tries) = (None, 0);
+            loop {
+                let (mut plan, used) = self.build(text, tok, ablit, only, images);
+                let f = factor_for(plan.ids.len());
+                if used.is_none_or(|u| u == f) || only == Some(0) {
+                    plan.factor = f;
+                    return plan;
+                }
+                tries += 1;
+                only = Some(if tries >= 2 { 0 } else { f });
+            }
+        }
+
+        fn finish(&mut self, p: &RefPlan, text: &str, generated: &[u32], tok: &Tokenizer, ablit: bool, images: &[ImageKey]) {
+            let gen_bytes = tok.decode_bytes(generated);
+            let (mut t, mut ids) = (text.to_string(), p.ids.clone());
+            if let Ok(g) = std::str::from_utf8(&gen_bytes) {
+                t.push_str(g);
+                ids.extend_from_slice(generated);
+            }
+            let factor = factor_for(ids.len()).max(p.factor);
+            let rec = RefSession { text: t, ids, prompt_len: text.len(), ablit, factor, images: images.to_vec() };
+            match self.s.iter_mut().find(|(id, _)| *id == p.session) {
+                Some((_, s)) => *s = RefSession { factor: s.factor.max(rec.factor), ..rec },
+                None => self.s.push((p.session, rec)),
+            }
+        }
+
+        fn has(&self, id: u64) -> bool {
+            self.s.iter().any(|(i, _)| *i == id)
+        }
+    }
+
+    // ---------------------------------------------------------------- edit histories from the real chat template
+
+    /// A deterministic pseudo-random stream.
+    fn lcg(state: &mut u64) -> u64 {
+        *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *state >> 33
+    }
+
+    const WORDS: [&str; 16] = ["build", "tests", "the", "file", "was", "changed", "héllo", "run", "✓", "again", "cargo", "error", "line", "fix", "next", "ok"];
+
+    /// `base` words and up to `spread` more.
+    fn words_r(rng: &mut u64, base: usize, spread: usize) -> String {
+        let n = base + lcg(rng) as usize % spread;
+        words(rng, n)
+    }
+
+    fn words(rng: &mut u64, n: usize) -> String {
+        (0..n).map(|_| WORDS[lcg(rng) as usize % WORDS.len()]).collect::<Vec<_>>().join(" ")
+    }
+
+    /// A conversation as a client holds it, rendered through the real chat encoding.
+    #[derive(Clone)]
+    struct Conv {
+        thinking: bool,
+        msgs: Vec<Value>,
+    }
+
+    impl Conv {
+        fn text(&self) -> Option<String> {
+            let o = EncodeOptions::new(if self.thinking { ThinkingMode::Thinking } else { ThinkingMode::Chat });
+            encode_messages(&self.msgs, &o).ok().map(|x| x.0)
+        }
+
+        /// An edit of one message's text that keeps its length (`same_len`) or not.
+        fn edit(&mut self, rng: &mut u64, same_len: bool) -> Option<(usize, Value)> {
+            let at: Vec<usize> = (0..self.msgs.len().saturating_sub(1)).filter(|&i| self.msgs[i]["content"].as_str().is_some_and(|c| !c.is_empty())).collect();
+            if at.is_empty() {
+                return None;
+            }
+            let i = at[lcg(rng) as usize % at.len()];
+            let old = self.msgs[i]["content"].clone();
+            let s = old.as_str().unwrap();
+            let new = if same_len {
+                let mut b: Vec<u8> = s.bytes().collect();
+                let k = b.iter().position(|c| c.is_ascii_lowercase()).unwrap_or(0);
+                if b[k].is_ascii_lowercase() {
+                    b[k] = if b[k] == b'z' { b'a' } else { b[k] + 1 };
+                }
+                String::from_utf8(b).unwrap_or_else(|_| s.to_string())
+            } else {
+                format!("{s} {}", words(rng, 3))
+            };
+            self.msgs[i]["content"] = json!(new);
+            Some((i, old))
+        }
+    }
+
+    /// The tallies of a run over many scenarios.
+    #[derive(Default, Debug)]
+    struct Tally {
+        requests: usize,
+        compared: usize,
+        same: usize,
+        /// counted differences: another session wins (the latest shared cut, not the longest byte match) and a fork where the reference's slack rule
+        /// says in place; and ids equal though the session choice differs
+        other_session: usize,
+        fork_for_place: usize,
+        same_ids_other_choice: usize,
+        /// of those: cold where the reference plan names a base, a base where the reference plan starts cold
+        cold_for_base: usize,
+        base_for_cold: usize,
+        gone: usize,
+        prefix_sent: usize,
+        skipped: usize,
+    }
+
+    /// One scenario: a conversation and the edits a client makes to its history, each request planned by the table (against the
+    /// engine's model) and by the reference plan. Err names the first thing that is wrong.
+    fn scenario(seed: u64, tok: &Tokenizer, tally: &mut Tally, version: u32, wild: bool, control: bool) -> Result<(), String> {
+        let mut rng = seed.wrapping_mul(0x9e3779b97f4a7c15) | 1;
+        let thinking = lcg(&mut rng).is_multiple_of(2);
+        let mut msgs: Vec<Value> = Vec::new();
+        if !lcg(&mut rng).is_multiple_of(4) {
+            msgs.push(json!({"role": "system", "content": words_r(&mut rng, 20, 60)}));
+        }
+        msgs.push(json!({"role": "user", "content": words_r(&mut rng, 4, 30)}));
+        let mut conv = Conv { thinking, msgs };
+        let mut rig = Rig::new(tok, version, wild, seed ^ 0x5555);
+        rig.t.append_without_truncating = control;
+        let mut reft = RefTable::default();
+        let mut n2r: HashMap<u64, u64> = HashMap::new();
+        let mut lockstep = true;
+        let mut ablit = lcg(&mut rng).is_multiple_of(7);
+        let mut undo: Option<(usize, Value)> = None;
+        for k in 0..(2 + lcg(&mut rng) as usize % 6) {
+            let Some(text) = conv.text() else {
+                tally.skipped += 1;
+                return Ok(());
+            };
+            let reasoning = words_r(&mut rng, 3, 10);
+            let answer = words_r(&mut rng, 2, 25);
+            let reply_text = if conv.thinking { format!("{reasoning}</think>{answer}") } else { answer.clone() };
+            let mut reply = tok.encode(&reply_text);
+            reply.push(1);
+            let sent = rig.turn(&text, ablit, &[], &reply);
+            tally.requests += 1;
+            tally.gone += sent.gone as usize;
+            tally.prefix_sent += sent.prefix as usize;
+            if version < 5 && sent.prefix {
+                return Err(format!("seed {seed} request {k}: a prefix on a connection of version {version}"));
+            }
+            if tok.decode(&sent.built) != text {
+                return Err(format!(
+                    "seed {seed} request {k}: the engine built a prompt that is not the request's text (prefix {}, from {} ids, session {} base {})",
+                    sent.prefix, sent.plan.from.ids, sent.plan.session_id, sent.plan.base_session_id
+                ));
+            }
+            let rp = reft.plan(&text, tok, ablit, &[]);
+            if tok.decode(&rp.ids) != text {
+                return Err(format!("seed {seed} request {k}: the reference plan is not the text (the reference is wrong)"));
+            }
+            if lockstep {
+                tally.compared += 1;
+                let new_src = if sent.plan.base_session_id != 0 { sent.plan.base_session_id } else if n2r.contains_key(&sent.plan.session_id) { sent.plan.session_id } else { 0 };
+                let ref_src = if rp.base != 0 { rp.base } else if reft.has(rp.session) { rp.session } else { 0 };
+                let same_src = n2r.get(&new_src).copied().unwrap_or(0) == ref_src;
+                let (new_fork, ref_fork) = (sent.plan.base_session_id != 0, rp.base != 0);
+                if sent.built == rp.ids {
+                    tally.same += 1;
+                    if !same_src {
+                        tally.same_ids_other_choice += 1;
+                        tally.cold_for_base += (new_src == 0 && ref_src != 0) as usize;
+                        tally.base_for_cold += (new_src != 0 && ref_src == 0) as usize;
+                        lockstep = false;
+                    } else if new_fork != ref_fork {
+                        tally.fork_for_place += 1;
+                        lockstep = false;
+                    }
+                } else if !same_src {
+                    tally.other_session += 1;
+                    lockstep = false;
+                } else if new_fork && !ref_fork {
+                    tally.fork_for_place += 1;
+                    lockstep = false;
+                } else {
+                    return Err(format!(
+                        "seed {seed} request {k}: the same session, and the prompts differ: new reuses {} ids ({} carried), the reference {}",
+                        sent.plan.from.ids,
+                        sent.plan.suffix.len(),
+                        rp.reused
+                    ));
+                }
+                if lockstep && (new_src == 0 || new_fork) {
+                    n2r.insert(sent.plan.session_id, rp.session);
+                }
+            }
+            reft.finish(&rp, &text, &reply, tok, ablit, &[]);
+            // the next request
+            if let Some((i, old)) = undo.take() {
+                conv.msgs[i]["content"] = old; // the edit is undone
+            }
+            if lcg(&mut rng).is_multiple_of(12) {
+                continue; // regenerate: the same prompt again
+            }
+            if conv.msgs.last().is_some_and(|m| m["role"] == "user" || m["role"] == "tool") {
+                if lcg(&mut rng).is_multiple_of(6) {
+                    let mut m = json!({"role": "assistant", "content": "", "tool_calls": [{"id": "a", "function": {"name": "f", "arguments": "{}"}}]});
+                    if conv.thinking {
+                        m["reasoning_content"] = json!(reasoning);
+                    }
+                    conv.msgs.push(m);
+                    conv.msgs.push(json!({"role": "tool", "tool_call_id": "a", "content": words_r(&mut rng, 10, 40)}));
+                } else {
+                    let mut m = json!({"role": "assistant", "content": answer});
+                    if conv.thinking {
+                        m["reasoning_content"] = json!(reasoning);
+                    }
+                    conv.msgs.push(m);
+                    conv.msgs.push(json!({"role": "user", "content": words_r(&mut rng, 3, 30)}));
+                }
+            }
+            match lcg(&mut rng) % 8 {
+                0 => {
+                    // a system (or first) message changed
+                    let _ = conv.edit(&mut rng, false);
+                }
+                1 => {
+                    // a message in the middle edited, then restored at the next request
+                    let same_len = lcg(&mut rng).is_multiple_of(2);
+                    undo = conv.edit(&mut rng, same_len);
+                }
+                2 if conv.msgs.len() > 3 => {
+                    // a fork: the conversation goes back to an earlier user message and continues another way
+                    let users: Vec<usize> = (0..conv.msgs.len()).filter(|&i| conv.msgs[i]["role"] == "user").collect();
+                    let j = users[lcg(&mut rng) as usize % users.len()];
+                    conv.msgs.truncate(j);
+                    conv.msgs.push(json!({"role": "user", "content": words(&mut rng, 6)}));
+                }
+                3 => ablit = !ablit,
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// The edit-then-undo history, in place: the client edits the output the engine just gave (same length) in its next request, which
+    /// continues the session in place and rewrites the engine's history below what it reported; then it restores the output. The cut at
+    /// the end of that output, made by the first request, describes ids the engine no longer holds.
+    fn edit_then_undo(tok: &Tokenizer, control: bool) -> Result<(), String> {
+        let mut msgs = vec![
+            json!({"role": "system", "content": "You are a careful assistant who answers briefly and well, and who never gives a long answer where a short one will do."}),
+            json!({"role": "user", "content": "please check the build and the tests of the project and tell me what is wrong"}),
+        ];
+        let mut rig = Rig::new(tok, 5, false, 1);
+        rig.t.append_without_truncating = control;
+        let reply = {
+            let mut r = tok.encode("the build is fine");
+            r.push(1);
+            r
+        };
+        let render = |msgs: &[Value]| encode_messages(msgs, &EncodeOptions::new(ThinkingMode::Chat)).unwrap().0;
+        for step in 0..4 {
+            match step {
+                1 => {
+                    msgs.push(json!({"role": "assistant", "content": "uhe build is fine"}));
+                    msgs.push(json!({"role": "user", "content": "and the tests"}));
+                }
+                2 => msgs[2]["content"] = json!("the build is fine"),
+                3 => {
+                    msgs.push(json!({"role": "assistant", "content": "all pass"}));
+                    msgs.push(json!({"role": "user", "content": "thanks"}));
+                }
+                _ => {}
+            }
+            let text = render(&msgs);
+            let sent = rig.turn(&text, false, &[], &reply);
+            if tok.decode(&sent.built) != text {
+                return Err(format!("request {step} (prefix {}, from {} ids): the engine built a prompt that is not the request's text", sent.prefix, sent.plan.from.ids));
+            }
+            if step == 1 {
+                assert_eq!(sent.plan.base_session_id, 0, "the edit of the last reply continues the session in place");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn an_edit_then_its_undo_never_reuses_a_rewritten_prefix() {
+        let tok = syn();
+        assert_eq!(edit_then_undo(&tok, false), Ok(()), "cuts above the cut a request continued from are dropped at its DONE");
+        // control: appending the new cuts without dropping the old ones leaves a cut whose hash describes ids the engine has since rewritten
+        let wrong = edit_then_undo(&tok, true).expect_err("the control reuses a rewritten prefix");
+        eprintln!("control: {wrong}");
+        assert!(wrong.contains("not the request's text"), "{wrong}");
+    }
+
+    /// 10,000 edit histories from the real chat template (thinking and chat, tools, a system change, a message edited, an edit and its
+    /// undo, a regenerate, a fork, the other weights path): every request's prompt the engine builds spells the request's text, the same
+    /// session is never given a different prompt than the reference plan gives it, and what differs is one of the two counted differences.
+    #[test]
+    fn the_plan_from_cuts_is_the_reference_plan_or_one_of_two_counted_differences() {
+        let tok = syn();
+        let mut tally = Tally::default();
+        for seed in 0..10_000u64 {
+            if let Err(e) = scenario(seed, &tok, &mut tally, 5, seed % 5 == 0, false) {
+                panic!("{e}\n{tally:?}");
+            }
+        }
+        eprintln!("{tally:?}");
+        assert!(tally.skipped < 100, "{tally:?}: the encoder refused too many histories");
+        assert!(tally.requests > 25_000, "{tally:?}");
+        assert!(tally.same * 10 >= tally.compared * 9, "{tally:?}: the plans must mostly be the reference's");
+        assert!(tally.other_session + tally.fork_for_place + tally.same_ids_other_choice > 0, "the counted differences never happen: the test says nothing");
+        assert!(tally.prefix_sent * 2 > tally.requests, "{tally:?}: most requests carry a prefix");
+        assert!(tally.gone > 50, "{tally:?}: the engine's cuts must reach the fallback");
+    }
+
+    /// Against an engine of protocol version 4 (no tail, no prefix), the same histories: every request is whole and the prompts are the reference's.
+    #[test]
+    fn against_an_engine_of_the_older_protocol_every_request_is_whole() {
+        let tok = syn();
+        let mut tally = Tally::default();
+        for seed in 0..400u64 {
+            if let Err(e) = scenario(seed, &tok, &mut tally, 4, false, false) {
+                panic!("{e}\n{tally:?}");
+            }
+        }
+        assert_eq!(tally.prefix_sent, 0);
+        assert!(tally.requests > 800);
+    }
+
+    // ---------------------------------------------------------------- factors, sessions, the index
+
+    const SYS: &str = "<｜begin▁of▁sentence｜><｜System｜>You are a careful assistant who answers briefly and well, and who never gives a long answer where a short one will do.";
+
+    fn turn(prefix: &str, msg: &str) -> String {
+        format!("{prefix}<｜User｜>{msg}<｜Assistant｜></think>")
+    }
+
+    fn reply(tok: &Tokenizer, s: &str) -> Vec<u32> {
+        let mut r = tok.encode(s);
+        r.push(1);
+        r
     }
 
     #[test]
@@ -1097,7 +1913,8 @@ mod tests {
 
     #[test]
     fn a_match_never_crosses_factors() {
-        let text = "<｜begin▁of▁sentence｜>a conversation long enough to be matched, with its system prompt and a few turns";
+        let tok = syn();
+        let text = "<｜begin▁of▁sentence｜>a conversation long enough to be matched, with its system prompt and a few turns<｜User｜>hi<｜Assistant｜></think>";
         let mut t = SessionTable::new(8, 1 << 20);
         put(&mut t, 1, text, false);
         t.sessions.get_mut(&1).unwrap().factor = 32;
@@ -1151,17 +1968,11 @@ mod tests {
     fn the_saved_table_carries_each_sessions_factor() {
         let dir = table_dir("factor");
         let path = dir.join("front.table");
-        let tok = crate::tokenizer::synthetic::tokenizer();
+        let tok = syn();
         let mut t = SessionTable::new(8, 1 << 20);
-        let text = "<｜begin▁of▁sentence｜>one conversation at factor thirty-two";
+        let text = "<｜begin▁of▁sentence｜>one conversation at factor thirty-two<｜User｜>hi<｜Assistant｜></think>";
         put_fresh(&mut t, 3, text, false);
-        let ids = tok.encode(text);
-        {
-            let s = t.sessions.get_mut(&3).unwrap();
-            s.marks = Vec::new();
-            s.ids = ids;
-            s.factor = 32;
-        }
+        t.sessions.get_mut(&3).unwrap().factor = 32;
         assert_eq!(&t.snapshot(3600).0[..8], TABLE_MAGIC);
         assert_eq!(t.save(&path, 3600), Ok(1));
         let mut u = SessionTable::new(8, 1 << 20);
@@ -1170,10 +1981,34 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// A saved table of an older layout holding one session of `text` (`DSFT0002` has the flags word, `DSFT0001` not).
+    fn old_table(magic: &[u8; 8], id: u64, text: &str, ids: &[u32]) -> Vec<u8> {
+        let now = unix_now();
+        let mut body = Vec::new();
+        let mut head = vec![id, 5, now, text.len() as u64, text.len() as u64];
+        if magic == TABLE_MAGIC_V2 {
+            head.push(0);
+        }
+        for v in head {
+            body.extend(v.to_le_bytes());
+        }
+        body.extend(text.as_bytes());
+        body.extend((ids.len() as u64).to_le_bytes());
+        for x in ids {
+            body.extend(x.to_le_bytes());
+        }
+        let mut f = magic.to_vec();
+        for v in [now, id + 1, 9, 1, body.len() as u64, fnv(&body)] {
+            f.extend(v.to_le_bytes());
+        }
+        f.extend(body);
+        f
+    }
+
     #[test]
     fn an_old_format_table_loads_at_factor_16() {
-        let tok = crate::tokenizer::synthetic::tokenizer();
-        let text = "<｜begin▁of▁sentence｜>an older table's conversation, long enough to be matched by a prompt";
+        let tok = syn();
+        let text = "<｜begin▁of▁sentence｜>an older table's conversation, long enough to be matched by a prompt<｜User｜>hi<｜Assistant｜></think>";
         let ids = tok.encode(text);
         for (name, magic) in [("v2", TABLE_MAGIC_V2), ("v1", TABLE_MAGIC_V1)] {
             let dir = table_dir(name);
@@ -1215,7 +2050,7 @@ mod tests {
         // a change: the file is written, and a second look finds nothing new
         {
             let mut t = table.lock().unwrap();
-            put_fresh(&mut t, 7, "<｜begin▁of▁sentence｜>a conversation long enough to be kept", false);
+            put_fresh(&mut t, 7, "<｜begin▁of▁sentence｜>a conversation long enough to be kept<｜User｜>hi<｜Assistant｜></think>", false);
             t.changes += 1;
         }
         assert_eq!(save_if_changed(&table, &mut saved, &path, 3600), Some(Ok(1)));
@@ -1253,7 +2088,7 @@ mod tests {
         let dir = table_dir("leftover");
         let path = dir.join("front.table");
         let mut t = SessionTable::new(8, 1 << 20);
-        put_fresh(&mut t, 3, "<｜begin▁of▁sentence｜>the first table's conversation", false);
+        put_fresh(&mut t, 3, "<｜begin▁of▁sentence｜>the first table's conversation<｜User｜>hi<｜Assistant｜></think>", false);
         assert_eq!(t.save(&path, 3600), Ok(1));
         let first = std::fs::read(&path).unwrap();
         // a crash in the middle of the next save: half a file under the temporary name
@@ -1261,7 +2096,7 @@ mod tests {
         std::fs::write(&tmp, &first[..first.len() / 2]).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), first, "the saved file is as it was");
         // the next save replaces the leftover and the file whole
-        put_fresh(&mut t, 4, "<｜begin▁of▁sentence｜>and a second conversation", false);
+        put_fresh(&mut t, 4, "<｜begin▁of▁sentence｜>and a second conversation<｜User｜>hi<｜Assistant｜></think>", false);
         assert_eq!(t.save(&path, 3600), Ok(2));
         assert!(!tmp.exists());
         assert_ne!(std::fs::read(&path).unwrap(), first);
@@ -1330,8 +2165,8 @@ mod tests {
         let dir = table_dir("roundtrip");
         let path = dir.join("front.table");
         let mut t = SessionTable::new(8, 1 << 20);
-        put_fresh(&mut t, 3, "<｜begin▁of▁sentence｜>one conversation", false);
-        put_fresh(&mut t, 9, "<｜begin▁of▁sentence｜>another, ablated", true);
+        put_fresh(&mut t, 3, "<｜begin▁of▁sentence｜>one conversation<｜User｜>hi<｜Assistant｜></think>", false);
+        put_fresh(&mut t, 9, "<｜begin▁of▁sentence｜>another, ablated<｜User｜>hi<｜Assistant｜></think>", true);
         assert_eq!(t.save(&path, 3600), Ok(2));
         // the file is exactly the snapshot, and saving the unchanged table again gives the same sessions
         let (snap, n) = t.snapshot(3600);
@@ -1344,44 +2179,59 @@ mod tests {
     }
 
     #[test]
-    fn the_index_finds_the_longest_shared_prefix() {
-        // conversations that share beginnings of every length (a common system prompt, then branches), against every
-        // session read whole: the index's best match shares as many bytes as the best of all (ids may differ on ties)
+    fn the_index_finds_the_session_that_shares_the_latest_cut() {
+        // conversations that share beginnings of every length (a common system prompt, then branches at added tokens), against every
+        // session read whole: the index's best match shares the latest cut that any session shares with the prompt
+        let tok = syn();
         let mut seed = 7u64;
-        let mut rnd = |n: u64| {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            (seed >> 33) % n
-        };
-        let alpha = |r: u64| (b'a' + (r % 3) as u8) as char;  // three letters: long accidental agreements
-        let sys: String = (0..300).map(|i| alpha(i * 7)).collect();
+        let seg = |r: &mut u64| -> String { format!("<｜User｜>{}<｜Assistant｜></think>{}<｜end▁of▁sentence｜>", words_r(r, 1, 12), words_r(r, 1, 40)) };
+        let sys: String = format!("<｜begin▁of▁sentence｜><｜System｜>{}", words(&mut seed, 40));
         let mut t = SessionTable::new(1 << 20, 1 << 30);
         let mut texts: Vec<(u64, String, bool)> = Vec::new();
-        for id in 1..=400u64 {
-            let base = if texts.is_empty() || rnd(4) == 0 { sys.clone() } else {
-                let (_, b, _) = &texts[rnd(texts.len() as u64) as usize];
-                b[..rnd(b.len() as u64 + 1) as usize].to_string()
+        for id in 1..=300u64 {
+            let base = if texts.is_empty() || lcg(&mut seed).is_multiple_of(4) {
+                sys.clone()
+            } else {
+                // a prefix of another conversation that ends where a segment ends
+                let (_, b, _) = &texts[lcg(&mut seed) as usize % texts.len()];
+                let ends: Vec<usize> = b.match_indices("<｜end▁of▁sentence｜>").map(|(i, m)| i + m.len()).collect();
+                if ends.is_empty() { sys.clone() } else { b[..ends[lcg(&mut seed) as usize % ends.len()]].to_string() }
             };
-            let tail: String = (0..rnd(6000)).map(|_| alpha(rnd(3))).collect();
-            let text = base + &tail;
-            let ablit = rnd(5) == 0;
+            let mut text = base;
+            for _ in 0..1 + lcg(&mut seed) % 5 {
+                text.push_str(&seg(&mut seed));
+            }
+            let ablit = lcg(&mut seed).is_multiple_of(5);
             put(&mut t, id, &text, ablit);
             texts.push((id, text, ablit));
         }
-        // half of them change their text (a finished turn): out of the index, the new text in
-        for k in 0..200 {
-            let (id, old, ablit) = texts[k * 2].clone();
-            let text = old.clone() + &(0..rnd(3000)).map(|_| alpha(rnd(3))).collect::<String>();
-            t.leave(id);
-            t.sessions.get_mut(&id).unwrap().text = text.clone();
-            t.enter(id);
-            texts[k * 2] = (id, text, ablit);
-        }
-        for q in 0..2000 {
-            let (_, b, _) = &texts[rnd(texts.len() as u64) as usize];
-            let p = b[..rnd(b.len() as u64 + 1) as usize].to_string() + &(0..rnd(800)).map(|_| alpha(rnd(3))).collect::<String>();
+        let cuts_of = |text: &str| -> Vec<usize> { scan(text, &Resume::start(), 0, &tok).0.iter().map(|e| e.bytes).collect() };
+        let sets: Vec<std::collections::HashSet<usize>> = texts.iter().map(|x| cuts_of(&x.1).into_iter().collect()).collect();
+        for q in 0..1500 {
+            let (_, b, _) = &texts[lcg(&mut seed) as usize % texts.len()];
+            let ends: Vec<usize> = b.match_indices("<｜end▁of▁sentence｜>").map(|(i, m)| i + m.len()).collect();
+            let mut cut_at = if ends.is_empty() || q % 3 == 0 { lcg(&mut seed) as usize % (b.len() + 1) } else { ends[lcg(&mut seed) as usize % ends.len()] };
+            while !b.is_char_boundary(cut_at) {
+                cut_at -= 1;
+            }
+            let mut p = b[..cut_at].to_string();
+            p.push_str(&seg(&mut seed));
             let ablit = q % 7 == 0;
-            let brute = texts.iter().filter(|x| x.2 == ablit).map(|x| common_prefix(p.as_bytes(), x.1.as_bytes())).max().unwrap_or(0);
-            let got = t.best(&p, ablit, None, &[]).map_or(0, |(_, n)| n);
+            let req_cuts = cuts_of(&p);
+            // what a session shares at least: the deepest index level its text agrees at, or its latest cut shared with the prompt
+            let brute = texts
+                .iter()
+                .zip(&sets)
+                .filter(|(x, _)| x.2 == ablit)
+                .map(|(x, theirs)| {
+                    let n = common_prefix(p.as_bytes(), x.1.as_bytes());
+                    let cut = req_cuts.iter().rev().copied().find(|e| *e <= n && theirs.contains(e)).unwrap_or(0);
+                    let level = (0..).map(level_len).take_while(|&l| l <= n).last().unwrap_or(0);
+                    cut.max(level)
+                })
+                .max()
+                .unwrap_or(0);
+            let got = t.pick(&Prompt::new(&p, &tok, ablit, &[]), None).top.map_or(0, |(_, n)| n);
             if brute >= MIN_SHARED {
                 assert_eq!(got, brute, "prompt {q} of {} bytes", p.len());
             } else {
@@ -1404,33 +2254,59 @@ mod tests {
         assert_eq!((t.max_sessions, t.max_tokens), (300_000_000 / 4096, 300_000_000));
     }
 
+    /// The ids of a conversation's next turn are the engine's own: what the model spelled stays as it spelled it, and the request names
+    /// the cut before its last id (the last sampled id is never in the engine's history) and carries that id again with the new text.
     #[test]
     fn reuses_the_models_own_ids() {
-        let Ok(tok) = Tokenizer::from_file(TOKENIZER) else { return };
-        let mut t = SessionTable::new(8, 1 << 20);
-        let sys = "<｜begin▁of▁sentence｜><｜System｜>You are a careful assistant who answers briefly and well.";
-        let p1 = format!("{sys}<｜User｜>hello<｜Assistant｜></think>");
-        let (plan, _) = t.plan(&p1, &tok, 1, false);
-        assert_eq!(plan.ids, tok.encode(&p1));
-        // the model spelled "Hi there" in single letters, which BPE would never produce
-        let mut gen: Vec<u32> = "Hi there".chars().map(|c| tok.encode(&c.to_string())[0]).collect();
-        gen.push(tok.token_id("<｜end▁of▁sentence｜>").unwrap());
-        t.finish(plan.session_id, &p1, &plan.ids, &gen, &tok);
-        let p2 = format!("{p1}Hi there<｜end▁of▁sentence｜><｜User｜>next<｜Assistant｜></think>");
-        let (plan2, _) = t.plan(&p2, &tok, 1, false);
-        assert_eq!(plan2.session_id, plan.session_id);
-        let mut want = plan.ids.clone();
-        want.extend(&gen);
-        want.extend(tok.encode("<｜User｜>next<｜Assistant｜></think>"));
-        assert_eq!(plan2.ids, want);
-        assert_eq!(plan2.reused, plan.ids.len() + gen.len());
-        assert_eq!(tok.decode(&plan2.ids), p2);
-        // the same system prompt in another conversation forks instead of taking over the session
-        let p3 = format!("{sys}<｜User｜>something else entirely<｜Assistant｜></think>");
-        let (plan3, _) = t.plan(&p3, &tok, 1, false);
-        assert_ne!(plan3.session_id, plan.session_id);
-        assert_eq!(plan3.base_session_id, plan.session_id);
-        assert_eq!(tok.decode(&plan3.ids), p3);
+        let Ok(real) = Tokenizer::from_file(TOKENIZER) else { return };
+        {
+            let tok = &real;
+            let mut rig = Rig::new(tok, 5, false, 3);
+            let sys = "<｜begin▁of▁sentence｜><｜System｜>You are a careful assistant who answers briefly and well.";
+            let p1 = format!("{sys}<｜User｜>hello<｜Assistant｜></think>");
+            let first = rig.turn(&p1, false, &[], &{
+                // the model spelled "Hi there" in single letters, which BPE would never produce
+                let mut gen: Vec<u32> = "Hi there".chars().map(|c| tok.encode(&c.to_string())[0]).collect();
+                gen.push(tok.token_id("<｜end▁of▁sentence｜>").unwrap());
+                gen
+            });
+            assert_eq!(first.built, tok.encode(&p1));
+            let p2 = format!("{p1}Hi there<｜end▁of▁sentence｜><｜User｜>next<｜Assistant｜></think>");
+            let second = rig.turn(&p2, false, &[], &[1]);
+            assert_eq!(second.plan.session_id, first.plan.session_id);
+            assert!(second.prefix, "the second turn names the entry");
+            let mut want = first.built.clone();
+            want.extend("Hi there".chars().map(|c| tok.encode(&c.to_string())[0]));
+            assert_eq!(second.plan.from.ids as usize, want.len(), "the cut is before the end id");
+            want.extend(tok.encode("<｜end▁of▁sentence｜><｜User｜>next<｜Assistant｜></think>"));
+            assert_eq!(second.built, want);
+            assert_eq!(tok.decode(&second.built), p2);
+            // the same system prompt in another conversation forks instead of taking over the session
+            let p3 = format!("{sys}<｜User｜>something else entirely<｜Assistant｜></think>");
+            let third = rig.turn(&p3, false, &[], &[1]);
+            assert_ne!(third.plan.session_id, first.plan.session_id);
+            assert_eq!(third.plan.base_session_id, first.plan.session_id);
+            assert_eq!(tok.decode(&third.built), p3);
+        }
+    }
+
+    /// The model spelled a special token's text in pieces, which no encoder of the text would: the engine holds those ids, the cut after them
+    /// counts them, and the next request's prompt keeps them (it is not the text tokenised again).
+    #[test]
+    fn the_models_own_ids_are_kept_where_the_text_tokenised_again_would_differ() {
+        let tok = syn();
+        let mut rig = Rig::new(&tok, 5, false, 3);
+        let p1 = turn(SYS, "hello");
+        let mut gen: Vec<u32> = "ok <｜User｜> then".chars().flat_map(|c| tok.encode(&c.to_string())).collect();
+        gen.push(1);
+        let first = rig.turn(&p1, false, &[], &gen);
+        let p2 = turn(&format!("{p1}ok <｜User｜> then<｜end▁of▁sentence｜>"), "next");
+        let second = rig.turn(&p2, false, &[], &[1]);
+        assert!(second.prefix);
+        assert_eq!(second.plan.from.ids as usize, first.built.len() + gen.len() - 1, "the cut counts the ids the model spelled");
+        assert_eq!(tok.decode(&second.built), p2);
+        assert_ne!(second.built, tok.encode(&p2), "the model's spelling stays: the prompt is not the text tokenised again");
+        assert_eq!(&second.built[..first.built.len() + gen.len() - 1], &[&first.built[..], &gen[..gen.len() - 1]].concat()[..]);
     }
 
     #[test]
@@ -1450,14 +2326,13 @@ mod tests {
         let b = conv("09:15:31 AM", "write the tests");
         let (pb, _) = t.plan(&b, &tok, 1, false);
         assert_eq!(pb.base_session_id, pa.session_id);
-        assert_eq!(pb.ids, tok.encode(&b), "the ids are a cold run's");
-        let head = tok.encode(&b[..b.find("09:15").unwrap()]).len();
-        assert!(pb.common + 2 >= head && pb.common <= head + 2, "{} ids in common, {head} before the time", pb.common);
+        let head = b.find("<｜System｜>").unwrap() + "<｜System｜>".len();
+        assert!(pb.from.bytes == head, "the cut is the last edge before the time: {} of {head}", pb.from.bytes);
         let d = pb.describe(b.len());
         assert!(d.starts_with(&format!("session {}, a fork of {}: it shares ", pb.session_id, pa.session_id)), "{d}");
-        assert!(d.ends_with(&format!("of {} bytes, {} ids in common", b.len(), pb.common)), "{d}");
+        assert!(d.ends_with(&format!("{} of {} bytes", pb.shared, b.len())) && !d.contains("in common"), "{d}");
         // the next turn of the first: in place
-        let a2 = format!("{a}Done.<｜end▁of▁sentence｜><｜User｜>thanks<｜Assistant｜></think>");
+        let a2 = turn(&format!("{a}Done.<｜end▁of▁sentence｜>"), "thanks");
         let (pa2, _) = t.plan(&a2, &tok, 1, false);
         assert_eq!(pa2.session_id, pa.session_id);
         assert!(pa2.describe(a2.len()).starts_with(&format!("session {} in place: it shares ", pa.session_id)));
@@ -1505,13 +2380,16 @@ mod tests {
         assert_eq!(again.load(&path, &tok, 3600), Ok(1), "a crash right after the start finds the same table");
         assert_eq!(again.next_id, u.next_id);
         assert!(u.next_id > busy.session_id, "ids go on after the saved table's");
-        let p2 = format!("{p1}Hi there.<｜User｜>next<｜Assistant｜></think>");
+        let p2 = turn(&format!("{p1}Hi there.<｜end▁of▁sentence｜>"), "next");
         let (plan2, _) = u.plan(&p2, &tok, 1, false);
         assert_eq!(plan2.session_id, plan.session_id);
-        assert_eq!(plan2.reused, plan.ids.len() + gen.len());
-        assert_eq!(tok.decode(&plan2.ids), p2);
-        // nothing there, a damaged file, a file open to others: nothing taken, the file gone
+        assert_eq!(plan2.from.ids as usize, plan.total() + gen.len() - 1);
+        assert_eq!(plan2.epoch, 5, "the epoch the engine gave survives the restart of the front-end");
+        // a second load finds the file; with none there nothing is taken
+        assert_eq!(u.load(&path, &tok, 3600), Ok(1));
+        std::fs::remove_file(&path).unwrap();
         assert_eq!(u.load(&path, &tok, 3600), Err(String::new()));
+        // a damaged file, a file open to others: nothing taken
         t.save(&path, 3600).unwrap();
         let mut b = std::fs::read(&path).unwrap();
         let k = b.len() - 3;
@@ -1644,29 +2522,53 @@ mod tests {
     #[test]
     fn images_are_matched_by_content() {
         let tok = crate::tokenizer::synthetic::tokenizer_with_images();
-        let mut t = SessionTable::new(8, 1 << 20);
+        let mut rig = Rig::new(&tok, 5, false, 1);
         let first = format!("{SYS}<｜User｜>what is on {PH}?<｜Assistant｜></think>");
         let (x1, k1) = with_images(&first, 3, &[11]);
-        let (p1, _) = t.plan_images(&x1, &tok, 1, false, &k1);
-        assert_eq!((p1.base_session_id, p1.reused), (0, 0));
-        assert_eq!(tok.decode(&p1.ids), x1, "the ids spell the expanded text");
-        assert_eq!(p1.ids.iter().filter(|&&i| i == tok.token_id(PH).unwrap()).count(), 3);
-        let gen = tok.encode("A cat.<｜end▁of▁sentence｜>");
-        t.finish_images(p1.session_id, &x1, &p1.ids, &gen, &tok, &k1);
-        // the client re-sends its history with the same image: the next turn continues the session in place
+        let gen = reply(&tok, "A cat.");
+        let p1 = rig.turn(&x1, false, &k1, &gen);
+        assert_eq!((p1.plan.base_session_id, p1.plan.from.ids), (0, 0));
+        assert_eq!(tok.decode(&p1.built), x1, "the ids spell the expanded text");
+        assert_eq!(p1.built.iter().filter(|&&i| i == tok.token_id(PH).unwrap()).count(), 3);
+        // the client re-sends its history with the same image: the next turn continues the session in place; the images' spans are
+        // positions in the whole prompt, so a request with images carries the whole prompt
         let hist = format!("{first}A cat.<｜end▁of▁sentence｜>");
         let (x2, k2) = with_images(&turn(&hist, "and its colour?"), 3, &[11]);
-        let (p2, _) = t.plan_images(&x2, &tok, 1, false, &k2);
-        assert_eq!((p2.session_id, p2.base_session_id), (p1.session_id, 0));
-        assert_eq!(p2.reused, p1.ids.len() + gen.len());
-        assert_eq!(tok.decode(&p2.ids), x2);
-        // the same text with another image at that place: the session is no candidate, a cold start
+        let p2 = rig.turn(&x2, false, &k2, &reply(&tok, "Grey."));
+        assert_eq!((p2.plan.session_id, p2.plan.base_session_id), (p1.plan.session_id, 0));
+        assert_eq!(p2.plan.from.ids as usize, p1.built.len() + gen.len() - 1, "the plan continues from the cut before the reply's last id");
+        assert!(!p2.prefix, "no prefix with images");
+        assert_eq!(tok.decode(&p2.built), x2);
+        // the same text with another image at that place: the cut before the image is shared, none after it; the ids are a cold run's
         let (x3, k3) = with_images(&turn(&hist, "and its colour?"), 3, &[12]);
         assert_eq!(x3, x2);
-        let (p3, _) = t.plan_images(&x3, &tok, 1, false, &k3);
-        assert_ne!(p3.session_id, p1.session_id);
-        assert_eq!((p3.base_session_id, p3.reused, p3.matched), (0, 0, 0));
-        assert_eq!(p3.ids, p2.ids, "the cold ids are the continued session's");
+        let p3 = rig.turn(&x3, false, &k3, &gen);
+        assert!(p3.plan.from.bytes <= first.find(PH).unwrap(), "a cut before the changed image: {}", p3.plan.from.bytes);
+        assert_eq!(p3.built, p2.built, "the cold ids are the continued session's");
+    }
+
+    /// The encoder's kind is part of an image's hash (`vision::ENGINE_ENCODER_KIND`): the same image made by the container and by the
+    /// engine is two images to the table, so a session made under one is never continued under the other, in either direction.
+    #[test]
+    fn a_session_made_under_one_encoder_kind_is_not_continued_under_the_other() {
+        use crate::vision::ENGINE_ENCODER_KIND as KIND;
+        let tok = crate::tokenizer::synthetic::tokenizer_with_images();
+        for (made, then, name) in [(0u64, KIND, "container then engine"), (KIND, 0, "engine then container")] {
+            let mut rig = Rig::new(&tok, 5, false, 1);
+            let first = format!("{SYS}<｜User｜>what is on {PH}?<｜Assistant｜></think>");
+            let (x1, k1) = with_images(&first, 3, &[11 ^ made]);
+            let gen = reply(&tok, "A cat.");
+            let p1 = rig.turn(&x1, false, &k1, &gen);
+            let hist = format!("{first}A cat.<｜end▁of▁sentence｜>");
+            // the same image, the same kind: continued in place (the control)
+            let (x2, k2) = with_images(&turn(&hist, "and its colour?"), 3, &[11 ^ made]);
+            let p2 = rig.turn(&x2, false, &k2, &reply(&tok, "Grey."));
+            assert_eq!(p2.plan.session_id, p1.plan.session_id, "{name}: the same kind continues the session");
+            // the same image under the other kind: no candidate past the image; a cut at most before it
+            let (x3, k3) = with_images(&turn(&hist, "and its colour?"), 3, &[11 ^ then]);
+            let p3 = rig.turn(&x3, false, &k3, &gen);
+            assert!(p3.plan.from.bytes <= first.find(PH).unwrap(), "{name}: a cut before the image, not after it: {}", p3.plan.from.bytes);
+        }
     }
 
     #[test]
@@ -1731,10 +2633,407 @@ mod tests {
         let hist = format!("{first}A cat.<｜end▁of▁sentence｜>");
         let (x2, k2) = with_images(&turn(&hist, "and its colour?"), 3, &[11]);
         let (p2, _) = u.plan_images(&x2, &tok, 1, false, &k2);
-        assert_eq!((p2.session_id, p2.reused), (p1.session_id, p1.ids.len() + gen.len()));
+        assert_eq!((p2.session_id, p2.from.ids as usize), (p1.session_id, p1.total() + gen.len() - 1));
         let (x3, k3) = with_images(&turn(&hist, "and its colour?"), 3, &[12]);
         let (p3, _) = u.plan_images(&x3, &tok, 1, false, &k3);
-        assert_eq!((p3.base_session_id, p3.reused), (0, 0));
+        assert!(p3.from.bytes <= first.find(PH).unwrap(), "no cut past the changed image");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The same lockstep as the text histories, with images: the same image, another image at the same place, an image added later, the
+    /// other weights path. A request with images carries its whole prompt, so what the engine builds is the reference's ids; a candidate whose
+    /// images inside the shared text differ is no candidate (the reference plan starts cold where a cut before the image is still shared).
+    #[test]
+    fn image_histories_build_the_same_prompts_as_the_reference() {
+        let tok = crate::tokenizer::synthetic::tokenizer_with_images();
+        let mut requests = 0;
+        for seed in 0..600u64 {
+            let mut rng = seed.wrapping_mul(0x9e3779b97f4a7c15) | 1;
+            let mut rig = Rig::new(&tok, 5, false, seed);
+            let mut reft = RefTable::default();
+            let rows = 3 + lcg(&mut rng) as u32 % 3;
+            let mut hist = format!("{SYS}<｜User｜>what is on {PH}?<｜Assistant｜></think>");
+            let mut base = 11u64;
+            for k in 0..4 {
+                let hashes: Vec<u64> = (0..hist.matches(PH).count() as u64).map(|i| base + i).collect();
+                let (text, keys) = with_images(&hist, rows, &hashes);
+                let ablit = k > 0 && lcg(&mut rng).is_multiple_of(9);
+                let gen = reply(&tok, &words(&mut rng, 4));
+                let sent = rig.turn(&text, ablit, &keys, &gen);
+                let rp = reft.plan(&text, &tok, ablit, &keys);
+                requests += 1;
+                assert_eq!(tok.decode(&sent.built), text, "seed {seed} request {k}");
+                assert!(!sent.prefix && !sent.gone);
+                assert_eq!(sent.built, rp.ids, "seed {seed} request {k}: the prompts differ");
+                reft.finish(&rp, &text, &gen, &tok, ablit, &keys);
+                let said = tok.decode(&gen);
+                hist = turn(&format!("{hist}{said}"), &format!("again {}", lcg(&mut rng) % 100));
+                match lcg(&mut rng) % 4 {
+                    0 => base = 12 + lcg(&mut rng) % 3, // another image in the same place
+                    1 => hist = hist.replacen("again", &format!("and {PH} again"), 1),
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(requests, 2400);
+    }
+
+    // ---------------------------------------------------------------- the cuts a finished turn leaves
+
+    #[test]
+    fn a_finished_session_has_a_cut_at_each_added_token_of_its_text_and_none_past_the_history() {
+        let tok = syn();
+        let mut t = SessionTable::new(8, 1 << 20);
+        let p = "<｜begin▁of▁sentence｜><｜System｜>You are a careful assistant.<｜User｜>héllo wörld ✓ <think> x</think><｜Assistant｜></think>".repeat(3);
+        let gen = reply(&tok, "reply ✓<｜User｜>also");
+        let a = serve(&mut t, &tok, &p, &gen, false);
+        let s = &t.sessions[&a.session_id];
+        let text = format!("{p}reply ✓<｜User｜>also<｜end▁of▁sentence｜>");
+        let ids = tok.encode(&text);
+        assert_eq!(s.n_hist as usize, ids.len() - 1, "the last id is not in the engine's history");
+        let mut want = Vec::new();
+        for (a, e) in tok.added_spans(&text) {
+            for p in [a, e] {
+                if p > 0 {
+                    want.push(p);
+                }
+            }
+        }
+        want.dedup();
+        want.retain(|&p| tok.encode(&text[..p]).len() <= s.n_hist as usize);
+        let got: Vec<usize> = s.cuts.iter().map(|c| c.bytes).collect();
+        assert_eq!(got, want);
+        for c in &s.cuts {
+            assert_eq!(c.ids as usize, tok.encode(&text[..c.bytes]).len(), "ids before byte {}", c.bytes);
+            assert_eq!(c.hash, digest128(&Sha256::new().chain_update(&text.as_bytes()[..c.bytes])), "SHA-256 of the text up to byte {}", c.bytes);
+        }
+        assert!(got.len() > 10 && s.cuts.last().unwrap().bytes < text.len(), "the end token's own edge is past the history");
+        // the keys are those of the text, level by level
+        assert_eq!(s.keys, scan(&text, &Resume::start(), 0, &tok).1);
+    }
+
+    /// A request that ended without a DONE changes nothing in its session but that it is no longer in a request; a session that never
+    /// finished a turn goes (the caller releases it on the engine).
+    #[test]
+    fn a_request_that_ends_without_a_done_leaves_its_session_as_it_was() {
+        let tok = syn();
+        let mut t = SessionTable::new(8, 1 << 20);
+        let p1 = turn(SYS, "hello");
+        let a = serve(&mut t, &tok, &p1, &reply(&tok, "Hi."), false);
+        let before = (t.sessions[&a.session_id].cuts.clone(), t.sessions[&a.session_id].epoch, t.sessions[&a.session_id].n_hist);
+        let p2 = turn(&format!("{p1}Hi.<｜end▁of▁sentence｜>"), "next");
+        let (b, _) = t.plan(&p2, &tok, 1, false);
+        assert_eq!(b.session_id, a.session_id);
+        assert!(t.sessions[&a.session_id].busy);
+        assert!(!t.give_up(b.session_id), "a session with a finished turn stays");
+        let s = &t.sessions[&a.session_id];
+        assert!(!s.busy);
+        assert_eq!((s.cuts.clone(), s.epoch, s.n_hist), before);
+        // a fork whose request never finished has no history: it goes
+        let other = turn(SYS, "something else entirely");
+        let (f, _) = t.plan(&other, &tok, 1, false);
+        assert_eq!(f.base_session_id, a.session_id);
+        assert!(t.sessions.contains_key(&f.session_id));
+        // it is no candidate while it lives
+        let (g, _) = t.plan(&other, &tok, 1, false);
+        assert_eq!(g.base_session_id, a.session_id);
+        assert!(t.give_up(f.session_id), "the caller releases it on the engine");
+        assert!(!t.sessions.contains_key(&f.session_id));
+        assert!(t.give_up(g.session_id));
+    }
+
+    #[test]
+    fn eight_requests_for_one_session_at_once_make_one_in_place_and_seven_forks() {
+        let tok = std::sync::Arc::new(syn());
+        let table = std::sync::Arc::new(Mutex::new(SessionTable::new(64, 1 << 24)));
+        let p1 = turn(SYS, "hello");
+        let a = {
+            let mut t = table.lock().unwrap();
+            serve(&mut t, &tok, &p1, &reply(&tok, "Hi."), false)
+        };
+        let next = turn(&format!("{p1}Hi.<｜end▁of▁sentence｜>"), "next");
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let (table, tok, next) = (table.clone(), tok.clone(), next.clone());
+                std::thread::spawn(move || plan_shared(&table, &next, &tok, 1, false, &[]).0)
+            })
+            .collect();
+        let plans: Vec<Plan> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let in_place = plans.iter().filter(|p| p.session_id == a.session_id && p.base_session_id == 0).count();
+        let forks = plans.iter().filter(|p| p.base_session_id == a.session_id && p.session_id != a.session_id).count();
+        assert_eq!((in_place, forks), (1, 7), "one request takes the session, the others fork it");
+        let ids: std::collections::HashSet<u64> = plans.iter().map(|p| p.session_id).collect();
+        assert_eq!(ids.len(), 8, "no two requests share a session");
+        assert!(plans.iter().all(|p| p.from.ids > 0 && p.epoch == 5));
+    }
+
+    /// The race, made to happen: between a request's choice (and the tokenising of its suffix, outside the lock) and its commit another
+    /// request takes the same session. The first is chosen again under the lock and forks; it never goes in place on a busy session.
+    #[test]
+    fn a_choice_the_table_has_since_changed_is_made_over() {
+        let tok = syn();
+        let table = Mutex::new(SessionTable::new(64, 1 << 24));
+        let p1 = turn(SYS, "hello");
+        let a = serve(&mut table.lock().unwrap(), &tok, &p1, &reply(&tok, "Hi."), false);
+        let next = turn(&format!("{p1}Hi.<｜end▁of▁sentence｜>"), "next");
+        let mut rival: Option<Plan> = None;
+        let mut calls = 0;
+        let (first, _) = plan_shared_with(&table, &next, &tok, 1, false, &[], &mut || {
+            calls += 1;
+            if calls == 1 {
+                rival = Some(plan_shared(&table, &next, &tok, 1, false, &[]).0);
+            }
+        });
+        let rival = rival.unwrap();
+        assert_eq!((rival.session_id, rival.base_session_id), (a.session_id, 0), "the rival took the session in place");
+        assert_eq!(first.base_session_id, a.session_id, "the first was chosen again and forks it");
+        assert_ne!(first.session_id, a.session_id);
+        assert!(calls >= 2, "the commit was tried again: {calls}");
+    }
+
+    // ---------------------------------------------------------------- the table file
+
+    /// A conversation as a table of text and ids holds it, and the file the `DSFT0003` writer makes of it.
+    struct V3 {
+        id: u64,
+        text: String,
+        ids: Vec<u32>,
+        prompt_len: usize,
+        ablit: bool,
+        factor: u64,
+        images: Vec<ImageKey>,
+    }
+
+    fn v3_table(sessions: &[V3]) -> Vec<u8> {
+        let now = unix_now();
+        let mut body = Vec::new();
+        for s in sessions {
+            let flags = (if s.ablit { TABLE_FLAG_ABLIT } else { 0 }) | (if s.images.is_empty() { 0 } else { TABLE_FLAG_IMAGES });
+            for v in [s.id, 3, now, s.prompt_len as u64, s.text.len() as u64, flags, s.factor] {
+                body.extend(v.to_le_bytes());
+            }
+            body.extend(s.text.as_bytes());
+            body.extend((s.ids.len() as u64).to_le_bytes());
+            for &x in &s.ids {
+                body.extend(x.to_le_bytes());
+            }
+            if !s.images.is_empty() {
+                body.extend((s.images.len() as u64).to_le_bytes());
+                for k in &s.images {
+                    for v in [k.at as u64, k.rows as u64, k.hash] {
+                        body.extend(v.to_le_bytes());
+                    }
+                }
+            }
+        }
+        let mut f = TABLE_MAGIC_V3.to_vec();
+        for v in [now, 100_000, 9, sessions.len() as u64, body.len() as u64, fnv(&body)] {
+            f.extend(v.to_le_bytes());
+        }
+        f.extend(body);
+        f
+    }
+
+    /// A `DSFT0003` file, made by its writer, is read once and becomes cuts: no conversation is lost, each continues at the
+    /// cut the reference plan reuses, with no epoch (its first request carries the whole prompt and the DONE teaches the epoch).
+    #[test]
+    fn a_file_of_the_last_layout_is_read_once_and_becomes_cuts() {
+        let tok = syn();
+        let dir = table_dir("v3");
+        let path = dir.join("front.table");
+        let mut seed = 5u64;
+        let mut reft = RefTable::default();
+        let mut convs: Vec<(String, u64)> = Vec::new();
+        for i in 0..40u64 {
+            let sys = format!("<｜begin▁of▁sentence｜><｜System｜>{}", words(&mut seed, 30));
+            let mut text = sys;
+            for _ in 0..1 + lcg(&mut seed) % 4 {
+                text = turn(&text, &words(&mut seed, 6));
+                let rp = reft.plan(&text, &tok, i % 5 == 0, &[]);
+                let gen = reply(&tok, &words(&mut seed, 8));
+                reft.finish(&rp, &text, &gen, &tok, i % 5 == 0, &[]);
+                text = format!("{text}{}", tok.decode(&gen));
+            }
+            convs.push((text, i));
+        }
+        let sessions: Vec<V3> = reft
+            .s
+            .iter()
+            .map(|(id, s)| V3 { id: *id, text: s.text.clone(), ids: s.ids.clone(), prompt_len: s.prompt_len, ablit: s.ablit, factor: s.factor as u64, images: s.images.clone() })
+            .collect();
+        assert!(sessions.len() >= 30, "{} conversations", sessions.len());
+        write_table(&path, &v3_table(&sessions)).unwrap();
+        let mut t = SessionTable::new(1000, 1 << 40);
+        assert_eq!(t.load(&path, &tok, 3600), Ok(sessions.len()), "no conversation lost");
+        for s in &sessions {
+            assert_eq!(t.sessions[&s.id].n_hist as usize, s.ids.len());
+            assert_eq!(t.sessions[&s.id].epoch, 0);
+        }
+        // each conversation's next turn goes where the reference plan sends it, reusing what the reference plan reuses (less an end id's position
+        // at the very end of an output, which is not in the engine's history)
+        for (k, (text, i)) in convs.iter().enumerate() {
+            let next = turn(&text.to_string(), &format!("next {k}"));
+            let rp = reft.plan(&next, &tok, i % 5 == 0, &[]);
+            let (np, _) = t.plan(&next, &tok, 1, i % 5 == 0);
+            assert_eq!(np.session_id, rp.session, "conversation {k}");
+            assert_eq!(np.base_session_id, rp.base);
+            assert_eq!(np.total(), rp.ids.len(), "conversation {k}: the same number of ids as the reference plan");
+            assert!(np.from.ids as usize <= rp.reused && rp.reused - np.from.ids as usize <= 1, "conversation {k}: {} of {}", np.from.ids, rp.reused);
+            assert_eq!(np.epoch, 0, "a restored session names no epoch");
+            assert!(!np.prefix_mode(5, false), "so the request carries its whole prompt");
+            t.give_up(np.session_id);
+        }
+        // saved as DSFT0004 and read back: the same sessions, cuts and epochs
+        let mut u = SessionTable::new(1000, 1 << 40);
+        let mut t2 = SessionTable::new(1000, 1 << 40);
+        t2.load(&path, &tok, 3600).unwrap();
+        t2.sessions.get_mut(&sessions[0].id).unwrap().epoch = 99;
+        assert_eq!(t2.save(&path, 3600), Ok(sessions.len()));
+        assert_eq!(&std::fs::read(&path).unwrap()[..8], b"DSFT0004");
+        assert_eq!(u.load(&path, &tok, 3600), Ok(sessions.len()));
+        for s in &sessions {
+            let (a, b) = (&t2.sessions[&s.id], &u.sessions[&s.id]);
+            assert_eq!((&a.cuts, &a.keys, a.epoch, a.n_hist, a.prompt_len, a.factor, a.ablit), (&b.cuts, &b.keys, b.epoch, b.n_hist, b.prompt_len, b.factor, b.ablit));
+        }
+        assert_eq!(u.sessions[&sessions[0].id].epoch, 99);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Two texts that differ in one byte share no edge's hash and no index level's key from that byte on, and share all of them before it:
+    /// 100,000 random pairs (a sanity check of the wiring, not a proof of the hash).
+    #[test]
+    fn two_texts_that_differ_in_one_byte_never_share_a_key_after_it() {
+        let tok = syn();
+        let mut rng = 99u64;
+        let mut levels_checked = [0usize; 6];
+        for pair in 0..100_000u32 {
+            let mut text = String::from("<｜begin▁of▁sentence｜>");
+            let mut words_at: Vec<usize> = Vec::new();
+            let n = 150 + lcg(&mut rng) as usize % 250;
+            for _ in 0..n {
+                if lcg(&mut rng).is_multiple_of(3) {
+                    text.push_str("<｜User｜>");
+                }
+                words_at.push(text.len());
+                text.push_str(words_r(&mut rng, 3, 6).as_str());
+                text.push(' ');
+            }
+            text.push_str("<｜Assistant｜></think>");
+            let w = words_at[lcg(&mut rng) as usize % words_at.len()];
+            let end = w + text[w..].find('<').unwrap_or(text.len() - w);
+            // an ASCII letter of a word: the text stays UTF-8 and no added token changes
+            let Some(k) = text.as_bytes()[w..end].iter().position(|b| b.is_ascii_lowercase()) else { continue };
+            let q = w + k;
+            let mut other = text.clone().into_bytes();
+            other[q] = if other[q] == b'x' { b'y' } else { b'x' };
+            let other = String::from_utf8(other).unwrap();
+            let (ea, ka) = scan(&text, &Resume::start(), 0, &tok);
+            let (eb, kb) = scan(&other, &Resume::start(), 0, &tok);
+            assert_eq!((ea.len(), ka.len()), (eb.len(), kb.len()), "pair {pair}");
+            for (a, b) in ea.iter().zip(&eb) {
+                assert_eq!(a.bytes, b.bytes);
+                assert_eq!(a.hash == b.hash, a.bytes <= q, "pair {pair}: edge at {} against a change at {q}", a.bytes);
+            }
+            for (l, (a, b)) in ka.iter().zip(&kb).enumerate() {
+                assert_eq!(a == b, level_len(l) <= q, "pair {pair}: level {l} against a change at {q}");
+                levels_checked[l.min(5)] += 1;
+            }
+        }
+        assert!(levels_checked[..4].iter().all(|&n| n > 10_000), "{levels_checked:?}: every level must be reached");
+    }
+
+    /// The record carries the whole 128-bit hash: both halves survive a save and a load, and a hash cut to 64 bits would not match.
+    #[test]
+    fn the_wide_hash_survives_a_saved_table() {
+        let tok = syn();
+        let dir = table_dir("wide");
+        let path = dir.join("front.table");
+        let mut t = SessionTable::new(8, 1 << 20);
+        put_fresh(&mut t, 3, &turn(SYS, "hello"), false);
+        {
+            let s = t.sessions.get_mut(&3).unwrap();
+            for (k, c) in s.cuts.iter_mut().enumerate() {
+                c.hash = ((0xABCD_0000_0000_0000u128 + k as u128) << 64) | (0x1234_5678_9ABC_DEF0u128 + k as u128);
+            }
+            s.keys = vec![u128::MAX - 1, 5u128 << 100];
+        }
+        assert_eq!(t.save(&path, 3600), Ok(1));
+        let mut u = SessionTable::new(8, 1 << 20);
+        assert_eq!(u.load(&path, &tok, 3600), Ok(1));
+        assert_eq!(u.sessions[&3].cuts, t.sessions[&3].cuts);
+        assert_eq!(u.sessions[&3].keys, t.sessions[&3].keys);
+        assert!(u.sessions[&3].cuts.iter().all(|c| c.hash >> 64 != 0));
+        assert_eq!(std::mem::size_of::<Cut>(), 32);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Hashing speed on a 16 MB rendered prompt (median of 5): run with `-- --ignored --nocapture` in a release build.
+    #[test]
+    #[ignore]
+    fn hash_speed() {
+        let tok = syn();
+        let mut rng = 5u64;
+        let mut text = String::from("<｜begin▁of▁sentence｜>");
+        while text.len() < 16 << 20 {
+            text.push_str("<｜User｜>");
+            text.push_str(&words(&mut rng, 40));
+            text.push_str("<｜Assistant｜></think>");
+            text.push_str(&words(&mut rng, 80));
+            text.push_str("<｜end▁of▁sentence｜>");
+        }
+        let mut raw = Vec::new();
+        let mut scans = Vec::new();
+        let mut spans = Vec::new();
+        for _ in 0..5 {
+            let t = Instant::now();
+            std::hint::black_box(tok.added_spans(&text).len());
+            spans.push(t.elapsed().as_secs_f64());
+            let t = Instant::now();
+            let mut h = Sha256::new();
+            h.update(text.as_bytes());
+            std::hint::black_box(digest128(&h));
+            raw.push(t.elapsed().as_secs_f64());
+            let t = Instant::now();
+            let p = Prompt::new(&text, &tok, false, &[]);
+            std::hint::black_box(p.edges.len());
+            scans.push(t.elapsed().as_secs_f64());
+        }
+        raw.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        scans.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        spans.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let mb = text.len() as f64 / 1e6;
+        eprintln!(
+            "hash speed: {mb:.1} MB; SHA-256 alone {:.0} MB/s; the added-token scan alone {:.0} MB/s; Prompt::new (scan, hash at {} edges with their states) {:.0} MB/s",
+            mb / raw[2],
+            mb / spans[2],
+            Prompt::new(&text, &tok, false, &[]).edges.len(),
+            mb / scans[2]
+        );
+    }
+
+    #[test]
+    fn a_damaged_cut_table_is_refused_whole() {
+        let tok = syn();
+        let dir = table_dir("badcuts");
+        let path = dir.join("front.table");
+        let mut t = SessionTable::new(8, 1 << 20);
+        put_fresh(&mut t, 3, &turn(SYS, "hello"), false);
+        // cuts out of order: the record is well formed (its hash is right) and is not taken
+        t.sessions.get_mut(&3).unwrap().cuts.reverse();
+        assert_eq!(t.save(&path, 3600), Ok(1));
+        assert_eq!(SessionTable::new(8, 1 << 20).load(&path, &tok, 3600), Ok(0), "a session whose cuts are out of order is left out");
+        // a count that cannot fit in the file
+        let mut body = Vec::new();
+        write_session(&mut body, 3, &t.sessions[&3]);
+        let k = 8 * 9;
+        body[k..k + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+        let mut f = TABLE_MAGIC.to_vec();
+        for v in [unix_now(), 9, 9, 1, body.len() as u64, fnv(&body)] {
+            f.extend(v.to_le_bytes());
+        }
+        f.extend(&body);
+        write_table(&path, &f).unwrap();
+        assert!(SessionTable::new(8, 1 << 20).load(&path, &tok, 3600).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1837,12 +3136,10 @@ mod tests {
         assert_eq!(token_end_in(&marks, &ids, total, 33 << 25, |_| 1 << 25), Some(33));
     }
 
-    /// A finished session of `text` (a prompt of its own, no reply), through the table's own steps.
-    fn add(t: &mut SessionTable, tok: &Tokenizer, i: usize, bytes: usize) -> u64 {
-        let text = format!("<｜begin▁of▁sentence｜>session number {i:05} {}", char::from(b'a' + (i % 26) as u8).to_string().repeat(bytes));
-        let (p, _) = t.plan(&text, tok, 1, false);
-        t.finish(p.session_id, &text, &p.ids, &[], tok);
-        p.session_id
+    /// A finished session of about `cuts` cuts (a prompt of `cuts / 2` user turns, no output), through the table's own steps.
+    fn add(t: &mut SessionTable, tok: &Tokenizer, i: usize, cuts: usize) -> u64 {
+        let text = format!("<｜begin▁of▁sentence｜>session number {i:05} {}", "<｜User｜>q".repeat(cuts / 2));
+        serve(t, tok, &text, &[], false).session_id
     }
 
     #[test]
@@ -1861,10 +3158,10 @@ mod tests {
         let mut made = Vec::new();
         for i in 0..12 {
             // a session is taken in by the plan that starts it, which is where the limit is kept; its record grows at its finish
-            let text = format!("<｜begin▁of▁sentence｜>session number {i:05} {}", "a".repeat(20_000));
+            let text = format!("<｜begin▁of▁sentence｜>session number {i:05} {}", "<｜User｜>q".repeat(1000));
             let (p, _) = t.plan(&text, &tok, 1, false);
-            assert!(t.bytes() <= 400_000, "after session {i}: {} bytes", t.bytes());
-            t.finish(p.session_id, &text, &p.ids, &[], &tok);
+            assert!(t.bytes() <= limit, "after session {i}: {} bytes", t.bytes());
+            finish_plan(&mut t, &tok, &p, &text, &[], &[]);
             made.push(p.session_id);
         }
         assert!(t.len() < 13, "only the byte limit can have dropped any: sessions, ids and positions are far from theirs");
@@ -1900,23 +3197,22 @@ mod tests {
 
     #[test]
     fn a_finished_session_gives_back_the_slack_its_buffers_grew() {
-        let tok = crate::tokenizer::synthetic::tokenizer();
+        let tok = syn();
         let mut t = SessionTable::new(8, 1 << 24);
-        let prompt = format!("<｜begin▁of▁sentence｜>{}", "p".repeat(100_000));
-        let (a, _) = t.plan(&prompt, &tok, 1, false);
-        t.finish(a.session_id, &prompt, &a.ids, &tok.encode(&"r".repeat(30_000)), &tok);
+        let prompt = format!("<｜begin▁of▁sentence｜>{}", "<｜User｜>p".repeat(20_000));
+        let a = serve(&mut t, &tok, &prompt, &tok.encode(&"<｜User｜>r".repeat(5_000)), false);
         let s = &t.sessions[&a.session_id];
-        assert!(s.text.capacity() <= s.text.len() + s.text.len() / 4 + 4096, "text {} of {}", s.text.len(), s.text.capacity());
-        assert!(s.ids.capacity() <= s.ids.len() + s.ids.len() / 4 + 4096, "ids {} of {}", s.ids.len(), s.ids.capacity());
-        assert_eq!(s.marks.capacity(), s.ids.len() / MARK_EVERY);
+        assert!(s.cuts.len() > 40_000);
+        assert!(s.cuts.capacity() <= s.cuts.len() + s.cuts.len() / 4 + 4096, "cuts {} of {}", s.cuts.len(), s.cuts.capacity());
+        assert!(s.keys.capacity() <= s.keys.len() + 4096);
     }
 
     #[test]
     fn over_the_process_limit_idle_sessions_go_oldest_first_until_the_excess_is_gone() {
-        let tok = crate::tokenizer::synthetic::tokenizer();
+        let tok = syn();
         let mut t = SessionTable::new(1000, 1 << 40);
-        let ids: Vec<u64> = (0..8).map(|i| add(&mut t, &tok, i, 30_000)).collect();
-        let (busy, _) = t.plan(&format!("<｜begin▁of▁sentence｜>busy and old {}", "b".repeat(30_000)), &tok, 1, false);
+        let ids: Vec<u64> = (0..8).map(|i| add(&mut t, &tok, i, 1000)).collect();
+        let (busy, _) = t.plan(&format!("<｜begin▁of▁sentence｜>busy and old {}", "<｜User｜>b".repeat(500)), &tok, 1, false);
         t.sessions.get_mut(&busy.session_id).unwrap().last_used = 0;
         let one = t.sessions[&ids[0]].bytes();
         let mut g = Governor::default();
@@ -2048,9 +3344,9 @@ mod tests {
         let table = std::sync::Mutex::new(SessionTable::new(1000, 1 << 40));
         {
             let mut t = table.lock().unwrap();
-            bulk(&mut t, &tok, 23, 150_000);
+            bulk(&mut t, 23, 20_000);
             put(&mut t, 5, "", false); // no finished turn: left out
-            put_fresh(&mut t, 6, "<｜begin▁of▁sentence｜>an old one", false);
+            put_fresh(&mut t, 6, "<｜begin▁of▁sentence｜>an old one<｜User｜>x", false);
             t.sessions.get_mut(&6).unwrap().t_used = 1;
         }
         let (n, _) = save_table(&table, &path, 3600).unwrap();
@@ -2105,5 +3401,65 @@ mod tests {
         let mut u = SessionTable::new(1000, 1 << 40);
         assert_eq!(u.load(&path, &tok, 3600), Ok(n), "a whole file that loads");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The bytes of text a real vocabulary spells in a token (an estimate). The synthetic tokenizer spells one, so a synthetic table has four
+    /// times the cuts a token that real text has, which only makes its counted size the more conservative.
+    const BYTES_PER_TOKEN: usize = 4;
+
+    /// A synthetic load of 70.7M tokens, its conversations' shape taken from real turns through the table's own steps (a user message of
+    /// about 500 bytes, an output of about 900, a token a byte here), counts under 32 MiB. The control is the table of text and ids on the
+    /// same conversations, counted by allocating its records (the text, the ids, the marks) at the same sizes: over 500 MiB.
+    #[test]
+    fn a_load_of_70_million_tokens_counts_under_32_mib_where_the_text_and_ids_counted_over_500() {
+        let tok = syn();
+        let mut t = SessionTable::new(1 << 20, 1 << 40);
+        let mut seed = 11u64;
+        let mut old_counted = 0usize;
+        for c in 0..14usize {
+            let mut text = format!("<｜begin▁of▁sentence｜><｜System｜>{}", words(&mut seed, 80));
+            let mut last = 0;
+            for _ in 0..120 {
+                text = turn(&text, &words(&mut seed, 90));
+                let gen = reply(&tok, &words(&mut seed, 160));
+                last = serve(&mut t, &tok, &text, &gen, c % 4 == 0).session_id;
+                text = format!("{text}{}", tok.decode(&gen));
+            }
+            // the record of text and ids for this conversation: its text, its ids and the marks of its ids, counted by allocating them
+            let n_ids = tok.encode(&text).len();
+            let (_keep, held, _) = probe::measure(|| (String::with_capacity(BYTES_PER_TOKEN * n_ids), Vec::<u32>::with_capacity(n_ids), Vec::<u32>::with_capacity(n_ids / MARK_EVERY)));
+            old_counted += held + (64 + 16 * 5) + INDEX_ENTRY * t.sessions[&last].keys.len();
+        }
+        let tokens: usize = t.sessions.values().map(|s| s.n_hist as usize).sum();
+        let (new_counted, cuts): (usize, usize) = (t.bytes(), t.sessions.values().map(|s| s.cuts.len()).sum());
+        let (new_per, old_per) = (new_counted as f64 / tokens as f64, old_counted as f64 / tokens as f64);
+        // the same conversations, repeated until they hold the measured load's tokens
+        let target = 70_700_000usize;
+        let rounds = target / tokens + 1;
+        let mut big = SessionTable::new(1 << 20, 1 << 40);
+        let base: Vec<Session> = t.sessions.values().cloned().collect();
+        let (_, held_big, _) = probe::measure(|| {
+            for r in 0..rounds {
+                for (i, s) in base.iter().enumerate() {
+                    let id = 1 + (r * base.len() + i) as u64;
+                    big.sessions.insert(id, s.clone());
+                    big.enter(id);
+                }
+            }
+        });
+        let counted = big.bytes();
+        let big_tokens: usize = big.sessions.values().map(|s| s.n_hist as usize).sum();
+        let old_at_target = (old_per * big_tokens as f64) as usize;
+        eprintln!(
+            "synthetic load: {big_tokens} tokens in {} sessions, {cuts} cuts per {tokens} tokens; counted {:.1} MiB ({new_per:.3} B/token, allocated {:.1} MiB); text-and-ids records on the same conversations {:.0} MiB ({old_per:.2} B/token)",
+            big.len(),
+            counted as f64 / 1048576.0,
+            held_big as f64 / 1048576.0,
+            old_at_target as f64 / 1048576.0
+        );
+        assert!(big_tokens >= target);
+        assert!(counted < 32 << 20, "{} MiB counted for {big_tokens} tokens", counted >> 20);
+        assert!(counted.abs_diff(held_big) * 10 < held_big, "counted {counted}, allocated {held_big}");
+        assert!(old_at_target > 500 << 20, "text-and-ids records count {} MiB for the same tokens", old_at_target >> 20);
     }
 }

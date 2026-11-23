@@ -16,7 +16,7 @@ add_dependencies(vision_dsw_roundtrip dsw_convert)
 target_compile_definitions(vision_dsw_roundtrip PRIVATE DSW_CONVERT_PATH="$<TARGET_FILE:dsw_convert>")
 target_link_libraries(vision_dsw_roundtrip PRIVATE vit_host)
 
-add_library(vit_kernels STATIC vit_kernels.cu vit_tower.cu)
+add_library(vit_kernels STATIC vit_kernels.cu vit_tower.cu vit_rank.cu)
 target_include_directories(vit_kernels PUBLIC ${CMAKE_SOURCE_DIR})
 target_link_libraries(vit_kernels PUBLIC vit_host CUDA::cudart_static)
 
@@ -43,3 +43,10 @@ target_include_directories(vit_npy_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test
 add_executable(vit_teacher tests/vit_teacher.cu)
 target_include_directories(vit_teacher PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(vit_teacher PRIVATE vit_kernels)
+
+# four Sparks: a rank's own run of the split tower over the ring (start it with engine/comm/run4-vit.sh)
+add_executable(vit_ring_test tests/vit_ring_test.cu)
+target_link_libraries(vit_ring_test PRIVATE vit_kernels vit_device dsgb10_comm)
+
+# host only: vit_ring_test's chunked host all-gather against a fake that refuses what the ring's refuses
+add_executable(vit_gather_test tests/vit_gather_test.cpp)

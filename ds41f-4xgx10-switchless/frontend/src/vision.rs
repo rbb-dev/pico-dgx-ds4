@@ -4,6 +4,10 @@
 //! placeholder ids are expanded into that many image ids, and the rows go to the engine with the SUBMIT
 //! (protocol FLAG_IMAGES). Text requests never come here.
 //!
+//! With `--vision engine` (`VisionKind::Engine`) the encoder runs in the engine: the media worker (tools/vision/media_worker.py,
+//! `--media-addr`) answers each image's padded u8 pixels and grid instead of rows, and they go to the engine in the SUBMIT
+//! (protocol FLAG_PIXELS; the layout is engine/server/pixels.h's). `encode_pixels` is that path's `encode`.
+//!
 //! Wire format (TCP, loopback): request u32 len + JSON {"images": [record, ...]}; reply u32 len + JSON
 //! {"ok", "error", "images": [{"rows", "hash", "grid", "ms", "bytes"}]}, then u64 len + the rows.
 //! The request also carries "max_rows", the cap on the rows of all its images together, so that an
@@ -30,6 +34,55 @@ pub const DEFAULT_MAX_IMAGE_ROWS: usize = 40_000;
 /// What the engine's frame limit has room for; --max-image-rows cannot be raised past it.
 pub const MAX_TOTAL_IMAGE_ROWS: usize = MAX_IMAGES * MAX_IMAGE_ROWS;
 
+/// Where the images are encoded (--vision).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VisionKind {
+    /// The rollback: the encoder container (--vision-addr) answers rows; the SUBMIT carries rows (FLAG_IMAGES).
+    Container,
+    /// The default: the engine encodes; the media worker (--media-addr) answers padded pixels and the SUBMIT carries them (FLAG_PIXELS).
+    Engine,
+}
+
+impl VisionKind {
+    pub fn parse(s: &str) -> Option<VisionKind> {
+        match s {
+            "container" => Some(VisionKind::Container),
+            "engine" => Some(VisionKind::Engine),
+            _ => None,
+        }
+    }
+}
+
+/// Mixed into the hash of every image the engine encodes. The engine's rows and the container's differ in the last bits, so a
+/// session made under one is no candidate under the other: the hash is part of what a session must match (session.rs).
+/// The container's hash is sent as the encoder made it.
+pub const ENGINE_ENCODER_KIND: u64 = 0x7069_7865_6c73_0001;
+
+/// A pixel part's limits: the engine's own (pixels.h: `kMaxRows`, `vit::kMaxPatches`, `kPatchK`) and the frame stage it reads a
+/// request's frame into (--frame-stage-mib, 400 MiB by default).
+pub const MAX_PIXEL_ROWS: usize = 1024;
+pub const MAX_PATCHES: usize = 9216;
+pub const PATCH_BYTES: usize = 588;
+pub const MAX_PIXEL_PART: usize = 400 << 20;
+
+/// An image's span rows for a grid of `n_h` x `n_w` patches: the aligner merges 3 x 3 patches; IMAGE_START and IMAGE_END and one
+/// IMAGE_NEW_LINE per grid row (pixels.h `rows_of`).
+pub fn rows_of_grid(n_h: u64, n_w: u64) -> u64 {
+    let (lh, lw) = (n_h.div_ceil(3), n_w.div_ceil(3));
+    lh * (lw + 1) + 2
+}
+
+/// A multiple of 8 at or above `n`: the padding of the pixel part's arrays and images.
+pub fn pad8(n: usize) -> usize {
+    (n + 7) & !7
+}
+
+/// Whether an error of `encode_pixels` is a size the request may not have (answered 413): the media worker's pixel limit or the
+/// frame stage's.
+pub fn is_too_large(e: &str) -> bool {
+    (e.contains("exceeds limit of") && e.contains("pixels")) || e.starts_with("at most ") && e.contains("MiB of image pixels")
+}
+
 /// The default for --max-image-rows-in-flight: two requests at the default request cap.
 pub const DEFAULT_MAX_IMAGE_ROWS_IN_FLIGHT: usize = 2 * DEFAULT_MAX_IMAGE_ROWS;
 
@@ -49,6 +102,9 @@ pub struct RowsInFlight {
     held: std::sync::Mutex<usize>,
     /// The process is over its memory limit: no request with images is taken until it is not.
     refusing: std::sync::atomic::AtomicBool,
+    /// The pixel bytes held by the requests in flight (`RowsHeld::set_pixel_bytes`), counted for the image memory when `pixels`.
+    pixel_bytes: std::sync::atomic::AtomicUsize,
+    pixels: std::sync::atomic::AtomicBool,
 }
 
 /// One request's share of the rows in flight; dropping it gives the rows back.
@@ -61,7 +117,26 @@ pub struct RowsHeld {
 
 impl RowsInFlight {
     pub fn new(max: usize) -> std::sync::Arc<RowsInFlight> {
-        std::sync::Arc::new(RowsInFlight { max, held: std::sync::Mutex::new(0), refusing: std::sync::atomic::AtomicBool::new(false) })
+        std::sync::Arc::new(RowsInFlight { max, held: std::sync::Mutex::new(0),
+            refusing: std::sync::atomic::AtomicBool::new(false),
+            pixel_bytes: std::sync::atomic::AtomicUsize::new(0),
+            pixels: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    /// Count the image memory in pixel bytes (the engine encodes: the front-end holds pixels, not rows) rather than in rows.
+    pub fn set_pixels(&self, pixels: bool) {
+        self.pixels.store(pixels, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The bytes the image requests in flight hold, for the session table's memory cap (`--front-image-mib`): their rows at
+    /// IMAGE_ROW_BYTES each, or with `set_pixels` the pixels they hold.
+    pub fn image_bytes(&self) -> usize {
+        if self.pixels.load(std::sync::atomic::Ordering::Relaxed) {
+            self.pixel_bytes.load(std::sync::atomic::Ordering::Relaxed)
+        } else {
+            self.in_flight() * IMAGE_ROW_BYTES
+        }
     }
 
     /// Refuse new image requests (true) or take them again (false), as the process is over its memory limit or not.
@@ -97,6 +172,14 @@ impl RowsHeld {
         *self.rows.lock().unwrap()
     }
 
+    /// This request holds `bytes` of pixels (its pixel part), from now on in place of what it held.
+    pub fn set_pixel_bytes(&self, bytes: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let before = self.pixel_bytes.swap(bytes, Relaxed);
+        self.budget.pixel_bytes.fetch_add(bytes, Relaxed);
+        self.budget.pixel_bytes.fetch_sub(before, Relaxed);
+    }
+
     /// Hold `rows` from now on, when that is less than what is held (it never grows: growing could
     /// pass the limit).
     pub fn shrink_to(&self, rows: usize) {
@@ -127,6 +210,8 @@ pub struct Encoded {
     /// and again as the SUBMIT's part.
     pub data: Vec<u8>,
     pub ms: f64,
+    /// The part carries pixels (FLAG_PIXELS), not rows (FLAG_IMAGES).
+    pub pixels: bool,
 }
 
 /// A loopback encoder RPC whose answer is its JSON header: video expansion (video.rs), which returns
@@ -244,7 +329,130 @@ pub async fn encode(addr: &str, records: &[Value], timeout: Duration, max_rows: 
         Ok::<_, String>((rows, hashes, data))
     };
     let (rows, hashes, data) = tokio::time::timeout(timeout, fut).await.map_err(|_| "the image encoder timed out".to_string())??;
-    Ok(Encoded { rows, hashes, data, ms: t0.elapsed().as_secs_f64() * 1e3 })
+    Ok(Encoded { rows, hashes, data, ms: t0.elapsed().as_secs_f64() * 1e3, pixels: false })
+}
+
+/// One image of the media worker's reply, from its frame's JSON `{"ok": true, "image": {rows, hash, grid, bytes, ...}}`: its span rows,
+/// hash and grid (n_h, n_w patches), the rows checked against the grid and the engine's limits.
+fn image_frame(h: &Value) -> Result<(u32, u64, (u16, u16), usize), String> {
+    let i = h.get("image").ok_or("image encoder: no image in its frame")?;
+    let r = i.get("rows").and_then(Value::as_u64).ok_or("image encoder: rows")?;
+    if !(3..=MAX_IMAGE_ROWS as u64).contains(&r) {
+        return Err("image encoder: bad span".into());
+    }
+    let g = i.get("grid").and_then(Value::as_array).ok_or("image encoder: no grid")?;
+    let at = |k: usize| g.get(k).and_then(Value::as_u64).filter(|&v| (1..=u16::MAX as u64).contains(&v)).ok_or("image encoder: bad grid");
+    let (n_h, n_w) = (at(0)?, at(1)?);
+    if n_h * n_w > MAX_PATCHES as u64 {
+        return Err(format!("cannot read the image: {} patches, over the {MAX_PATCHES} the encoder takes", n_h * n_w));
+    }
+    if rows_of_grid(n_h, n_w) != r {
+        return Err("image encoder: the grid does not match its rows".into());
+    }
+    if r as usize > MAX_PIXEL_ROWS {
+        return Err(format!("cannot read the image: it takes {r} rows, over the {MAX_PIXEL_ROWS} an image takes"));
+    }
+    Ok((r as u32, i.get("hash").and_then(Value::as_u64).unwrap_or(0), (n_h as u16, n_w as u16), PATCH_BYTES * n_h as usize * n_w as usize))
+}
+
+/// The images' padded pixels from the media worker, as the SUBMIT's pixel part (`encode_pixels_counted` with the frame stage's
+/// cap and no count).
+pub async fn encode_pixels(addr: &str, records: &[Value], timeout: Duration, max_rows: usize) -> Result<Encoded, String> {
+    encode_pixels_counted(addr, records, timeout, max_rows, MAX_PIXEL_PART, None).await
+}
+
+/// The images' padded pixels from the media worker, as the SUBMIT's pixel part (engine/server/pixels.h): `u32 n`, n spans (the
+/// table `payload` writes), n grids of `u16 n_h, u16 n_w` padded to 8 bytes, then each image's `588 x n_h x n_w` bytes padded to
+/// 8. The worker answers a run of frames, each `u32 len, JSON, u64 len, bytes`: one per image in order (`{"ok": true, "image":
+/// {rows, hash, grid, ms, bytes}}` and its padded u8), then the end frame `{"ok": true, "images": n}`; an error frame
+/// `{"ok": false, "error", "code"}` ends the reply at any image and what came before it is dropped. Each image is read straight
+/// into its place in the part, and the part's bytes are counted as the frames arrive (`held`, for `--front-image-mib`): a request
+/// is refused after the frame that takes it over `max_bytes` (at most `MAX_PIXEL_PART`, the engine's frame stage), an error
+/// `is_too_large`, as it is over `max_rows` (the rows of all the images together, as for `encode`). The hashes carry
+/// `ENGINE_ENCODER_KIND`.
+pub async fn encode_pixels_counted(addr: &str, records: &[Value], timeout: Duration, max_rows: usize, max_bytes: usize, held: Option<&RowsHeld>) -> Result<Encoded, String> {
+    if records.len() > MAX_IMAGES {
+        return Err(format!("at most {MAX_IMAGES} images per request"));
+    }
+    let max_rows = max_rows.min(MAX_TOTAL_IMAGE_ROWS);
+    let max_bytes = max_bytes.min(MAX_PIXEL_PART);
+    let n = records.len();
+    let t0 = Instant::now();
+    let fut = async {
+        let mut s = TcpStream::connect(addr).await.map_err(|e| format!("the image encoder is not reachable: {e}"))?;
+        let body = EncodeRequest { images: records, max_rows }.to_bytes()?;
+        s.write_all(&(body.len() as u32).to_le_bytes()).await.map_err(|e| e.to_string())?;
+        s.write_all(&body).await.map_err(|e| e.to_string())?;
+        drop(body);
+        let grid_at = span_table_len(n);
+        let data_at = grid_at + pad8(4 * n);
+        let mut data = vec![0u8; data_at];
+        let (mut rows, mut hashes) = (Vec::with_capacity(n), Vec::with_capacity(n));
+        loop {
+            let mut n4 = [0u8; 4];
+            s.read_exact(&mut n4).await.map_err(|e| format!("image encoder: {e}"))?;
+            let header_len = u32::from_le_bytes(n4) as usize;
+            if header_len > MAX_HEADER {
+                return Err("image encoder: JSON reply too large".to_string());
+            }
+            let mut h = vec![0u8; header_len];
+            s.read_exact(&mut h).await.map_err(|e| format!("image encoder: {e}"))?;
+            let h: Value = serde_json::from_slice(&h).map_err(|e| format!("image encoder: {e}"))?;
+            if h.get("ok").and_then(Value::as_bool) != Some(true) {
+                let e = h.get("error").and_then(Value::as_str).unwrap_or("unknown error");
+                // a worker that knows the cap stops at the image that crosses it
+                if h.get("code").and_then(Value::as_str) == Some("too_many_rows") && e.starts_with("at most ") {
+                    return Err(e.to_string());
+                }
+                return Err(format!("cannot read the image: {e}"));
+            }
+            if let Some(total) = h.get("images").and_then(Value::as_u64) {
+                if total as usize != n || rows.len() != n {
+                    return Err("image encoder: wrong number of images".into());
+                }
+                break;
+            }
+            if rows.len() == n {
+                return Err("image encoder: wrong number of images".into());
+            }
+            let (r, hash, (n_h, n_w), bytes) = image_frame(&h)?;
+            rows.push(r);
+            hashes.push(hash ^ ENGINE_ENCODER_KIND);
+            let total_rows: usize = rows.iter().map(|&r| r as usize).sum();
+            if total_rows > max_rows {
+                return Err(too_many_rows(max_rows, total_rows));
+            }
+            let part = data.len() + pad8(bytes);
+            if part > max_bytes {
+                return Err(format!("at most {} MiB of image pixels per request; the images of this request take {} MiB", max_bytes >> 20, part >> 20));
+            }
+            let mut n8 = [0u8; 8];
+            s.read_exact(&mut n8).await.map_err(|e| format!("image encoder: {e}"))?;
+            if u64::from_le_bytes(n8) != bytes as u64 {
+                return Err("image encoder: the pixels do not match the grid".to_string());
+            }
+            let i = rows.len() - 1;
+            data[grid_at + 4 * i..grid_at + 4 * i + 2].copy_from_slice(&n_h.to_le_bytes());
+            data[grid_at + 4 * i + 2..grid_at + 4 * i + 4].copy_from_slice(&n_w.to_le_bytes());
+            let at = data.len();
+            data.reserve_exact(pad8(bytes));
+            data.resize(at + pad8(bytes), 0);
+            s.read_exact(&mut data[at..at + bytes]).await.map_err(|e| format!("image encoder: {e}"))?;
+            if let Some(held) = held {
+                held.set_pixel_bytes(data.len());
+            }
+        }
+        Ok::<_, String>((rows, hashes, data))
+    };
+    let r = tokio::time::timeout(timeout, fut).await.map_err(|_| "the image encoder timed out".to_string())?;
+    if r.is_err() {
+        // what came before an error is dropped, and so is what it counted
+        if let Some(held) = held {
+            held.set_pixel_bytes(0);
+        }
+    }
+    let (rows, hashes, data) = r?;
+    Ok(Encoded { rows, hashes, data, ms: t0.elapsed().as_secs_f64() * 1e3, pixels: true })
 }
 
 /// The prompt's ids with each placeholder expanded into its image's span, and the spans' starts.
@@ -579,5 +787,280 @@ pub(crate) mod tests {
         assert!(span_starts(&ids, &[3, 3]).is_err());
         assert!(span_starts(&ids, &[3]).is_err());
         assert!(span_starts(&ids, &[4, 4]).is_err());
+    }
+
+    // ------------------------------------------------------------------ pixels (--vision engine)
+
+    /// What a stand-in media worker answers for an image: its padded pixels are `fill` bytes, 588 x n_h x n_w of them.
+    #[derive(Clone, Copy)]
+    pub(crate) struct Img {
+        pub n_h: u16,
+        pub n_w: u16,
+        pub fill: u8,
+        pub hash: u64,
+    }
+
+    /// The frames the media worker answers for `imgs`: one per image, `({"ok": true, "image": {rows, hash, grid, ms, bytes}}, its
+    /// padded pixels)`, then the end frame `({"ok": true, "images": n}, no bytes)`.
+    pub(crate) fn media_frames(imgs: &[Img]) -> Vec<(Value, Vec<u8>)> {
+        let mut v: Vec<(Value, Vec<u8>)> = imgs
+            .iter()
+            .map(|i| {
+                let (lh, lw) = ((i.n_h as u64).div_ceil(3), (i.n_w as u64).div_ceil(3));
+                let bytes = 588 * i.n_h as usize * i.n_w as usize;
+                (json!({"ok": true, "image": {"rows": rows_of_grid(i.n_h as u64, i.n_w as u64), "hash": i.hash, "grid": [i.n_h, i.n_w, lh, lw], "ms": 1.0, "bytes": bytes}}), vec![i.fill; bytes])
+            })
+            .collect();
+        v.push((json!({"ok": true, "images": imgs.len()}), Vec::new()));
+        v
+    }
+
+    /// A stand-in for tools/vision/media_worker.py: answers one request with `frames`, each as `u32 len, JSON, u64 len, bytes`. After
+    /// the frame at index `pause.0` it waits for `pause.1` to be notified (a test looks at the reader meanwhile). After the last frame
+    /// it keeps the connection open until the reader goes. Returns its address and the request it was sent.
+    pub(crate) async fn fake_media_frames(frames: Vec<(Value, Vec<u8>)>, pause: Option<(usize, std::sync::Arc<tokio::sync::Notify>)>) -> (String, tokio::task::JoinHandle<Value>) {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let h = tokio::spawn(async move {
+            let (mut s, _) = l.accept().await.unwrap();
+            let mut n4 = [0u8; 4];
+            s.read_exact(&mut n4).await.unwrap();
+            let mut body = vec![0u8; u32::from_le_bytes(n4) as usize];
+            s.read_exact(&mut body).await.unwrap();
+            for (i, (j, data)) in frames.into_iter().enumerate() {
+                let hdr = j.to_string().into_bytes();
+                if s.write_all(&(hdr.len() as u32).to_le_bytes()).await.is_err() || s.write_all(&hdr).await.is_err() {
+                    break;
+                }
+                if s.write_all(&(data.len() as u64).to_le_bytes()).await.is_err() || s.write_all(&data).await.is_err() {
+                    break;
+                }
+                if let Some((at, n)) = &pause {
+                    if *at == i {
+                        n.notified().await;
+                    }
+                }
+            }
+            let _ = s.read(&mut [0u8; 1]).await;
+            serde_json::from_slice(&body).unwrap()
+        });
+        (addr, h)
+    }
+
+    /// The pixel part as engine/server/tests/pixels_test.cpp's `frame()` lays it out after the prompt, for images in `spans`
+    /// order: u32 n, {start, rows, hash} each, the grids (u16 n_h, u16 n_w) padded to 8, each image's bytes padded to 8.
+    fn pixel_part(starts: &[u32], imgs: &[Img], salt: u64) -> Vec<u8> {
+        let mut p = (imgs.len() as u32).to_le_bytes().to_vec();
+        for (s, i) in starts.iter().zip(imgs) {
+            p.extend((*s).to_le_bytes());
+            p.extend((rows_of_grid(i.n_h as u64, i.n_w as u64) as u32).to_le_bytes());
+            p.extend((i.hash ^ salt).to_le_bytes());
+        }
+        let mut g = Vec::new();
+        for i in imgs {
+            g.extend(i.n_h.to_le_bytes());
+            g.extend(i.n_w.to_le_bytes());
+        }
+        g.resize(pad8(g.len()), 0);
+        p.extend(g);
+        for i in imgs {
+            let mut px = vec![i.fill; 588 * i.n_h as usize * i.n_w as usize];
+            px.resize(pad8(px.len()), 0);
+            p.extend(px);
+        }
+        p
+    }
+
+    /// The images of pixels_test's `three` (grids 3 x 3, 39 x 39, 5 x 7; starts 10, 20, 400; hash 0x1111 x i; fill i).
+    pub(crate) fn three() -> Vec<Img> {
+        vec![Img { n_h: 3, n_w: 3, fill: 1, hash: 0x1111 }, Img { n_h: 39, n_w: 39, fill: 2, hash: 0x2222 }, Img { n_h: 5, n_w: 7, fill: 3, hash: 0x3333 }]
+    }
+
+    #[test]
+    fn the_grid_rule_is_the_engines() {
+        // pixels_test: rows_of({3,3}) == 4, {39,39} == 184, {5,7} == 10, {93,93} == 31 x 32 + 2
+        assert_eq!([rows_of_grid(3, 3), rows_of_grid(39, 39), rows_of_grid(5, 7), rows_of_grid(93, 93)], [4, 184, 10, 31 * 32 + 2]);
+        // 588 x 35 = 20,580 pads by 4; 588 x 9 pads by 4; 588 x 2 by none (pixels_test)
+        assert_eq!([pad8(588 * 35) - 588 * 35, pad8(588 * 9) - 588 * 9, pad8(588 * 2) - 588 * 2], [4, 4, 0]);
+    }
+
+    #[tokio::test]
+    async fn a_pixel_part_is_the_frame_pixels_test_reads() {
+        let imgs = three();
+        let (addr, enc) = fake_media_frames(media_frames(&imgs), None).await;
+        let recs = vec![json!({"type": "image", "url": "data:image/png;base64,AAAA"}); 3];
+        let e = encode_pixels(&addr, &recs, T, DEFAULT_MAX_IMAGE_ROWS).await.unwrap();
+        assert!(e.pixels, "the part says it carries pixels");
+        assert_eq!(e.rows, vec![4, 184, 10]);
+        let part = payload(&[10, 20, 400], e);
+        assert!(part == pixel_part(&[10, 20, 400], &imgs, ENGINE_ENCODER_KIND), "the part equals pixels_test's well-formed layout, byte for byte");
+        // the offsets pixels_test checks: grids at 4 + 16 n, the first image at the padded grids' end, the last ends the part
+        let data_at = 4 + 16 * 3 + 16;
+        assert_eq!(part[data_at], 1);
+        assert_eq!(part[data_at + pad8(588 * 9)], 2);
+        assert_eq!(part[data_at + pad8(588 * 9) + pad8(588 * 39 * 39)], 3);
+        assert_eq!(data_at + pad8(588 * 9) + pad8(588 * 39 * 39) + pad8(588 * 35), part.len());
+        // and the worker is asked what the container is asked: the records and the rows cap
+        assert_eq!(enc.await.unwrap(), json!({"images": recs, "max_rows": DEFAULT_MAX_IMAGE_ROWS}));
+    }
+
+    #[tokio::test]
+    async fn the_encoders_kind_is_in_the_hash() {
+        let imgs = vec![Img { n_h: 3, n_w: 3, fill: 9, hash: 0xabcd }];
+        let (addr, _enc) = fake_media_frames(media_frames(&imgs), None).await;
+        let e = encode_pixels(&addr, &[json!({"url": "x"})], T, DEFAULT_MAX_IMAGE_ROWS).await.unwrap();
+        assert_eq!(e.hashes, vec![0xabcd ^ ENGINE_ENCODER_KIND]);
+        assert_ne!(e.hashes[0], 0xabcd, "the same image under the container's encoder has another hash");
+        // the container's hash is sent as the encoder made it
+        let (addr, _enc) = fake_encoder(reply_with_rows(&[3]), true).await;
+        let e = encode(&addr, &records(1), T, DEFAULT_MAX_IMAGE_ROWS).await.unwrap();
+        assert_eq!((e.hashes[0], e.pixels), (0, false));
+    }
+
+    #[tokio::test]
+    async fn a_grid_that_is_not_its_rows_is_the_workers_fault() {
+        let imgs = three();
+        let mut frames = media_frames(&imgs);
+        frames[1].0["image"]["grid"] = json!([39, 40, 13, 14]);
+        let (addr, _enc) = fake_media_frames(frames, None).await;
+        let e = encode_pixels(&addr, &records(3), T, DEFAULT_MAX_IMAGE_ROWS).await.unwrap_err();
+        assert_eq!(e, "image encoder: the grid does not match its rows");
+        assert!(!is_request_error(&e) && !is_too_large(&e), "a 503, not the request's fault");
+        // pixels that are not the grid's bytes
+        let mut frames = media_frames(&imgs);
+        frames[2].1.truncate(10);
+        let (addr, _enc) = fake_media_frames(frames, None).await;
+        let e = encode_pixels(&addr, &records(3), T, DEFAULT_MAX_IMAGE_ROWS).await.unwrap_err();
+        assert!(e.contains("do not match the grid") && !is_request_error(&e), "{e}");
+        // an end frame that counts other than the images sent
+        let mut frames = media_frames(&imgs);
+        frames[3].0 = json!({"ok": true, "images": 2});
+        let (addr, _enc) = fake_media_frames(frames, None).await;
+        assert_eq!(encode_pixels(&addr, &records(3), T, DEFAULT_MAX_IMAGE_ROWS).await.unwrap_err(), "image encoder: wrong number of images");
+    }
+
+    #[tokio::test]
+    async fn an_image_over_the_engines_rows_is_refused_before_its_pixels() {
+        // 96 x 96 patches make 1,058 rows: under the span cap of 1,100 and over the 1,024 the engine takes
+        let imgs = vec![Img { n_h: 96, n_w: 96, fill: 0, hash: 1 }];
+        assert_eq!(rows_of_grid(96, 96), 1058);
+        let mut frames = media_frames(&imgs);
+        frames[0].1.clear(); // no pixels follow: the frame's JSON alone is refused
+        let (addr, _enc) = fake_media_frames(frames, None).await;
+        let e = encode_pixels(&addr, &records(1), T, DEFAULT_MAX_IMAGE_ROWS).await.unwrap_err();
+        assert!(e.starts_with("cannot read the image: it takes 1058 rows") && is_request_error(&e) && !is_too_large(&e), "{e}");
+    }
+
+    /// An error frame after two image frames: the reply ends there, what came before is dropped (nothing returned, nothing counted),
+    /// and the error is the one a worker that answered the error alone would have given.
+    #[tokio::test]
+    async fn an_error_frame_after_two_images_drops_both() {
+        let imgs = three();
+        let said = "cannot identify image file";
+        let mut frames = media_frames(&imgs[..2]);
+        frames.truncate(2);
+        frames.push((json!({"ok": false, "error": said}), Vec::new()));
+        let (addr, _enc) = fake_media_frames(frames, None).await;
+        let b = RowsInFlight::new(10_000);
+        b.set_pixels(true);
+        let held = b.reserve(1000).unwrap();
+        let e = encode_pixels_counted(&addr, &records(3), T, DEFAULT_MAX_IMAGE_ROWS, MAX_PIXEL_PART, Some(&held)).await.unwrap_err();
+        assert_eq!(e, format!("cannot read the image: {said}"));
+        assert!(is_request_error(&e) && !is_too_large(&e));
+        assert_eq!(b.image_bytes(), 0, "what the two images counted is given back");
+        // the worker's own cap: it stops at the image that crosses it, whatever came before
+        let mut frames = media_frames(&imgs[..2]);
+        frames.truncate(2);
+        frames.push((json!({"ok": false, "code": "too_many_rows", "error": "at most 40000 image tokens per request; the first 3 of 3 images already take 40754"}), Vec::new()));
+        let (addr, _enc) = fake_media_frames(frames, None).await;
+        let e = encode_pixels(&addr, &records(3), T, DEFAULT_MAX_IMAGE_ROWS).await.unwrap_err();
+        assert!(e.starts_with("at most 40000 image tokens") && is_request_error(&e), "{e}");
+    }
+
+    /// The pixels count against `--front-image-mib` as the frames arrive; a request is refused after the frame that crosses it.
+    #[tokio::test]
+    async fn the_image_memory_is_counted_as_frames_arrive() {
+        let imgs = vec![Img { n_h: 39, n_w: 39, fill: 1, hash: 1 }; 3]; // 894,348 bytes each
+        let one = pad8(588 * 39 * 39);
+        let head = 4 + 16 * 3 + pad8(12);
+        let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+        let (addr, _enc) = fake_media_frames(media_frames(&imgs), Some((1, gate.clone()))).await;
+        let b = RowsInFlight::new(10_000);
+        b.set_pixels(true);
+        let held = std::sync::Arc::new(b.reserve(552).unwrap());
+        let (h2, a2) = (held.clone(), addr.clone());
+        let task = tokio::spawn(async move { encode_pixels_counted(&a2, &records(3), T, DEFAULT_MAX_IMAGE_ROWS, 400 << 20, Some(&*h2)).await });
+        let t0 = Instant::now();
+        while b.image_bytes() != head + 2 * one {
+            assert!(t0.elapsed() < Duration::from_secs(10), "after two frames the part counts two images, saw {}", b.image_bytes());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!task.is_finished(), "the third frame has not been sent");
+        gate.notify_one();
+        let e = task.await.unwrap().unwrap();
+        assert_eq!(e.data.len(), head + 3 * one);
+        assert_eq!(b.image_bytes(), head + 3 * one);
+        // a limit of 2 MiB: the first two images (1.7 MiB with the table) pass, the frame that crosses it is refused
+        let (addr, _enc) = fake_media_frames(media_frames(&imgs), None).await;
+        let e = encode_pixels_counted(&addr, &records(3), T, DEFAULT_MAX_IMAGE_ROWS, 2 << 20, None).await.unwrap_err();
+        assert!(e.starts_with("at most 2 MiB of image pixels per request") && is_too_large(&e), "{e}");
+        // and one of 1 MiB is crossed by the second frame, not the first
+        let (addr, _enc) = fake_media_frames(media_frames(&imgs[..1]), None).await;
+        assert!(encode_pixels_counted(&addr, &records(1), T, DEFAULT_MAX_IMAGE_ROWS, 1 << 20, None).await.is_ok());
+        let (addr, _enc) = fake_media_frames(media_frames(&imgs[..2]), None).await;
+        assert!(encode_pixels_counted(&addr, &records(2), T, DEFAULT_MAX_IMAGE_ROWS, 1 << 20, None).await.unwrap_err().contains("MiB of image pixels"));
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn a_part_over_the_frame_stage_is_refused_at_the_frame_that_crosses_it() {
+        // 93 x 93 patches: 994 rows, 5,085,616 bytes padded; 82 fit the 400 MiB the engine stages a frame in, the 83rd does not
+        let part = |n: usize| 4 + 16 * n + pad8(4 * n) + n * pad8(588 * 93 * 93);
+        assert!(part(82) <= MAX_PIXEL_PART && part(83) > MAX_PIXEL_PART);
+        // the same rule at a cap small enough to send: 4 of them are under 24 MiB, the 5th crosses it
+        let imgs = vec![Img { n_h: 93, n_w: 93, fill: 0, hash: 1 }; 10];
+        let (addr, _enc) = fake_media_frames(media_frames(&imgs), None).await;
+        let e = encode_pixels_counted(&addr, &records(10), T, MAX_TOTAL_IMAGE_ROWS, 24 << 20, None).await.unwrap_err();
+        assert!(e.starts_with("at most 24 MiB of image pixels per request") && is_too_large(&e), "{e}");
+        // a cap above the stage is the stage
+        let (addr, _enc) = fake_media_frames(media_frames(&imgs[..1]), None).await;
+        assert!(encode_pixels_counted(&addr, &records(1), T, MAX_TOTAL_IMAGE_ROWS, usize::MAX, None).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn the_workers_pixel_limit_is_too_large_not_a_bad_request() {
+        let said = "Image size (41000000 pixels) exceeds limit of 40000000 pixels, could be decompression bomb DOS attack.";
+        let (addr, _enc) = fake_media_frames(vec![(json!({"ok": false, "error": said}), Vec::new())], None).await;
+        let e = encode_pixels(&addr, &records(1), T, DEFAULT_MAX_IMAGE_ROWS).await.unwrap_err();
+        assert_eq!(e, format!("cannot read the image: {said}"));
+        assert!(is_too_large(&e) && is_request_error(&e));
+        assert!(!is_too_large("cannot read the image: cannot identify image file"));
+        assert_eq!(encode_pixels("127.0.0.1:1", &records(101), T, 1).await.unwrap_err(), "at most 100 images per request");
+    }
+
+    #[test]
+    fn pixels_count_for_the_image_memory() {
+        let b = RowsInFlight::new(10_000);
+        let held = b.reserve(1000).unwrap();
+        assert_eq!(b.image_bytes(), 1000 * IMAGE_ROW_BYTES, "rows, as before");
+        b.set_pixels(true);
+        assert_eq!(b.image_bytes(), 0, "before the media worker has answered the request holds no pixels");
+        held.set_pixel_bytes(5_000_000);
+        let other = b.reserve(10).unwrap();
+        other.set_pixel_bytes(40);
+        assert_eq!(b.image_bytes(), 5_000_040, "the pixels, not rows x 10 KiB");
+        held.set_pixel_bytes(3_000_000);
+        assert_eq!(b.image_bytes(), 3_000_040, "a request holds what it holds now");
+        drop(held);
+        assert_eq!(b.image_bytes(), 40);
+        drop(other);
+        assert_eq!((b.image_bytes(), b.in_flight()), (0, 0));
+    }
+
+    #[test]
+    fn the_vision_kinds() {
+        assert_eq!(VisionKind::parse("container"), Some(VisionKind::Container));
+        assert_eq!(VisionKind::parse("engine"), Some(VisionKind::Engine));
+        assert_eq!(VisionKind::parse("Engine"), None);
     }
 }

@@ -225,6 +225,43 @@ void part_c() {
   check(attn::rope_table_rows(65536) == 65536 && attn::rope_table_rows(65536, 8) == 65544, "small windows lose rows", 0);
 }
 
+// The plain rotation of layers 0-1 and the drafter is computed, never read from a table. Proves, on the rows a model
+// reads (small, middle, the last rows of the 1M window plus the drafter's 8), that rope_at on rope_plain_calc() equals the
+// plain table's entry in cos and in sin, bit for bit, at every pair. Needs one GPU; not a host test (powf/cosf/sinf are
+// device functions). Run: ./rope_factor_test
+__global__ void plain_rows_kernel(const int* pos, int n, attn::Rope calc, attn::Rope table, unsigned long long* bad) {
+  int k = blockIdx.x * blockDim.x + threadIdx.x;
+  if (k >= n * 32) return;
+  int t = pos[k >> 5], i = k & 31;
+  float2 a = attn::rope_at(calc, t, i), b = attn::rope_at(table, t, i);
+  if (__float_as_uint(a.x) != __float_as_uint(b.x)) atomicAdd(bad, 1ull);
+  if (__float_as_uint(a.y) != __float_as_uint(b.y)) atomicAdd(bad, 1ull);
+}
+
+void part_d() {
+  const int rows = attn::rope_table_rows(1 << 22, 8);
+  const std::vector<int> pos = {0, 1, 2, 5, 63, 4096, 65535, 65536, 262144, 524288, rows - 9, rows - 8, rows - 1};
+  float2* tab;
+  CUDA_CHECK(cudaMalloc(&tab, (size_t)rows * 32 * sizeof(float2)));
+  attn::rope_table_build(tab, rows, false, 0);
+  int* dpos;
+  CUDA_CHECK(cudaMalloc(&dpos, pos.size() * sizeof(int)));
+  CUDA_CHECK(cudaMemcpy(dpos, pos.data(), pos.size() * sizeof(int), cudaMemcpyHostToDevice));
+  unsigned long long* bad;
+  CUDA_CHECK(cudaMalloc(&bad, sizeof *bad));
+  CUDA_CHECK(cudaMemset(bad, 0, sizeof *bad));
+  const int n = (int)pos.size();
+  plain_rows_kernel<<<(n * 32 + 127) / 128, 128>>>(dpos, n, attn::rope_plain_calc(), attn::Rope(tab), bad);
+  CUDA_CHECK(cudaGetLastError());
+  unsigned long long hb = 0;
+  CUDA_CHECK(cudaMemcpy(&hb, bad, sizeof hb, cudaMemcpyDeviceToHost));
+  std::printf("(d) plain rotation computed vs table, %d sampled rows x 32 pairs, cos and sin: %llu differ\n", n, hb);
+  check(hb == 0, "computed plain rotation differs from the plain table on the sampled rows", 0, (long long)hb);
+  CUDA_CHECK(cudaFree(tab));
+  CUDA_CHECK(cudaFree(dpos));
+  CUDA_CHECK(cudaFree(bad));
+}
+
 int main() {
   part_a(false);
   part_a(true);

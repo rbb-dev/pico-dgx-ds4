@@ -15,7 +15,14 @@
 // non-zero on any difference. --no-table runs the steps without their slot tables: a negative control, every
 // group must differ but index_merge2's, which takes no table (it fails only where a scan without its table wrote
 // nothing); decode_prep is left out past 8 rows there (without a table they are one session: attn.h).
-//   slot_tests [--no-table]
+// P-scan (index_dense's part, nparts with a slot table; PSCAN-DESIGN section 4): test_parts runs every step's dense scan as
+// four parts (each session split by its own length: the quarter of ITS keys in 64-key units, a short session's later parts
+// empty), the parts' candidate lists in the rank-major layout an all-gather delivers, [4][rows][kmax], then index_merge2
+// over them (rank_major_parts = 4): the merged top-k, pool and their keys equal the whole scan's of the same step, bit for
+// bit, ratio 2 and ratio 1 with the pool; steps of 1 / 2 / 4 / 16 sessions, 1-16 rows, a session under 256 keys beside long
+// ones. `--long`: only that test, at contexts up to 1,048,576 positions (the wide instance, parts of up to 262,144 keys; five
+// slots; about 5 GB of device memory): a session at 1,048,575 beside short and mid ones. Needs one GPU. Skipped with --no-table.
+//   slot_tests [--no-table] [--long]
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -617,6 +624,48 @@ void test_fused(const Step& st, int ratio, int part, bool blocks) {
     same(t + " pool keys", mpk.p + (size_t)f * kPool, opk.p, opk.n);
     if (part_empty(st.ss[i].last, ratio, part)) nonzero(t + " top (empty)", ot.p, ot.n);  // all -1
     else nonzero(t + " top keys", otk.p, otk.n);
+  }
+  end();
+}
+
+// The dense scan of a step as kParts parts + index_merge2 over the gathered candidates, against the whole scan
+void test_parts(const Step& st, int ratio, bool pool) {
+  if (g_no_table) return;
+  begin("index_dense parts x" + std::to_string(kParts) + " ratio=" + std::to_string(ratio) + (pool ? " +pool" : "") +
+        " + merge rank-major " + st.name());
+  const int R = st.rows, max_scan = kMaxCtx / ratio;
+  const int ks = (max_scan + attn::kScoreAlign - 1) / attn::kScoreAlign * attn::kScoreAlign;
+  const int part_scan = ((max_scan + kParts - 1) / kParts + 63) / 64 * 64;
+  const int ksp = (part_scan + attn::kScoreAlign - 1) / attn::kScoreAlign * attn::kScoreAlign;
+  CompSlots cs(ratio);
+  IdxIn in(st, ratio);
+  Dev<uint32_t> scratch(attn::index_dense_scratch() / 4);
+  IdxOut whole(R, ks);
+  attn::index_dense(in.q(0), in.w(0), st.pos.p, rope_table(), R, ratio, cs.ik(st), max_scan, whole.keys.p, ks,
+                    whole.bkeys.p, ks / 8, whole.tsel(), pool ? whole.psel() : attn::IndexSel{}, scratch.p, true, g_s);
+  // the parts, each into its quarter of the gathered buffers: [part][row][kmax]
+  Dev<int> cpos((size_t)kParts * R * kTopk), ppos((size_t)kParts * R * kPool);
+  Dev<uint16_t> ckey((size_t)kParts * R * kTopk), pkey((size_t)kParts * R * kPool);
+  IdxOut tmp(R, ksp);  // the parts' own keys: written from 0, overwritten by each part
+  for (int q = 0; q < kParts; ++q) {
+    const attn::IndexSel t{kTopk, cpos.p + (size_t)q * R * kTopk, ckey.p + (size_t)q * R * kTopk, kTopk};
+    const attn::IndexSel ps{kPool, ppos.p + (size_t)q * R * kPool, pkey.p + (size_t)q * R * kPool, kPool};
+    attn::index_dense(in.q(0), in.w(0), st.pos.p, rope_table(), R, ratio, cs.ik(st), part_scan, tmp.keys.p, ksp,
+                      tmp.bkeys.p, ksp / 8, t, pool ? ps : attn::IndexSel{}, scratch.p, true, g_s, -1, q, kParts);
+  }
+  same("scratch left zero", scratch.p, Dev<uint32_t>(scratch.n).p, scratch.n);
+  Dev<int> mtop((size_t)R * kTopk), mpool((size_t)R * kPool);
+  Dev<uint16_t> mtk((size_t)R * kTopk), mpk((size_t)R * kPool);
+  attn::index_merge2(R, cpos.p, ckey.p, kParts * kTopk, attn::IndexSel{kTopk, mtop.p, mtk.p, kTopk},
+                     pool ? ppos.p : nullptr, pool ? pkey.p : nullptr, kParts * kPool,
+                     pool ? attn::IndexSel{kPool, mpool.p, mpk.p, kPool} : attn::IndexSel{}, true, g_s, kParts);
+  same("merged top == the whole scan's", mtop.p, whole.top.p, mtop.n);
+  same("merged top keys == the whole scan's", mtk.p, whole.tkey.p, mtk.n);
+  nonzero("merged top keys", mtk.p, mtk.n);
+  if (pool) {
+    same("merged pool == the whole scan's", mpool.p, whole.pool.p, mpool.n);
+    same("merged pool keys == the whole scan's", mpk.p, whole.pkey.p, mpk.n);
+    nonzero("merged pool keys", mpk.p, mpk.n);
   }
   end();
 }
