@@ -55,8 +55,8 @@ __host__ __device__ inline int spec_batch_layout(StepIn& d, const SpecState* ss,
 }
 
 // B3 phase 2a: the draft passes of a batch step (dspark::Draft::draft_batch). bent [kMaxSess]: the entries on in
-// entry order (the compact list; the rest 0); pstab [kMaxSess * kDrafts]: their rows' slot tables, the c-th entry
-// on at rows [kDrafts c, kDrafts c + kDrafts) (pass p takes bent + 3 p and pstab + 3 p * kDrafts; the rest slot
+// entry order (the compact list; the rest 0); pstab [kMaxSess * kBatchDrafts]: their rows' slot tables, the c-th entry
+// on at rows [kBatchDrafts c, kBatchDrafts c + kBatchDrafts) (pass p takes bent + 3 p and pstab + 3 p * kBatchDrafts; the rest slot
 // 0, never read). Returns S, the entries on (the switch over the passes runs body S - 1).
 __host__ __device__ inline int spec_batch_passes(const StepIn& d, int* bent, int* pstab) {
   const int ns = d.nsess < 1 ? 1 : d.nsess > kMaxSess ? kMaxSess : d.nsess;
@@ -65,7 +65,7 @@ __host__ __device__ inline int spec_batch_passes(const StepIn& d, int* bent, int
     if (d.sess_on[k]) bent[S++] = k;
   for (int c = S; c < kMaxSess; ++c) bent[c] = 0;
   for (int c = 0; c < kMaxSess; ++c)
-    for (int j = 0; j < kDrafts; ++j) pstab[c * kDrafts + j] = c < S ? d.sess_slot[bent[c]] : 0;
+    for (int j = 0; j < kBatchDrafts; ++j) pstab[c * kBatchDrafts + j] = c < S ? d.sess_slot[bent[c]] : 0;
   return S;
 }
 

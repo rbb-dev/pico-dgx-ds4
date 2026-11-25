@@ -12,6 +12,8 @@
 // no walk; no `fails`; a ladder that climbs on a partly accepted step; a 16-row body allowed; the block without its rule.
 // Build flags that show RED for the rule as it was before this change: -DCOPY_RUN_TEST_PRESENT_RULE (steps never leave 7 drafts),
 // -DCOPY_RUN_TEST_NO_BLOCK_RULE (the block without the rule). Command: copy_run_test (exit 0 = all pass)
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -372,6 +374,45 @@ void l8_block() {
   say(!block_runs(dead, 4, 5), "L8: the block waits for L accepted drafts");
 }
 
+// block_step: the decision k_spec_dyn takes, on a mirror whose source repeats (tokens 100 .. 119 twice) and a cursor left on it.
+void l8_step() {
+  int32_t tok[64];
+  for (int i = 0; i < 20; ++i) tok[i] = 100 + i, tok[20 + i] = 100 + i;
+  const int known = 36;  // the second copy is being written: positions [0, 36) are known, the bonus is token 35's successor
+  Run rec{};
+  rec.cur = 16, rec.len = 12, rec.pos = 36;  // predicts tok[16] = 116 for position 36 (the bonus after the last step)
+  // a step that accepted 5 drafts emitted 6 tokens: rows[0 .. 5], and the bonus after them; the source continues 116 117 118 119 100 101
+  const int32_t on_source[8] = {99, 116, 117, 118, 119, 100, 0, 0};  // rows[0] is the bonus the cursor was left at
+  const int32_t off_source[8] = {99, 116, 117, 999, 119, 100, 0, 0};
+  say(!block_step(rec, tok, known, true, 36, on_source, 6, 101, 5), "L8: tokens that walk the live cursor keep the block out");
+  say(block_step(rec, tok, known, true, 36, off_source, 6, 101, 5), "L8: tokens that leave the source let the block run");
+  say(!block_step(rec, tok, known, true, 36, on_source, 4, 101, 5), "L8: fewer than L accepted drafts: no block, cursor or not");
+  Run stale = rec;
+  stale.pos = 30;  // left by a step another graph ran: the next walk drops it
+  say(block_step(stale, tok, known, true, 36, on_source, 6, 101, 5), "L8: a stale cursor does not hold the block back");
+  say(block_step(rec, tok, known, false, 36, on_source, 6, 101, 5), "L8: a given step starts the cursor over: the block runs");
+  Run none{};
+  say(block_step(none, tok, known, true, 36, on_source, 6, 101, 5), "L8: no cursor: the block runs");
+  say(rec.cur == 16 && rec.len == 12 && rec.pos == 36, "L8: the decision leaves the unit's record as it was");
+  control("the cursor not walked", [&] {
+    // a decision that reads the record without walking it keeps the block out for tokens that left the source too
+    say(block_runs(rec, 5, 5), "L8: tokens that leave the source let the block run (cursor not walked)");
+  });
+}
+
+void l8_ms() {
+  float a[8] = {21.10f, 25.38f, 29.26f, 32.76f, 35.61f, 38.70f, 0.f, 0.f};
+  extend_step_ms(a, 5, 7);
+  say(std::fabs(a[6] - (38.70f + (38.70f - 35.61f))) < 1e-4f && std::fabs(a[7] - (a[6] + (a[6] - a[5]))) < 1e-4f,
+      "L8: copy rows past the chain's 5 drafts extend by the last difference");
+  float b[8] = {21.10f, 25.38f, 29.26f, 32.76f, 35.61f, 38.70f, 41.70f, 44.70f};
+  extend_step_ms(b, 7, 7);
+  say(b[6] == 41.70f && b[7] == 44.70f, "L8: with a block of 7 the given values stay");
+  float c[8] = {1.f, 2.f, 3.f, 4.f, 5.f, 4.f, 0.f, 0.f};  // a falling difference adds nothing
+  extend_step_ms(c, 5, 7);
+  say(c[6] == 4.f && c[7] == 4.f, "L8: a difference below 0 extends flat");
+}
+
 }  // namespace
 
 int main() {
@@ -383,6 +424,8 @@ int main() {
   h4_settings();
   h5_learner();
   l8_block();
+  l8_step();
+  l8_ms();
   std::printf("copy_run_test: %d checks, %d failed, %d controls rejected\n", checks, fails, controls);
   return fails ? 1 : 0;
 }

@@ -284,6 +284,17 @@ the two without the overlap, lets the gate end first. No arithmetic changes. Bas
 - Setting: `DSGB10_GATE_SEP=1` (`MODE[,LO,HI]`, rows 2 to 4 by default; off unless set).
 - Measured: one user 1.4 % faster, inside the spread of the measurement (4 to 5 %).
 
+**A block of 7 drafts for a request alone.** The draft module is trained for 5 drafts a pass; with `DSGB10_DRAFT_MAX=7` the pass of
+one session runs 7 block rows, so a step of text the drafter predicts well may verify up to 7 drafts (rows past the 5 it was trained
+for keep the shipped head's confidence logit, scaled by `DSGB10_CF_TAIL=A,B`). With `DSGB10_DRAFT_DYN=L` the step graph holds two
+draft passes and a step takes the long block only after a step that accepted at least L drafts; with copy rows on, the block also
+waits while a copy cursor is live at the bonus, so copy rows 6 and 7 keep their place. The passes over several entries stay at 5
+rows. Every draft is verified, so the replies are the model's own. Based on pico-dgx-ds4's a40eeb8 by Pico (the block rows of the
+draft pass and the confidence tail; its batch-pass variable and its other levers are not taken); the cursor rule is ours.
+- Setting: `DSGB10_DRAFT_MAX=6|7`, `DSGB10_DRAFT_DYN=L`, `DSGB10_CF_TAIL=A,B` (on every Spark; a `DSGB10_DRAFT_MAX` outside 5..7 or a malformed `DSGB10_CF_TAIL` stops the start; off unless set).
+- Measured: greedy replies bit-equal with the block on; its speed could not be read apart from the long copy steps (the edit bench's
+  runs gave different replies).
+
 ## Drafting
 
 Every drafted token is checked by the model before it counts, so the output is the model's own. [`docs/batching.md`](docs/batching.md)

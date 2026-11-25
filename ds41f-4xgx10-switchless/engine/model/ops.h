@@ -17,7 +17,8 @@ using bf16 = __nv_bfloat16;
 // so the next step can be queued while one runs); step_in copies the next slot to device memory first
 // thing, so one captured graph serves every step of its row count.
 constexpr int kInSlots = 4;
-constexpr int kDrafts = 5;  // DSpark's drafts per pass (dspark::kDraft)
+constexpr int kDrafts = 7;       // DSpark's drafts per one-session pass AT MOST (dspark::kDraft; the pass runs dspark::draft_rows(): 5 unless DSGB10_DRAFT_MAX)
+constexpr int kBatchDrafts = 5;  // the passes over several entries: drafts per entry (dspark::kDraftModel)
 enum : int32_t { kSpecOff = 0, kSpecGiven = 1, kSpecVerify = 2 };
 // How a spec step chooses the next step's drafts (StepIn::gate; spec.cu k_spec_next):
 // - kGateThresh: draft j while survival[j - 1] >= thresh;
@@ -75,7 +76,7 @@ struct StepIn {
   int32_t sbatch;               // 1: a batch spec step (k_spec_in_batch's layout, verdicts per entry)
   int32_t sess_on[kMaxSess];    // entry k takes part in this step (the host writes it before every launch)
   int32_t sess_slot[kMaxSess];  // entry k's session slot
-  int32_t scap[kMaxSess];       // entry k's drafts for the next step, at most (0..kDrafts)
+  int32_t scap[kMaxSess];       // entry k's drafts for the next step, at most (0..kBatchDrafts)
   int32_t spos_end[kMaxSess];   // entry k's rows stay below this position
   float sthresh[kMaxSess];      // entry k's threshold (kGateThresh)
   // night T2/T4: > 0: the next step's rows in all, at most (the entries' caps may sum past it); the gate then
@@ -99,7 +100,7 @@ void step_in(const StepIn* ring, uint32_t* counter, const int32_t* fb, StepIn* d
 constexpr int kTopLogprobs = 20;  // top logprobs per row, at most
 constexpr int kCand = 64;         // candidates per rank and row for top-k / top-p / top logprobs
 constexpr int kOutSlots = 4;
-constexpr int kProbeWords = 100;  // sizeof(dspark::ProbeOut) / 4
+constexpr int kProbeWords = 20 * kDrafts;  // sizeof(dspark::ProbeOut) / 4
 struct SampleRow {
   int32_t token;
   float logprob;   // of token under softmax(logits / T) (T = 1 when greedy), before top-k / top-p

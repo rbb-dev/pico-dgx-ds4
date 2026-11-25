@@ -45,6 +45,7 @@
 // indexes its file (state.cu); this server writes their histories beside it (keep). The next start
 // whose store reused those files reads them back in (load_kept), and the front-end's session ids find
 // their sessions as before the stop.
+#include "dspark/dspark.h"
 #include "server/serve.h"
 #include "server/bounds.h"
 #include "server/cancel.h"
@@ -2535,7 +2536,7 @@ class Server {
       first = m_.wait(k);
       tu.rows_ms += m_.last_gpu_ms();
       first_row = R - 1;
-      S->w = std::max(S->w, pos + R + (m_.spec() ? model::copy::verify_reach(model::ops::kDrafts, (model::copy::mode() & model::copy::kRows) != 0, model::copy::copy_rows()) : 0));  // its draft's block keys
+      S->w = std::max(S->w, pos + R + (m_.spec() ? model::copy::verify_reach(dspark::draft_rows(), (model::copy::mode() & model::copy::kRows) != 0, model::copy::copy_rows()) : 0));  // its draft's block keys
     } else {
       c.op = kCmdPrefill;
       const bool watch = memwatch::chunk_ride_due(mem_watch_on(), now_s(), watch_at_);  // the memory watch rides this chunk
@@ -3180,7 +3181,7 @@ class Server {
     c.spec_gate = o_.spec_gate;
     std::copy(o_.spec_row_ms, o_.spec_row_ms + model::ops::kDrafts + 1, c.spec_row_ms);
     c.spec_tok = f.spec_tok, c.spec_ms = f.spec_ms;  // the drafts' rate goes on from the last run
-    room_for_bookmarks(reclaim::run_snaps(pos, c.max_new, o_.snap_every, model::ops::kDrafts + 2), {h.session_id}, h.session_id, bkf(f));
+    room_for_bookmarks(reclaim::run_snaps(pos, c.max_new, o_.snap_every, dspark::draft_rows() + 2), {h.session_id}, h.session_id, bkf(f));
     const double t_dec = now_s();
     issue(c);
     std::vector<int32_t> samples;
@@ -3279,7 +3280,7 @@ class Server {
       int snaps = 0;
       std::set<uint64_t> run_ids;
       for (int k = 0; k < n; ++k) {
-        snaps += reclaim::run_snaps(e[k].pos0, e[k].max_new, o_.snap_every, model::ops::kDrafts + 2);
+        snaps += reclaim::run_snaps(e[k].pos0, e[k].max_new, o_.snap_every, dspark::draft_rows() + 2);
         run_ids.insert(fl[k].rq.h.session_id);
       }
       room_for_bookmarks(snaps, run_ids, 0, 0);
@@ -3645,11 +3646,14 @@ class Server {
                   de->copy_rows_accepted, de->copy_rho256 / 256.0);
     }
     if (de->vsteps) {
+      char h67[48] = "";  // only with a longer block, so the default log line is as before
+      if (dspark::draft_rows() > dspark::kDraftModel)
+        std::snprintf(h67, sizeof h67, " 6..7: %d %d;", de->rows_hist[6], de->rows_hist[7]);
       std::printf("serve: req %llu drafts: %d verify steps, %.2f drafts verified and %.2f accepted per step, "
-                  "steps verifying 0..5: %d %d %d %d %d %d; gate %.3f (%.3f-%.3f); GPU ms by rows:",
+                  "steps verifying 0..5: %d %d %d %d %d %d;%s gate %.3f (%.3f-%.3f); GPU ms by rows:",
                   (unsigned long long)h.req_id, de->vsteps, (double)de->verified / de->vsteps,
                   (double)de->accepted / de->vsteps, de->rows_hist[0], de->rows_hist[1], de->rows_hist[2],
-                  de->rows_hist[3], de->rows_hist[4], de->rows_hist[5], de->gate_sum / std::max(1, de->gate_n),
+                  de->rows_hist[3], de->rows_hist[4], de->rows_hist[5], h67, de->gate_sum / std::max(1, de->gate_n),
                   de->gate_min, de->gate_max);
       for (int r = 1; r <= model::ops::kDrafts + 1; ++r)
         if (de->gpu_n[r]) std::printf(" %d: %.2f (%d)", r, de->gpu_ms[r] / de->gpu_n[r], de->gpu_n[r]);

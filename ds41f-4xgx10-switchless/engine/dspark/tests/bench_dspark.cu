@@ -192,14 +192,14 @@ int main(int argc, char** argv) {
   // distinct experts per block in this draft (what the MoE reads)
   int* ridx[kBlocks];
   for (int b = 0; b < kBlocks; ++b) {
-    CUDA_CHECK(cudaMalloc(&ridx[b], kDraft * 6 * 4));
+    CUDA_CHECK(cudaMalloc(&ridx[b], kDraftModel * 6 * 4));
     d.taps.route_idx[b] = ridx[b];
   }
   d.draft(token, s);
   CUDA_CHECK(cudaStreamSynchronize(s));
   std::printf("distinct experts per block (5 rows x top-3; the stand-in gathers repeat rank 0's router logits):");
   for (int b = 0; b < kBlocks; ++b) {
-    std::vector<int> h(kDraft * 6);
+    std::vector<int> h(kDraftModel * 6);
     CUDA_CHECK(cudaMemcpy(h.data(), ridx[b], h.size() * 4, cudaMemcpyDeviceToHost));
     std::printf(" %zu", std::set<int>(h.begin(), h.end()).size());
     d.taps.route_idx[b] = nullptr;
@@ -216,18 +216,18 @@ int main(int argc, char** argv) {
   const uint8_t* head = w.head;
   float* lg;
   uint16_t* hx;
-  CUDA_CHECK(cudaMalloc(&lg, (size_t)kDraft * kVocabRank * 4));
-  CUDA_CHECK(cudaMalloc(&hx, (size_t)kDraft * kDim * 2));
-  CUDA_CHECK(cudaMemset(hx, 0, (size_t)kDraft * kDim * 2));
+  CUDA_CHECK(cudaMalloc(&lg, (size_t)kDraftModel * kVocabRank * 4));
+  CUDA_CHECK(cudaMalloc(&hx, (size_t)kDraftModel * kDim * 2));
+  CUDA_CHECK(cudaMemset(hx, 0, (size_t)kDraftModel * kDim * 2));
   dsk::GemvCfg ch{2, 1, 16}, ch8{2, 1, 8}, ch4{mt4, wn4, 8};  // draft()'s (ch4: draft() takes ch8)
   const int hrows = vr ? vr : kVocabRank;
   Graph gh = capture(s, [&] {
     if (head4)  // the MXFP4 head over the rows the pass covers
-      dsk::gemv_fp4w_f32(reinterpret_cast<const __nv_bfloat16*>(hx), kDraft, w.head4, w.head4_s, hrows, kDim, lg, ch4, s);
+      dsk::gemv_fp4w_f32(reinterpret_cast<const __nv_bfloat16*>(hx), kDraftModel, w.head4, w.head4_s, hrows, kDim, lg, ch4, s);
     else if (fp8)  // the FP8 head copy over the rows the pass covers
-      dsk::gemv_fp8w_f32(reinterpret_cast<const __nv_bfloat16*>(hx), kDraft, w.head8, w.head8_s, hrows, kDim, lg, ch8, s);
+      dsk::gemv_fp8w_f32(reinterpret_cast<const __nv_bfloat16*>(hx), kDraftModel, w.head8, w.head8_s, hrows, kDim, lg, ch8, s);
     else
-      dsk::gemv_bf16(reinterpret_cast<const __nv_bfloat16*>(hx), kDraft, head, kVocabRank, kDim, lg, nullptr, ch, false,
+      dsk::gemv_bf16(reinterpret_cast<const __nv_bfloat16*>(hx), kDraftModel, head, kVocabRank, kDim, lg, nullptr, ch, false,
                      s);
   });
 

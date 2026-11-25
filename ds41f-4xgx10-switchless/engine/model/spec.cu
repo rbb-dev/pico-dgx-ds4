@@ -211,6 +211,23 @@ __global__ void k_mh_dump(const uint16_t* mh, const ops::StepIn* in, uint16_t* b
   for (int i = threadIdx.x; i < dspark::kMainK; i += blockDim.x) d[i] = s[i];
 }
 
+// DSGB10_DRAFT_DYN=L: which draft pass this step runs: the long block (DSGB10_DRAFT_MAX rows) after a step that accepted at
+// least L drafts (the text is being predicted well), else the model's own rows. With copy rows on (long steps' cursor kept) the
+// block does not run while a cursor is live at the bonus (copy::block_runs, copy_run.h): the cursor as the step before left it,
+// walked over this step's tokens as k_spec_next will walk it. A match that only k_spec_next finds afterwards is not seen here.
+__global__ void k_spec_dyn(const ops::StepIn* in, const ops::SpecState* ss, copy::Args cp, cudaGraphConditionalHandle h, int L) {
+  if (threadIdx.x != 0) return;
+  const int accepted = ss->count - 1;
+  bool run = accepted >= L;
+  if (run && cp.dev && (in->copy & copy::kRows)) {
+    const int uidx = min(max(in->slot[0], 0), copy::kMaxUnitsCopy - 1);
+    const copy::Unit& u = cp.dev->unit[uidx];
+    if (u.cap > 0)
+      run = copy::block_step(cp.dev->run[uidx], u.tok, u.len, in->spec == ops::kSpecVerify, ss->pos0, in->tokens, ss->count, ss->bonus, L);
+  }
+  cudaGraphSetConditional(h, run ? 1u : 0u);
+}
+
 // After the draft pass: the drafts the next step verifies, by the gate (ops.h; at most max_drafts, its
 // rows below pos_end); then the step is published.
 //
@@ -370,7 +387,7 @@ struct GateOpt {
   int trim16;
   float tc0, tc1;
   int has_cal;
-  float cal[2 * ops::kDrafts];
+  float cal[2 * ops::kBatchDrafts];
   int dump;
   const float *ship0, *mlp0, *feat0;
 };
@@ -402,11 +419,11 @@ __global__ void k_spec_gate_batch_all(const ops::StepIn* in, ops::SpecState* ss,
   int n = 0, nchain = 0;
   if (on) {
     const float* surv_in = surv0 + k * surv_stride;
-    float surv[ops::kDrafts];
-    for (int j = 0; j < ops::kDrafts; ++j) surv[j] = surv_in[j];
+    float surv[ops::kBatchDrafts];
+    for (int j = 0; j < ops::kBatchDrafts; ++j) surv[j] = surv_in[j];
     if (opt.has_cal) {
       float prev_in = 1.f, prev_out = 1.f;
-      for (int j = 0; j < ops::kDrafts; ++j) {
+      for (int j = 0; j < ops::kBatchDrafts; ++j) {
         const float cond = surv_in[j] / fmaxf(prev_in, 1e-12f);
         const float c2 = 1.f / (1.f + expf(-(opt.cal[2 * j] * gate_logit(cond) + opt.cal[2 * j + 1])));
         prev_in = surv_in[j];
@@ -416,7 +433,7 @@ __global__ void k_spec_gate_batch_all(const ops::StepIn* in, ops::SpecState* ss,
     }
     const ops::SpecState& s = ss[k];
     const int P = s.pos0 + s.count;
-    const int maxk = min(min(ops::kDrafts, in->scap[k]), in->spos_end[k] - 1 - P);
+    const int maxk = min(min(ops::kBatchDrafts, in->scap[k]), in->spos_end[k] - 1 - P);
     const float thresh = in->sthresh[k];
     if (opt.dump == 2) {
       n = maxk;
@@ -432,7 +449,7 @@ __global__ void k_spec_gate_batch_all(const ops::StepIn* in, ops::SpecState* ss,
     } else {
       while (n < maxk && surv[n] >= thresh) ++n;
     }
-    for (int j = 0; j < ops::kDrafts; ++j) ssv[k][j] = surv[j];
+    for (int j = 0; j < ops::kBatchDrafts; ++j) ssv[k][j] = surv[j];
     nchain = n;
     if (cp.dev && in->copy) {
       copy::Unit& u = cp.dev->unit[min(max(in->sess_slot[k], 0), copy::kMaxUnitsCopy - 1)];
@@ -483,7 +500,7 @@ __global__ void k_spec_gate_batch_all(const ops::StepIn* in, ops::SpecState* ss,
     }
     if (opt.dump) {
       ops::SampleOut& od = outs[in->step % ops::kOutSlots];
-      for (int j = 0; j < ops::kDrafts; ++j) {
+      for (int j = 0; j < ops::kBatchDrafts; ++j) {
         od.gate_ship[k][j] = opt.ship0 ? opt.ship0[k * surv_stride + j] : 0.f;
         od.gate_mlp[k][j] = opt.mlp0 ? opt.mlp0[k * surv_stride + j] : 0.f;
         od.gate_used[k][j] = surv[j];
@@ -998,11 +1015,11 @@ void Model::Impl::bind_spec(dsw::WeightFile& wf, const dsw::WeightFile* draft) {
                       offsetof(dspark::NoiseSamp, n_top) == offsetof(ops::StepSamp, n_top) &&
                       offsetof(dspark::NoiseSamp, ablit) == offsetof(ops::StepSamp, ablit) && dspark::kNoiseGumbel == ops::kSampGumbel,
                   "dspark::NoiseSamp is ops::StepSamp");
-    static_assert(ops::kGDepths == dspark::kDraft, "the settings hold a Td per drafter depth");
+    static_assert(ops::kGDepths == dspark::kDraftModel, "the settings hold a Td per drafter depth (a deeper draft of the block takes the last one)");
     sp.draft->set_couple(reinterpret_cast<const dspark::NoiseSamp*>(in_d->samp), g.td, g.cf_a, g.cf_b);
     if (rank == 0) {
       std::fprintf(stderr, "spec: coupled drafts for sessions on the Gumbel path (DSGB10_GCOUPLE): Td");
-      for (int j = 0; j < dspark::kDraft; ++j) std::fprintf(stderr, " %.3g", g.td[j]);
+      for (int j = 0; j < ops::kGDepths; ++j) std::fprintf(stderr, " %.3g", g.td[j]);
       std::fprintf(stderr, "; gate logit A lg + B: %g, %g (DSGB10_GCOUPLE_CF)\n", g.cf_a, g.cf_b);
     }
   }
@@ -1017,9 +1034,10 @@ void Model::Impl::bind_spec(dsw::WeightFile& wf, const dsw::WeightFile* draft) {
   // B3 phase 2a: the draft passes over the entries (spec_batch_passes' list and tables, the draft module's
   // batch buffers), with session slots only
   static_assert(ops::kMaxSess <= dspark::kMaxEnts, "every batch entry keeps an anchor and results in the draft module");
-  static_assert(ops::kDrafts == dspark::kDraft, "a pass's rows per entry are the drafter's");
+  static_assert(ops::kDrafts == dspark::kDraft, "a one-session pass's rows are the drafter's");
+  static_assert(ops::kBatchDrafts == dspark::kDraftModel, "a batch pass's rows per entry are the drafter's own");
   sp.bent = dalloc<int>(ops::kMaxSess);
-  sp.pstab = dalloc<int>((size_t)ops::kMaxSess * ops::kDrafts);
+  sp.pstab = dalloc<int>((size_t)ops::kMaxSess * ops::kBatchDrafts);
   sp.mism = dalloc<unsigned>(1);
   if (sp.bents >= 2) sp.draft->enable_batch();
   // DSGB10_BATCH_CF=1 (the batch gate reads the MLP's survival) or DSGB10_GATE_DUMP (the MLP's values and inputs are dumped):
@@ -1245,7 +1263,36 @@ cudaGraphExec_t Model::Impl::spec_graph(int ctx) {
     sp.nodes = nodes;
     CUDA_CHECK(cudaStreamBeginCaptureToGraph(st, g, &wn, nullptr, 1, mode));
   }
-  sp.draft->draft(&sp.ss->bonus, st, slot);
+  static const int dynL = getenv("DSGB10_DRAFT_DYN") ? atoi(getenv("DSGB10_DRAFT_DYN")) : 0;
+  if (dynL > 0 && dspark::draft_rows() > dspark::kDraftModel) {  // a switch over two draft passes (the model's rows / the long block)
+    cudaGraphConditionalHandle hd;
+    CUDA_CHECK(cudaGraphConditionalHandleCreate(&hd, g, 0, 0));
+    k_spec_dyn<<<1, 32, 0, st>>>(in_d, sp.ss, copy::Args{sp.copy ? sp.copy->dev() : nullptr, nullptr}, hd, dynL);
+    CUDA_CHECK(cudaGetLastError());
+    const cudaGraphNode_t* ddeps = nullptr;
+    size_t dn = 0;
+    CUDA_CHECK(cudaStreamGetCaptureInfo(st, &cs, nullptr, nullptr, &ddeps, nullptr, &dn));
+    const std::vector<cudaGraphNode_t> dtail(ddeps, ddeps + dn);
+    CUDA_CHECK(cudaStreamEndCapture(st, &cap));
+    cudaGraphNodeParams dp{};
+    dp.type = cudaGraphNodeTypeConditional;
+    dp.conditional.handle = hd;
+    dp.conditional.type = cudaGraphCondTypeSwitch;
+    dp.conditional.size = 2;
+    cudaGraphNode_t dsw;
+    CUDA_CHECK(cudaGraphAddNode(&dsw, g, dtail.data(), nullptr, dtail.size(), &dp));
+    for (int b = 0; b < 2; ++b) {
+      CUDA_CHECK(cudaStreamBeginCaptureToGraph(st, dp.conditional.phGraph_out[b], nullptr, nullptr, 0, mode));
+      sp.draft->draft(&sp.ss->bonus, st, slot, 0, b ? dspark::draft_rows() : dspark::kDraftModel);
+      CUDA_CHECK(cudaStreamEndCapture(st, &cap));
+    }
+    CUDA_CHECK(cudaStreamBeginCaptureToGraph(st, g, &dsw, nullptr, 1, mode));
+    if (rank == 0 && !sp.quiet)
+      std::printf("spec: draft pass by step (DSGB10_DRAFT_DYN=%d): %d rows after %d accepted drafts and no live copy cursor, else %d\n",
+                  dynL, dspark::draft_rows(), dynL, dspark::kDraftModel);
+  } else {
+    sp.draft->draft(&sp.ss->bonus, st, slot);
+  }
   if (opt.tree_probe) {  // EXPERIMENT (docs/engine.md, "Draft trees")
     sp.draft->probe(in_d->probe, st);
     k_probe_out<<<1, 128, 0, st>>>(in_d, sp.draft->probe_out(), out_h);
@@ -1398,7 +1445,7 @@ cudaGraphExec_t Model::Impl::spec_batch_graph(int ctx) {
         bp.n = std::min(per, S - c0);
         bp.tok = &sp.ss[0].bonus;
         bp.tok_stride = (int)(sizeof(ops::SpecState) / sizeof(int32_t));
-        bp.slot = sp.pstab + (size_t)c0 * ops::kDrafts;
+        bp.slot = sp.pstab + (size_t)c0 * ops::kBatchDrafts;
         sp.draft->draft_batch(bp, st);
       }
       CUDA_CHECK(cudaStreamEndCapture(st, &cap));
@@ -1449,8 +1496,8 @@ cudaGraphExec_t Model::Impl::spec_batch_graph(int ctx) {
     if (const char* e = getenv("DSGB10_BATCH_CAL"); e && *e) {
       float* c = o.cal;
       if (std::sscanf(e, "%f,%f,%f,%f,%f,%f,%f,%f,%f,%f", c, c + 1, c + 2, c + 3, c + 4, c + 5, c + 6, c + 7, c + 8,
-                      c + 9) != 2 * ops::kDrafts)
-        die("spec: DSGB10_BATCH_CAL=%s: not %d numbers (a1,b1,..,a5,b5)", e, 2 * ops::kDrafts);
+                      c + 9) != 2 * ops::kBatchDrafts)
+        die("spec: DSGB10_BATCH_CAL=%s: not %d numbers (a1,b1,..,a5,b5)", e, 2 * ops::kBatchDrafts);
       o.has_cal = 1;
     }
     o.dump = gate_dump_mode();
@@ -1556,15 +1603,14 @@ void Model::Impl::spec_use_slot(int s) {
 void Model::Impl::spec_fill(ops::StepIn& in, int mode, const SpecCfg& c) {
   in.spec = mode;
   in.thresh = c.thresh;
-  in.max_drafts = std::max(0, std::min(ops::kDrafts, c.max_drafts));
+  in.max_drafts = std::max(0, std::min(dspark::draft_rows(), c.max_drafts));
   in.pos_end = std::min(c.pos_end, opt.max_ctx);
   in.force = c.force;
   std::copy(c.probe, c.probe + ops::kDrafts, in.probe);
   in.gate = c.gate;
   std::copy(c.step_ms, c.step_ms + ops::kDrafts + 1, in.step_ms);
   // copy rows reach past the chain's: the modelled ms of 6 and 7 drafts, by the last difference
-  for (int i = ops::kDrafts + 1; i <= ops::kCopyDrafts; ++i)
-    in.step_ms[i] = in.step_ms[i - 1] + std::max(0.f, in.step_ms[i - 1] - in.step_ms[i - 2]);
+  copy::extend_step_ms(in.step_ms, dspark::draft_rows(), ops::kCopyDrafts);
   in.copy = spec && spec->copy ? copy::mode() | (spec->xlong ? copy::long_bits() : 0) : 0;
   in.copy_min = copy::min_match();
 }
@@ -1636,7 +1682,7 @@ void Model::Impl::spec_fill_batch(ops::StepIn& in, int mode, const SpecBatch& b)
     const bool has = k < b.n;
     in.sess_on[k] = has && b.on[k] ? 1 : 0;
     in.sess_slot[k] = has ? unit_of[b.slot[k]] : 0;
-    in.scap[k] = has ? std::max(0, std::min(ops::kDrafts, b.cap[k])) : 0;
+    in.scap[k] = has ? std::max(0, std::min(ops::kBatchDrafts, b.cap[k])) : 0;
     in.spos_end[k] = has ? std::min(b.pos_end[k], slot_ctx_[b.slot[k]]) : 0;
     in.sthresh[k] = has ? b.thresh[k] : 0.f;
   }
@@ -1664,7 +1710,7 @@ int Model::Impl::spec_batch_check(const SpecBatch& b, bool given) {
     if (b.slot[k] < 0 || b.slot[k] >= nslots) die("model: batch spec entry %d in slot %d", k, b.slot[k]);
     for (int q = 0; q < k; ++q)
       if (b.on[q] && b.slot[q] == b.slot[k]) die("model: batch spec entries %d and %d share slot %d", q, k, b.slot[k]);
-    if (b.cap[k] < 0 || b.cap[k] > ops::kDrafts || 1 + b.cap[k] > kMaxSessRows)
+    if (b.cap[k] < 0 || b.cap[k] > ops::kBatchDrafts || 1 + b.cap[k] > kMaxSessRows)
       die("model: batch spec entry %d with %d drafts", k, b.cap[k]);
     rows += 1 + b.cap[k];
     if (given && (b.token[k] < 0 || b.pos0[k] < 0 || b.pos0[k] >= slot_ctx_[b.slot[k]]))

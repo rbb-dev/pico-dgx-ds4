@@ -433,11 +433,11 @@ struct Args {
   std::string ablit;          // --ablit FILE: the runtime abliteration (model/ablit.h); requests opt in per request
   int node_stats_port = 9760;  // serve: the dashboard's node sampler on this rank's first link address (0: none)
   std::string node_stats_addr, node_stats_rails[2];  // from the fleet file: that address, the rails' devices
-  int spec_drafts = 5;
+  int spec_drafts = -1;  // -1: the one-session pass's rows (dspark::draft_rows(), DSGB10_DRAFT_MAX; 5 by default)
   float spec_thresh = -1.f;
   float spec_cost[3] = {19.4f, 3.6f, 3.3f};
   int spec_gate = model::ops::kGateThresh;
-  float spec_row_ms[model::ops::kDrafts + 1] = {21.10f, 25.38f, 29.26f, 32.76f, 35.61f, 38.70f};
+  float spec_row_ms[model::ops::kDrafts + 1] = {21.10f, 25.38f, 29.26f, 32.76f, 35.61f, 38.70f, 41.70f, 44.70f};
 };
 
 Args parse(int argc, char** argv) {
@@ -712,7 +712,8 @@ Args parse(int argc, char** argv) {
        a.chain_every < 0))
     die("--route-file FILE [--route-every 1..%d] [--chain-every N] [--props FILE]: --mode spectf only",
         model::kMaxSessRows);
-  if (a.spec_drafts < 0 || a.spec_drafts > model::ops::kDrafts) die("--spec-drafts must be 0..5");
+  if (a.spec_drafts < 0) a.spec_drafts = dspark::draft_rows();  // after every --setenv
+  if (a.spec_drafts > model::ops::kDrafts) die("--spec-drafts must be 0..%d", model::ops::kDrafts);
   if (a.spec && (a.mode == "decode" || a.mode == "generate") && !a.big)
     die("--spec: the prompt goes through the prefill path (--big), which fills the draft module's windows");
   for (int k : a.ks) {
@@ -1436,6 +1437,7 @@ int main(int argc, char** argv) {
                 e.vsteps, (double)e.verified / e.vsteps, (double)e.accepted / e.vsteps,
                 e.verified ? 100.0 * e.accepted / e.verified : 0.0, 1.0 + (double)e.accepted / e.vsteps, e.rows_hist[0],
                 e.rows_hist[1], e.rows_hist[2], e.rows_hist[3], e.rows_hist[4], e.rows_hist[5]);
+    if (e.rows_hist[6] + e.rows_hist[7]) std::printf("  steps verifying 6, 7 drafts: %d %d\n", e.rows_hist[6], e.rows_hist[7]);
     std::printf("  verify-length gate (%s): mean %.3f, min %.3f, max %.3f over %d steps\n",
                 a.spec_gate == model::ops::kGateRatio      ? "ratio; lambda, tokens per ms"
                 : a.spec_gate == model::ops::kGateMarginal ? "marginal; lambda, tokens per ms"
@@ -1862,7 +1864,7 @@ int main(int argc, char** argv) {
           static_assert(sizeof p == sizeof o.probe, "ProbeOut");
           std::memcpy(&p, o.probe, sizeof p);
           std::string id = "[", pr = "[";
-          for (int j = 0; j < model::ops::kDrafts; ++j) {
+          for (int j = 0; j < dspark::draft_rows(); ++j) {
             id += (j ? "," : "") + ints(p.id[j], dspark::kProbeK);
             pr += (j ? "," : "") + flts(p.p[j], dspark::kProbeK);
           }
@@ -1877,12 +1879,12 @@ int main(int argc, char** argv) {
                        flts(o.top_lp[0], o.n_top).c_str());
         }
         int acc = 0;
-        while (acc < model::ops::kDrafts && i + 2 + acc < SL && o.drafts[acc] == tk[i + 2 + acc]) ++acc;
+        while (acc < dspark::draft_rows() && i + 2 + acc < SL && o.drafts[acc] == tk[i + 2 + acc]) ++acc;
         std::printf("%sspectf %d: drafts %d %d %d %d %d, survival %.4f %.4f %.4f %.4f %.4f, %d equal\n", pre, i,
                     o.drafts[0], o.drafts[1], o.drafts[2], o.drafts[3], o.drafts[4], o.survival[0], o.survival[1],
                     o.survival[2], o.survival[3], o.survival[4], acc);
         ++hist[acc];
-        for (int j = 0; j < model::ops::kDrafts && j <= acc && i + 2 + j < SL; ++j) {  // P(d_j+1 | d_1..d_j accepted)
+        for (int j = 0; j < dspark::draft_rows() && j <= acc && i + 2 + j < SL; ++j) {  // P(d_j+1 | d_1..d_j accepted)
           const double prev = j ? o.survival[j - 1] : 1.0;
           conf[j] += prev > 0 ? o.survival[j] / prev : 0.0;
           rate[j] += j < acc;
@@ -1908,8 +1910,8 @@ int main(int argc, char** argv) {
             route_rec((int)sq, 0, A, std::min(a.route_every, SL - A), tk + A);
           if (a.chain_every > 0 && (i - first) % a.chain_every == 0) {
             int32_t r[1 + model::ops::kDrafts] = {tk[A]};
-            std::copy(drafts, drafts + model::ops::kDrafts, r + 1);
-            route_rec((int)sq, 1, A, 1 + model::ops::kDrafts, r);
+            std::copy(drafts, drafts + dspark::draft_rows(), r + 1);
+            route_rec((int)sq, 1, A, 1 + dspark::draft_rows(), r);
           }
           const auto it = props.find({(int)sq, A});
           if (it != props.end())

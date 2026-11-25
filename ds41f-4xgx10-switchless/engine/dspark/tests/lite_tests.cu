@@ -177,7 +177,7 @@ std::vector<Out> run_module(const Weights& w, const std::string& golden, int ste
       CUDA_CHECK(cudaMemcpy(count, &n, 4, cudaMemcpyHostToDevice));
       CUDA_CHECK(cudaMemcpy(pos0, &p, 4, cudaMemcpyHostToDevice));
     };
-    float *lg = dev<float>((size_t)kDraft * kVocabRank), *bias = dev<float>((size_t)kDraft * kVocabRank);
+    float *lg = dev<float>((size_t)kDraftModel * kVocabRank), *bias = dev<float>((size_t)kDraftModel * kVocabRank);
     d.taps.logits = lg, d.taps.bias = bias;
     const int anchor0 = 100;
     for (int p = 0; p <= anchor0; p += kMaxAcc) {
@@ -194,7 +194,7 @@ std::vector<Out> run_module(const Weights& w, const std::string& golden, int ste
       CUDA_CHECK(cudaMemcpy(token, &tok, 4, cudaMemcpyHostToDevice));
       d.draft(token, s);
       CUDA_CHECK(cudaStreamSynchronize(s));
-      const size_t n = (size_t)kDraft * kVocabRank;
+      const size_t n = (size_t)kDraftModel * kVocabRank;
       outs.push_back({host(lg, n), host(bias, n), host(d.logits(), n), host(d.confidence(), 16), host(d.ids(), 6)});
     }
     for (void* p : {(void*)x, (void*)mh, (void*)count, (void*)pos0, (void*)token, (void*)lg, (void*)bias})

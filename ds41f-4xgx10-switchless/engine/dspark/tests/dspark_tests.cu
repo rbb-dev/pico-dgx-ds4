@@ -55,7 +55,7 @@ using dspark::Cand;
 using dspark::GatherSeg;
 using dspark::kBlocks;
 using dspark::kDim;
-using dspark::kDraft;
+constexpr int kDraft = dspark::kDraftModel;  // the rows the passes run unset (dspark::kDraft is the most a pass can run)
 using dspark::kHc;
 using dspark::kMainK;
 using dspark::kMaxAcc;

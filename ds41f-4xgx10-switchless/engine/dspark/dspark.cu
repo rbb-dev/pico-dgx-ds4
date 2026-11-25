@@ -1,4 +1,6 @@
 // DSpark draft module: kernels and host side (dspark.h, README.md).
+#include <cstdio>
+#include <cstdlib>
 #include "dspark/dspark.h"
 
 #include <string>
@@ -29,6 +31,20 @@ constexpr int kSplits = 3;           // sparse_attn CTAs per row: the window's 3
 constexpr int kMarkovCtas = kVocabRank / 64;  // 505 CTAs x 8 warps x 8 rows
 constexpr int kStreamBytes = kDraft * kHc * kDim * 2;
 constexpr int kTopKPad = dsk::kTopK;  // dsk::moe's picks per row
+
+// The block rows of draft() in device memory (DSGB10_DRAFT_MAX), set once by the first Draft and read by the kernels
+// below; the passes over several entries always run kDraftModel rows.
+__device__ int g_nd1 = kDraftModel;
+__global__ void nd_set_kernel(int a) { g_nd1 = a; }
+__global__ void nd_get_kernel(int* o) { o[0] = g_nd1; }
+__global__ void nd_set1_kernel(int a) { g_nd1 = a; }  // DSGB10_DRAFT_DYN: first in each body of the step's draft switch
+int nd_env(const char* name) {
+  const char* e = getenv(name);
+  if (!e || !*e) return kDraftModel;
+  const int v = atoi(e);
+  if (v < kDraftModel || v > kDraft) die("%s=%s: %d..%d", name, e, kDraftModel, kDraft);
+  return v;
+}
 
 __nv_bfloat16* bf(uint16_t* p) { return reinterpret_cast<__nv_bfloat16*>(p); }
 const __nv_bfloat16* bf(const uint16_t* p) { return reinterpret_cast<const __nv_bfloat16*>(p); }
@@ -116,7 +132,7 @@ __global__ void __launch_bounds__(kDim / 8) draft_prep_kernel(const int* token, 
     const int p = *start;
     pos[j] = p + 1 + j;
     lo[j] = max(0, p - (attn::kWindow - 1));
-    hi[j] = p + kDraft;
+    hi[j] = p + g_nd1;
     if (j == 0) ids[0] = id;
   }
 }
@@ -131,7 +147,7 @@ __global__ void __launch_bounds__(kDim / 8) draft_prep_batch_kernel(const int* e
                                                                     float* pre, int* ids) {
   pdl_trigger();
   pdl_wait();
-  const int j = blockIdx.x, q = blockIdx.y, r = q * kDraft + j, t = threadIdx.x;
+  const int j = blockIdx.x, q = blockIdx.y, r = q * kDraftModel + j, t = threadIdx.x;
   const int e = ent[q];
   const int id = j == 0 ? tok[e * tok_stride] : kNoiseToken;
   const uint4 v = reinterpret_cast<const uint4*>(rows + (size_t)(j == 0 ? q : gridDim.y) * kDim)[t];
@@ -143,7 +159,7 @@ __global__ void __launch_bounds__(kDim / 8) draft_prep_batch_kernel(const int* e
     const int p = start[e];
     pos[r] = p + 1 + j;
     lo[r] = max(0, p - (attn::kWindow - 1));
-    hi[r] = p + kDraft;
+    hi[r] = p + kDraftModel;
     if (j == 0) ids[8 * e] = id;
   }
 }
@@ -157,7 +173,7 @@ template <bool BATCH>
 __global__ void __launch_bounds__(32 * kDraft) router3_kernel(const float* logits, const float* bias, int* idx,
                                                               float* wts, bool zdup) {
   pdl_trigger();
-  const int r = (BATCH ? blockIdx.x * kDraft : 0) + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+  const int r = (BATCH ? blockIdx.x * kDraftModel : 0) + (threadIdx.x >> 5), lane = threadIdx.x & 31;
   float b[4];
 #pragma unroll
   for (int j = 0; j < 4; ++j) b[j] = bias[lane + 32 * j];
@@ -229,7 +245,7 @@ __global__ void __launch_bounds__(256) markov_kernel(int j, const uint16_t* mrow
   pdl_trigger();
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   const int g = blockIdx.x * 8 + warp;
-  const int q = BATCH ? blockIdx.y : 0, jr = BATCH ? q * kDraft + j : j, cs = BATCH ? kCandStride : 1;
+  const int q = BATCH ? blockIdx.y : 0, jr = BATCH ? q * kDraftModel + j : j, cs = BATCH ? kCandStride : 1;
   if constexpr (BATCH) {
     cta += q * kMarkovCtas;
     counter += q;
@@ -343,7 +359,8 @@ __global__ void __launch_bounds__(32 * kDraft) conf_kernel(const uint16_t* hx, c
   pdl_trigger();
   pdl_wait();
   const int j = threadIdx.x >> 5, lane = threadIdx.x & 31;
-  const int q = BATCH ? blockIdx.x : 0, jr = BATCH ? q * kDraft + j : j, cs = BATCH ? kCandStride : 1;
+  const int q = BATCH ? blockIdx.x : 0, jr = BATCH ? q * kDraftModel + j : j, cs = BATCH ? kCandStride : 1;
+  const int nd = BATCH ? kDraftModel : g_nd1;
   if constexpr (BATCH) {
     const int e = ent[q];
     ids += 8 * e;
@@ -370,10 +387,11 @@ __global__ void __launch_bounds__(32 * kDraft) conf_kernel(const uint16_t* hx, c
   __syncthreads();
   if (threadIdx.x == 0) {
     float p = 1.f;
-    for (int i = 0; i < kDraft; ++i) {
+    for (int i = 0; i < nd; ++i) {
       p *= 1.f / (1.f + expf(-c[i]));
       conf[8 + i] = p;
     }
+    for (int i = nd; i < kDraft; ++i) conf[8 + i] = 0.f;
   }
 }
 
@@ -469,7 +487,7 @@ __global__ void probe_merge_kernel(const float* grec, const int* path, const flo
   pdl_trigger();
   pdl_wait();
   const int j = threadIdx.x;
-  if (j >= kDraft) return;
+  if (j >= g_nd1) return;
   auto rec = [&](int r) { return grec + (r * kDraft + j) * kProbeRec; };
   float m = -INFINITY;
   for (int r = 0; r < kRanks; ++r) m = fmaxf(m, rec(r)[2 * kProbeK]);
@@ -534,12 +552,15 @@ __global__ void __launch_bounds__(1024) cf_scan_kernel(const float* dl, int vbas
 }
 // Every rank's records (gathered in rank order) and the shipped confidence logits -> the MLP's logits in out[0..4] and
 // their survival in out[8..12]. One thread, a fixed order of fp32 operations: the same bits on every rank. rec(r, j): rank
-// r's record of depth j (4 floats); cin: the shipped logits [5]; raw: this draft's 15 inputs are written to rawout.
+// r's record of depth j (4 floats); cin: the shipped logits [nd]; raw: this draft's 15 inputs are written to rawout. The MLP
+// covers the first kCfD depths; a deeper draft (nd > kCfD, the one-session block of DSGB10_DRAFT_MAX) keeps the shipped
+// head's logit, scaled A tail_a + B (DSGB10_CF_TAIL).
 template <class Rec>
 __device__ void cf_mlp_core(Rec rec, const float* cin, const float* w, float* out_conf, int dbg, float* rawout, bool cpl,
-                            float ca, float cb) {
+                            float ca, float cb, int nd, float tail_a, float tail_b) {
   float x[kCfIn], raw[kCfIn], c[kDraft];
-  for (int j = 0; j < kDraft; ++j) {
+  for (int j = kCfD; j < nd; ++j) c[j] = cin[j];
+  for (int j = 0; j < kCfD; ++j) {
     float M = -INFINITY;
     for (int r = 0; r < kRanks; ++r) M = fmaxf(M, rec(r, j)[0]);
     float S2 = -INFINITY, s = 0.f;
@@ -552,40 +573,49 @@ __device__ void cf_mlp_core(Rec rec, const float* cin, const float* w, float* ou
       s = __fmaf_rn(rec(r, j)[2], expf(a - M), s);
     }
     c[j] = cin[j];
-    raw[j] = c[j], raw[kDraft + j] = M - S2, raw[2 * kDraft + j] = -logf(s);
+    raw[j] = c[j], raw[kCfD + j] = M - S2, raw[2 * kCfD + j] = -logf(s);
   }
   for (int i = 0; i < kCfIn; ++i) rawout[i] = raw[i];
   const float *mu = w, *sd = mu + kCfIn, *w1 = sd + kCfIn, *b1 = w1 + kCfHid * kCfIn, *w2 = b1 + kCfHid,
-              *b2 = w2 + kDraft * kCfHid, *a = b2 + kDraft;
+              *b2 = w2 + kCfD * kCfHid, *a = b2 + kCfD;
   for (int i = 0; i < kCfIn; ++i) x[i] = __fdiv_rn(__fsub_rn(raw[i], mu[i]), sd[i]);
-  float out[kDraft];
-  for (int j = 0; j < kDraft; ++j) out[j] = b2[j];
+  float out[kCfD];
+  for (int j = 0; j < kCfD; ++j) out[j] = b2[j];
   for (int k = 0; k < kCfHid; ++k) {
     float h = b1[k];
     for (int i = 0; i < kCfIn; ++i) h = __fmaf_rn(w1[k * kCfIn + i], x[i], h);
     h = fmaxf(h, 0.f);
-    for (int j = 0; j < kDraft; ++j) out[j] = __fmaf_rn(w2[j * kCfHid + k], h, out[j]);
+    for (int j = 0; j < kCfD; ++j) out[j] = __fmaf_rn(w2[j * kCfHid + k], h, out[j]);
   }
   float p = 1.f;
-  for (int j = 0; j < kDraft; ++j) {
+  for (int j = 0; j < kCfD; ++j) {
     float lg = __fmaf_rn(a[j], c[j], out[j]);
     if (cpl) lg = __fmaf_rn(ca, lg, cb);  // DSGB10_GCOUPLE_CF: the MLP was fitted on argmax drafts
     p *= 1.f / (1.f + expf(-lg));
     if (dbg == 0) out_conf[j] = lg, out_conf[8 + j] = p;
-    else out_conf[8 + j] = raw[dbg * kDraft + j];
+    else out_conf[8 + j] = raw[dbg * kCfD + j];
   }
+  for (int j = kCfD; j < nd; ++j) {  // the drafts past the MLP's depths
+    float lg = __fmaf_rn(tail_a, c[j], tail_b);
+    if (cpl) lg = __fmaf_rn(ca, lg, cb);
+    p *= 1.f / (1.f + expf(-lg));
+    if (dbg == 0) out_conf[j] = lg, out_conf[8 + j] = p;
+    else out_conf[8 + j] = 0.f;
+  }
+  for (int j = nd; j < kDraft; ++j) out_conf[8 + j] = 0.f;
 }
 // nz (null: off), en0: the entry whose sampling decides whether the gate logit takes A lg + B (ca, cb)
 __global__ void cf_mlp_kernel(const float* grec, const float* w, float* conf, int dbg, float* rawout, const NoiseSamp* nz, int en0,
-                              float ca, float cb) {
+                              float ca, float cb, float tail_a, float tail_b) {
   pdl_trigger();
   pdl_wait();
   if (threadIdx.x) return;
-  auto rec = [&](int r, int j) { return grec + (r * kDraft + j) * 4; };
+  const int nd = g_nd1;  // the gathered records are [rank][nd]
+  auto rec = [&](int r, int j) { return grec + (r * nd + j) * 4; };
   const bool cpl = nz && nz_on(nz[en0].temperature, nz[en0].top_k);
-  cf_mlp_core(rec, conf, w, conf, dbg, rawout, cpl, ca, cb);
+  cf_mlp_core(rec, conf, w, conf, dbg, rawout, cpl, ca, cb, nd, tail_a, tail_b);
 }
-// BATCH: a thread of block q for the pass's entry q (entry ent[q], rows kDraft q ..): its records from every rank (a
+// BATCH: a thread of block q for the pass's entry q (entry ent[q], rows kDraftModel q ..): its records from every rank (a
 // rank's block of the gather holds the pass's rows, nrows of them), its shipped logits in conf (entry stride 16) -> its
 // MLP logits and survival in out and its inputs in raw (the shipped results stay in conf).
 __global__ void cf_mlp_batch_kernel(const float* grec, int nrows, const float* w, const float* conf, float* out, float* raw,
@@ -594,9 +624,9 @@ __global__ void cf_mlp_batch_kernel(const float* grec, int nrows, const float* w
   pdl_wait();
   if (threadIdx.x) return;
   const int q = blockIdx.x, k = ent[q];
-  auto rec = [&](int r, int j) { return grec + ((size_t)r * nrows + q * kDraft + j) * 4; };
+  auto rec = [&](int r, int j) { return grec + ((size_t)r * nrows + q * kDraftModel + j) * 4; };
   const bool cpl = nz && nz_on(nz[k].temperature, nz[k].top_k);
-  cf_mlp_core(rec, conf + 16 * k, w, out + 16 * k, 0, raw + 16 * k, cpl, ca, cb);
+  cf_mlp_core(rec, conf + 16 * k, w, out + 16 * k, 0, raw + 16 * k, cpl, ca, cb, kDraftModel, 1.f, 0.f);
 }
 
 // ---- STAND-IN collectives -----------------------------------------------------------------------------------
@@ -713,6 +743,11 @@ Weights weights_from(std::initializer_list<const dsw::WeightFile*> files) {
   w.markov_head = f.u8("mtp.2.markov_head.head.weight", (uint64_t)kVocabRank * kMarkov * 2);
   w.conf = f.u16("mtp.2.confidence_head.proj.weight", kDim + kMarkov);
   return w;
+}
+
+int draft_rows() {
+  static const int v = nd_env("DSGB10_DRAFT_MAX");
+  return v;
 }
 
 void main_hidden(const uint16_t* x, int rows, int slot, uint16_t* mh, bool pdl, cudaStream_t s) {
@@ -1012,6 +1047,18 @@ Draft::Draft(const Weights& w, int rank, Comm* comm, const float2* table, int sl
   }
   ids_ = b.ids;
   conf_ = b.conf;
+  {  // the block rows into device memory, read back (every rank the same environment)
+    int* o;
+    int got = -1;
+    CUDA_CHECK(cudaMalloc(&o, 4));
+    nd_set_kernel<<<1, 1>>>(draft_rows());
+    nd_get_kernel<<<1, 1>>>(o);
+    CUDA_CHECK(cudaMemcpy(&got, o, 4, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaFree(o));
+    if (got != draft_rows()) die("dspark::Draft: block rows %d on the device", got);
+    if (rank == 0 && draft_rows() > kDraftModel)
+      std::fprintf(stderr, "dspark: block rows %d (one session, DSGB10_DRAFT_MAX)\n", got);
+  }
   if (const char* v = getenv("DSPARK_VROWS")) {  // EXPERIMENT, bench only
     vrows_ = atoi(v);
     if (vrows_ < 64 || vrows_ > kVocabRank || vrows_ % 64) die("DSPARK_VROWS=%s", v);
@@ -1057,11 +1104,11 @@ void tap(void* dst, const void* src, size_t bytes, cudaStream_t s) {
 void copy_in(void* dst, const void* src, size_t bytes, cudaStream_t s) {
   if (src) CUDA_CHECK(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, s));
 }
-void tap_mix(float* dst, const float* pre, const float* post, const float* comb, cudaStream_t s) {
+void tap_mix(float* dst, const float* pre, const float* post, const float* comb, int nd, cudaStream_t s) {
   if (!dst) return;
-  CUDA_CHECK(cudaMemcpy2DAsync(dst, 24 * 4, pre, 16, 16, kDraft, cudaMemcpyDeviceToDevice, s));
-  CUDA_CHECK(cudaMemcpy2DAsync(dst + 4, 24 * 4, post, 16, 16, kDraft, cudaMemcpyDeviceToDevice, s));
-  CUDA_CHECK(cudaMemcpy2DAsync(dst + 8, 24 * 4, comb, 64, 64, kDraft, cudaMemcpyDeviceToDevice, s));
+  CUDA_CHECK(cudaMemcpy2DAsync(dst, 24 * 4, pre, 16, 16, nd, cudaMemcpyDeviceToDevice, s));
+  CUDA_CHECK(cudaMemcpy2DAsync(dst + 4, 24 * 4, post, 16, 16, nd, cudaMemcpyDeviceToDevice, s));
+  CUDA_CHECK(cudaMemcpy2DAsync(dst + 8, 24 * 4, comb, 64, 64, nd, cudaMemcpyDeviceToDevice, s));
 }
 }  // namespace
 
@@ -1098,14 +1145,16 @@ void Draft::accept(const uint16_t* mh, const int* count, const int* pos0, cudaSt
 void Draft::mix(const uint16_t* x, const float* fn, const float* fn_all, const float* scale, const float* base,
                 const uint16_t* norm, cudaStream_t s) {
   Buf& b = *b_;
+  const int nd = nd_cur_ ? nd_cur_ : draft_rows();
+  const size_t chunk_bytes = (size_t)10 * nd * 25 * 4;  // this rank's 10 chunks of the rows
   if (fn_all) {
-    attn::hc_project(x, kDraft, fn_all, 0, kHc * kDim, b.chunks, true, s, 0);
+    attn::hc_project(x, nd, fn_all, 0, kHc * kDim, b.chunks, true, s, 0);
   } else {
-    attn::hc_project(x, kDraft, fn, kDim * rank_, kDim * (rank_ + 1), b.chunks_r, true, s, kDim);
-    const GatherSeg g{b.chunks_r, kChunkBytes, b.chunks, kChunkBytes, kChunkBytes, 1};
+    attn::hc_project(x, nd, fn, kDim * rank_, kDim * (rank_ + 1), b.chunks_r, true, s, kDim);
+    const GatherSeg g{b.chunks_r, chunk_bytes, b.chunks, chunk_bytes, chunk_bytes, 1};
     comm_->all_gather(&g, 1, s);  // COLLECTIVE: all-gather of the hc projection chunks (40 in rank order)
   }
-  attn::hc_mix(x, b.chunks, kHcChunks, kDraft, scale, base, norm, b.pre, b.post, b.comb, b.y, b.xq, b.xs, true, s,
+  attn::hc_mix(x, b.chunks, kHcChunks, nd, scale, base, norm, b.pre, b.post, b.comb, b.y, b.xq, b.xs, true, s,
                b.pre);
 }
 
@@ -1127,86 +1176,91 @@ const uint16_t* Draft::markov_exchange(int j, const int* forced, const Cand* gca
   return sum;
 }
 
-void Draft::draft(const int* token, cudaStream_t s, const int* slot, int ent) {
+void Draft::draft(const int* token, cudaStream_t s, const int* slot, int ent, int rows) {
   Buf& b = *b_;
+  if (rows && (rows < kDraftModel || rows > draft_rows())) die("dspark::Draft: draft() of %d rows", rows);
+  const int nd = rows ? rows : draft_rows();
+  nd_cur_ = nd;
+  if (rows) nd_set1_kernel<<<1, 1, 0, s>>>(nd);  // this body's rows, before its kernels read them
+  const size_t stream_bytes = (size_t)nd * kHc * kDim * 2;
   // wq_b and wo_b with two MMA tiles per warp: half the CTAs, each row's sums as with one (~10 us less per block)
   dsk::GemvCfg c8k{1, 1, 8}, cqb{2, 1, 8}, cob{2, 1, 16}, cw{1, 4, 4}, cg{1, 1, 8}, ch{2, 1, 16}, ch8{2, 1, 8};
   c8k.tiled = cqb.tiled = cob.tiled = true;
   dsk::MoeCfg mc{};
   mc.down = 4;
-  const size_t rows_bytes = (size_t)kDraft * kDim * 2;
+  const size_t rows_bytes = (size_t)nd * kDim * 2;
   embed_exchange(nullptr, token, 1, 1, b.epart, b.esum, s);  // COLLECTIVE: all-reduce of the token's and the noise token's rows
-  launch(draft_prep_kernel, dim3(kDraft), dim3(kDim / 8), 0, s, true, token, (const int*)b.start, (const uint16_t*)b.esum,
+  launch(draft_prep_kernel, dim3(nd), dim3(kDim / 8), 0, s, true, token, (const int*)b.start, (const uint16_t*)b.esum,
          b.xa, b.pos, b.lo, b.hi, b.pre, ids_);
   for (int i = 0; i < kBlocks; ++i) {
     const BlockW& w = w_.b[i];
     // ---- attention sublayer: SWA over the window's last 128 main positions and the block itself
-    copy_in(b.xa, inject.stream[i], kStreamBytes, s);
-    copy_in(b.pre, inject.pre[i], kDraft * 16, s);
+    copy_in(b.xa, inject.stream[i], stream_bytes, s);
+    copy_in(b.pre, inject.pre[i], nd * 16, s);
     mix(b.xa, w.attn_fn, w.attn_fn_all, w.attn_scale, w.attn_base, w.attn_norm, s);
-    tap_mix(taps.mix[i][0], b.pre, b.post, b.comb, s);
+    tap_mix(taps.mix[i][0], b.pre, b.post, b.comb, nd, s);
     tap(taps.attn_in[i], b.y, rows_bytes, s);
     const dsk::Fp8Seg seg[2] = {{w.wq_a, w.wq_a_s, bf(b.qa_r), 320}, {w.wkv, w.wkv_s, bf(b.kvp_r), 128}};
-    dsk::gemv_fp8_multi(b.xq, b.xs, kDraft, seg, 2, kDim, c8k, s);
-    const GatherSeg g[2] = {{b.qa_r, 320 * 2, b.qa, kQLora * 2, 320 * 2, kDraft},
-                            {b.kvp_r, 128 * 2, b.kvp, 512 * 2, 128 * 2, kDraft}};
+    dsk::gemv_fp8_multi(b.xq, b.xs, nd, seg, 2, kDim, c8k, s);
+    const GatherSeg g[2] = {{b.qa_r, 320 * 2, b.qa, kQLora * 2, 320 * 2, nd},
+                            {b.kvp_r, 128 * 2, b.kvp, 512 * 2, 128 * 2, nd}};
     comm_->all_gather(g, 2, s);  // COLLECTIVE: all-gather of wq_a's and wkv's outputs
-    tap(taps.qa[i], b.qa, (size_t)kDraft * kQLora * 2, s);
+    tap(taps.qa[i], b.qa, (size_t)nd * kQLora * 2, s);
     attn::DecodePrep a;
     a.pos = b.pos, a.table = table_, a.qa = b.qa, a.q_norm = w.q_norm, a.qq = b.qq, a.qs = b.qs;
     a.kv_pre = b.kvp, a.kv_norm = w.kv_norm, a.win = win(i, slot);
-    attn::decode_prep(a, kDraft, true, s);
-    dsk::gemv_fp8(b.qq, b.qs, kDraft, w.wq_b, w.wq_b_s, 8192, kQLora, bf(b.qb), cqb, s);
-    tap(taps.q_pre[i], b.qb, (size_t)kDraft * 8192 * 2, s);
-    attn::sparse_attn(b.qb, b.pos, {b.lo, b.hi}, kDraft, table_, win(i, slot), attn::Compressed{}, nullptr, 0, w.sink,
+    attn::decode_prep(a, nd, true, s);
+    dsk::gemv_fp8(b.qq, b.qs, nd, w.wq_b, w.wq_b_s, 8192, kQLora, bf(b.qb), cqb, s);
+    tap(taps.q_pre[i], b.qb, (size_t)nd * 8192 * 2, s);
+    attn::sparse_attn(b.qb, b.pos, {b.lo, b.hi}, nd, table_, win(i, slot), attn::Compressed{}, nullptr, 0, w.sink,
                       b.o, kSplits, {b.so, b.sml, kSplits}, s, true);
-    tap(taps.attn_o[i], b.o, (size_t)kDraft * 8192 * 2, s);
-    dsk::gemv_woa(bf(b.o), kDraft, w.wo_a, w.wo_a_s, 2048, 4096, 1024, nullptr, cw, false, s, b.oq, b.os);
-    dsk::gemv_fp8(b.oq, b.os, kDraft, w.wo_b, w.wo_b_s, kDim, 2048, bf(b.part), cob, s);
-    comm_->all_reduce(b.part, false, b.sub, (size_t)kDraft * kDim, s);  // COLLECTIVE: all-reduce of wo_b's partial
+    tap(taps.attn_o[i], b.o, (size_t)nd * 8192 * 2, s);
+    dsk::gemv_woa(bf(b.o), nd, w.wo_a, w.wo_a_s, 2048, 4096, 1024, nullptr, cw, false, s, b.oq, b.os);
+    dsk::gemv_fp8(b.oq, b.os, nd, w.wo_b, w.wo_b_s, kDim, 2048, bf(b.part), cob, s);
+    comm_->all_reduce(b.part, false, b.sub, (size_t)nd * kDim, s);  // COLLECTIVE: all-reduce of wo_b's partial
     tap(taps.attn_out[i], b.sub, rows_bytes, s);
-    attn::hc_post(b.sub, b.xa, b.post, b.comb, kDraft, b.xb, s, true);
-    tap(taps.mid[i], b.xb, kStreamBytes, s);
+    attn::hc_post(b.sub, b.xa, b.post, b.comb, nd, b.xb, s, true);
+    tap(taps.mid[i], b.xb, stream_bytes, s);
     // ---- FFN sublayer: 128 experts, top-3, and the shared expert
-    copy_in(b.xb, inject.mid[i], kStreamBytes, s);
-    copy_in(b.pre, inject.attn_pre[i], kDraft * 16, s);
+    copy_in(b.xb, inject.mid[i], stream_bytes, s);
+    copy_in(b.pre, inject.attn_pre[i], nd * 16, s);
     mix(b.xb, w.ffn_fn, w.ffn_fn_all, w.ffn_scale, w.ffn_base, w.ffn_norm, s);
-    tap_mix(taps.mix[i][1], b.pre, b.post, b.comb, s);
+    tap_mix(taps.mix[i][1], b.pre, b.post, b.comb, nd, s);
     tap(taps.ffn_in[i], b.y, rows_bytes, s);
     if (w.gate_all) {
-      dsk::gemv_bf16(bf(b.y), kDraft, w.gate_all, kExperts, kDim, b.lg, nullptr, cg, false, s);
+      dsk::gemv_bf16(bf(b.y), nd, w.gate_all, kExperts, kDim, b.lg, nullptr, cg, false, s);
     } else {
-      dsk::gemv_bf16(bf(b.y), kDraft, w.gate, 32, kDim, b.lg_r, nullptr, cg, false, s);
-      const GatherSeg gl{b.lg_r, 32 * 4, b.lg, kExperts * 4, 32 * 4, kDraft};
+      dsk::gemv_bf16(bf(b.y), nd, w.gate, 32, kDim, b.lg_r, nullptr, cg, false, s);
+      const GatherSeg gl{b.lg_r, 32 * 4, b.lg, kExperts * 4, 32 * 4, nd};
       comm_->all_gather(&gl, 1, s);  // COLLECTIVE: all-gather of the router logits
     }
-    launch(router3_kernel<false>, dim3(1), dim3(32 * kDraft), 0, s, true, (const float*)b.lg, w.gate_bias, b.idx,
+    launch(router3_kernel<false>, dim3(1), dim3(32 * nd), 0, s, true, (const float*)b.lg, w.gate_bias, b.idx,
            b.wts, false);
-    tap(taps.route_idx[i], b.idx, kDraft * kTopKPad * 4, s);
-    tap(taps.route_w[i], b.wts, kDraft * kTopKPad * 4, s);
-    dsk::moe(b.xq, b.xs, kDraft, b.idx, b.wts, w.moe, b.moe_ws, b.ymoe, mc, s);
-    comm_->all_reduce(b.ymoe, true, b.sub, (size_t)kDraft * kDim, s);  // COLLECTIVE: all-reduce of the MoE's partial
+    tap(taps.route_idx[i], b.idx, nd * kTopKPad * 4, s);
+    tap(taps.route_w[i], b.wts, nd * kTopKPad * 4, s);
+    dsk::moe(b.xq, b.xs, nd, b.idx, b.wts, w.moe, b.moe_ws, b.ymoe, mc, s);
+    comm_->all_reduce(b.ymoe, true, b.sub, (size_t)nd * kDim, s);  // COLLECTIVE: all-reduce of the MoE's partial
     tap(taps.ffn_out[i], b.sub, rows_bytes, s);
-    attn::hc_post(b.sub, b.xb, b.post, b.comb, kDraft, b.xa, s, true);
-    tap(taps.out[i], b.xa, kStreamBytes, s);
+    attn::hc_post(b.sub, b.xb, b.post, b.comb, nd, b.xa, s, true);
+    tap(taps.out[i], b.xa, stream_bytes, s);
   }
   // ---- head: hc_pre with the last pre-mix, norm, the vocab slice; the Markov chain; the confidence head
-  copy_in(b.xa, inject.head_stream, kStreamBytes, s);
-  copy_in(b.pre, inject.head_pre, kDraft * 16, s);
-  attn::hc_pre(b.xa, b.pre, kDraft, w_.norm, b.hxn, b.hx, s, true);
+  copy_in(b.xa, inject.head_stream, stream_bytes, s);
+  copy_in(b.pre, inject.head_pre, nd * 16, s);
+  attn::hc_pre(b.xa, b.pre, nd, w_.norm, b.hxn, b.hx, s, true);
   tap(taps.head_x, b.hx, rows_bytes, s);
   tap(taps.head_xn, b.hxn, rows_bytes, s);
   if (w_.head4)  // ch8's wk: the FP8 kernel's sums, on the MXFP4 values
-    dsk::gemv_fp4w_f32(bf(b.hxn), kDraft, w_.head4, w_.head4_s, vrows_, kDim, b.logits, ch8, s);
+    dsk::gemv_fp4w_f32(bf(b.hxn), nd, w_.head4, w_.head4_s, vrows_, kDim, b.logits, ch8, s);
   else if (w_.head8)
-    dsk::gemv_fp8w_f32(bf(b.hxn), kDraft, w_.head8, w_.head8_s, vrows_, kDim, b.logits, ch8, s);
+    dsk::gemv_fp8w_f32(bf(b.hxn), nd, w_.head8, w_.head8_s, vrows_, kDim, b.logits, ch8, s);
   else if (w_.head_coded)
-    dsk::gemv_bf16x(bf(b.hxn), kDraft, w_.head_coded, kVocabRank, kDim, b.logits, nullptr, ch, s);
+    dsk::gemv_bf16x(bf(b.hxn), nd, w_.head_coded, kVocabRank, kDim, b.logits, nullptr, ch, s);
   else
-    dsk::gemv_bf16(bf(b.hxn), kDraft, w_.head, kVocabRank, kDim, b.logits, nullptr, ch, false, s);
-  tap(taps.logits, b.logits, (size_t)kDraft * kVocabRank * 4, s);
+    dsk::gemv_bf16(bf(b.hxn), nd, w_.head, kVocabRank, kDim, b.logits, nullptr, ch, false, s);
+  tap(taps.logits, b.logits, (size_t)nd * kVocabRank * 4, s);
   const bool carry = comm_->carries_rows() && !inject.ids;
-  for (int j = 0; j < kDraft; ++j) {
+  for (int j = 0; j < nd; ++j) {
     // step 0's Markov row came with the embedding exchange; a later step's token is the previous step's argmax
     // (or the test's injected one), whose row the argmax carried (carry) or an all-reduce brings
     const uint16_t* mrows = (const uint16_t*)b.esum + 2 * kDim;
@@ -1215,29 +1269,30 @@ void Draft::draft(const int* token, cudaStream_t s, const int* slot, int ent) {
     launch(w_.markov8 ? markov_kernel<true, false> : markov_kernel<false, false>, dim3(vrows_ / 64), dim3(256), 0, s,
            true, j, mrows, w_.markov8 ? w_.markov8 : w_.markov_head, w_.markov8_s, (const float*)b.logits, b.dl,
            taps.bias, b.emb, b.cta, b.cand, b.counter, kVocabRank * rank_, (const int*)nullptr, ent, cpl_, (const int*)b.start, cpl_td_);
-    if (carry && j + 1 < kDraft)  // the winner's Markov row travels with it: it is step j + 1's
+    if (carry && j + 1 < nd)  // the winner's Markov row travels with it: it is step j + 1's
       comm_->argmax_rows_row(b.cand + j, b.gcand + j, 1, w_.markov_embed, kVocabRank * rank_, b.msum, s);  // COLLECTIVE
     else
       comm_->argmax(b.cand + j, b.gcand + j, s);  // COLLECTIVE: argmax over the ranks' candidates
   }
-  tap(taps.markov_embed, b.emb, kDraft * kMarkov * 2, s);
-  launch(conf_kernel<false>, dim3(1), dim3(32 * kDraft), 0, s, true, (const uint16_t*)b.hx, (const uint16_t*)b.emb,
+  tap(taps.markov_embed, b.emb, nd * kMarkov * 2, s);
+  launch(conf_kernel<false>, dim3(1), dim3(32 * nd), 0, s, true, (const uint16_t*)b.hx, (const uint16_t*)b.emb,
          w_.conf, (const Cand*)b.gcand, ids_, conf_, (const int*)nullptr);
   if (cf_w_) {  // stack4: the confidence MLP over the chain's scalars
-    launch(cf_scan_kernel, dim3(kDraft), dim3(1024), 0, s, true, (const float*)b.dl, kVocabRank * rank_, cf_rec_);
-    const GatherSeg g{cf_rec_, (size_t)kDraft * 16, cf_grec_, (size_t)kDraft * 16, (size_t)kDraft * 16, 1};
+    launch(cf_scan_kernel, dim3(nd), dim3(1024), 0, s, true, (const float*)b.dl, kVocabRank * rank_, cf_rec_);
+    const GatherSeg g{cf_rec_, (size_t)nd * 16, cf_grec_, (size_t)nd * 16, (size_t)nd * 16, 1};
     comm_->all_gather(&g, 1, s);  // COLLECTIVE: all-gather of the ranks' (max, second, sum exp) per depth
     launch(cf_mlp_kernel, dim3(1), dim3(32), 0, s, true, (const float*)cf_grec_, (const float*)cf_w_, conf_, cf_dbg_, cf_raw_,
-           cpl_cf_on_ ? cpl_ : nullptr, ent, cpl_cf_[0], cpl_cf_[1]);
+           cpl_cf_on_ ? cpl_ : nullptr, ent, cpl_cf_[0], cpl_cf_[1], cf_tail_[0], cf_tail_[1]);
   }
 }
 
 void Draft::set_couple(const NoiseSamp* samp, const float* td, float cf_a, float cf_b) {
   if (!samp) die("dspark::Draft: set_couple without the sessions' sampling");
-  for (int j = 0; j < kDraft; ++j) {
+  for (int j = 0; j < kDraftModel; ++j) {  // td holds the drafter's own depths; a deeper draft of the block takes the last one's
     if (!(td[j] > 0.f)) die("dspark::Draft: set_couple: Td[%d] = %g", j, td[j]);
     cpl_td_.inv[j] = 1.f / td[j];
   }
+  for (int j = kDraftModel; j < kDraft; ++j) cpl_td_.inv[j] = cpl_td_.inv[kDraftModel - 1];
   cpl_ = samp;
   cpl_cf_[0] = cf_a, cpl_cf_[1] = cf_b;
   cpl_cf_on_ = !(cf_a == 1.f && cf_b == 0.f);
@@ -1254,6 +1309,8 @@ void Draft::enable_cf(const float* w, int dbg) {
   CUDA_CHECK(cudaMalloc(&cf_raw_, 16 * 4));
   CUDA_CHECK(cudaMemset(cf_raw_, 0, 16 * 4));
   cf_dbg_ = dbg;
+  if (const char* e = getenv("DSGB10_CF_TAIL"))
+    if (std::sscanf(e, "%f,%f", &cf_tail_[0], &cf_tail_[1]) != 2) die("DSGB10_CF_TAIL=%s: A,B", e);
 }
 
 void Draft::enable_cf_batch() {
@@ -1286,8 +1343,8 @@ void Draft::enable_batch() {
     p = reinterpret_cast<std::remove_reference_t<decltype(p)>>(base ? base + off : nullptr);
     off += bytes;
   };
-  // wide64: sized for the one-pass drafter's kWideRows rows of kWideEnts entries; C: a pass's candidates [kDraft][16]
-  constexpr size_t R = kWideRows, E = kWideEnts, C = kDraft * kCandStride;
+  // wide64: sized for the one-pass drafter's kWideRows rows of kWideEnts entries; C: a pass's candidates [kDraftModel][16]
+  constexpr size_t R = kWideRows, E = kWideEnts, C = kDraftModel * kCandStride;
   for (int pass = 0; pass < 2; ++pass) {
     off = 0;
     take(b.bstart, kMaxEnts * 4), take(b.bids, kMaxEnts * 8 * 4), take(b.bconf, kMaxEnts * 16 * 4);
@@ -1352,14 +1409,15 @@ void Draft::draft_batch(const BatchPass& p, cudaStream_t s) {
   if (p.n < 1 || p.n > kWideEnts || !p.ent || !p.tok || p.tok_stride < 1 || !p.slot)
     die("dspark::Draft: draft_batch of %d entries (1..%d, with tokens and a slot table)", p.n, kWideEnts);
   if (p.n > kBatchEnts) return draft_batch_wide(p, s);
-  const int R = kDraft * p.n;
+  const int ndb = kDraftModel, brows = kBatchRows;
+  const int R = ndb * p.n;
   // draft()'s configs: the same k order, split-K slices and folds per output
   dsk::GemvCfg c8k{1, 1, 8}, cqb{2, 1, 8}, cob{2, 1, 16}, cw{1, 4, 4}, cg{1, 1, 8}, ch{2, 1, 16}, ch8{2, 1, 8};
   c8k.tiled = cqb.tiled = cob.tiled = true;
   dsk::MoeCfg mc{};
   mc.down = 4;
   embed_exchange(p.ent, p.tok, p.tok_stride, p.n, b.bepart, b.besum, s);  // COLLECTIVE: all-reduce of the entries' token rows
-  launch(draft_prep_batch_kernel, dim3(kDraft, p.n), dim3(kDim / 8), 0, s, true, p.ent, p.tok, p.tok_stride,
+  launch(draft_prep_batch_kernel, dim3(kDraftModel, p.n), dim3(kDim / 8), 0, s, true, p.ent, p.tok, p.tok_stride,
          (const int*)b.bstart, (const uint16_t*)b.besum, b.bxa, b.bpos, b.blo, b.bhi, b.bpre, b.bids);
   for (int i = 0; i < kBlocks; ++i) {
     const BlockW& w = w_.b[i];
@@ -1390,7 +1448,7 @@ void Draft::draft_batch(const BatchPass& p, cudaStream_t s) {
       const GatherSeg gl{b.blg_r, 32 * 4, b.blg, kExperts * 4, 32 * 4, R};
       comm_->all_gather(&gl, 1, s);  // COLLECTIVE: all-gather of the router logits
     }
-    launch(router3_kernel<true>, dim3(p.n), dim3(32 * kDraft), 0, s, true, (const float*)b.blg, w.gate_bias, b.bidx,
+    launch(router3_kernel<true>, dim3(p.n), dim3(32 * ndb), 0, s, true, (const float*)b.blg, w.gate_bias, b.bidx,
            b.bwts, false);
     dsk::moe(b.bxq, b.bxs, R, b.bidx, b.bwts, w.moe, b.bmoe_ws, b.bymoe, mc, s);
     comm_->all_reduce(b.bymoe, true, b.bsub, (size_t)R * kDim, s);  // COLLECTIVE: all-reduce of the MoE's partial
@@ -1403,20 +1461,21 @@ void Draft::draft_batch(const BatchPass& p, cudaStream_t s) {
 // the confidence head.
 void Draft::draft_batch_head(const BatchPass& p, int R, cudaStream_t s) {
   Buf& b = *b_;
+  const int ndb = kDraftModel, brows = kBatchRows;
   dsk::GemvCfg ch{2, 1, 16}, ch8{2, 1, 8};
   attn::hc_pre(b.bxa, b.bpre, R, w_.norm, b.bhxn, b.bhx, s, true);
   // stack4: with the FP8 copy kept beside the MXFP4 head (DSGB10_HEAD4_C1), passes of several entries read the FP8 copy
   // once (the paths below) instead of the MXFP4 head once per entry; one-entry passes and draft() read the MXFP4 head
   if (w_.head4 && (p.n == 1 || !w_.head8)) {  // at most 8 rows a call: each entry's 5, draft()'s call
     for (int q = 0; q < p.n; ++q)
-      dsk::gemv_fp4w_f32(bf(b.bhxn) + (size_t)q * kDraft * kDim, kDraft, w_.head4, w_.head4_s, vrows_, kDim,
-                         b.blogits + (size_t)q * kDraft * kVocabRank, ch8, s);
-  } else if (w_.head8 && R > kBatchRows && vrows_ == kVocabRank) {
+      dsk::gemv_fp4w_f32(bf(b.bhxn) + (size_t)q * ndb * kDim, ndb, w_.head4, w_.head4_s, vrows_, kDim,
+                         b.blogits + (size_t)q * ndb * kVocabRank, ch8, s);
+  } else if (w_.head8 && R > brows && vrows_ == kVocabRank) {
     // wide64: the FP8 head as one GEMM over every entry's rows (the head read once, not once per 3 entries)
     dsk::gemm_fp8w_f32_p(bf(b.bhxn), R, w_.head8, w_.head8_s, kVocabRank, kDim, b.blogits, s);
   } else {
-    for (int r0 = 0; r0 < R; r0 += kBatchRows) {  // calls of at most 3 entries (the GEMVs' 16 rows)
-      const int m = std::min(kBatchRows, R - r0);
+    for (int r0 = 0; r0 < R; r0 += brows) {  // calls of at most 3 entries (the GEMVs' 16 rows)
+      const int m = std::min(brows, R - r0);
       const __nv_bfloat16* hx = bf(b.bhxn) + (size_t)r0 * kDim;
       float* lo = b.blogits + (size_t)r0 * kVocabRank;
       if (w_.head8) dsk::gemv_fp8w_f32(hx, m, w_.head8, w_.head8_s, vrows_, kDim, lo, ch8, s);
@@ -1426,19 +1485,19 @@ void Draft::draft_batch_head(const BatchPass& p, int R, cudaStream_t s) {
   }
   const int ncand = (p.n + 1) & ~1;  // the pass's candidates per step, an even count (argmax_rows's 16 bytes)
   const bool carry = comm_->carries_rows();
-  for (int j = 0; j < kDraft; ++j) {
+  for (int j = 0; j < kDraftModel; ++j) {
     const uint16_t* mrows = (const uint16_t*)b.besum + (size_t)(p.n + 1) * kDim;  // step 0's came with the prep exchange
     if (j > 0) mrows = carry ? b.bmsum : markov_exchange(j, nullptr, b.bgcand, kCandStride, p.n, b.bmpart, b.bmsum, s);
     launch(w_.markov8 ? markov_kernel<true, true> : markov_kernel<false, true>, dim3(vrows_ / 64, p.n), dim3(256), 0,
            s, true, j, mrows, w_.markov8 ? w_.markov8 : w_.markov_head, w_.markov8_s, (const float*)b.blogits, b.bdl,
            (float*)nullptr, b.bemb, b.bcta, b.bcand, b.bcounter, kVocabRank * rank_, p.ent, 0, cpl_, (const int*)b.bstart, cpl_td_);
-    if (carry && j + 1 < kDraft)  // the winners' Markov rows travel with them: step j + 1's
+    if (carry && j + 1 < kDraftModel)  // the winners' Markov rows travel with them: step j + 1's
       comm_->argmax_rows_row(b.bcand + j * kCandStride, b.bgcand + j * kCandStride, ncand, w_.markov_embed,
                              kVocabRank * rank_, b.bmsum, s);  // COLLECTIVE
     else
       comm_->argmax_rows(b.bcand + j * kCandStride, b.bgcand + j * kCandStride, ncand, s);  // COLLECTIVE
   }
-  launch(conf_kernel<true>, dim3(p.n), dim3(32 * kDraft), 0, s, true, (const uint16_t*)b.bhx, (const uint16_t*)b.bemb,
+  launch(conf_kernel<true>, dim3(p.n), dim3(32 * kDraftModel), 0, s, true, (const uint16_t*)b.bhx, (const uint16_t*)b.bemb,
          w_.conf, (const Cand*)b.bgcand, b.bids, b.bconf, p.ent);
   if (cf_batch_) {  // the one-session confidence MLP over each entry's rows: the records of the rows' biased logits
     launch(cf_scan_kernel, dim3(R), dim3(1024), 0, s, true, (const float*)b.bdl, kVocabRank * rank_, b.bcfrec);
@@ -1456,13 +1515,14 @@ void Draft::draft_batch_head(const BatchPass& p, int R, cudaStream_t s) {
 // tokens of a spec decode cannot (the target verifies every one).
 void Draft::draft_batch_wide(const BatchPass& p, cudaStream_t s) {
   Buf& b = *b_;
-  const int R = kDraft * p.n;
+  const int ndb = kDraftModel, brows = kBatchRows;
+  const int R = ndb * p.n;
   dsk::GemvCfg c8k{1, 1, 8}, cqb{2, 1, 8}, cob{2, 1, 16}, cw{1, 4, 4}, cg{1, 1, 8};
   c8k.tiled = cqb.tiled = cob.tiled = true;
   // DSGB10_DRAFT1_GEMM=0: wq_b, wo_a and wo_b as the narrow pass's GEMV calls too (only the MoE and head wide)
   static const bool gemm = !getenv("DSGB10_DRAFT1_GEMM") || atoi(getenv("DSGB10_DRAFT1_GEMM")) != 0;
   embed_exchange(p.ent, p.tok, p.tok_stride, p.n, b.bepart, b.besum, s);  // COLLECTIVE: all-reduce of the entries' token rows
-  launch(draft_prep_batch_kernel, dim3(kDraft, p.n), dim3(kDim / 8), 0, s, true, p.ent, p.tok, p.tok_stride,
+  launch(draft_prep_batch_kernel, dim3(kDraftModel, p.n), dim3(kDim / 8), 0, s, true, p.ent, p.tok, p.tok_stride,
          (const int*)b.bstart, (const uint16_t*)b.besum, b.bxa, b.bpos, b.blo, b.bhi, b.bpre, b.bids);
   for (int i = 0; i < kBlocks; ++i) {
     const BlockW& w = w_.b[i];
@@ -1476,8 +1536,8 @@ void Draft::draft_batch_wide(const BatchPass& p, cudaStream_t s) {
     const GatherSeg g[2] = {{b.bqa_r, 320 * 2, b.bqa, kQLora * 2, 320 * 2, R},
                             {b.bkvp_r, 128 * 2, b.bkvp, 512 * 2, 128 * 2, R}};
     comm_->all_gather(g, 2, s);  // COLLECTIVE: all-gather of wq_a's and wkv's outputs
-    for (int r0 = 0; r0 < R; r0 += kBatchRows) {
-      const int m = std::min(kBatchRows, R - r0);
+    for (int r0 = 0; r0 < R; r0 += brows) {
+      const int m = std::min(brows, R - r0);
       attn::DecodePrep a;
       a.pos = b.bpos + r0, a.table = table_, a.qa = b.bqa + (size_t)r0 * kQLora, a.q_norm = w.q_norm;
       a.qq = b.bqq + (size_t)r0 * kQLora, a.qs = b.bqs + (size_t)r0 * (kQLora / 32);
@@ -1488,8 +1548,8 @@ void Draft::draft_batch_wide(const BatchPass& p, cudaStream_t s) {
       const dsk::Fp8Seg qb{w.wq_b, w.wq_b_s, bf(b.bqb), 8192};
       dsk::gemm_fp8_p(b.bqq, b.bqs, R, &qb, 1, kQLora, s);
     } else {
-      for (int r0 = 0; r0 < R; r0 += kBatchRows)
-        dsk::gemv_fp8(b.bqq + (size_t)r0 * kQLora, b.bqs + (size_t)r0 * (kQLora / 32), std::min(kBatchRows, R - r0),
+      for (int r0 = 0; r0 < R; r0 += brows)
+        dsk::gemv_fp8(b.bqq + (size_t)r0 * kQLora, b.bqs + (size_t)r0 * (kQLora / 32), std::min(brows, R - r0),
                       w.wq_b, w.wq_b_s, 8192, kQLora, bf(b.bqb) + (size_t)r0 * 8192, cqb, s);
     }
     attn::sparse_attn(b.bqb, b.bpos, {b.blo, b.bhi}, R, table_, win(i, p.slot), attn::Compressed{}, nullptr, 0, w.sink,
@@ -1499,8 +1559,8 @@ void Draft::draft_batch_wide(const BatchPass& p, cudaStream_t s) {
       const dsk::Fp8Seg ob{w.wo_b, w.wo_b_s, bf(b.bpart), kDim};
       dsk::gemm_fp8_p(b.boq, b.bos, R, &ob, 1, 2048, s);
     } else {
-      for (int r0 = 0; r0 < R; r0 += kBatchRows) {
-        const int m = std::min(kBatchRows, R - r0);
+      for (int r0 = 0; r0 < R; r0 += brows) {
+        const int m = std::min(brows, R - r0);
         dsk::gemv_woa(bf(b.bo) + (size_t)r0 * 8192, m, w.wo_a, w.wo_a_s, 2048, 4096, 1024, nullptr, cw, false, s,
                       b.boq + (size_t)r0 * 2048, b.bos + (size_t)r0 * (2048 / 32));
         dsk::gemv_fp8(b.boq + (size_t)r0 * 2048, b.bos + (size_t)r0 * (2048 / 32), m, w.wo_b, w.wo_b_s, kDim, 2048,
@@ -1511,10 +1571,10 @@ void Draft::draft_batch_wide(const BatchPass& p, cudaStream_t s) {
     attn::hc_post(b.bsub, b.bxa, b.bpost, b.bcomb, R, b.bxb, s, true);
     bmix(b.bxb, R, w.ffn_fn, w.ffn_fn_all, w.ffn_scale, w.ffn_base, w.ffn_norm, s);
     if (!w.gate_all) die("dspark::Draft: the wide pass needs the whole router (gate_all)");
-    for (int r0 = 0; r0 < R; r0 += kBatchRows)  // 1.3 MB: the narrow pass's GEMV calls
-      dsk::gemv_bf16(bf(b.by) + (size_t)r0 * kDim, std::min(kBatchRows, R - r0), w.gate_all, kExperts, kDim,
+    for (int r0 = 0; r0 < R; r0 += brows)  // 1.3 MB: the narrow pass's GEMV calls
+      dsk::gemv_bf16(bf(b.by) + (size_t)r0 * kDim, std::min(brows, R - r0), w.gate_all, kExperts, kDim,
                      b.blg + (size_t)r0 * kExperts, nullptr, cg, false, s);
-    launch(router3_kernel<true>, dim3(p.n), dim3(32 * kDraft), 0, s, true, (const float*)b.blg, w.gate_bias, b.bidx,
+    launch(router3_kernel<true>, dim3(p.n), dim3(32 * ndb), 0, s, true, (const float*)b.blg, w.gate_bias, b.bidx,
            b.bwts, true);
     dsk::moe_prefill(b.bxq, b.bxs, R, b.bidx, b.bwts, kExperts, w.moe, b.bpws, b.bymoe, s);
     comm_->all_reduce(b.bymoe, true, b.bsub, (size_t)R * kDim, s);  // COLLECTIVE: all-reduce of the MoE's partial
@@ -1557,15 +1617,16 @@ void Draft::probe(const int* path, cudaStream_t s) {
   if (!b.probe_arena) die("dspark::Draft: probe() before enable_probe()");
   const int vbase = kVocabRank * rank_;
   launch(probe_prep_kernel, dim3(1), dim3(32), 0, s, true, (const int*)ids_, path, b.pr_forced);
-  for (int j = 0; j < kDraft; ++j) {
+  const int nd = draft_rows();
+  for (int j = 0; j < nd; ++j) {
     const uint16_t* mrows = markov_exchange(j, b.pr_forced, b.gcand, 1, 1, b.mpart, b.msum, s);  // the path's token, every step
     launch(w_.markov8 ? markov_kernel<true, false> : markov_kernel<false, false>, dim3(kMarkovCtas), dim3(256), 0, s,
            true, j, mrows, w_.markov8 ? w_.markov8 : w_.markov_head, w_.markov8_s, (const float*)b.logits, b.pr_dl,
            nullptr, b.pr_emb, b.cta, b.pr_cand, b.counter, vbase, (const int*)nullptr, 0, (const NoiseSamp*)nullptr, (const int*)nullptr,
            CoupleTd{});
   }
-  launch(probe_topk_kernel, dim3(kDraft), dim3(1024), 0, s, true, (const float*)b.pr_dl, path, vbase, b.pr_rec);
-  launch(conf_kernel<false>, dim3(1), dim3(32 * kDraft), 0, s, true, (const uint16_t*)b.hx, (const uint16_t*)b.pr_emb,
+  launch(probe_topk_kernel, dim3(nd), dim3(1024), 0, s, true, (const float*)b.pr_dl, path, vbase, b.pr_rec);
+  launch(conf_kernel<false>, dim3(1), dim3(32 * nd), 0, s, true, (const uint16_t*)b.hx, (const uint16_t*)b.pr_emb,
          w_.conf, (const Cand*)b.pr_cand, b.pr_ids, b.pr_conf, (const int*)nullptr);
   const GatherSeg g{b.pr_rec, kProbeBytes, b.pr_grec, kProbeBytes, kProbeBytes, 1};
   comm_->all_gather(&g, 1, s);  // COLLECTIVE: all-gather of the ranks' probe records

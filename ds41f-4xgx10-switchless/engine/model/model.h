@@ -75,12 +75,12 @@ struct Batch {
 // must pass the same.
 struct SpecCfg {
   float thresh = 0.21f;
-  int max_drafts = 5;  // 0..5
+  int max_drafts = 5;  // 0..5 (0..dspark::draft_rows() with DSGB10_DRAFT_MAX)
   int pos_end = 0;
   int force = -1;  // >= 0: draft from this token instead of the step's last sample (teacher-forced checks)
-  int probe[ops::kDrafts] = {-1, -1, -1, -1, -1};  // EXPERIMENT (Options::tree_probe): the probe's path
+  int probe[ops::kDrafts] = {-1, -1, -1, -1, -1, -1, -1};  // EXPERIMENT (Options::tree_probe): the probe's path
   int gate = ops::kGateThresh;
-  float step_ms[ops::kDrafts + 1] = {21.10f, 25.38f, 29.26f, 32.76f, 35.61f, 38.70f};  // 0..5 drafts
+  float step_ms[ops::kDrafts + 1] = {21.10f, 25.38f, 29.26f, 32.76f, 35.61f, 38.70f, 41.70f, 44.70f};  // 0..7 drafts (6 and 7: DSGB10_DRAFT_MAX)
 };
 
 // A batch spec step (docs/batching.md, B3: drafts across sessions; Model::launch_spec_batch and

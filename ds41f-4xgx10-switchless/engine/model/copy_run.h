@@ -143,4 +143,28 @@ CPY_HD inline bool block_runs(const Run& r, int accepted, int dyn) {
 #endif
 }
 
+// The decision of one step's draft pass, as k_spec_dyn takes it (DSGB10_DRAFT_DYN=dyn): the cursor as the step before left it (rec,
+// not changed: k_spec_next brings the unit's own up to date) is walked over this step's tokens the way run_step walks it, and the
+// block runs when enough drafts were accepted and no cursor is live at the bonus. tok / known: the unit's mirror and the positions
+// it holds before this step's tokens; verify: a verify step (a given step starts the cursor over); pos0 / rows / count / bonus: the
+// step just verified. A match that only run_find finds after the step's tokens are appended is not seen here.
+CPY_HD inline bool block_step(const Run& rec, const int32_t* tok, int known, bool verify, int pos0, const int32_t* rows, int count,
+                              int32_t bonus, int dyn) {
+  const int accepted = count - 1;
+  if (accepted < dyn) return false;
+  Run r = rec;
+  if (verify) run_walk(r, tok, known, pos0, rows, count, bonus);
+  else run_reset(r);
+  return block_runs(r, accepted, dyn);
+}
+
+// The modelled ms of a step verifying n drafts (n + 1 rows), for the copy rows past the chain's: step_ms[0 .. have] are given
+// (the draft pass's rows), step_ms[have + 1 .. last] follow by the last difference. With a block of 7 (have = 7) nothing is added.
+CPY_HD inline void extend_step_ms(float* step_ms, int have, int last) {
+  for (int i = have + 1; i <= last; ++i) {
+    const float d = step_ms[i - 1] - step_ms[i - 2];
+    step_ms[i] = step_ms[i - 1] + (d > 0.f ? d : 0.f);
+  }
+}
+
 }  // namespace model::copy

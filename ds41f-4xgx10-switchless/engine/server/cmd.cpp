@@ -1,5 +1,6 @@
 // Rank 0's commands and what every rank runs alike (cmd.h).
 #include <cstdlib>
+#include "dspark/dspark.h"
 #include "server/cmd.h"
 #include "server/ride_wire.h"
 
@@ -392,7 +393,7 @@ void copy_dump_line(FILE* f, int step, int entry, int pos0, int n_emit, const in
 
 // decode_loop with DSpark (cmd.h)
 DecodeEnd spec_loop(model::Model& m, const Cmd& c, Watchdog& wd, const OnSample& on, const OnStep& step) {
-  constexpr int kD = model::ops::kDrafts;
+  static const int kD = dspark::draft_rows();  // the drafts of a pass: 5 unless DSGB10_DRAFT_MAX
   // rows a step can reach past the previous step's last: the chain's drafts, or copy drafting's (copy.h) when copy rows are on
   static const int kR = model::copy::verify_reach(kD, (model::copy::mode() & model::copy::kRows) != 0, model::copy::copy_rows());
   DecodeEnd e;
@@ -487,6 +488,8 @@ DecodeEnd spec_loop(model::Model& m, const Cmd& c, Watchdog& wd, const OnSample&
       std::fprintf(slog, "],\"s\":[");
       for (int j = 0; j < kD; ++j) std::fprintf(slog, "%s%.5f", j ? "," : "", o.survival[j]);
       std::fprintf(slog, "]");
+      // with the copy dump on: the chain's drafts the next step keeps and the copy rows after them (rows past the chain's are copy rows)
+      if (model::copy::mode() & model::copy::kDump) std::fprintf(slog, ",\"cp\":[%d,%d]", (int)o.copy_info[0][2], (int)o.copy_info[0][3]);
       static const bool slog_cf = getenv("DSGB10_CF_MLP") != nullptr;
       if (slog_cf) {
         std::fprintf(slog, ",\"cf\":[");
@@ -862,7 +865,7 @@ std::vector<float> batch_tf_loop(model::Model& m, const Cmd& c, const std::vecto
 // kCmdSpecBatch (cmd.h): spec_loop's accounting per entry, over batch spec steps
 std::vector<DecodeEnd> spec_batch_loop(model::Model& m, const Cmd& c, const std::vector<BatchEntry>& e, Watchdog& wd,
                                        const OnBatch& on, SpecBatchStats* st, const OnStep& step) {
-  constexpr int kD = model::ops::kDrafts;
+  constexpr int kD = model::ops::kBatchDrafts;
   static const int kR = model::copy::verify_reach(kD, (model::copy::mode() & model::copy::kRows) != 0);
   g_t_wait.clear(), g_t_late.clear(), g_t_launch.clear();
   const int n = (int)e.size(), slot0 = m.slot();
