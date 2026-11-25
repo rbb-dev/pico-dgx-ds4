@@ -169,6 +169,23 @@ def compare(name, a, b):
     return ok
 
 
+REUSE_EXACT = False  # --reuse-exact: the engine runs DSGB10_REUSE_EXACT=1
+
+
+def bits(name, a, b):
+    """A reply that must be another one bit for bit: every token id and every token's logprob equal (compare() passes a
+    difference in the logprobs when the tokens agree, so it cannot see one)."""
+    n = min(len(a['ids']), len(b['ids']))
+    same = sum(1 for i in range(n) if a['ids'][i] == b['ids'][i])
+    m = min(len(a['lp']), len(b['lp']))
+    lpd = [i for i in range(m) if a['lp'][i] != b['lp'][i]]
+    ok = a['ids'] == b['ids'] and a['lp'] == b['lp'] and m == len(a['ids'])
+    print('  %-26s %s: %d/%d tokens equal, %d of %d logprobs differ%s' % (
+        name, 'BIT-EQUAL' if ok else 'DIFFER', same, max(len(a['ids']), len(b['ids'])), len(lpd), m,
+        (' (first at token %d: %.6f vs %.6f)' % (lpd[0], a['lp'][lpd[0]], b['lp'][lpd[0]])) if lpd else ''))
+    return ok
+
+
 def close(name, a, b, tol=2e-3):
     """A restart that reruns prefilled positions through the step path (a regenerate reruns the prompt's
     last positions, a remainder of at most --small-rows) matches the prefill path to numerics, not bits:
@@ -228,10 +245,11 @@ def scenarios(e, T):
     show('  same prompt cold', c)
     res.append(compare('fork (stored base)', b, c))
     # 5. regenerate: the same prompt again on the same session (the prompt-end snapshot); its last
-    # positions run through the step this time, so it matches the cold prefill to numerics
+    # positions run through the step this time, so it matches the cold prefill to numerics. With --reuse-exact (an engine
+    # started with DSGB10_REUSE_EXACT=1) they take the prefill path and the reply must equal the first one bit for bit.
     b2 = e.run(S + 7, p6, max_new=32, n_top=2)
     show('regenerate', b2)
-    res.append(close('regenerate', b2, b))
+    res.append(bits('regenerate (reuse exact)', b2, b) if REUSE_EXACT else close('regenerate', b2, b))
     # 6. seeded sampling twice, with logprobs
     s1 = e.run(S + 9, T[0:1500], max_new=64, temp=0.8, top_p=0.95, seed=1234, n_top=3, keep=False)
     show('sampled (seed 1234)', s1)
@@ -365,7 +383,10 @@ def main():
     ap.add_argument('--tokens', default='/data/dsgb10/golden/long/tokens.npy')
     ap.add_argument('--speed', action='store_true')
     ap.add_argument('--ced', action='store_true', help="CED's turn rule (the server's default; else --exact)")
+    ap.add_argument('--reuse-exact', action='store_true', help='the engine runs DSGB10_REUSE_EXACT=1: a regenerate must equal the first reply bit for bit')
     a = ap.parse_args()
+    global REUSE_EXACT
+    REUSE_EXACT = a.reuse_exact
     T = load_npy_i32(a.tokens)
     e = Engine(a.socket)
     print('engine: %s, context %d' % (e.name, e.max_ctx))

@@ -152,6 +152,15 @@ the last checkpoint; the front-end saves its session table the same way.
 - Measured: the next turn of a 64K-token conversation after a planned restart: first token after 0.23 s, where the same prompt
   cold took 6.55 s. A new engine binary cannot read the kept conversations, so an upgrade starts them cold.
 
+**A request sent again gets its first reply, bit for bit.** When a prompt the engine holds comes again (a retry, a regenerate),
+the positions after its restart point run as one decode step when there are at most `--small-rows` of them; the step adds
+in another order than the prefill, so the state is not the cold one and a near-tie can change the reply. With the switch they
+take the prefill path. Based on pico-dgx-ds4's a40eeb8 by Pico.
+- Setting: `DSGB10_REUSE_EXACT=1` (off unless set).
+- Measured: a re-sent prompt's first reply bit-equal to the first send's (without the switch 32 of 32 log probabilities differed,
+  with it 0); its first token 10 to 20 ms later (median at 2K tokens 51 against 72 ms, 8K 47 against 57 ms, 32K 56 against 73 ms);
+  first sends unchanged.
+
 ## Prompts
 
 **Interleaved prefill.** A long prompt is processed in pieces between the decoding users' steps, so they keep receiving tokens;

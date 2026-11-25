@@ -2515,7 +2515,19 @@ class Server {
     wd_.started = now_s();
     bool img = false;  // vision: rows of an image span take the chunk path (the step path has no injection)
     for (const fe::ImageSpan& sp : f.rq.spans) img = img || (int)(sp.start + sp.rows) > pos;
-    if (R <= o_.small_rows && !ced && !img) {
+    // DSGB10_REUSE_EXACT=1: a reused prompt's short remainder (at most --small-rows positions after its restart point) takes the
+    // prefill path, not one decode step. The step sums in another order than the prefill, so a request sent again would leave
+    // a state that is not its cold prefill's, and its reply could differ at a near-tie. A whole prompt of at most --small-rows
+    // positions (its cold run steps it too) and a time-sliced request's resume keep the step. 0 / unset: as without it.
+    static const int reuse_exact = [] {
+      const char* e = std::getenv("DSGB10_REUSE_EXACT");
+      const int v = e && *e ? std::atoi(e) : 0;
+      if (v < 0 || v > 1 || (e && *e && !(e[0] >= '0' && e[0] <= '1' && e[1] == 0))) die("DSGB10_REUSE_EXACT=%s: 0 or 1", e);
+      if (v) std::printf("serve: DSGB10_REUSE_EXACT=1: a reused prompt's remainder of at most --small-rows positions takes the prefill path\n");
+      return v;
+    }();
+    const bool step_ok = resume || reuse_exact < 1 || n <= o_.small_rows;
+    if (R <= o_.small_rows && !ced && !img && step_ok) {
       c.op = kCmdRows;
       std::copy(prompt.begin() + pos, prompt.begin() + pos + R, c.tokens);
       issue(c);
