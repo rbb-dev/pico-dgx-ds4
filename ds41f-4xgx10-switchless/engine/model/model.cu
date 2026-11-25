@@ -76,6 +76,39 @@ __global__ void route_rotate(float* gl, int shift, int group) {
   for (int i = threadIdx.x; i < kExperts; i += blockDim.x) g[(i + shift * (blockIdx.x / group)) % kExperts] = s[i];
 }
 
+// DSGB10_WIDE_SH=1: a wide step's shared expert (moe_prefill phase 2: its w1 + w3 SwiGLU GEMM and its w2 GEMM) runs on the
+// side stream sb from ffn_norm on, beside the gate GEMM, router_topk and the bucketing + routed up (phases 1 | 4), which
+// otherwise run one after another with the shared expert between the router and the routed experts. It needs only the
+// normed, quantised input, not the routes; the routed down (phases 8 | 16) starts after its join. The same kernels on
+// the same inputs: every output has the same bits.
+bool wide_sh() {
+  static const bool u = [] {
+    const bool on = getenv("DSGB10_WIDE_SH") && atoi(getenv("DSGB10_WIDE_SH"));
+    if (on) std::fprintf(stderr, "wide steps: the shared expert beside the gate and the router (DSGB10_WIDE_SH)\n");
+    return on;
+  }();
+  return u;
+}
+
+// DSGB10_WIDE_AR=1|2: a wide step's all-reduces (the attention's bf16 partials, the FFN's fp32 ones) run as
+// comm::allreduce_bulk_* (each quarter reduced on one rank, then all-gathered) followed by the separate hc_post and
+// hc_pre kernels, instead of ops::allreduce_hc, in which every rank receives the other three partials whole. The same
+// sums in the same order and the same hc_post / hc_pre arithmetic (ops.h: allreduce_hc is bit-identical to this chain).
+// 2: the FFN's bulk all-reduce rounds each reduced quarter to bf16 on the rank that sums it, before the all-gather
+// (comm::allreduce_bulk_f32_bf16): the all-gather carries 2 bytes an element instead of 4 and the separate
+// f32_to_bf16 kernel goes; the fp32 sums and the one rounding are the same.
+int wide_ar_mode() {
+  static const int u = [] {
+    const int m = getenv("DSGB10_WIDE_AR") ? atoi(getenv("DSGB10_WIDE_AR")) : 0;
+    if (m >= 1)
+      std::fprintf(stderr, "wide steps: the all-reduce as reduce-scatter + all-gather, %s (DSGB10_WIDE_AR=%d)\n",
+                   m >= 2 ? "the FFN's gather in bf16" : "the FFN's gather in fp32", m);
+    return m;
+  }();
+  return u;
+}
+bool wide_ar() { return wide_ar_mode() >= 1; }
+
 // night (technique 5): at 9..16 rows the normed GEMVs' prologue (every CTA normalising all rows) made wq_b,
 // wq_a+wkv and the gate run at 50-150 GB/s; one rmsnorm launch, then the plain r16 GEMVs, gives the same bits
 // (test_kernels rows16 checks fused == unfused). DSGB10_FUSED16=1 restores the fused prologues.
@@ -914,7 +947,11 @@ void Model::Impl::attention(int L, int R, int ctx, bool dumps, bool sub_in, Sink
   ablit::rows_bf16(U(part), R, kDim, ab, L, in_d, st);  // this rank's partial: the all-reduce sums projected parts
   l2pf(4, L, R);
   join(sa);
-  ops::allreduce_hc(ch, part, false, R, x, a_post, a_comb, a_pre, mid, yraw, dumps ? sub : nullptr, st);
+  if (R > kDecodeRows && wide_ar()) {  // bulk all-reduce + the separate kernels (same bits)
+    ops::allreduce_hc_bulk(ch, part, false, wide_ar_mode(), R, x, a_post, a_comb, a_pre, mid, yraw, sub, nullptr, st);
+  } else {
+    ops::allreduce_hc(ch, part, false, R, x, a_post, a_comb, a_pre, mid, yraw, dumps ? sub : nullptr, st);
+  }
   if (dumps) {
     dump(sink, L, "attn_out", pos0, R, sub, kDim * 2);
     dump(sink, L, "mid", pos0, R, mid, kHcDim * 2);
@@ -965,6 +1002,12 @@ void Model::Impl::ffn(int L, int R, bool dumps, Sink* sink, int pos0) {
   const bool wide = R > kDecodeRows;
   if (wide) {  // wide64: the gate as a GEMM, then router_topk and the grouped prefill MoE (one read of the union)
     dsk::rmsnorm(yraw, w.ffn_norm, R, kDim, kNormEps, y, yq, ys, st);
+    if (wide_sh()) {  // the shared expert beside the gate and the router
+      fork(sb);
+      dsk::MoePCfg sh;
+      sh.phases = 2;
+      dsk::moe_prefill(yq, ys, R, ridx, rwts, kExperts, w.moe, moe_pws, ymoe, sb, sh);
+    }
     dsk::gemm_bf16_p(y, R, w.gate, kExperts, kDim, gl, st);
   } else if (R > dsk::kLowRows && unfused16()) {  // night: the gate on the normed rows (y is free after the attention)
     dsk::rmsnorm(yraw, w.ffn_norm, R, kDim, kNormEps, y, yq, ys, st);
@@ -986,7 +1029,16 @@ void Model::Impl::ffn(int L, int R, bool dumps, Sink* sink, int pos0) {
       dsk::router_topk_oea(gl, w.gate_bias, R, kExperts, ridx, rwts, kRouteScale, oea.first, oea.second, st);
     else
       dsk::router_topk(gl, w.gate_bias, R, kExperts, ridx, rwts, kRouteScale, st);
-    dsk::moe_prefill(yq, ys, R, ridx, rwts, kExperts, w.moe, moe_pws, ymoe, st);
+    if (wide_sh()) {  // bucketing + routed up, the shared expert's join, then down (+ combine)
+      dsk::MoePCfg mc;
+      mc.phases = 1 | 4;
+      dsk::moe_prefill(yq, ys, R, ridx, rwts, kExperts, w.moe, moe_pws, ymoe, st, mc);
+      join(sb);
+      mc.phases = 8 | 16;
+      dsk::moe_prefill(yq, ys, R, ridx, rwts, kExperts, w.moe, moe_pws, ymoe, st, mc);
+    } else {
+      dsk::moe_prefill(yq, ys, R, ridx, rwts, kExperts, w.moe, moe_pws, ymoe, st);
+    }
   } else {
     dsk::MoeCfg mc{};
     mc.down = R == 1 ? 2 : 4;
@@ -1007,7 +1059,11 @@ void Model::Impl::ffn(int L, int R, bool dumps, Sink* sink, int pos0) {
   l2pf(1, L + 1, R);
   join(sa);  // the mixes
   // the experts' partial sums all-reduced, hc_post into the next block's input, and its collapse
-  ops::allreduce_hc(ch, ymoe, true, R, mid, f_post, f_comb, next_pm, x, yraw, dumps ? sub : nullptr, st);
+  if (R > kDecodeRows && wide_ar()) {  // bulk all-reduce + the separate kernels (same bits)
+    ops::allreduce_hc_bulk(ch, ymoe, true, wide_ar_mode(), R, mid, f_post, f_comb, next_pm, x, yraw, sub, ymoe, st);
+  } else {
+    ops::allreduce_hc(ch, ymoe, true, R, mid, f_post, f_comb, next_pm, x, yraw, dumps ? sub : nullptr, st);
+  }
   if (dumps) {
     dump(sink, L, "ffn_out", pos0, R, sub, kDim * 2);
     dump(sink, L, "route_idx", pos0, R, ridx, kTopK * 4);
@@ -1507,7 +1563,15 @@ void Model::Impl::forward_rows(int R, int ctx, uint32_t flags, Sink* sink, int p
   static const bool headg = !getenv("DSGB10_HEADG") || atoi(getenv("DSGB10_HEADG")) != 0;
   if (cert_cap) cert_head(R);  // stack4: a certified body of the one-session spec graph
   else if (R > kDecodeRows && headg) {
-    dsk::gemv_bf16_norm_rows(yraw, norm_w, kNormEps, R, head, head_coded, kVocabPart, kDim, logits, chead, st);
+    // DSGB10_HEADG=2: the rows are normalised once into hfin (the dumps' final_hidden otherwise) and the head
+    // kernel loads them
+    static const bool headpre = [] {
+      const bool on = getenv("DSGB10_HEADG") && atoi(getenv("DSGB10_HEADG")) >= 2;
+      if (on) std::fprintf(stderr, "wide steps: the head on rows normalised once (DSGB10_HEADG=2)\n");
+      return on;
+    }();
+    dsk::gemv_bf16_norm_rows(yraw, norm_w, kNormEps, R, head, head_coded, kVocabPart, kDim, logits, chead, st,
+                             headpre && !dumps ? hfin : nullptr);
   } else
   for (int r0 = 0; r0 < R; r0 += kDecodeRows) {  // wide64: the head GEMVs in groups of kDecodeRows rows
     const int m = std::min(kDecodeRows, R - r0);

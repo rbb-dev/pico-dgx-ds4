@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstddef>
 
+#include "attn/attn.h"
 #include "common/check.h"
 #include "common/embed_shard.h"
 #include "model/config.h"
@@ -279,6 +280,24 @@ void unpack_gate(const float* gath, int R, float* logits, cudaStream_t s) {
 void f32_to_bf16(const float* in, bf16* out, int n, cudaStream_t s) {
   k_f32_to_bf16<<<(n + 1023) / 1024, 256, 0, s>>>(in, out, n);
   CUDA_CHECK(cudaGetLastError());
+}
+
+void allreduce_hc_bulk(const comm::DevChannel& ch, const void* part, bool f32, int mode, int R, const bf16* res,
+                       const float* post, const float* comb, const float* pre, bf16* stream, bf16* yraw, bf16* sub,
+                       float* sums, cudaStream_t s) {
+  const size_t n = (size_t)R * kDim;
+  auto U = [](const bf16* p) { return reinterpret_cast<const uint16_t*>(p); };
+  auto W = [](bf16* p) { return reinterpret_cast<uint16_t*>(p); };
+  if (!f32) {
+    comm::allreduce_bulk_bf16(ch, static_cast<const bf16*>(part), sub, n, s);
+  } else if (mode >= 2) {
+    comm::allreduce_bulk_f32_bf16(ch, static_cast<const float*>(part), sub, n, s);
+  } else {
+    comm::allreduce_bulk_f32(ch, static_cast<const float*>(part), sums, n, s);
+    f32_to_bf16(sums, sub, (int)n, s);
+  }
+  attn::hc_post(U(sub), U(res), post, comb, R, W(stream), s);
+  attn::hc_pre(U(stream), pre, R, nullptr, W(yraw), nullptr, s);
 }
 
 void round_bf16(float* x, size_t n, cudaStream_t s) {

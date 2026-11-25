@@ -229,6 +229,16 @@ void engram_combine(const bf16* x, const uint8_t* gath, int R, bf16* y, cudaStre
 // the separate kernels.
 void allreduce_hc(const comm::DevChannel& ch, const void* part, bool f32, int R, const bf16* res, const float* post,
                   const float* comb, const float* pre, bf16* stream, bf16* yraw, bf16* sub, cudaStream_t s);
+// allreduce_hc's outputs (stream, yraw and sub, all three written) by the bulk chain, for a wide step (DSGB10_WIDE_AR):
+// comm::allreduce_bulk_bf16 / allreduce_bulk_f32 (each quarter reduced on one rank, then all-gathered: 1.5 times the payload
+// instead of 3) and the separate attn::hc_post and attn::hc_pre. The same sums in the same order and the same arithmetic,
+// so the same bits as allreduce_hc. mode 1: fp32 partials are all-reduced into sums (fp32 [R][5120]; may be part itself)
+// and rounded to bf16 by f32_to_bf16; mode 2: each reduced quarter is rounded to bf16 on the rank that sums it, before the
+// all-gather (comm::allreduce_bulk_f32_bf16: 2 bytes an element on the wire, sums unused, part and sub must not overlap).
+// bf16 partials ignore mode and sums. R * 5120 elements must make a multiple of 128 bytes.
+void allreduce_hc_bulk(const comm::DevChannel& ch, const void* part, bool f32, int mode, int R, const bf16* res,
+                       const float* post, const float* comb, const float* pre, bf16* stream, bf16* yraw, bf16* sub,
+                       float* sums, cudaStream_t s);
 // allreduce_hc with the sublayer's mixes riding along (single-pass mHC needs them only here): chunks
 // [nchunks][R][25] is attn::hc_project of this rank's copy (columns [5120 rank, 5120 rank + 5120) of
 // res); their sum in chunk order is sent with part, the four ranks' sums are added in rank order, and

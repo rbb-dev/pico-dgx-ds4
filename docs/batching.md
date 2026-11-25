@@ -187,3 +187,31 @@ load of at most 7 tokens, serial in the one thread of the kernel that picks the 
 independent ones: a few microseconds inside a step of tens of milliseconds); the host adds nothing. Memory: 4 bytes a
 position for the mirror and 16 for a table at its full size (a unit of 1M positions: 20 MiB; 16 such units: 320 MiB of the
 512 MiB default, computed from `plan_units` in `engine/model/copy.h`).
+
+## Wide steps: three switches
+
+Three switches for steps of 17 to 64 rows (`R > kDecodeRows`), each off unless set, every one giving the same bits as the step
+without it; they are read when the engine starts, so every Spark needs the same settings. Based on pico-dgx-ds4's a40eeb8 and
+f2bafa4 by Pico. Each prints one line at its first use (`wide steps: ...`) so a log shows it was in force.
+
+- `DSGB10_WIDE_SH=1`: the shared expert (`moe_prefill` phase 2, its w1 + w3 SwiGLU GEMM and its w2 GEMM) is forked onto the
+  side stream `sb` right after `ffn_norm`. It needs only the normed, quantised input, so it runs beside the gate GEMM,
+  `router_topk` and phases 1 and 4 (bucketing, routed up) on the main stream; the stream joins before phases 8 and 16 (routed
+  down, combine). The kernels and their inputs are the same. The abliteration's shared-expert term reads the shared expert's
+  activations after the join.
+- `DSGB10_WIDE_AR=1`: both all-reduces of a wide step are `comm::allreduce_bulk_bf16` (attention, bf16 partials) and
+  `allreduce_bulk_f32` followed by `f32_to_bf16` (FFN, fp32 partials), then `attn::hc_post` and `attn::hc_pre`
+  (`ops::allreduce_hc_bulk`), in place of `ops::allreduce_hc`, in which every Spark receives the other three partials whole. Each
+  quarter is summed on one Spark in rank order and all-gathered: the same sums in the same order, the same rounding to bf16.
+  `DSGB10_WIDE_AR=2`: the FFN's reduced quarter is rounded to bf16 on the Spark that sums it, before the all-gather
+  (`allreduce_bulk_f32_bf16`), so the gather carries 2 bytes an element in place of 4 and the separate conversion is gone.
+- `DSGB10_HEADG=2` (`1` is the default, `0` the 16-row groups): the wide head's rows are normalised once into `hfin` by
+  `k_gemv16_prenorm` (one CTA per group of 16 rows, the head kernel's thread count, so each row's squares add in the same order)
+  and the row-group head kernel loads them. Not in a run that dumps `final_hidden`, which uses `hfin` for the dump.
+
+Tests (GPU rows): `kernels/tests/test_kernels.cu headrg` (the prenormalised head against the head that
+normalises in every CTA and against calls of 16 rows, bit for bit, 17 to 64 rows, coded and plain);
+`model/tests/coll_tests.cu wide` on the four Sparks (`ops::allreduce_hc_bulk`, modes 1 and 2, against `ops::allreduce_hc` at 17,
+32 and 64 rows); `engine/server/tests/wide_test.sh` (the teacher-forced batch mode at 18, 32 and 64 rows with each switch and all
+three: the samples hashes against the run with none, and each run's median step time); all run on the four Sparks and pass. Speed: 16
+users 6.0 % faster, 32 users 4.9 %, 2 to 5 users unchanged.

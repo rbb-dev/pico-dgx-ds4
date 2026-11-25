@@ -206,6 +206,9 @@ options, and the code behind `DSGB10_RING_RSBAL` and `DSGB10_PF_TUNE` is pico-dg
 | `DSGB10_BUDGET=1` | every session may draft up to the rows left after one for each, so drafts are shared across sessions (lossless) |
 | `DSGB10_DRAFT1=6` | batch steps of 6 or more sessions draft them in one pass |
 | `DSGB10_WIDE=64`, `DSGB10_WIDE_COST=24,2.2,57,1.1` | steps of 17 to 64 rows run through the prefill GEMMs, and the cost model that takes the wide step only when the drafts pay for it |
+| `DSGB10_WIDE_SH=1` (not in the line above) | steps of 17 to 64 rows run the shared expert on the side stream, beside the gate, the router and the routed experts' first half. Off unless set; same bits ([`docs/batching.md`](docs/batching.md#wide-steps-three-switches)) |
+| `DSGB10_WIDE_AR=1\|2` (not in the line above) | steps of 17 to 64 rows all-reduce as a reduce-scatter and an all-gather; `2` carries the FFN's gather in bf16. Off unless set; same bits; every Spark must have the same setting |
+| `DSGB10_HEADG=2` (not in the line above) | the wide head reads rows normalised once (`1`, the default, is the head in one read of its weights; `0` the 16-row groups). Same bits; every Spark must have the same setting |
 | `DSGB10_HEAD4_C1=1` | the 4-bit draft head serves one-user drafts only; batches use the FP8 copy |
 | `DSGB10_CF_MLP=FILE`, `DSGB10_CF_ALPHA=1.0` | the small network that decides how many drafts a step verifies (`tools/stack4/cfmlp_cml.bin`, copied to the same path on every Spark; a start with the variable set and the file missing or of the wrong size stops), and the scale of its threshold |
 | `DSGB10_BATCH_CF=1`, `DSGB10_BATCH_TRIM=1`, `DSGB10_BATCH_TRIM_COST=19,2.9` | the draft count for several sessions ([Drafting](#drafting)) |

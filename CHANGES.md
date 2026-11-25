@@ -232,6 +232,17 @@ one only where the winner is in doubt) also serves requests sampled at temperatu
 probabilities. With the served default of top_p 0.95, requests use it only when they set top_p to 1.
 - Measured: a decode step at one user 0.7 % shorter; checked against the full head on 43,041 rows, 0 differences.
 
+**Wide steps: the shared expert beside the router, a lighter all-reduce, the head on rows normalised once.** Three switches for
+steps of 17 to 64 rows, each off unless set, each giving the same bits as without it. `DSGB10_WIDE_SH=1` runs the shared expert on
+the side stream while the gate, the router and the routed experts' first half run. `DSGB10_WIDE_AR=1` makes the attention's and
+the FFN's all-reduce a reduce-scatter and an all-gather (each Spark sums one quarter) in place of every Spark receiving the other
+three partials whole; `2` also rounds the FFN's reduced quarter to bf16 before the all-gather, so it carries 2 bytes an element in
+place of 4. `DSGB10_HEADG=2` normalises the rows once for the wide head in place of in every CTA of the head kernel. Based on
+pico-dgx-ds4's a40eeb8 / f2bafa4 by Pico. [`docs/batching.md`](docs/batching.md#wide-steps-three-switches)
+- Setting: `DSGB10_WIDE_SH=1`, `DSGB10_WIDE_AR=1|2`, `DSGB10_HEADG=2` (on every Spark).
+- Measured: 16 users 6.0 % faster, 16 users on three shared prompts 7.1 %, 32 users 4.9 %; 2 to 5 users unchanged (within 0.3 %);
+  each switch and all three bit-equal to none (the samples hashes at 18, 32 and 64 rows).
+
 ## Drafting
 
 Every drafted token is checked by the model before it counts, so the output is the model's own. [`docs/batching.md`](docs/batching.md)

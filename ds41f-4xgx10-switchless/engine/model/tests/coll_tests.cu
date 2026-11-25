@@ -1,6 +1,6 @@
 // The runner's fused collectives (model/fused.cu) against the separate kernels they replace, and their
 // timing.
-//   coll_tests [--fleet FILE] [--mode proxy|ring] [--rows 1,6,8] [--n 80] [--rounds 21] [--proxy-cpu C] test|bench ...
+//   coll_tests [--fleet FILE] [--mode proxy|ring] [--rows 1,6,8] [--n 80] [--rounds 21] [--proxy-cpu C] test|bench|wide ...
 // test: one box, the ring in loop mode (the proxy answers every post itself); before each collective the
 // other three ranks' contributions are written where theirs would arrive, and everything runs once as
 // each of the four ranks:
@@ -14,6 +14,10 @@
 //     mix_ranks of the gathered sums against the same hc_finish of the rank-order sums, bit for bit;
 //   - mix_allreduce (the mixes by a collective of their own) against the same, bit for bit;
 //   - every output is the same bits whichever rank computes it.
+// wide (four boxes, --mode ring; engine/comm/run4.sh build/model/coll_tests --mode ring --rows 17,32,64 wide): the wide steps'
+// all-reduce (DSGB10_WIDE_AR), ops::allreduce_hc_bulk at 17..64 rows, mode 1 (fp32 partials: allreduce_bulk_f32 and
+// f32_to_bf16, also in place as the engine runs it) and mode 2 (allreduce_bulk_f32_bf16), bf16 partials too, against
+// ops::allreduce_hc on the same partials, bit for bit in stream, yraw and sub, and the same bits on all four ranks.
 // bench: graphs of --n collectives back to back, bf16 and fp32 partials alternating (attention's and
 // the FFN's), µs per collective, the variants interleaved, median of --rounds. With --mode ring on all
 // four boxes (engine/comm/run4.sh build/model/coll_tests --mode ring bench) every rank's outputs are
@@ -590,6 +594,64 @@ void bench(comm::Ring& ring, const std::vector<int>& rows, int n, int rounds, bo
   }
 }
 
+// ---- wide ---------------------------------------------------------------------------------------------
+
+// The wide steps' bulk chain against allreduce_hc, on the real ring (the bulk collectives need the four ranks).
+void wide(comm::Ring& ring, const std::vector<int>& rows) {
+  const comm::DevChannel& ch = ring.dev();
+  const int rank = ring.rank();
+  for (int R : rows) {
+    const int f0 = g_fail, c0 = g_checks;
+    Inputs in(R);
+    uint64_t hash = 1469598103934665603ull;
+    for (bool f32 : {false, true}) {
+      const std::string t = "R=" + std::to_string(R) + " rank " + std::to_string(rank) + (f32 ? " fp32 " : " bf16 ");
+      Outs ref(R);
+      sync();
+      ring.barrier();
+      model::ops::allreduce_hc(ch, in.part(rank, f32), f32, R, B(in.x.p), in.post.p, in.comb.p, in.pre.p,
+                               B(ref.stream.p), B(ref.yraw.p), B(ref.sub.p), g_s);
+      for (int mode : {1, 2}) {
+        if (!f32 && mode == 2) continue;  // bf16 partials have one bulk chain
+        for (bool inplace : {false, true}) {
+          if (!f32 && inplace) continue;
+          if (f32 && mode == 2 && inplace) continue;  // mode 2 does not write sums
+          const std::string tt = t + "mode " + std::to_string(mode) + (inplace ? " in place " : " ");
+          Outs got(R);
+          Dev<float> sums((size_t)R * kDim);
+          const void* part = in.part(rank, f32);
+          float* sm = sums.p;
+          if (inplace) {  // the engine's call: the partials are overwritten by their sums
+            CUDA_CHECK(cudaMemcpyAsync(sums.p, in.pf[rank].p, (size_t)R * kDim * 4, cudaMemcpyDeviceToDevice, g_s));
+            part = sums.p;
+          }
+          sync();
+          ring.barrier();
+          model::ops::allreduce_hc_bulk(ch, part, f32, mode, R, B(in.x.p), in.post.p, in.comb.p, in.pre.p,
+                                        B(got.stream.p), B(got.yraw.p), B(got.sub.p), sm, g_s);
+          same(tt + "stream", ref.stream, got.stream);
+          same(tt + "yraw", ref.yraw, got.yraw);
+          same(tt + "sub", ref.sub, got.sub);
+          for (auto p : {&Outs::stream, &Outs::yraw, &Outs::sub}) {
+            const auto h = host(got.*p);
+            hash = fnv(h.data(), h.size() * 2, hash);
+          }
+        }
+      }
+    }
+    std::vector<uint64_t> all(kRanks);
+    ring.allgather_host(&hash, all.data(), sizeof hash);
+    for (int k = 0; k < kRanks; ++k) {
+      ++g_checks;
+      if (all[k] != hash) {
+        ++g_fail;
+        std::printf("  R=%d rank %d: the bulk chain's outputs differ from rank %d's\n", R, rank, k);
+      }
+    }
+    std::printf("rank %d rows %d: %d checks, %s\n", rank, R, g_checks - c0, g_fail == f0 ? "all identical" : "DIFFERENT");
+  }
+}
+
 std::vector<int> parse_list(const std::string& s) {
   std::vector<int> v;
   size_t p = 0;
@@ -635,6 +697,11 @@ int main(int argc, char** argv) {
     if (w == "test") {
       if (o.mode == comm::Options::kRing) die("test runs in loop mode (one box)");
       test(rows.empty() ? std::vector<int>{1, 6, 8} : rows, o);
+    } else if (w == "wide") {
+      if (o.mode != comm::Options::kRing) die("wide runs on the four boxes (--mode ring: engine/comm/run4.sh)");
+      o.cap = std::max<size_t>(o.cap, 4u << 20);  // the engine's ring size (--ring-cap's default): 64 rows of fp32 partials fit
+      comm::Ring ring(o);
+      wide(ring, rows.empty() ? std::vector<int>{17, 32, 64} : rows);
     } else if (w == "bench") {
       comm::Ring ring(o);
       bench(ring, rows.empty() ? std::vector<int>{1, 6} : rows, n, rounds, o.mode != comm::Options::kRing);
