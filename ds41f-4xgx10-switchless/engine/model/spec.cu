@@ -95,8 +95,6 @@ __device__ __forceinline__ void st_release_sys_u32(uint32_t* p, uint32_t v) {
   asm volatile("st.release.sys.global.u32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
 }
 
-ops::StepSamp samp_of(const Sampling& s) { return ops::StepSamp{s.seed, s.temperature, s.top_p, s.top_k, s.n_top}; }
-
 // The step's input (as ops::step_in), a verify step's rows, tokens and positions from the spec state;
 // then the switch's value, the row count - 1.
 // stack4: cert_bodies > 0: the certified bodies follow the plain ones; a step takes them when every row's session is

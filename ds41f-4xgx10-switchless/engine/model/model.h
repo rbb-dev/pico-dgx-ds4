@@ -30,6 +30,12 @@ struct Sampling {
   uint64_t seed = 0;
   float ablit = 0.f;  // 1: the runtime abliteration (Options::ablit) on this request's rows; 0: the checkpoint's model
 };
+// A session's sampling as a step's input carries it, every field: every step kind (one session, batch, batch spec)
+// builds its input with this one function, so a field such as the abliteration's strength (read per row by
+// ablit.cu) reaches every kind.
+inline ops::StepSamp samp_of(const Sampling& s) {
+  return ops::StepSamp{s.seed, s.temperature, s.top_p, s.top_k, s.n_top, s.ablit};
+}
 using ops::SampleOut;
 
 struct Sink;

@@ -338,3 +338,4 @@ Fixes to code this repository builds on; each was shown failing before the fix.
 | Engram look-ahead used only by its own conversation | a prompt cancelled between pieces could give another conversation a wrong output (4 of 5 in the test) | 5 of 5 equal |
 | A full session store keeps every restart point | under a squeezed store, agents resumed from nothing or an old point | every agent resumes at its end |
 | Batch cancel marks index the batch's entries | a request on line 31 would have paused the whole batch | marks only its own entry |
+| The abliterated name applies in steps shared with other drafting sessions | beside another drafting session, a `NAME-ablit` request ran the published checkpoint from its second token on | the same tokens as alone, in either order (the batch spec steps carry each session's abliteration strength) |
