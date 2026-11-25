@@ -216,6 +216,42 @@ normalises in every CTA and against calls of 16 rows, bit for bit, 17 to 64 rows
 three: the samples hashes against the run with none, and each run's median step time); all run on the four Sparks and pass. Speed: 16
 users 6.0 % faster, 32 users 4.9 %, 2 to 5 users unchanged.
 
+## Long copy steps
+
+Copy drafting appends at most 7 drafts to the bonus token of a session's step (8 rows). A request that decodes alone and rewrites text
+it holds can verify far more in one step. With `DSGB10_COPY_ROWS=32` or `64` (and `DSGB10_COPY=1`) the one-session step graph holds one
+more body for each of the buckets of 32 and 64 rows, captured with the exact kernels of [Exact shared steps](#exact-shared-steps) in
+force whatever `DSGB10_WIDE_EXACT` says, and a step of 29 to 32 or 57 to 64 rows takes its bucket's body; steps of 1 to 8 rows keep
+their bodies (certified or plain). Unset or `8`, the graph is the present one, node for node. Each body ends with its own sampler
+launch (the exact ones' grid is 64 blocks), the draft module accepts a long step's last 8 final rows first and the earlier ones in a
+loop of chunks of 8, and the three ratio-2 compressor carries, which keep a call's last 16 rows by position, get the step's last 16
+final rows back from the projections the body saved (a rejected row's projection must not stay in them).
+
+The rows are chosen on the device, in `k_spec_next`, by a cursor kept per unit (`model/copy_run.h`): `cur`, the mirror index of the
+token predicted for the next position, and `len`, the tokens that matched behind it. After each step the tokens it emitted (its
+accepted drafts, then the bonus) walk the cursor while each equals the source's token; with no cursor the matcher looks up the bare
+tail. A ladder of three rungs (7, 31, 63 drafts) climbs by one after a step whose drafts were all accepted and whose tokens all
+walked the cursor, and enters from the first rung only when the match is at least `DSGB10_COPY_ENTER << fails` long; any other step
+sets it to the first rung. A long step not accepted whole adds one to `fails` (at most 3); one accepted whole clears it. A long
+step's drafts are the source's tokens alone (no chain drafts, no short proposal), cut at the first token that is not a real id and
+fitted to a body that exists (`copy_fit`: never 9 to 16 rows, never a bucket without an exact body). The learner's record of a
+long step is void, so its counts keep describing proposals of at most 7 rows. The cursor carries the position it was left at: a step
+run by another graph (the unit rode a batch step) does not match, and the cursor is dropped. A request's first step starts it over.
+
+Long steps run for a request that decodes alone; in shared steps copy rows are at most 7 as before. The host's bounds
+(`verify_reach`) widen to 63 rows, the draft rate and the step-cost model are not fed by long steps, and each request logs one line
+beside the digests: `copy: long steps N (whole W), drafts D, accepted A`.
+
+Settings (on every Spark; a value outside its range stops the start): `DSGB10_COPY_ROWS` 8 (unset), 32 or 64 (32: the 32-row body,
+31 drafts; 64: both bodies, 63 drafts), `DSGB10_COPY_ENTER` 8 to 72, default 32. Memory: one more body each (a graph of the one-session
+step is about 33 MiB a body, the start prints the figure) and 0.75 MiB of saved projections. Test-only: `DSGB10_TF_SOLO=1` with
+`DSGB10_TF_SESSROWS=1` runs the tool's teacher-forced given steps of more than 16 rows as an exact body. Based on pico-dgx-ds4's
+`0580fe6` by Pico.
+
+Tests: `copy_run_test` (host: the cursor, the ladder, `copy_fit`, the settings, each with its wrong-rule control); GPU rows in `engine/server/tests/long_copy_gpu.sh` (the kernels' `rg` section, the tool's hash at 1, 8, 32 and 64 rows, the service's
+rewrites with the setting unset and on, the speed workloads); the kernels, the tool's hashes and the greedy rewrites run on the four
+Sparks and pass. Speed: rewrites of 1K, 4K and 8K tokens 47 %, 41 % and 37 % shorter.
+
 ## Exact shared steps
 
 A request alone steps 1 to 8 rows at a time. Beside others it rides steps of 9 to 64 rows, where a row's values are added in

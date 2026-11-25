@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "model/copy.h"
+#include "model/copy_run.h"
 #include "model/ops.h"
 
 namespace model::copy {
@@ -20,6 +21,7 @@ struct Dev {
   uint32_t pad;
   Learn learn;               // the chances that follow the traffic (copy.h; read and written only with kAdapt)
   UnitLearn ul[kMaxUnitsCopy];  // each unit's conversation counts and its last proposal
+  Run run[kMaxUnitsCopy];       // each unit's cursor and ladder rung (copy_run.h; read and written only with DSGB10_COPY_ROWS above 8)
 };
 
 // What a spec step's gate kernels take: null dev = copy drafting off (the kernels are then as without it).

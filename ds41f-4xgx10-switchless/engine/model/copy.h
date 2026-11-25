@@ -56,9 +56,57 @@ inline int min_match() {
   }();
   return n;
 }
+// Long copy steps (copy_run.h): DSGB10_COPY_ROWS = 8 (unset: the steps of before) | 32 | 64, DSGB10_COPY_ENTER = the match length
+// (kOrder..kOrder + kBack, default 32) a cursor needs before its first long step. A text outside the range is -1.
+constexpr int kRowsDefault = 8, kEnterDefault = 32, kEnterMax = kOrder + kBack;
+inline int rows_from(const char* e) {
+  if (!e || !*e) return kRowsDefault;
+  if (e[0] == '8' && !e[1]) return 8;
+  if (e[0] == '3' && e[1] == '2' && !e[2]) return 32;
+  if (e[0] == '6' && e[1] == '4' && !e[2]) return 64;
+  return -1;
+}
+inline int enter_from(const char* e) {
+  if (!e || !*e) return kEnterDefault;
+  long x = 0;
+  for (const char* p = e; *p; ++p) {
+    if (*p < '0' || *p > '9') return -1;
+    x = x * 10 + (*p - '0');
+    if (x > 100000) return -1;
+  }
+  return x >= kOrder && x <= kEnterMax ? (int)x : -1;
+}
+// The first of the two settings outside its range, as "NAME=text: what it takes" in msg; 0 when both are fine.
+inline int run_env_error(const char* rows, const char* enter, char* msg, size_t n) {
+  if (rows_from(rows) < 0) return std::snprintf(msg, n, "DSGB10_COPY_ROWS=%s: 8, 32 or 64", rows), 1;
+  if (enter_from(enter) < 0) return std::snprintf(msg, n, "DSGB10_COPY_ENTER=%s: a match length %d..%d", enter, kOrder, kEnterMax), 1;
+  return 0;
+}
+inline int run_env_error(char* msg, size_t n) { return run_env_error(getenv("DSGB10_COPY_ROWS"), getenv("DSGB10_COPY_ENTER"), msg, n); }
+// The values the engine runs with (main.cpp has refused a bad text by the time these are read).
+inline int copy_rows() {
+  static const int v = rows_from(getenv("DSGB10_COPY_ROWS")) > 0 ? rows_from(getenv("DSGB10_COPY_ROWS")) : kRowsDefault;
+  return v;
+}
+inline int copy_enter() {
+  static const int v = enter_from(getenv("DSGB10_COPY_ENTER")) > 0 ? enter_from(getenv("DSGB10_COPY_ENTER")) : kEnterDefault;
+  return v;
+}
+// Long steps' bits in StepIn::copy, beside the mode bits: the ladder's top (0 / 1 / 2) in bits 8-9, the entry length in bits 16-23.
+// 0 (DSGB10_COPY_ROWS unset or 8): no long step, the step as without them.
+inline int32_t long_bits() {
+  const int top = copy_rows() >= 64 ? 2 : copy_rows() >= 32 ? 1 : 0;
+  return top ? (int32_t)(top << 8 | copy_enter() << 16) : 0;
+}
+CPY_HD inline int long_top(int32_t copy_word) { return (copy_word >> 8) & 3; }
+CPY_HD inline int long_enter(int32_t copy_word) { return (copy_word >> 16) & 255; }
+
 // The drafts a step's rows can reach past the previous step's last row, for the host's mapped-memory bounds (cmd.cpp:
 // verify(pos + 1 + reach)): the chain's kDrafts, or kMaxDrafts when copy rows are on.
-CPY_HD inline int verify_reach(int chain_drafts, bool rows_on) { return rows_on ? kMaxDrafts : chain_drafts; }
+// With long copy steps (DSGB10_COPY_ROWS above 8, copy_run.h) a step of one session reaches 63 rows past the previous step's last.
+CPY_HD inline int verify_reach(int chain_drafts, bool rows_on, int long_rows = 8) {
+  return rows_on ? (long_rows > 8 ? 63 : kMaxDrafts) : chain_drafts;
+}
 
 CPY_HD inline bool valid_token(int32_t t) { return t >= 0 && t < kVocabIds; }
 
@@ -456,14 +504,14 @@ CPY_HD inline Obs unpack_obs(uint32_t w) {
   return o;
 }
 
-// The settings every rank must hold alike (compared at start-up on the host all-gather): the mode bits, the shortest match and the
+// The settings every rank must hold alike (compared at start-up on the host all-gather): the mode bits, the shortest match, the long steps' rows and entry length and the
 // table file's bytes (0 without one). A rank that differs would verify other rows than the others and stop at the next collective.
 struct Settings {
-  uint32_t mode, min_match;
+  uint32_t mode, min_match, rows, enter;
   uint64_t table_hash;
 };
 inline Settings settings() {
-  Settings s{(uint32_t)mode(), (uint32_t)min_match(), 0};
+  Settings s{(uint32_t)mode(), (uint32_t)min_match(), (uint32_t)copy_rows(), (uint32_t)copy_enter(), 0};
   const char* f = getenv("DSGB10_COPY_TABLE");
   if (f && *f) {
     uint64_t h = 1469598103934665603ull;

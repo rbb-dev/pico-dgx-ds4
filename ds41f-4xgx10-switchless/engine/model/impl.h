@@ -152,6 +152,7 @@ struct RouteRec {
 struct Prefill;  // prefill.cu's buffers
 struct Store;    // state.cu's sessions
 struct Spec;     // spec.cu's draft module and spec steps
+extern bool g_xbody;  // model.cu: an exact body of the one-session step graph is being captured (long copy steps)
 
 }  // namespace detail
 
@@ -537,7 +538,7 @@ struct Model::Impl {
     CUDA_CHECK(cudaEventRecord(e, s));
     CUDA_CHECK(cudaStreamWaitEvent(st, e, 0));
   }
-  void engram_prepare(int pos0, int R, const uint64_t seq[2]);
+  void engram_prepare(int pos0, int R, const uint64_t seq[2], int pad_to = 0);
   void engram_submit(int R, const uint64_t seq[2]);  // the store's requests for the rows' ids
   // a batch step's rows: each one's token into its slot's history, then its session's hashes
   void engram_rows(int R, const int32_t* tok, const int32_t* pos, const int32_t* slot, const uint64_t seq[2],
@@ -623,6 +624,7 @@ struct Model::Impl {
   void bind_spec(dsw::WeightFile& wf, const dsw::WeightFile* draft = nullptr);
   void spec_head_coded();  // code_head: the draft module's bf16 head GEMV on the coded head
   void spec_use_slot(int s);  // the draft module's eager paths act on slot s's windows
+  void spec_copy_save(int k, int R, cudaStream_t s);  // long copy steps: a wide body's ratio-2 projections kept for the carries' repair
   void spec_hidden(int L, int R);  // main_hidden of the step's rows at the input of layer L
   // prefill: main_hidden of the rows that enter the draft's window (the chunk's last 256, the 128 before
   // each snapshot), then their accept()s and the snapshots' copies of the windows. Under CED only the

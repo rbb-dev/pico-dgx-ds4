@@ -265,6 +265,19 @@ without them. Based on pico-dgx-ds4's `0580fe6` by Pico (its kernels and tests; 
   beside others gave its tokens alone (200 of 200) and its log probabilities (0 of 200 different), the abliteration included. With
   the draft gate's cost fits of the plain bodies: 16 users 8.5 % slower, 32 users 7.3 %, 2 to 5 users 1.0 to 1.7 %.
 
+**Long copy steps: a request alone verifies 31 or 63 copy drafts in one step.** When a reply repeats text the conversation already
+holds, the tokens that followed there are the drafts. Our copy drafting offered at most 7 of them in a step of one session; with
+`DSGB10_COPY_ROWS=32|64` the step graph of one session also holds exact bodies of 32 and 64 rows (the row-group kernels of the exact
+shared steps, so a long step's rows compute what a step of at most 8 rows computes), and a unit's cursor walks the source while the
+reply equals it: after `DSGB10_COPY_ENTER` matching tokens the step grows from 7 to 31 to 63 drafts, falls back to 7 at the first
+draft that is not accepted, and waits longer before the next entry. The matcher stays the one on the device; nothing is sent from the
+host. Based on pico-dgx-ds4's `0580fe6` by Pico (its row-group kernels and the copy tail of its graph; its host matcher, its second
+step graph and the `prediction` field are not taken). [`docs/batching.md`](docs/batching.md#long-copy-steps)
+- Setting: `DSGB10_COPY_ROWS=32|64`, `DSGB10_COPY_ENTER=N` (on every Spark; a value outside its range stops the start; off unless set).
+- Measured: rewrites of 1K, 4K and 8K-token passages 47 %, 41 % and 37 % shorter, bit-equal to the run without it (4 of 4 at each
+  length); one session's steps of 16, 32 and 64 rows give its 1-row samples hash, also at an odd context and with slot tables. Not
+  measured: a long step accepted only in part, and the wait of a request that arrives during a long step.
+
 **The router gate ends before the MoE starts in steps of 2 to 4 rows.** At 2-4 rows the MoE's first kernel is launched to
 overlap the router gate's GEMV and shares its SMs while the gate streams its rows; a kernel that does nothing, launched between
 the two without the overlap, lets the gate end first. No arithmetic changes. Based on pico-dgx-ds4's 1fcae63 by Pico.

@@ -102,8 +102,11 @@ __device__ __forceinline__ void st_release_sys_u32(uint32_t* p, uint32_t v) {
 // greedy and asks no top logprobs (the sampler then needs the argmax alone); with cert_samp also when it samples with
 // the temperature alone, up to 1 (no top-k or top-p: the sampler needs the Gumbel-max winner alone; above 1 the scores
 // flatten and more of the head survives the bound).
+// Long copy steps (xmask != 0, copy_run.h): a verify step of more than 8 rows takes the exact body of its bucket (body xbase + the
+// number of exact buckets below it; a bucket with no body takes the next one up, its pad rows copies of the last row's token so that
+// they add no experts).
 __global__ void k_spec_in(const ops::StepIn* ring, uint32_t* counter, const ops::SpecState* ss, ops::StepIn* d,
-                          cudaGraphConditionalHandle h, int cert_bodies, int cert_samp) {
+                          cudaGraphConditionalHandle h, int cert_bodies, int cert_samp, int xmask, int xbase) {
   constexpr int n = sizeof(ops::StepIn) / 4;
   static_assert(sizeof(ops::StepIn) % 4 == 0, "StepIn");
   const uint32_t slot = *counter % ops::kInSlots;
@@ -114,8 +117,9 @@ __global__ void k_spec_in(const ops::StepIn* ring, uint32_t* counter, const ops:
     if (d->spec == ops::kSpecVerify) {
       const int R = ss->next_rows;
       d->rows = R;
+      const int32_t pad = xmask && R > copy::kStepRows ? ss->next_tok[R - 1] : 0;
       for (int r = 0; r < kMaxRows; ++r) {
-        d->tokens[r] = r < R ? ss->next_tok[r] : 0;
+        d->tokens[r] = r < R ? ss->next_tok[r] : pad;
         d->pos[r] = ss->next_pos0 + min(r, R - 1);
       }
     }
@@ -129,7 +133,71 @@ __global__ void k_spec_in(const ops::StepIn* ring, uint32_t* counter, const ops:
       }
       if (ok) cv = cert_bodies;
     }
-    cudaGraphSetConditional(h, (unsigned)(d->rows - 1 + cv));
+    unsigned body = (unsigned)(d->rows - 1 + cv);
+    if (xmask && d->rows > copy::kStepRows) {
+      int b = copy::bucket_of_rows(d->rows);
+      while (b < 7 && !((xmask >> b) & 1)) ++b;
+      int j = 0;
+      for (int i = 0; i < b; ++i) j += (xmask >> i) & 1;
+      body = (unsigned)(xbase + j);
+    }
+    cudaGraphSetConditional(h, body);
+  }
+}
+
+// ---- long copy steps (copy_run.h) ------------------------------------------------------------------------------
+// The one-session step's accept of its final rows when it may hold more than kMaxAcc of them: the last kMaxAcc go first (acc: count,
+// pos0, row0; the draft pass's anchor is the last final row), the rows before them follow in chunks of kMaxAcc in a loop (lp: count,
+// pos0, row0, a dummy anchor, -, rows done, -, -, then the slot table of the chunk).
+__device__ __forceinline__ bool run_chunk(const ops::StepIn* in, const ops::SpecState* ss, int* lp) {
+  const int done = lp[5];
+  const int left = ss->count - dspark::kMaxAcc - done;
+  if (left <= 0) return false;
+  const int n = min(left, (int)dspark::kMaxAcc);
+  lp[0] = n, lp[1] = ss->pos0 + done, lp[2] = done;
+  for (int j = 0; j < dspark::kMaxAcc; ++j) lp[8 + j] = in->slot[0];
+  lp[5] = done + n;
+  return true;
+}
+__global__ void k_run_acc(const ops::StepIn* in, const ops::SpecState* ss, int* acc, int* lp, cudaGraphConditionalHandle hw) {
+  if (threadIdx.x != 0) return;
+  const int c = ss->count, over = c > dspark::kMaxAcc ? c - dspark::kMaxAcc : 0;
+  acc[0] = c - over, acc[1] = ss->pos0 + over, acc[2] = over;
+  lp[5] = 0;
+  cudaGraphSetConditional(hw, run_chunk(in, ss, lp) ? 1u : 0u);
+}
+__global__ void k_run_next(const ops::StepIn* in, const ops::SpecState* ss, int* lp, cudaGraphConditionalHandle hw) {
+  if (threadIdx.x != 0) return;
+  cudaGraphSetConditional(hw, run_chunk(in, ss, lp) ? 1u : 0u);
+}
+// An exact body's rows' ratio-2 projections and scores (block r: row r) into save [2][kMaxRows][kHead].
+__global__ void k_copy_save(const float* kv, const float* sc, float* save) {
+  const int r = blockIdx.x;
+  for (int c = threadIdx.x; c < kHead; c += blockDim.x) {
+    save[(size_t)r * kHead + c] = kv[(size_t)r * kHead + c];
+    save[((size_t)kMaxRows + r) * kHead + c] = sc[(size_t)r * kHead + c];
+  }
+}
+// After the verdicts of a step of more than kDecodeRows rows: each ratio-2 carry holds its last 16 rows by position, the rejected ones
+// among them; the step's last 16 final rows go back in, so that the next step's first row finds the projection of the position
+// before it. Block (j, y): the final row count - 1 - j, kv source y. carry: the three sources' kv and score, a unit `stride` floats.
+struct CopyCarry {
+  float* kv[3];
+  float* sc[3];
+  size_t stride;
+};
+__global__ void k_run_repair(const ops::StepIn* in, const ops::SpecState* ss, const float* save, CopyCarry carry) {
+  const int j = blockIdx.x, y = blockIdx.y;
+  if (in->rows <= kDecodeRows) return;
+  const int q = ss->count - 1 - j;
+  if (q < 0) return;
+  const int slot = (ss->pos0 + q) & 15;
+  const float* sv = save + (size_t)y * 2 * kMaxRows * kHead;
+  float* dkv = carry.kv[y] + (size_t)in->slot[0] * carry.stride + (size_t)slot * kHead;
+  float* dsc = carry.sc[y] + (size_t)in->slot[0] * carry.stride + (size_t)slot * kHead;
+  for (int c = threadIdx.x; c < kHead; c += blockDim.x) {
+    dkv[c] = sv[(size_t)q * kHead + c];
+    dsc[c] = sv[((size_t)kMaxRows + q) * kHead + c];
   }
 }
 
@@ -170,6 +238,8 @@ __global__ void k_spec_next(const ops::StepIn* in, ops::SpecState* ss, const int
   }
   int n_copy = 0;
   int32_t ctok[copy::kMaxDrafts] = {};
+  int n_long = 0;  // long copy steps: the drafts of a step of 29..32 or 57..64 rows, taken from the unit's cursor (copy_run.h)
+  int32_t ltok[copy::kMaxLong];
   if (cp.dev && in->copy) {
     const int uidx = min(max(in->slot[0], 0), copy::kMaxUnitsCopy - 1);
     copy::Unit& u = cp.dev->unit[uidx];
@@ -185,8 +255,12 @@ __global__ void k_spec_next(const ops::StepIn* in, ops::SpecState* ss, const int
         tk = copy::outcome(ul->pend, in->spec == ops::kSpecVerify, in->force, ss->pos0, ss->count, ss->bonus);
         copy::sess_apply(ul->sess, cp.dev->learn, tk);
       }
+      const int ltop = (in->copy & copy::kRows) ? copy::long_top(in->copy) : 0;
+      if (ltop > 0)  // the cursor walks this step's tokens, the ladder takes its verdict, and a long step may follow
+        n_long = copy::run_step(cp.dev->run[uidx], u, in->spec == ops::kSpecVerify, ss->pos0, in->rows, ss->count, in->tokens, ss->bonus, P,
+                                in->pos_end - 1 - P, ltop, copy::long_enter(in->copy), copy::exact_mask(ltop == 2 ? 64 : 32), ltok);
       const int maxm = min(copy::kMaxDrafts - k, in->pos_end - 1 - (P + k));
-      if (in->max_drafts > 0 && maxm > 0) {
+      if (in->max_drafts > 0 && maxm > 0 && n_long == 0) {
         int32_t d[ops::kDrafts];
         for (int j = 0; j < k; ++j) d[j] = drafts[j];
         m = copy::propose(u, P, d, k, maxm, in->copy_min, ctok, &mt);
@@ -223,13 +297,15 @@ __global__ void k_spec_next(const ops::StepIn* in, ops::SpecState* ss, const int
       o.copy_obs[0] = 0;
     }
   }
+  if (n_long > 0) k = 0;  // a long step is the cursor's rows alone: no chain drafts, no short proposal (its learner record above is void)
   k += n_copy;  // the chain's kept drafts, then the copy rows: the step's drafts
   const int kc = k - n_copy;
-  ss->next_rows = 1 + k;
+  ss->next_rows = 1 + (n_long > 0 ? n_long : k);
   ss->next_pos0 = P;
   ss->next_tok[0] = ss->bonus;
-  for (int j = 1; j < kMaxRows; ++j) ss->next_tok[j] = j <= kc ? drafts[j - 1] : j <= k ? ctok[j - kc - 1] : 0;
-  o.next_rows = 1 + k;
+  for (int j = 1; j < kMaxRows; ++j)
+    ss->next_tok[j] = n_long > 0 ? (j <= n_long ? ltok[j - 1] : 0) : j <= kc ? drafts[j - 1] : j <= k ? ctok[j - kc - 1] : 0;
+  o.next_rows = ss->next_rows;
   o.next_pos0 = P;
   for (int j = 0; j < kMaxRows; ++j) o.next_tok[j] = ss->next_tok[j];
   for (int j = 0; j < ops::kDrafts; ++j) o.drafts[j] = drafts[j], o.survival[j] = surv[j];
@@ -751,6 +827,9 @@ Spec::~Spec() {
   cudaFree(bent);
   cudaFree(pstab);
   cudaFree(mism);
+  cudaFree(lacc);
+  cudaFree(clp);
+  cudaFree(csave);
   cudaFree(pf_mh);
   cudaFree(pf_acc);
   cudaFreeHost(pf_acc_h);
@@ -958,6 +1037,22 @@ void Model::Impl::bind_spec(dsw::WeightFile& wf, const dsw::WeightFile* draft) {
     int ctx[kMaxUnits] = {};
     for (int s = 0; s < nslots; ++s) ctx[unit_of[s]] = slot_ctx_[s];
     sp.copy = std::make_unique<copy::Index>(ctx, nunits, (size_t)opt.copy_mib << 20, st);
+    if (copy::copy_rows() > copy::kStepRows && (copy::mode() & copy::kRows)) {  // long copy steps (copy_run.h)
+      sp.xlong = true;
+      sp.xmask = copy::exact_mask(copy::copy_rows());
+      for (int i = 0; i < ops::kNumWideBuckets; ++i)
+        if (copy::bucket_rows(i) != ops::wide_bucket_rows(i)) die("model: copy_run.h's bucket %d holds %d rows, the engine's %d", i, copy::bucket_rows(i), ops::wide_bucket_rows(i));
+      sp.lacc = dalloc<int>(3);
+      sp.clp = dalloc<int>(16);
+      sp.csave = dalloc<float>((size_t)3 * 2 * kMaxRows * kHead);
+      CUDA_CHECK(cudaMemsetAsync(sp.lacc, 0, 3 * sizeof(int), st));
+      CUDA_CHECK(cudaMemsetAsync(sp.clp, 0, 16 * sizeof(int), st));
+      CUDA_CHECK(cudaMemsetAsync(sp.csave, 0, (size_t)3 * 2 * kMaxRows * kHead * sizeof(float), st));
+      if (rank == 0)
+        std::printf("copy: long steps on (DSGB10_COPY_ROWS=%d, DSGB10_COPY_ENTER=%d): exact bodies of %s rows in the one-session step graph, "
+                    "up to %d drafts a step\n", copy::copy_rows(), copy::copy_enter(), copy::copy_rows() >= 64 ? "32 and 64" : "32",
+                    copy::copy_rows() >= 64 ? 63 : 31);
+    }
     if (rank == 0)
       std::printf("copy: drafting %s%s, %.1f MiB of the %d MiB arena a rank (an estimate of one session's lookup: a few "
                   "us a step, not timed)\n", copy::mode() & copy::kRows ? "rows on" : "probe", copy::mode() & copy::kAll ? ", every proposed row" : "",
@@ -973,6 +1068,12 @@ void Model::Impl::bind_spec(dsw::WeightFile& wf, const dsw::WeightFile* draft) {
 void Model::Impl::spec_head_coded() {
   if (!spec->graphs.empty()) die("model: code_head after a spec step was captured");
   if (!opt.draft_fp8 && !opt.draft_head4) spec->draft->set_head_coded(head);  // dspark's Weights::head is this slot too
+}
+
+void Model::Impl::spec_copy_save(int k, int R, cudaStream_t s) {
+  if (!spec || !spec->xlong || k < 0 || k > 2) return;
+  k_copy_save<<<R, 128, 0, s>>>(ckvf, cscf, spec->csave + (size_t)k * 2 * kMaxRows * kHead);
+  CUDA_CHECK(cudaGetLastError());
 }
 
 void Model::Impl::spec_hidden(int L, int R) {
@@ -1049,7 +1150,15 @@ cudaGraphExec_t Model::Impl::spec_graph(int ctx) {
   // the step's rows, and the switch's value
   CUDA_CHECK(cudaStreamBeginCaptureToGraph(st, g, nullptr, nullptr, 0, mode));
   const int cert_bodies = cert.on && head_coded ? kMaxSessRows : 0;  // stack4
-  k_spec_in<<<1, 128, 0, st>>>(in_h, in_ctr, sp.ss, in_d, h, cert_bodies, cert.samp ? 1 : 0);
+  // long copy steps (DSGB10_COPY_ROWS above 8): an exact body for each bucket of xmask after the plain and the certified bodies, each
+  // body ending with its own sampler launch (the exact ones' grid is kMaxRows blocks), and a chunked accept of the final rows
+  const bool xl = sp.xlong;
+  int xrows[ops::kNumWideBuckets] = {}, nx = 0;
+  if (xl)
+    for (int i = 0; i < ops::kNumWideBuckets; ++i)
+      if ((sp.xmask >> i) & 1) xrows[nx++] = ops::wide_bucket_rows(i);
+  k_spec_in<<<1, 128, 0, st>>>(in_h, in_ctr, sp.ss, in_d, h, cert_bodies, cert.samp ? 1 : 0, xl ? sp.xmask : 0,
+                               kMaxSessRows + cert_bodies);
   CUDA_CHECK(cudaGetLastError());
   cudaStreamCaptureStatus cs;
   const cudaGraphNode_t* deps = nullptr;
@@ -1066,21 +1175,26 @@ cudaGraphExec_t Model::Impl::spec_graph(int ctx) {
   cp.type = cudaGraphNodeTypeConditional;
   cp.conditional.handle = h;
   cp.conditional.type = cudaGraphCondTypeSwitch;
-  cp.conditional.size = kBodies + cert_bodies;
+  cp.conditional.size = kBodies + cert_bodies + nx;
   cudaGraphNode_t sw;
   CUDA_CHECK(cudaGraphAddNode(&sw, g, head.data(), nullptr, head.size(), &cp));
   mh_on = true;
-  for (int i = 0; i < kBodies + cert_bodies; ++i) {  // stack4: bodies kBodies.. are the certified ones of R = i - kBodies + 1
-    const int R = i % kBodies + 1;
-    cert_cap = i >= kBodies;
+  for (int i = 0; i < kBodies + cert_bodies + nx; ++i) {  // stack4: bodies kBodies.. are the certified ones of R = i - kBodies + 1; then the exact ones
+    const bool xb = i >= kBodies + cert_bodies;
+    const int R = xb ? xrows[i - kBodies - cert_bodies] : i % kBodies + 1;
+    cert_cap = !xb && i >= kBodies;
     CUDA_CHECK(cudaStreamBeginCaptureToGraph(st, cp.conditional.phGraph_out[i], nullptr, nullptr, 0, mode));
+    g_xbody = xb;
     forward_rows(R, ctx, 0, nullptr, 0);
+    g_xbody = false;
+    if (xl)  // each body ends with its own sampler launch: the plain ones' grid of kLowRows blocks, the exact ones' of kMaxRows
+      ops::sample(ch, logits, kVocabPart * rank, in_d, ctl_h, out_h, fb, samp_ctr, st, sp.ss, xb ? kMaxRows : ops::kLowRows);
     CUDA_CHECK(cudaStreamEndCapture(st, &cap));
     cert_cap = false;
   }
   mh_on = false;
   size_t nodes = 0;
-  for (int i = 0; i < kBodies + cert_bodies; ++i) {
+  for (int i = 0; i < kBodies + cert_bodies + nx; ++i) {
     size_t k = 0;
     CUDA_CHECK(cudaGraphGetNodes(cp.conditional.phGraph_out[i], nullptr, &k));
     nodes += k;
@@ -1089,12 +1203,48 @@ cudaGraphExec_t Model::Impl::spec_graph(int ctx) {
   // the verdicts (the sampler's grid of kLowRows blocks: the bodies hold at most that many rows), the draft
   // module, the next step's rows, the publication
   CUDA_CHECK(cudaStreamBeginCaptureToGraph(st, g, &sw, nullptr, 1, mode));
-  ops::sample(ch, logits, kVocabPart * rank, in_d, ctl_h, out_h, fb, samp_ctr, st, sp.ss, ops::kLowRows);
+  if (!xl) ops::sample(ch, logits, kVocabPart * rank, in_d, ctl_h, out_h, fb, samp_ctr, st, sp.ss, ops::kLowRows);
   if (sp.mhd) k_mh_dump<<<kMaxSessRows, 256, 0, st>>>(sp.mh, in_d, sp.mhd);  // stack4: data collection
   // the step's session's windows (every entry of its slot table holds its slot)
   const int* slot = nunits > 1 ? in_d->slot : nullptr;
   sp.draft->use_factor(sf);
-  sp.draft->accept(sp.mh, &sp.ss->count, &sp.ss->pos0, st, slot);
+  if (!xl) {
+    sp.draft->accept(sp.mh, &sp.ss->count, &sp.ss->pos0, st, slot);
+  } else {
+    // long copy steps: the carries first (a step of more than 16 rows left the rejected rows' projections in them), the accept of the
+    // last kMaxAcc final rows (the draft pass's anchor), then a loop over the final rows before them, kMaxAcc a chunk
+    cudaGraphConditionalHandle hw;
+    CUDA_CHECK(cudaGraphConditionalHandleCreate(&hw, g, 0, 0));
+    k_run_acc<<<1, 32, 0, st>>>(in_d, sp.ss, sp.lacc, sp.clp, hw);
+    CopyCarry cc{};
+    for (int y = 0; y < 3; ++y) cc.kv[y] = kvs0[y].carry_kv, cc.sc[y] = kvs0[y].carry_sc;
+    cc.stride = KvSrc::kCarryStride;
+    k_run_repair<<<dim3(16, 3), 128, 0, st>>>(in_d, sp.ss, sp.csave, cc);
+    CUDA_CHECK(cudaGetLastError());
+    sp.draft->accept(sp.mh, sp.lacc, sp.lacc + 1, st, slot, sp.lacc + 2);
+    const cudaGraphNode_t* wdeps = nullptr;
+    size_t wnd = 0;
+    CUDA_CHECK(cudaStreamGetCaptureInfo(st, &cs, nullptr, nullptr, &wdeps, nullptr, &wnd));
+    const std::vector<cudaGraphNode_t> wtail(wdeps, wdeps + wnd);
+    CUDA_CHECK(cudaStreamEndCapture(st, &cap));
+    cudaGraphNodeParams wp{};
+    wp.type = cudaGraphNodeTypeConditional;
+    wp.conditional.handle = hw;
+    wp.conditional.type = cudaGraphCondTypeWhile;
+    wp.conditional.size = 1;
+    cudaGraphNode_t wn;
+    CUDA_CHECK(cudaGraphAddNode(&wn, g, wtail.data(), nullptr, wtail.size(), &wp));
+    CUDA_CHECK(cudaStreamBeginCaptureToGraph(st, wp.conditional.phGraph_out[0], nullptr, nullptr, 0, mode));
+    sp.draft->accept(sp.mh, sp.clp, sp.clp + 1, st, nunits > 1 ? sp.clp + 8 : nullptr, sp.clp + 2, sp.clp + 3);
+    k_run_next<<<1, 32, 0, st>>>(in_d, sp.ss, sp.clp, hw);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaStreamEndCapture(st, &cap));
+    size_t kn = 0;
+    CUDA_CHECK(cudaGraphGetNodes(wp.conditional.phGraph_out[0], nullptr, &kn));
+    nodes += kn;
+    sp.nodes = nodes;
+    CUDA_CHECK(cudaStreamBeginCaptureToGraph(st, g, &wn, nullptr, 1, mode));
+  }
   sp.draft->draft(&sp.ss->bonus, st, slot);
   if (opt.tree_probe) {  // EXPERIMENT (docs/engine.md, "Draft trees")
     sp.draft->probe(in_d->probe, st);
@@ -1415,7 +1565,7 @@ void Model::Impl::spec_fill(ops::StepIn& in, int mode, const SpecCfg& c) {
   // copy rows reach past the chain's: the modelled ms of 6 and 7 drafts, by the last difference
   for (int i = ops::kDrafts + 1; i <= ops::kCopyDrafts; ++i)
     in.step_ms[i] = in.step_ms[i - 1] + std::max(0.f, in.step_ms[i - 1] - in.step_ms[i - 2]);
-  in.copy = spec && spec->copy ? copy::mode() : 0;
+  in.copy = spec && spec->copy ? copy::mode() | (spec->xlong ? copy::long_bits() : 0) : 0;
   in.copy_min = copy::min_match();
 }
 

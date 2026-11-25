@@ -28,6 +28,13 @@ namespace model {
 
 using namespace detail;
 
+// Long copy steps (copy_run.h): true while an exact body of the one-session step graph is captured. Inside it the families of a wide
+// step run through the decode kernels' sums whatever DSGB10_WIDE_EXACT and DSGB10_NORM_EXACT say, so no variable can make a long
+// copy step inexact.
+namespace detail {
+bool g_xbody = false;
+}
+
 // DSGB10_GSAMPLE, DSGB10_GCOUPLE (Td per depth) and DSGB10_GCOUPLE_CF (A, B): read once, every rank (main.cpp compares them)
 const ops::GSettings& gsample_settings() {
   static const ops::GSettings g = [] {
@@ -134,6 +141,7 @@ bool unfused16() {
 // the row-group kernels instead (dsk::gemv_fp8_rows, gemv_woa_rows, gemv_bf16_rows, moe_rows): the same bits, the weights
 // read once for all the rows. 95 = the whole exact wide body. 0 (default): the wide body.
 int wide_exact() {
+  if (g_xbody) return exact::kWideMax;
   static const int v = [] {
     const int x = exact::wide_exact(getenv("DSGB10_WIDE_EXACT"));
     if (x > 0) std::fprintf(stderr, "exact shared steps: 17..64-row steps through the decode kernels' sums, families %d (DSGB10_WIDE_EXACT)\n", x);
@@ -163,7 +171,7 @@ int norm_nt(const dsk::GemvCfg& c, int R) {
     if (x) std::fprintf(stderr, "exact shared steps: the RMSNorm launches add in the fused kernels' order (DSGB10_NORM_EXACT)\n");
     return x;
   }();
-  return on && (R <= kDecodeRows || wide_exact()) ? 32 * c.wn * c.wk : 0;
+  return (on || g_xbody) && (R <= kDecodeRows || wide_exact()) ? 32 * c.wn * c.wk : 0;
 }
 // DSGB10_R16_EXACT=bits (test only) runs parts of a 9..16-row step through the kernels of a step of at most 8 rows, in two
 // groups (the weights are read once per group): 1 wq_a + wkv and wq_b, 2 wo_a + wo_b, 4 the router gate, 8 the MoE, 16 the
@@ -176,9 +184,21 @@ int r16_exact() {
   }();
   return v;
 }
+// test only (DSGB10_TF_SOLO=1, the tool's teacher-forced runs of one session with DSGB10_TF_SESSROWS): a given step of more than
+// kDecodeRows rows runs as the exact bodies of the one-session step graph do. Never set in serve.
+bool tf_solo() {
+  static const bool on = [] {
+    const char* e = getenv("DSGB10_TF_SOLO");
+    const bool v = e && atoi(e) > 0;
+    if (v) std::fprintf(stderr, "batch steps: DSGB10_TF_SOLO: steps of more than %d rows run as an exact body (test only)\n", kDecodeRows);
+    return v;
+  }();
+  return on;
+}
 // Any exact setting in force: a step of one session's rows is then never re-routed by DSGB10_OEA (its text must not depend on its
 // step's width). Unset: the re-routing applies to every call of its minimum rows, as before.
 bool exact_any() {
+  if (g_xbody) return true;
   static const bool v = exact::norm_exact(getenv("DSGB10_NORM_EXACT")) > 0 || exact::wide_exact(getenv("DSGB10_WIDE_EXACT")) > 0 ||
                         exact::r16_exact(getenv("DSGB10_R16_EXACT")) > 0;
   return v;
@@ -801,9 +821,14 @@ attn::CompressorCarry Model::Impl::step_carry(int k) const {
 // Host side, once a step's tokens are known: hash the rows' n-grams and ask the store for this rank's
 // records of both Engram layers (completion seqs seq[0], seq[1]); the GPU waits for them only when it
 // reaches layer 1 / 14.
-void Model::Impl::engram_prepare(int pos0, int R, const uint64_t seq[2]) {
+// pad_to > R (a long copy step in an exact body of pad_to rows): the pad rows look up row R - 1's n-grams again, as a wide bucket's do in
+// engram_rows, so that the gathered segments and offsets are the body's and the pad rows compute row R - 1's values
+void Model::Impl::engram_prepare(int pos0, int R, const uint64_t seq[2], int pad_to) {
   engram::hash_positions(*emap, hist.data(), nullptr, pos0, R, ids.data(), hist.base);
-  engram_submit(R, seq);
+  for (int r = R; r < pad_to; ++r)
+    std::copy(ids.begin() + (size_t)(R - 1) * 2 * kEngramCols, ids.begin() + (size_t)R * 2 * kEngramCols,
+              ids.begin() + (size_t)r * 2 * kEngramCols);
+  engram_submit(std::max(R, pad_to), seq);
 }
 
 void Model::Impl::engram_rows(int R, const int32_t* tok, const int32_t* pos, const int32_t* slot, const uint64_t seq[2],
@@ -1008,6 +1033,7 @@ void Model::Impl::attention(int L, int R, int ctx, bool dumps, bool sub_in, Sink
       attn::compressor_emit(ckvf + (size_t)r0 * kHead, cscf + (size_t)r0 * kHead, pos_d + r0, std::min(kDecodeRows, R - r0),
                             cw, ca, yarn(), cc, ck, nullptr, 0, sb, R > kDecodeRows ? &in_d->rows : nullptr, r0);
     }
+    if (g_xbody && mh_on && ncomp == 2 && R > kDecodeRows) spec_copy_save(k, R, sb);  // long copy steps (spec.cu): the projections the carries are repaired from
   }
   const dsk::Fp8Seg qseg[2] = {{w.wqb, w.sqb, q, kQ}, {w.ix_wqb, w.ix_sqb, iqpre, kIdxQ}};
   if (lx & 1) {  // exact: the fused kernels of a step of at most 8 rows, in two groups
@@ -1409,7 +1435,7 @@ void Model::Impl::engram_late(int pos0, int R, const int32_t* tokens) {
   if (R < 1 || R > kMaxRows) die("model: engram_late(%d, %d)", pos0, R);
   if (n_steps >= 2) wait_done(n_steps - 2);  // the step before it has read the Engram buffers
   hist_put(hist, pos0, R, tokens);
-  engram_prepare(pos0, R, late.seq);
+  engram_prepare(pos0, R, late.seq, spec && spec->xlong && R > kDecodeRows ? ops::spec_body_rows(R) : 0);  // a long copy step: its body's rows
   late.on = false;
 }
 
@@ -1474,7 +1500,12 @@ cudaGraphExec_t Model::Impl::graph(int R, int ctx) {
 
 void Model::Impl::forward(int R, int ctx, uint32_t flags, Sink* sink, int pos0) {
   ops::step_in(in_h, in_ctr, fb, in_d, st);
+  // test only (DSGB10_TF_SOLO): a given step of more than kDecodeRows rows runs as the exact bodies of the one-session step graph
+  // do, eager or captured alike (a row count's first step runs eagerly, outside graph())
+  const bool solo = tf_solo() && R > kDecodeRows;
+  if (solo) g_xbody = true;
   forward_rows(R, ctx, flags, sink, pos0);
+  if (solo) g_xbody = false;
   // the sampler's grid by the row budget: a step of at most 8 rows launches what it did before B4
   ops::sample(ch, logits, kVocabPart * rank, in_d, ctl_h, out_h, fb, samp_ctr, st, nullptr, ops::row_budget(R));
 }

@@ -53,6 +53,13 @@ struct Spec {
   uint16_t* pf_mh = nullptr;
   int* pf_acc = nullptr;    // device [pf_groups][2]: count, pos0
   int* pf_acc_h = nullptr;  // pinned staging
+  // long copy steps (copy_run.h, DSGB10_COPY_ROWS above 8): the one-session graph holds an exact body for each bucket of xmask (bit i:
+  // wide_bucket_rows(i) rows), its accept of the final rows is chunked, and its carries are repaired after a long step
+  bool xlong = false;
+  int xmask = 0;
+  int* lacc = nullptr;       // device [3]: the step's last kMaxAcc final rows' accept: count, pos0, row0
+  int* clp = nullptr;        // device [16]: the loop over the final rows before them (count, pos0, row0, a dummy anchor, -, done, -, -, slot table [8])
+  float* csave = nullptr;    // device [3][2][kMaxRows][kHead]: the wide body's ratio-2 projections and scores, per source
   ~Spec();
 };
 

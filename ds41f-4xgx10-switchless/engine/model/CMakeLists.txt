@@ -34,6 +34,11 @@ target_include_directories(exact_rule_test PRIVATE ${CMAKE_SOURCE_DIR})
 add_executable(copy_match_test tests/copy_match_test.cpp)
 target_include_directories(copy_match_test PRIVATE ${CMAKE_SOURCE_DIR})
 
+# Long copy steps (copy_run.h: the cursor, the ladder, copy_fit, DSGB10_COPY_ROWS / _ENTER, the 7-draft block's rule) against a plain
+# reference on planted streams, each rule with its wrong-rule control; host only, no GPU
+add_executable(copy_run_test tests/copy_run_test.cpp)
+target_include_directories(copy_run_test PRIVATE ${CMAKE_SOURCE_DIR})
+
 # Copy drafting's learner (copy.h: outcome, the shared cells, a conversation's ratio, the gate's row) against its cases and a
 # simulated stream; host only, no GPU. COPY_ADAPT_TEST_RULES adds the wrong-rule switches its controls use
 add_executable(copy_adapt_test tests/copy_adapt_test.cpp)

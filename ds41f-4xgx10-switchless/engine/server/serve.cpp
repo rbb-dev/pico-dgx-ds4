@@ -2535,7 +2535,7 @@ class Server {
       first = m_.wait(k);
       tu.rows_ms += m_.last_gpu_ms();
       first_row = R - 1;
-      S->w = std::max(S->w, pos + R + (m_.spec() ? model::copy::verify_reach(model::ops::kDrafts, (model::copy::mode() & model::copy::kRows) != 0) : 0));  // its draft's block keys
+      S->w = std::max(S->w, pos + R + (m_.spec() ? model::copy::verify_reach(model::ops::kDrafts, (model::copy::mode() & model::copy::kRows) != 0, model::copy::copy_rows()) : 0));  // its draft's block keys
     } else {
       c.op = kCmdPrefill;
       const bool watch = memwatch::chunk_ride_due(mem_watch_on(), now_s(), watch_at_);  // the memory watch rides this chunk

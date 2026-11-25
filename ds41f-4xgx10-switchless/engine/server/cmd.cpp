@@ -21,6 +21,7 @@
 #include "common/check.h"
 #include "common/heap.h"
 #include "model/copy.h"
+#include "model/copy_run.h"
 #include "model/nvtx.h"
 #include "server/mem_watch.h"
 
@@ -393,9 +394,10 @@ void copy_dump_line(FILE* f, int step, int entry, int pos0, int n_emit, const in
 DecodeEnd spec_loop(model::Model& m, const Cmd& c, Watchdog& wd, const OnSample& on, const OnStep& step) {
   constexpr int kD = model::ops::kDrafts;
   // rows a step can reach past the previous step's last: the chain's drafts, or copy drafting's (copy.h) when copy rows are on
-  static const int kR = model::copy::verify_reach(kD, (model::copy::mode() & model::copy::kRows) != 0);
+  static const int kR = model::copy::verify_reach(kD, (model::copy::mode() & model::copy::kRows) != 0, model::copy::copy_rows());
   DecodeEnd e;
   e.written = c.pos0;
+  int long_steps = 0, long_whole = 0, long_drafts = 0, long_accepted = 0;  // long copy steps of this request (copy_run.h)
   // verify rows stay below pos_end: the tokens they emit stay within max_new and the context. As in
   // plain decode, the step after the last token still runs (up to `feed`), so the KV of every emitted
   // token is there for the session's next request.
@@ -526,7 +528,11 @@ DecodeEnd spec_loop(model::Model& m, const Cmd& c, Watchdog& wd, const OnSample&
     if (i > 4)  // the step before (done; past the graphs' captures): its GPU time by its rows
       e.gpu_ms[prev_rows] += m.gpu_ms(first + i - 1), ++e.gpu_n[prev_rows];
     prev_rows = o.step_rows;
-    rate.add(c, o.rows, o.step_rows);
+    if (o.step_rows > model::copy::kStepRows) {  // a long copy step: the drafts' rate and the step-ms model are not fed by it
+      ++long_steps, long_whole += o.rows == o.step_rows, long_drafts += o.step_rows - 1, long_accepted += o.rows - 1;
+    } else {
+      rate.add(c, o.rows, o.step_rows);
+    }
     e.spec_tok = rate.tok, e.spec_ms = rate.ms;
     // the tokens it emits, until a stop
     bool stop = false;
@@ -563,6 +569,9 @@ DecodeEnd spec_loop(model::Model& m, const Cmd& c, Watchdog& wd, const OnSample&
     if (stop) {
       if (model::copy::mode())  // the rank-agreement digest of the rows every step chose (copy.h): equal on all four ranks
         std::fprintf(stderr, "copy: digest %08x after %d steps (request at %d)\n", o.copy_digest, i + 1, c.pos0);
+      if (model::copy::copy_rows() > model::copy::kStepRows && (model::copy::mode() & model::copy::kRows))  // long copy steps of this request
+        std::fprintf(stderr, "copy: long steps %d (whole %d), drafts %d, accepted %d after %d steps (request at %d)\n", long_steps, long_whole,
+                     long_drafts, long_accepted, i + 1, c.pos0);
       if (model::copy::mode() & model::copy::kAdapt)  // and the fold of every outcome the learner took: equal on all four ranks too
         std::fprintf(stderr, "copy: learn %08x after %d steps (request at %d)\n", o.copy_learn, i + 1, c.pos0);
       if (slog) std::fflush(slog);

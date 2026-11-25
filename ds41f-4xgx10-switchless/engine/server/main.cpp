@@ -800,6 +800,7 @@ int main(int argc, char** argv) {
   {  // the exact shared steps' settings (model/exact_rule.h): a value outside its range stops the start
     char msg[160];
     if (model::exact::env_error(msg, sizeof msg)) die("%s", msg);
+    if (model::copy::run_env_error(msg, sizeof msg)) die("%s", msg);  // the long copy steps' settings (model/copy.h)
   }
   const double t0 = now_s();
   std::printf("rank %d (%s): the fleet file %s; weights %s", a.rank, comm::fleet(a.fleet).rank[a.rank].name.c_str(),
@@ -914,9 +915,10 @@ int main(int argc, char** argv) {
       if (std::memcmp(&all[r], &mine, sizeof mine) != 0)
         die("rank %d: copy drafting settings differ between the ranks (mode bits %u %u %u %u, shortest match %u %u %u %u, table file hash "
             "%016llx %016llx %016llx %016llx): set DSGB10_COPY, DSGB10_COPY_DUMP, DSGB10_COPY_ADAPT, DSGB10_COPY_MIN and DSGB10_COPY_TABLE alike "
-            "on every Spark", a.rank, all[0].mode, all[1].mode, all[2].mode, all[3].mode, all[0].min_match, all[1].min_match, all[2].min_match,
+            "on every Spark (and DSGB10_COPY_ROWS %u %u %u %u, DSGB10_COPY_ENTER %u %u %u %u)", a.rank, all[0].mode, all[1].mode, all[2].mode, all[3].mode, all[0].min_match, all[1].min_match, all[2].min_match,
             all[3].min_match, (unsigned long long)all[0].table_hash, (unsigned long long)all[1].table_hash, (unsigned long long)all[2].table_hash,
-            (unsigned long long)all[3].table_hash);
+            (unsigned long long)all[3].table_hash, all[0].rows, all[1].rows, all[2].rows, all[3].rows, all[0].enter, all[1].enter,
+            all[2].enter, all[3].enter);
   }
   // 3a'. the Gumbel sampler's settings (DSGB10_GSAMPLE, DSGB10_GCOUPLE, DSGB10_GCOUPLE_CF) must be one set on the four ranks: a rank with
   // another A, B computes another survival and chooses other rows, and the ranks stop at the next collective. Every rank makes this call.
