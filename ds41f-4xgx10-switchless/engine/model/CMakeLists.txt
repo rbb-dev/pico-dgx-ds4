@@ -25,6 +25,11 @@ target_include_directories(spec_batch_test PRIVATE ${CMAKE_SOURCE_DIR})
 add_executable(samp_rule_test tests/samp_rule_test.cpp)
 target_include_directories(samp_rule_test PRIVATE ${CMAKE_SOURCE_DIR})
 
+# The exact shared steps' settings (exact_rule.h: DSGB10_NORM_EXACT, DSGB10_WIDE_EXACT, _MT, _GQ, DSGB10_R16_EXACT: their ranges and the
+# refusals of a value outside them), each with its wrong-rule control; host only, no GPU
+add_executable(exact_rule_test tests/exact_rule_test.cpp)
+target_include_directories(exact_rule_test PRIVATE ${CMAKE_SOURCE_DIR})
+
 # Copy drafting's matcher (copy.h) against a plain reference; host only, no GPU
 add_executable(copy_match_test tests/copy_match_test.cpp)
 target_include_directories(copy_match_test PRIVATE ${CMAKE_SOURCE_DIR})

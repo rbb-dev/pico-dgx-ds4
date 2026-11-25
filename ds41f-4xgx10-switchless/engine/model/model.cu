@@ -16,6 +16,7 @@
 
 #include "attn/launch.h"
 #include "common/alloc_seal.h"
+#include "model/exact_rule.h"
 #include "model/impl.h"
 #include "model/store_trace.h"
 #include "model/prefill.h"
@@ -115,6 +116,65 @@ bool wide_ar() { return wide_ar_mode() >= 1; }
 bool unfused16() {
   static const bool u = !(getenv("DSGB10_FUSED16") && atoi(getenv("DSGB10_FUSED16")));
   return u;
+}
+
+// Exact shared steps (docs/batching.md): a row of a 9..64-row step computes with the arithmetic of the 1..8-row kernels, so a
+// greedy or seeded request gets beside others the bits it gets alone. Every setting defaults to the kernels and bodies of
+// before; server/main.cpp has refused a value outside its range (model/exact_rule.h) by the time these read it.
+// DSGB10_WIDE_EXACT=bits runs parts of a wide step's body (17..64 rows) through the decode kernels in groups of kDecodeRows
+// rows, each row computing what it computes in a 16-row step (the weights are read once per group): 1 wq_a + wkv and wq_b,
+// 2 wo_a + wo_b, 4 the router gate, 8 the MoE, 16 the Engram's GEMV. Bit 64 runs the families selected by bits 1..16 through
+// the row-group kernels instead (dsk::gemv_fp8_rows, gemv_woa_rows, gemv_bf16_rows, moe_rows): the same bits, the weights
+// read once for all the rows. 95 = the whole exact wide body. 0 (default): the wide body.
+int wide_exact() {
+  static const int v = [] {
+    const int x = exact::wide_exact(getenv("DSGB10_WIDE_EXACT"));
+    if (x > 0) std::fprintf(stderr, "exact shared steps: 17..64-row steps through the decode kernels' sums, families %d (DSGB10_WIDE_EXACT)\n", x);
+    return x;
+  }();
+  return v;
+}
+// DSGB10_WIDE_EXACT_GQ (0, 2, 4, + 16): moe_rows' groups of 16 row slots a pass; 0 picks by the step's rows.
+int wide_gq() {
+  static const int v = std::max(0, exact::wide_gq(getenv("DSGB10_WIDE_EXACT_GQ")));
+  return v;
+}
+// DSGB10_WIDE_EXACT_MT (1, 2): wo_b's row-group kernel's tiles of 8 weight rows per warp (the same bits; 2 halves the
+// activation reads per output: 64 rows of wo_b's input no longer fit L1).
+int wide_mt() {
+  static const int v = std::max(1, exact::wide_mt(getenv("DSGB10_WIDE_EXACT_MT")));
+  return v;
+}
+// DSGB10_NORM_EXACT=1: the separate RMSNorm launches of a 9..64-row step (attn_norm, q_norm, ffn_norm) add each row's squares in
+// the order of the fused kernels a step of at most 8 rows runs (their thread count), so a row's normed input has the same bits
+// in a step of any size. 0 / unset: D / 8 threads, as before (the 1/rms may differ in its last bit, which flips a bf16 rounding
+// now and then). Steps of 9..16 rows, and wide steps when DSGB10_WIDE_EXACT is set: a plain wide step is not bit-equal whatever
+// its norm, and the fused order costs it about 2 % (64 CTAs of 256 threads instead of 640; pico-dgx-ds4's measure).
+int norm_nt(const dsk::GemvCfg& c, int R) {
+  static const bool on = [] {
+    const bool x = exact::norm_exact(getenv("DSGB10_NORM_EXACT")) > 0;
+    if (x) std::fprintf(stderr, "exact shared steps: the RMSNorm launches add in the fused kernels' order (DSGB10_NORM_EXACT)\n");
+    return x;
+  }();
+  return on && (R <= kDecodeRows || wide_exact()) ? 32 * c.wn * c.wk : 0;
+}
+// DSGB10_R16_EXACT=bits (test only) runs parts of a 9..16-row step through the kernels of a step of at most 8 rows, in two
+// groups (the weights are read once per group): 1 wq_a + wkv and wq_b, 2 wo_a + wo_b, 4 the router gate, 8 the MoE, 16 the
+// Engram's GEMV, 32 the head. 0 (default): the 16-row kernels.
+int r16_exact() {
+  static const int v = [] {
+    const int x = std::max(0, exact::r16_exact(getenv("DSGB10_R16_EXACT")));
+    if (x > 0) std::fprintf(stderr, "exact shared steps: 9..16-row steps in two groups of 8 rows, families %d (DSGB10_R16_EXACT)\n", x);
+    return x;
+  }();
+  return v;
+}
+// Any exact setting in force: a step of one session's rows is then never re-routed by DSGB10_OEA (its text must not depend on its
+// step's width). Unset: the re-routing applies to every call of its minimum rows, as before.
+bool exact_any() {
+  static const bool v = exact::norm_exact(getenv("DSGB10_NORM_EXACT")) > 0 || exact::wide_exact(getenv("DSGB10_WIDE_EXACT")) > 0 ||
+                        exact::r16_exact(getenv("DSGB10_R16_EXACT")) > 0;
+  return v;
 }
 
 }  // namespace
@@ -307,7 +367,7 @@ Model::Impl::Impl(int r, const Options& op) : rank(r), opt(op) {
     pcand_key = dalloc<uint16_t>((size_t)kRanks * kDecodeRows * kPoolBlocks);
   }
   moe_ws = dalloc<uint8_t>(dsk::moe_workspace_bytes());
-  moe_pws = dalloc<uint8_t>(dsk::moe_prefill_workspace_bytes(kMaxRows, kExperts));  // wide64: moe_prefill's
+  moe_pws = dalloc<uint8_t>(std::max(dsk::moe_prefill_workspace_bytes(kMaxRows, kExperts), dsk::moe_rows_workspace_bytes()));  // wide64: moe_prefill's (exact wide: moe_rows')
   in_h = halloc<ops::StepIn>(ops::kInSlots);
   in_d = dalloc<ops::StepIn>(1);
   tok_d = in_d->tokens;
@@ -777,7 +837,16 @@ void Model::Impl::engram_apply(int L, int R) {
   ops::wait_seq(&e_done[e], &in_d->e_wait[e], st);
   comm::allgather(ch, e_send[e], e_gath, engram_seg(R), st);
   ops::engram_pack(e_gath, e_off[e], R, e_xq, e_xs, st);
-  if (R > kDecodeRows) {  // wide64
+  const int eg = R > kDecodeRows ? ((wide_exact() & 16) ? kDecodeRows : 0)
+                                 : R > dsk::kLowRows && (r16_exact() & 16) ? dsk::kLowRows : 0;
+  if (eg && R > kDecodeRows && (wide_exact() & 64)) {  // exact wide: the decode GEMV's sums, one read of the weights
+    const dsk::Fp8Seg es{w.e_wkv, w.e_skv, e_kv, kEngramN};
+    dsk::gemv_fp8_rows(e_xq, e_xs, R, &es, 1, kEngramK, c8k, st);
+  } else if (eg) {  // exact: the decode GEMV in groups
+    for (int r0 = 0; r0 < R; r0 += eg)
+      dsk::gemv_fp8(e_xq + (size_t)r0 * kEngramK, e_xs + (size_t)r0 * (kEngramK / 32), std::min(eg, R - r0), w.e_wkv, w.e_skv,
+                    kEngramN, kEngramK, e_kv + (size_t)r0 * kEngramN, c8k, st);
+  } else if (R > kDecodeRows) {  // wide64
     const dsk::Fp8Seg es{w.e_wkv, w.e_skv, e_kv, kEngramN};
     dsk::gemm_fp8_p(e_xq, e_xs, R, &es, 1, kEngramK, st);
   } else {
@@ -865,11 +934,28 @@ void Model::Impl::attention(int L, int R, int ctx, bool dumps, bool sub_in, Sink
   float* pcs = pck + (size_t)R * kCompPart;
   const dsk::Fp8Seg seg[2] = {{w.wqa, w.sqa, pqa, kQaPart}, {w.wkv, w.skv, pkv, kKvPart}};
   const bool wide = R > kDecodeRows;  // wide64 (docs/wide64.md): the prefill GEMMs
-  if (wide) {
-    dsk::rmsnorm(yraw, w.attn_norm, R, kDim, kNormEps, y, yq, ys, st);
+  const int wx = wide ? wide_exact() : 0;                       // exact: the families of a wide step on the decode kernels' sums
+  const int lx = R > dsk::kLowRows && !wide ? r16_exact() : 0;  // exact (test): the families of a 9..16-row step in groups of 8
+  if (lx & 1) {  // exact: the fused kernels of a step of at most 8 rows, in two groups
+    for (int r0 = 0; r0 < R; r0 += dsk::kLowRows) {
+      const dsk::Fp8Seg g[2] = {{w.wqa, w.sqa, pqa + (size_t)r0 * kQaPart, kQaPart}, {w.wkv, w.skv, pkv + (size_t)r0 * kKvPart, kKvPart}};
+      dsk::gemv_fp8_norm(yraw + (size_t)r0 * kDim, w.attn_norm, kNormEps, std::min<int>(dsk::kLowRows, R - r0), g, 2, kDim, c8k, st,
+                         y + (size_t)r0 * kDim);
+    }
+  } else if ((wx & 65) == 65) {  // exact wide: the 16-row GEMV's sums, one read of the weights
+    dsk::rmsnorm(yraw, w.attn_norm, R, kDim, kNormEps, y, yq, ys, st, norm_nt(c8k, R));
+    dsk::gemv_fp8_rows(yq, ys, R, seg, 2, kDim, c8k, st);
+  } else if (wx & 1) {  // exact: the 16-row GEMV in groups
+    dsk::rmsnorm(yraw, w.attn_norm, R, kDim, kNormEps, y, yq, ys, st, norm_nt(c8k, R));
+    for (int r0 = 0; r0 < R; r0 += kDecodeRows) {
+      const dsk::Fp8Seg g[2] = {{w.wqa, w.sqa, pqa + (size_t)r0 * kQaPart, kQaPart}, {w.wkv, w.skv, pkv + (size_t)r0 * kKvPart, kKvPart}};
+      dsk::gemv_fp8_multi(yq + (size_t)r0 * kDim, ys + (size_t)r0 * (kDim / 32), std::min(kDecodeRows, R - r0), g, 2, kDim, c8k, st);
+    }
+  } else if (wide) {
+    dsk::rmsnorm(yraw, w.attn_norm, R, kDim, kNormEps, y, yq, ys, st, norm_nt(c8k, R));
     dsk::gemm_fp8_p(yq, ys, R, seg, 2, kDim, st);
   } else if (R > dsk::kLowRows && unfused16()) {  // night: 9..16 rows: norm once, then the plain r16 GEMV (same bits)
-    dsk::rmsnorm(yraw, w.attn_norm, R, kDim, kNormEps, y, yq, ys, st);
+    dsk::rmsnorm(yraw, w.attn_norm, R, kDim, kNormEps, y, yq, ys, st, norm_nt(c8k, R));
     dsk::gemv_fp8_multi(yq, ys, R, seg, 2, kDim, c8k, st);  // c8k: the fused call's split-K, same bits
   } else {
     dsk::gemv_fp8_norm(yraw, w.attn_norm, kNormEps, R, seg, 2, kDim, c8k, st, y);
@@ -912,11 +998,27 @@ void Model::Impl::attention(int L, int R, int ctx, bool dumps, bool sub_in, Sink
     }
   }
   const dsk::Fp8Seg qseg[2] = {{w.wqb, w.sqb, q, kQ}, {w.ix_wqb, w.ix_sqb, iqpre, kIdxQ}};
-  if (wide) {
-    dsk::rmsnorm(qa, w.q_norm, R, kQLora, kNormEps, o, oq, os, st);
+  if (lx & 1) {  // exact: the fused kernels of a step of at most 8 rows, in two groups
+    for (int r0 = 0; r0 < R; r0 += dsk::kLowRows) {
+      const dsk::Fp8Seg g[2] = {{w.wqb, w.sqb, q + (size_t)r0 * kQ, kQ}, {w.ix_wqb, w.ix_sqb, iqpre + (size_t)r0 * kIdxQ, kIdxQ}};
+      dsk::gemv_fp8_norm(qa + (size_t)r0 * kQLora, w.q_norm, kNormEps, std::min<int>(dsk::kLowRows, R - r0), g, idx_src(L) ? 2 : 1,
+                         kQLora, c8k, st);
+    }
+  } else if ((wx & 65) == 65) {  // exact wide
+    dsk::rmsnorm(qa, w.q_norm, R, kQLora, kNormEps, o, oq, os, st, norm_nt(c8k, R));
+    dsk::gemv_fp8_rows(oq, os, R, qseg, idx_src(L) ? 2 : 1, kQLora, c8k, st);
+  } else if (wx & 1) {  // exact: the 16-row GEMV in groups
+    dsk::rmsnorm(qa, w.q_norm, R, kQLora, kNormEps, o, oq, os, st, norm_nt(c8k, R));
+    for (int r0 = 0; r0 < R; r0 += kDecodeRows) {
+      const dsk::Fp8Seg g[2] = {{w.wqb, w.sqb, q + (size_t)r0 * kQ, kQ}, {w.ix_wqb, w.ix_sqb, iqpre + (size_t)r0 * kIdxQ, kIdxQ}};
+      dsk::gemv_fp8_multi(oq + (size_t)r0 * kQLora, os + (size_t)r0 * (kQLora / 32), std::min(kDecodeRows, R - r0), g,
+                          idx_src(L) ? 2 : 1, kQLora, c8k, st);
+    }
+  } else if (wide) {
+    dsk::rmsnorm(qa, w.q_norm, R, kQLora, kNormEps, o, oq, os, st, norm_nt(c8k, R));
     dsk::gemm_fp8_p(oq, os, R, qseg, idx_src(L) ? 2 : 1, kQLora, st);
   } else if (R > dsk::kLowRows && unfused16()) {  // night: wq_b's input normed once (oq/os are free until wo_a)
-    dsk::rmsnorm(qa, w.q_norm, R, kQLora, kNormEps, o, oq, os, st);  // o: scratch for the bf16 copy
+    dsk::rmsnorm(qa, w.q_norm, R, kQLora, kNormEps, o, oq, os, st, norm_nt(c8k, R));  // o: scratch for the bf16 copy
     dsk::gemv_fp8_multi(oq, os, R, qseg, idx_src(L) ? 2 : 1, kQLora, c8k, st);
   } else {
     dsk::gemv_fp8_norm(qa, w.q_norm, kNormEps, R, qseg, idx_src(L) ? 2 : 1, kQLora, c8k, st);
@@ -936,7 +1038,24 @@ void Model::Impl::attention(int L, int R, int ctx, bool dumps, bool sub_in, Sink
                     attn::AttnScratch{po, pml, kMaxSplits}, st, true);
   // output projections; wo_b is row-parallel: partial sums, all-reduced in fp32 in rank order, then
   // hc_post into mid and the FFN's collapse (by attn_pre) in the same kernel
-  if (wide) {
+  if ((wx & 66) == 66) {  // exact wide: wo_a and wo_b with the 16-row kernels' sums, one read of the weights
+    dsk::gemv_woa_rows(o, R, w.woa, w.soa, kOPart, kWoaK, kOGroupRows, nullptr, cwoa, st, oq, os);
+    const dsk::Fp8Seg bseg{w.wob, w.sob, part, kDim};
+    dsk::GemvCfg cb = c8;
+    cb.mt = wide_mt();
+    dsk::gemv_fp8_rows(oq, os, R, &bseg, 1, kOPart, cb, st);
+  } else if ((wx | lx) & 2) {  // exact: wo_a and wo_b as the 16-row (wide) or 8-row (9..16 rows) step runs them, in groups
+    const size_t ostride = (size_t)(kOPart / kOGroupRows) * kWoaK;
+    const int kDecodeRows = wide ? model::kDecodeRows : dsk::kLowRows;  // the group
+    for (int r0 = 0; r0 < R; r0 += kDecodeRows) {
+      const int m = std::min(kDecodeRows, R - r0);
+      dsk::gemv_woa(o + r0 * ostride, m, w.woa, w.soa, kOPart, kWoaK, kOGroupRows, nullptr, cwoa, false, st,
+                    oq + (size_t)r0 * kOPart, os + (size_t)r0 * (kOPart / 32));
+    }
+    for (int r0 = 0; r0 < R; r0 += kDecodeRows)
+      dsk::gemv_fp8(oq + (size_t)r0 * kOPart, os + (size_t)r0 * (kOPart / 32), std::min(kDecodeRows, R - r0), w.wob, w.sob, kDim,
+                    kOPart, part + (size_t)r0 * kDim, c8, st);
+  } else if (wide) {
     dsk::gemm_woa_p(o, R, w.woa, w.soa, kOPart, kWoaK, kOGroupRows, nullptr, oq, os, st);
     const dsk::Fp8Seg bseg{w.wob, w.sob, part, kDim};
     dsk::gemm_fp8_p(oq, os, R, &bseg, 1, kOPart, st);
@@ -1000,23 +1119,70 @@ void Model::Impl::ffn(int L, int R, bool dumps, Sink* sink, int pos0) {
   // ffn_norm + the router's 384 logits in one launch (CTA 0 also quantises the normed input for the
   // experts); the MoE runs the top-6 selection itself
   const bool wide = R > kDecodeRows;
-  if (wide) {  // wide64: the gate as a GEMM, then router_topk and the grouped prefill MoE (one read of the union)
-    dsk::rmsnorm(yraw, w.ffn_norm, R, kDim, kNormEps, y, yq, ys, st);
-    if (wide_sh()) {  // the shared expert beside the gate and the router
-      fork(sb);
-      dsk::MoePCfg sh;
-      sh.phases = 2;
-      dsk::moe_prefill(yq, ys, R, ridx, rwts, kExperts, w.moe, moe_pws, ymoe, sb, sh);
+  const int wx = wide ? wide_exact() : 0;                       // exact: the families of a wide step on the decode kernels' sums
+  const int lx = R > dsk::kLowRows && !wide ? r16_exact() : 0;  // exact (test): the families of a 9..16-row step in groups of 8
+  const int* osess = exact_any() ? in_d->sess : nullptr;        // exact: no re-routing of one session's rows
+  // the wide step's shared expert beside the gate and the router (side stream sb), whenever the wide MoE (moe_prefill) runs; not
+  // with DSGB10_WIDE_EXACT's decode MoE (bit 8), which computes the shared expert itself
+  const bool wsh = wide && !(wx & 8) && wide_sh();
+  auto shared_side = [&] {
+    fork(sb);
+    dsk::MoePCfg sh;
+    sh.phases = 2;
+    dsk::moe_prefill(yq, ys, R, ridx, rwts, kExperts, w.moe, moe_pws, ymoe, sb, sh);
+  };
+  if (lx & 4) {  // exact: the fused gate of a step of at most 8 rows, in two groups
+    for (int r0 = 0; r0 < R; r0 += dsk::kLowRows)
+      dsk::gemv_bf16_norm(yraw + (size_t)r0 * kDim, w.ffn_norm, kNormEps, std::min<int>(dsk::kLowRows, R - r0), w.gate, kExperts,
+                          kDim, gl + (size_t)r0 * kExperts, nullptr, cgate, st, yq + (size_t)r0 * kDim,
+                          ys + (size_t)r0 * (kDim / 32));
+  } else if (wx & 4) {  // exact: the gate's 16-row GEMV
+    dsk::rmsnorm(yraw, w.ffn_norm, R, kDim, kNormEps, y, yq, ys, st, norm_nt(cgate, R));
+    if (wsh) shared_side();
+    if (wx & 64) {  // exact wide: one read of the gate
+      dsk::gemv_bf16_rows(y, R, w.gate, kExperts, kDim, gl, cgate, st);
+    } else {
+      for (int r0 = 0; r0 < R; r0 += kDecodeRows)
+        dsk::gemv_bf16(y + (size_t)r0 * kDim, std::min(kDecodeRows, R - r0), w.gate, kExperts, kDim, gl + (size_t)r0 * kExperts,
+                       nullptr, cgate, false, st);
     }
+  } else if (wide) {  // wide64: the gate as a GEMM, then router_topk and the grouped prefill MoE (one read of the union)
+    dsk::rmsnorm(yraw, w.ffn_norm, R, kDim, kNormEps, y, yq, ys, st, norm_nt(cgate, R));
+    if (wsh) shared_side();  // the shared expert beside the gate and the router
     dsk::gemm_bf16_p(y, R, w.gate, kExperts, kDim, gl, st);
   } else if (R > dsk::kLowRows && unfused16()) {  // night: the gate on the normed rows (y is free after the attention)
-    dsk::rmsnorm(yraw, w.ffn_norm, R, kDim, kNormEps, y, yq, ys, st);
+    dsk::rmsnorm(yraw, w.ffn_norm, R, kDim, kNormEps, y, yq, ys, st, norm_nt(cgate, R));
     dsk::gemv_bf16(y, R, w.gate, kExperts, kDim, gl, nullptr, cgate, false, st);
   } else {
     dsk::gemv_bf16_norm(yraw, w.ffn_norm, kNormEps, R, w.gate, kExperts, kDim, gl, nullptr, cgate, st, yq, ys);
   }
   if (route_shift) route_rotate<<<R, 128, 0, st>>>(gl, route_shift, route_group);  // bench only
-  if (wide) {
+  if ((wx & 72) == 72) {  // exact wide: the decode MoE's sums over the whole step's union, every expert read once
+    static const std::pair<int, int> oea = [] {  // the wide step's re-routing (lossy), as the plain wide body below
+      int k0 = 0, kp = 0, mr = 0;
+      if (const char* e = getenv("DSGB10_WIDE_OEA")) std::sscanf(e, "%d,%d", &k0, &kp);
+      else if (const char* e2 = getenv("DSGB10_OEA")) std::sscanf(e2, "%d,%d,%d", &k0, &kp, &mr);
+      return std::make_pair(k0, kp);
+    }();
+    if (oea.first > 0)
+      dsk::router_topk_oea(gl, w.gate_bias, R, kExperts, ridx, rwts, kRouteScale, oea.first, oea.second, st, osess, &in_d->rows);
+    else
+      dsk::router_topk(gl, w.gate_bias, R, kExperts, ridx, rwts, kRouteScale, st);
+    dsk::moe_rows(yq, ys, R, ridx, rwts, w.moe, moe_pws, ymoe, st, wide_gq());
+  } else if ((wx | lx) & 8) {  // exact: the decode MoE (its own top-6) in groups of 16 (wide) or 8 rows: each group reads its experts
+    if (ab.on && ab.s[L][1] != 0.f)
+      die("DSGB10_WIDE_EXACT / DSGB10_R16_EXACT bit 8 without the row-group MoE (bit 64 with bit 8) keeps only the last group's "
+          "shared-expert activations: the abliteration needs 95");
+    const int kDecodeRows = wide ? model::kDecodeRows : dsk::kLowRows;  // the group
+    for (int r0 = 0; r0 < R; r0 += kDecodeRows) {
+      const int m = std::min(kDecodeRows, R - r0);
+      dsk::MoeCfg mc{};
+      mc.down = m == 1 ? 2 : 4;
+      dsk::moe_routed(yq + (size_t)r0 * kDim, ys + (size_t)r0 * (kDim / 32), m, gl + (size_t)r0 * kExperts, w.gate_bias, kExperts,
+                      kRouteScale, w.moe, moe_ws, ymoe + (size_t)r0 * kDim, mc, st, ridx + (size_t)r0 * kTopK,
+                      rwts + (size_t)r0 * kTopK, osess, &in_d->rows, r0);
+    }
+  } else if (wide) {
     // wide64: DSGB10_WIDE_OEA=K0,KP (default: DSGB10_OEA's K0,KP when that is set) re-routes the wide step's rows
     // toward the batch's core experts (lossy, as DSGB10_OEA in moe_routed)
     static const std::pair<int, int> oea = [] {
@@ -1026,7 +1192,7 @@ void Model::Impl::ffn(int L, int R, bool dumps, Sink* sink, int pos0) {
       return std::make_pair(k0, kp);
     }();
     if (oea.first > 0)
-      dsk::router_topk_oea(gl, w.gate_bias, R, kExperts, ridx, rwts, kRouteScale, oea.first, oea.second, st);
+      dsk::router_topk_oea(gl, w.gate_bias, R, kExperts, ridx, rwts, kRouteScale, oea.first, oea.second, st, osess, &in_d->rows);
     else
       dsk::router_topk(gl, w.gate_bias, R, kExperts, ridx, rwts, kRouteScale, st);
     if (wide_sh()) {  // bucketing + routed up, the shared expert's join, then down (+ combine)
@@ -1042,11 +1208,13 @@ void Model::Impl::ffn(int L, int R, bool dumps, Sink* sink, int pos0) {
   } else {
     dsk::MoeCfg mc{};
     mc.down = R == 1 ? 2 : 4;
-    dsk::moe_routed(yq, ys, R, gl, w.gate_bias, kExperts, kRouteScale, w.moe, moe_ws, ymoe, mc, st, ridx, rwts);
+    dsk::moe_routed(yq, ys, R, gl, w.gate_bias, kExperts, kRouteScale, w.moe, moe_ws, ymoe, mc, st, ridx, rwts, osess, &in_d->rows);
   }
   if (ab.on && ab.s[L][1] != 0.f) {  // the shared expert's share of this rank's partial, through its activations
     const uint8_t *hq, *hs;
-    if (wide) {
+    if (wide && (wx & 72) == 72) {  // exact wide: the shared expert's activations moe_rows left
+      dsk::moe_rows_shared(moe_pws, &hq, &hs);
+    } else if (wide) {
       dsk::moe_prefill_shared(moe_pws, R, kExperts, &hq, &hs);
     } else {  // moe_routed's workspace: the shared expert is the slot after the union's (dsk.h moe_hs_offset)
       const int RB = dsk::row_budget(R);
@@ -1148,7 +1316,13 @@ uint64_t Model::Impl::launch_batch(const Batch& b) {
     if (same) ok &= b.slot[r] == b.slot[r - 1] && b.pos[r] == b.pos[r - 1] + 1;
     int run = 1;  // the session's rows so far: at most kMaxSessRows (config.h: attn's race past it)
     while (run <= r && b.sess[r - run] == b.sess[r]) ++run;
-    if (run > kMaxSessRows)
+    // test only (the tool's teacher-forced batch mode with DSGB10_TF_SESSROWS set): a session may hold more rows in a step
+    static const bool tf_sessrows = [] {
+      const bool on = getenv("DSGB10_TF_SESSROWS") != nullptr;
+      if (on) std::fprintf(stderr, "batch steps: a session may hold up to %d rows of a step (DSGB10_TF_SESSROWS, test only)\n", kMaxRows);
+      return on;
+    }();
+    if (run > kMaxSessRows && !tf_sessrows)
       die("model: a batch step with %d rows of one session (at most %d: config.h kMaxSessRows)", run, kMaxSessRows);
     for (int q = 0; q < r; ++q) ok &= b.sess[q] == b.sess[r] || b.slot[q] != b.slot[r];  // a slot each
     if (!ok) die("model: batch row %d: position %d, slot %d, session %d", r, b.pos[r], b.slot[r], b.sess[r]);
@@ -1573,8 +1747,9 @@ void Model::Impl::forward_rows(int R, int ctx, uint32_t flags, Sink* sink, int p
     dsk::gemv_bf16_norm_rows(yraw, norm_w, kNormEps, R, head, head_coded, kVocabPart, kDim, logits, chead, st,
                              headpre && !dumps ? hfin : nullptr);
   } else
-  for (int r0 = 0; r0 < R; r0 += kDecodeRows) {  // wide64: the head GEMVs in groups of kDecodeRows rows
-    const int m = std::min(kDecodeRows, R - r0);
+  // wide64: the head GEMVs in groups of kDecodeRows rows (exact, DSGB10_R16_EXACT bit 32: a 9..16-row step in groups of 8)
+  for (int r0 = 0, hg = R > dsk::kLowRows && R <= kDecodeRows && (r16_exact() & 32) ? dsk::kLowRows : kDecodeRows; r0 < R; r0 += hg) {
+    const int m = std::min(hg, R - r0);
     const bf16* hin = yraw + (size_t)r0 * kDim;
     float* lo = logits + (size_t)r0 * kVocabPart;
     if (head_coded) dsk::gemv_bf16x_norm(hin, norm_w, kNormEps, m, head, kVocabPart, kDim, lo, nullptr, chead, st);

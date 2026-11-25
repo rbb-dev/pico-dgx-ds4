@@ -215,3 +215,35 @@ normalises in every CTA and against calls of 16 rows, bit for bit, 17 to 64 rows
 32 and 64 rows); `engine/server/tests/wide_test.sh` (the teacher-forced batch mode at 18, 32 and 64 rows with each switch and all
 three: the samples hashes against the run with none, and each run's median step time); all run on the four Sparks and pass. Speed: 16
 users 6.0 % faster, 32 users 4.9 %, 2 to 5 users unchanged.
+
+## Exact shared steps
+
+A request alone steps 1 to 8 rows at a time. Beside others it rides steps of 9 to 64 rows, where a row's values are added in
+other orders (the RMSNorm launches' thread count, the 16-row kernels, and for 17 to 64 rows the prefill GEMMs and `moe_prefill`),
+so a greedy or seeded request got other bits than it gets alone. Three settings make a row of a shared step compute with the
+arithmetic of the 1 to 8-row kernels. Each defaults to the behaviour without it (the step graphs are then the same ones, node for
+node: every branch is guarded by the setting and the new kernel arguments default to the old call); each is read at start, a
+value outside its range stops the start (`model/exact_rule.h`), and each prints one line when on (`exact shared steps: ...`). Every
+Spark needs the same settings. Based on pico-dgx-ds4's `0580fe6` by Pico.
+
+- `DSGB10_NORM_EXACT=1`: the three separate RMSNorm launches of a layer (attention input, query, FFN input) of a step of 9 to 16
+  rows, and of 17 to 64 rows when `DSGB10_WIDE_EXACT` is set, use the thread count of the fused kernels of a step of at most 8
+  rows (`32 * wn * wk` of their `GemvCfg`) in place of D / 8. A row's squares then add in the same order. With a `DSGB10_OEA`
+  set, a step of one session's rows is not re-routed whenever any exact setting is on.
+- `DSGB10_WIDE_EXACT=bits` (0 to 95, bit 32 unused): the families of a 17 to 64-row step that run through the decode kernels'
+  sums: 1 wq_a + wkv and wq_b, 2 wo_a + wo_b, 4 the router gate, 8 the MoE, 16 the Engram's GEMV. Without bit 64 each family runs
+  the decode kernel in groups of 16 rows (the weights are read once per group). With bit 64 the row-group kernels
+  (`gemv_fp8_rows`, `gemv_woa_rows`, `gemv_bf16_rows`, `moe_rows`) read each weight once for all the rows and give each row the
+  outputs of a call of at most 16 rows. 95 is the whole exact wide body. With the abliteration on, bit 8 needs bit 64 (the
+  shared expert's activations are then read where `moe_rows` leaves them).
+- `DSGB10_WIDE_EXACT_MT=1|2`: wo_b's row-group kernel takes 1 or 2 tiles of 8 weight rows a warp; the same bits. `DSGB10_WIDE_EXACT_GQ`
+  (0, 2, 4, plus 16) sets how many groups of 16 row slots `moe_rows` keeps in registers a pass (0: by the step's rows).
+
+Test-only settings: `DSGB10_R16_EXACT=bits` (0 to 63) runs the families of a 9 to 16-row step in two groups of 8 rows (bit 32 the
+head); `DSGB10_TF_SESSROWS=1` lets the tool's teacher-forced batch mode (`--batch-tf --batch-rows`) put up to 64 rows of one
+session in a step.
+
+Tests (GPU rows): `kernels/tests/test_kernels.cu rg` (every row-group kernel against calls of 8 rows, bit for
+bit, at 9, 16, 17, 32, 48 and 64 rows; its control is a path that must differ); `model/tests/exact_rule_test` (host: the ranges and
+the refusals); the GPU rows run on the four Sparks and pass. Speed, with the draft gate's cost fits of the plain bodies: 16 users
+8.5 % slower, 32 users 7.3 %, 2 to 5 users 1.0 to 1.7 %.

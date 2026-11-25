@@ -809,8 +809,9 @@ std::vector<float> batch_tf_loop(model::Model& m, const Cmd& c, const std::vecto
                                  const std::vector<std::vector<int32_t>>& tokens, Watchdog& wd, const OnBatch& on,
                                  model::Sink* sink) {
   const int n = (int)e.size(), G = c.rows;
-  if (n < 1 || n > model::ops::kMaxSess || G < 1 || G > model::kMaxSessRows || (int)tokens.size() != n)
-    die("batch_tf: %d entries, %d rows of each per step (1..%d)", n, G, model::kMaxSessRows);
+  const int gmax = getenv("DSGB10_TF_SESSROWS") ? model::kMaxRows : model::kMaxSessRows;  // test only: runs of long steps
+  if (n < 1 || n > model::ops::kMaxSess || G < 1 || G > gmax || (int)tokens.size() != n)
+    die("batch_tf: %d entries, %d rows of each per step (1..%d)", n, G, gmax);
   for (int k = 0; k < n; ++k)
     if (e[k].max_new < 0 || (int)tokens[k].size() != e[k].max_new || e[k].pos0 < 0 ||
         e[k].pos0 + e[k].max_new > e[k].limit)

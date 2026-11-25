@@ -252,6 +252,19 @@ pico-dgx-ds4's a40eeb8 / f2bafa4 by Pico. [`docs/batching.md`](docs/batching.md#
 - Measured: 16 users 6.0 % faster, 16 users on three shared prompts 7.1 %, 32 users 4.9 %; 2 to 5 users unchanged (within 0.3 %);
   each switch and all three bit-equal to none (the samples hashes at 18, 32 and 64 rows).
 
+**Exact shared steps: each row of a step of 9 to 64 rows computes what it computes alone.** A step shared by several requests
+sums a row's values in another order than a step of 1 to 8 rows does, so a greedy or seeded request beside others got other bits
+than it gets alone. `DSGB10_NORM_EXACT=1` makes the RMSNorm launches add a row's squares in the fused kernels' order.
+`DSGB10_WIDE_EXACT=95` runs the projections, the gate, the MoE and the Engram's GEMV of a step of 17 to 64 rows through row-group
+kernels: each weight is read once, and each row's outputs are those of a call of at most 16 rows. `DSGB10_WIDE_EXACT_MT=2` sets
+wo_b's tile. With `DSGB10_OEA` set, a step of one session's rows is then never re-routed. Every default is the behaviour
+without them. Based on pico-dgx-ds4's `0580fe6` by Pico (its kernels and tests; the copy drafting of that commit is not taken).
+[`docs/batching.md`](docs/batching.md#exact-shared-steps)
+- Setting: `DSGB10_NORM_EXACT=1`, `DSGB10_WIDE_EXACT=95`, `DSGB10_WIDE_EXACT_MT=2` (on every Spark; a value outside its range stops the start).
+- Measured: in the teacher-forced tool every shape of 12 to 64 rows gives each session its hash alone; through the service a request
+  beside others gave its tokens alone (200 of 200) and its log probabilities (0 of 200 different), the abliteration included. With
+  the draft gate's cost fits of the plain bodies: 16 users 8.5 % slower, 32 users 7.3 %, 2 to 5 users 1.0 to 1.7 %.
+
 ## Drafting
 
 Every drafted token is checked by the model before it counts, so the output is the model's own. [`docs/batching.md`](docs/batching.md)

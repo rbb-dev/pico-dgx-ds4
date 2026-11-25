@@ -92,7 +92,7 @@ Fixed	step buffers and graphs	model/model.cu	Model::Impl::Impl	1	dalloc<uint16_t
 Fixed	step buffers and graphs	model/model.cu	Model::Impl::Impl	1	dalloc<int>((size_t)kRanks * kDecodeRows * kPoolBlocks)
 Fixed	step buffers and graphs	model/model.cu	Model::Impl::Impl	1	dalloc<uint16_t>((size_t)kRanks * kDecodeRows * kPoolBlocks)
 Fixed	step buffers and graphs	model/model.cu	Model::Impl::Impl	1	dalloc<uint8_t>(dsk::moe_workspace_bytes())
-Fixed	step buffers and graphs	model/model.cu	Model::Impl::Impl	1	dalloc<uint8_t>(dsk::moe_prefill_workspace_bytes(kMaxRows, kExperts))
+Fixed	step buffers and graphs	model/model.cu	Model::Impl::Impl	1	dalloc<uint8_t>(std::max(dsk::moe_prefill_workspace_bytes(kMaxRows, kExperts), dsk::moe_rows_workspace_bytes()))
 Fixed	step buffers and graphs	model/model.cu	Model::Impl::Impl	1	halloc<ops::StepIn>(ops::kInSlots)
 Fixed	step buffers and graphs	model/model.cu	Model::Impl::Impl	1	dalloc<ops::StepIn>(1)
 Fixed	step buffers and graphs	model/model.cu	Model::Impl::Impl	2	dalloc<uint32_t>(1)
