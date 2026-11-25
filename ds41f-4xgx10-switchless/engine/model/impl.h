@@ -366,6 +366,9 @@ struct Model::Impl {
   uint64_t n_steps = 0;      // launched
   int pos_stride = 1;        // Model::set_pos_stride (bench)
   int pos_group = 1;         // its runs of consecutive rows
+  // DSGB10_GATE_SEP=MODE[,LO,HI]: in steps of LO..HI rows (default 2..4) the MoE's first kernel does not start under the router
+  // gate's GEMV: MODE 1 launches a no-op kernel between them. 0 / unset: the launches without it.
+  int gate_sep = 0, gate_sep_lo = 2, gate_sep_hi = 4;
   int route_shift = 0;       // Model::set_route_shift (bench)
   int route_group = 1;       // its rows per rotation
   uint64_t n_done = 0;       // known finished

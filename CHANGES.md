@@ -265,6 +265,12 @@ without them. Based on pico-dgx-ds4's `0580fe6` by Pico (its kernels and tests; 
   beside others gave its tokens alone (200 of 200) and its log probabilities (0 of 200 different), the abliteration included. With
   the draft gate's cost fits of the plain bodies: 16 users 8.5 % slower, 32 users 7.3 %, 2 to 5 users 1.0 to 1.7 %.
 
+**The router gate ends before the MoE starts in steps of 2 to 4 rows.** At 2-4 rows the MoE's first kernel is launched to
+overlap the router gate's GEMV and shares its SMs while the gate streams its rows; a kernel that does nothing, launched between
+the two without the overlap, lets the gate end first. No arithmetic changes. Based on pico-dgx-ds4's 1fcae63 by Pico.
+- Setting: `DSGB10_GATE_SEP=1` (`MODE[,LO,HI]`, rows 2 to 4 by default; off unless set).
+- Measured: one user 1.4 % faster, inside the spread of the measurement (4 to 5 %).
+
 ## Drafting
 
 Every drafted token is checked by the model before it counts, so the output is the model's own. [`docs/batching.md`](docs/batching.md)
