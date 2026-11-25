@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Bit probe: two engine builds or settings compared bit for bit on the decode / verify path: prompts cut from a token file
-through rank 0's socket (serve_test.py's client), one session at a time, greedy, drafts on; every token's id, logprob and
-top two are recorded. Each prompt is prefilled cold. Run with no front-end connected.
+through rank 0's socket (serve_test.py's client), one session at a time, drafts on; every token's id, logprob and
+top two are recorded. Greedy unless --temperature says otherwise (with --seed S prompt i carries seed S + i, so the run is
+repeatable; without it the engine draws one). Each prompt is prefilled cold. Run with no front-end connected.
 
-  bit_probe.py --socket S --tokens T.npy --out A.json [--n 8] [--len 2048] [--new 200]
+  bit_probe.py --socket S --tokens T.npy --out A.json [--n 8] [--len 2048] [--new 200] [--temperature T] [--top-p P] [--top-k K] [--seed S]
   bit_probe.py --compare A.json B.json      exit 0 when every token, logprob and top-two pair is the same
 """
 import argparse
@@ -43,6 +44,10 @@ def main():
     ap.add_argument('--n', type=int, default=8)
     ap.add_argument('--len', type=int, default=2048)
     ap.add_argument('--new', type=int, default=200)
+    ap.add_argument('--temperature', type=float, default=0.0)
+    ap.add_argument('--top-p', type=float, default=1.0)
+    ap.add_argument('--top-k', type=int, default=0)
+    ap.add_argument('--seed', type=int, default=-1, help='prompt i is sent with seed SEED + i (-1: none sent)')
     ap.add_argument('--compare', nargs=2, default=None)
     args = ap.parse_args()
     if args.compare:
@@ -56,7 +61,8 @@ def main():
     base = 0x6269740000000000 | (int(time.time() * 1000) & 0xffffffffff) << 8  # 'bit', then fresh ids per run
     out = []
     for i in range(args.n):
-        o = e.run(base + i, toks[i * stride:i * stride + args.len], max_new=args.new, n_top=2, keep=False)
+        o = e.run(base + i, toks[i * stride:i * stride + args.len], max_new=args.new, n_top=2, keep=False, temp=args.temperature,
+                  top_p=args.top_p, top_k=args.top_k, seed=args.seed + i if args.seed >= 0 else None)
         show('probe %d' % i, o)
         out.append({'i': i, 'ids': list(o['ids']), 'lp': list(o['lp']), 'top': [[list(p) for p in t] for t in o['top']],
                     'cached': o['cached'], 'reason': o['reason'], 'completion': o['completion'],

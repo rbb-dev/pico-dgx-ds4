@@ -27,6 +27,31 @@ namespace model {
 
 using namespace detail;
 
+// DSGB10_GSAMPLE, DSGB10_GCOUPLE (Td per depth) and DSGB10_GCOUPLE_CF (A, B): read once, every rank (main.cpp compares them)
+const ops::GSettings& gsample_settings() {
+  static const ops::GSettings g = [] {
+    ops::GSettings v;
+    const char* e = getenv("DSGB10_GSAMPLE");
+    v.mode = ops::parse_gsample(e);
+    if (v.mode < 0) die("DSGB10_GSAMPLE=%s: 0, 1 or 2", e);
+    const char* c = getenv("DSGB10_GCOUPLE");
+    const int cp = ops::parse_gcouple(c, v.td);
+    if (cp < 0) die("DSGB10_GCOUPLE=%s: Td[,Td2,..], each in (0, 4]", c);
+    v.coupled = cp;
+    if (cp) {
+      const char* f = getenv("DSGB10_GCOUPLE_CF");
+      float ab[2] = {1.f, 0.f};
+      if (ops::parse_ab(f, ab) < 0) die("DSGB10_GCOUPLE_CF=%s: A,B", f);
+      v.cf_a = ab[0], v.cf_b = ab[1];
+    }
+    if (v.mode)
+      std::fprintf(stderr, "sample: DSGB10_GSAMPLE=%d: %s on the Gumbel path (top-p / top-k rows: Gumbel-max among the kept tokens)\n", v.mode,
+                   v.mode == 1 ? "sampled requests without a client seed" : "every sampled request");
+    return v;
+  }();
+  return g;
+}
+
 namespace {
 
 // Bench only (Model::set_route_shift): row blockIdx.x's router logits [kExperts] rotated by

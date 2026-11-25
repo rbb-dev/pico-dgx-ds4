@@ -19,6 +19,12 @@ target_link_libraries(ablit_test dsmodel)
 add_executable(spec_batch_test tests/spec_batch_test.cu)
 target_include_directories(spec_batch_test PRIVATE ${CMAKE_SOURCE_DIR})
 
+# The sampler's shared rules (samp_rule.h: the Gumbel path's flag, the certified head's row test, the noise and the Gumbel-max pick, the
+# settings' parsers) and the draft module's copy of the noise (dspark/noise.h) against their own oracles, each with its wrong-rule
+# control; host only, no GPU
+add_executable(samp_rule_test tests/samp_rule_test.cpp)
+target_include_directories(samp_rule_test PRIVATE ${CMAKE_SOURCE_DIR})
+
 # Copy drafting's matcher (copy.h) against a plain reference; host only, no GPU
 add_executable(copy_match_test tests/copy_match_test.cpp)
 target_include_directories(copy_match_test PRIVATE ${CMAKE_SOURCE_DIR})

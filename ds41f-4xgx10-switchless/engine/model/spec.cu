@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstddef>
 #include <ctime>
 
 #include "model/copy_dev.h"
@@ -124,8 +125,7 @@ __global__ void k_spec_in(const ops::StepIn* ring, uint32_t* counter, const ops:
       bool ok = d->rows >= 1 && d->rows <= cert_bodies;
       for (int r = 0; ok && r < d->rows; ++r) {
         const ops::StepSamp& sp = d->samp[min(max(d->sess[r], 0), ops::kMaxSess - 1)];
-        ok = sp.n_top <= 0 && (!(sp.temperature > 0.f) ||
-                               (cert_samp && sp.temperature <= 1.f && !(sp.top_k > 0) && !(sp.top_p < 1.f)));
+        ok = ops::cert_row_ok(sp.n_top, sp.temperature, sp.top_p, sp.top_k, cert_samp != 0);
       }
       if (ok) cv = cert_bodies;
     }
@@ -908,6 +908,25 @@ void Model::Impl::bind_spec(dsw::WeightFile& wf, const dsw::WeightFile* draft) {
     sp.draft->enable_cf(w.data(), dbg);
     std::fprintf(stderr, "spec: rank %d: confidence MLP %s (hash %08x, dbg %d) for one-session drafts\n", rank, path.c_str(), h, dbg);
   }
+  // coupled drafts: DSGB10_GCOUPLE=Td[,Td2,..] (the drafter temperature factor per depth, the last one repeats; unset or 0: off):
+  // sessions on the Gumbel path (DSGB10_GSAMPLE; ops::kSampGumbel) get Gumbel-coupled drafts (dspark.h NoiseSamp). The settings are
+  // the same on the four ranks (main.cpp compares them).
+  if (const ops::GSettings& g = gsample_settings(); g.coupled) {
+    static_assert(sizeof(dspark::NoiseSamp) == sizeof(ops::StepSamp) && offsetof(dspark::NoiseSamp, seed) == offsetof(ops::StepSamp, seed) &&
+                      offsetof(dspark::NoiseSamp, temperature) == offsetof(ops::StepSamp, temperature) &&
+                      offsetof(dspark::NoiseSamp, top_p) == offsetof(ops::StepSamp, top_p) &&
+                      offsetof(dspark::NoiseSamp, top_k) == offsetof(ops::StepSamp, top_k) &&
+                      offsetof(dspark::NoiseSamp, n_top) == offsetof(ops::StepSamp, n_top) &&
+                      offsetof(dspark::NoiseSamp, ablit) == offsetof(ops::StepSamp, ablit) && dspark::kNoiseGumbel == ops::kSampGumbel,
+                  "dspark::NoiseSamp is ops::StepSamp");
+    static_assert(ops::kGDepths == dspark::kDraft, "the settings hold a Td per drafter depth");
+    sp.draft->set_couple(reinterpret_cast<const dspark::NoiseSamp*>(in_d->samp), g.td, g.cf_a, g.cf_b);
+    if (rank == 0) {
+      std::fprintf(stderr, "spec: coupled drafts for sessions on the Gumbel path (DSGB10_GCOUPLE): Td");
+      for (int j = 0; j < dspark::kDraft; ++j) std::fprintf(stderr, " %.3g", g.td[j]);
+      std::fprintf(stderr, "; gate logit A lg + B: %g, %g (DSGB10_GCOUPLE_CF)\n", g.cf_a, g.cf_b);
+    }
+  }
   static_assert(kDecodeRows <= dspark::kMaxHidden, "a batch spec step's rows fit the draft module's main_hidden tap");
   sp.mh = dalloc<uint16_t>((size_t)kMaxRows * dspark::kMainK);
   if (const char* e = getenv("DSGB10_MH_DUMP"); e && *e && rank == (getenv("DSGB10_MH_RANK") ? atoi(getenv("DSGB10_MH_RANK")) : 3))
@@ -1255,7 +1274,7 @@ cudaGraphExec_t Model::Impl::spec_batch_graph(int ctx) {
     const int* slot = sp.stab + (size_t)k * dspark::kMaxAcc;
     sp.draft->use_factor(sf);
     sp.draft->accept(sp.mh, &sp.ss[k].count, &sp.ss[k].pos0, st, slot, sp.row0 + k);
-    sp.draft->draft(&sp.ss[k].bonus, st, slot);
+    sp.draft->draft(&sp.ss[k].bonus, st, slot, k);
     k_spec_draft_check<<<1, 32, 0, st>>>(sp.draft->ids(), sp.draft->confidence(), sp.draft->batch_ids(k),
                                          sp.draft->batch_confidence(k), sp.mism);
     CUDA_CHECK(cudaGetLastError());

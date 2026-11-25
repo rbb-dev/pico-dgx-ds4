@@ -7,6 +7,7 @@
 
 #include "comm/collectives.h"
 #include "model/config.h"
+#include "model/samp_rule.h"
 
 namespace model::ops {
 
@@ -40,7 +41,7 @@ struct StepSamp {  // one session's sampling (model::Sampling)
   uint64_t seed;
   float temperature;  // 0: greedy
   float top_p;        // 1: off
-  int32_t top_k;      // 0: off
+  int32_t top_k;      // 0: off; the bit kSampGumbel (samp_rule.h) set: the session is on the Gumbel path
   int32_t n_top;      // top logprobs per row, 0..kTopLogprobs
   float ablit;        // the runtime abliteration on this session's rows (model/ablit.h): 0 off, 1 on
 };

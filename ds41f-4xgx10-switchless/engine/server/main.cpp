@@ -913,6 +913,19 @@ int main(int argc, char** argv) {
             all[3].min_match, (unsigned long long)all[0].table_hash, (unsigned long long)all[1].table_hash, (unsigned long long)all[2].table_hash,
             (unsigned long long)all[3].table_hash);
   }
+  // 3a'. the Gumbel sampler's settings (DSGB10_GSAMPLE, DSGB10_GCOUPLE, DSGB10_GCOUPLE_CF) must be one set on the four ranks: a rank with
+  // another A, B computes another survival and chooses other rows, and the ranks stop at the next collective. Every rank makes this call.
+  {
+    const model::ops::GSettings mine = model::gsample_settings();
+    model::ops::GSettings all[comm::kRanks];
+    ring.allgather_host(&mine, all, sizeof mine, comm::kCallGSampleAgree);
+    for (int r = 0; r < comm::kRanks; ++r)
+      if (std::memcmp(&all[r], &mine, sizeof mine) != 0)
+        die("rank %d: the Gumbel sampler settings differ between the ranks (mode %d %d %d %d, coupled %d %d %d %d, Td[0] %g %g %g %g, gate A,B "
+            "%g,%g %g,%g %g,%g %g,%g): set DSGB10_GSAMPLE, DSGB10_GCOUPLE and DSGB10_GCOUPLE_CF alike on every Spark", a.rank, all[0].mode,
+            all[1].mode, all[2].mode, all[3].mode, all[0].coupled, all[1].coupled, all[2].coupled, all[3].coupled, all[0].td[0], all[1].td[0],
+            all[2].td[0], all[3].td[0], all[0].cf_a, all[0].cf_b, all[1].cf_a, all[1].cf_b, all[2].cf_a, all[2].cf_b, all[3].cf_a, all[3].cf_b);
+  }
   // 3b. --vision-weights: this rank's quarter of the image encoder (dsw_convert --vision), into device memory before the
   // store is sized, so the pool's offer is taken from what is left. The file is checked against the 266 tensors this rank
   // must hold, and the four ranks compare a digest of their files before any byte is read: a file of another rank, another
@@ -1381,7 +1394,7 @@ int main(int argc, char** argv) {
     c.tokens[0] = tok0;
     c.sp.temperature = a.temp;
     c.sp.top_p = a.top_p;
-    c.sp.top_k = a.top_k;
+    c.sp.top_k = model::gsample_top_k(a.top_k, a.temp, a.top_p, true);  // the tools' seed is a client's
     c.sp.seed = a.seed;
     c.max_new = n;
     c.limit = a.max_ctx;
@@ -1600,7 +1613,7 @@ int main(int argc, char** argv) {
       for (size_t k = 0; k < ss.size(); ++k) {
         BatchEntry& x = e[k];
         x.slot = ss[k].slot, x.pos0 = ss[k].ctx, x.max_new = per, x.limit = a.max_ctx;
-        x.sp.temperature = a.temp, x.sp.top_p = a.top_p, x.sp.top_k = a.top_k, x.sp.seed = a.seed;
+        x.sp.temperature = a.temp, x.sp.top_p = a.top_p, x.sp.top_k = model::gsample_top_k(a.top_k, a.temp, a.top_p, true), x.sp.seed = a.seed;
         t[k].assign(toks.begin() + ss[k].ctx, toks.begin() + ss[k].ctx + per);
       }
       Cmd c{};
@@ -1649,7 +1662,7 @@ int main(int argc, char** argv) {
       BatchEntry& x = e[k];
       x.slot = ss[k].slot, x.pos0 = ss[k].ctx, x.token = ss[k].first;
       x.max_new = a.steps, x.limit = a.max_ctx;
-      x.sp.temperature = a.temp, x.sp.top_p = a.top_p, x.sp.top_k = a.top_k, x.sp.seed = a.seed;
+      x.sp.temperature = a.temp, x.sp.top_p = a.top_p, x.sp.top_k = model::gsample_top_k(a.top_k, a.temp, a.top_p, true), x.sp.seed = a.seed;
     }
     Cmd c{};
     c.op = a.spec ? kCmdSpecBatch : kCmdBatch;  // with --spec: drafts across the sessions, every one to its end

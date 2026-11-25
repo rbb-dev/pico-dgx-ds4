@@ -15,6 +15,7 @@
 #include <cuda_runtime.h>
 
 #include "attn/attn.h"
+#include "dspark/noise.h"
 #include "kernels/dsk.h"
 
 namespace dsw {
@@ -117,6 +118,28 @@ void sim_fp8_l2(uint8_t* w, int N, int K, cudaStream_t st);
 // where there is one): the mean of the 4 copies (torch's bf16 mean) into columns [5120 * slot, +5120) of
 // main_hidden [rows][15360] (rows <= kMaxHidden: a step's; accept() reads at most kMaxAcc of them), slot = layer - 37.
 void main_hidden(const uint16_t* x, int rows, int slot, uint16_t* mh, bool pdl, cudaStream_t s);
+
+// Coupled drafts (DSGB10_GCOUPLE; Draft::set_couple): a session on the Gumbel path (ops::kSampGumbel in StepSamp::top_k) has the
+// Markov chain pick its drafts with the request's own noise. A session's sampling as the runner's step input holds it
+// (ops::StepSamp's layout; spec.cu asserts it), entry k's at samp[k]. For an entry that samples (temperature T > 0) with the
+// bit set, the chain's pick at depth j is
+//   argmax over the WHOLE vocabulary of  dl[j][id] / (T * Td[j]) + g(seed, position of that draft's verify row, id),
+// g the request's noise (noise.h: the row that verifies the draft adds the same g to the full model's logits). The drafter does
+// not know the full model's kept (top-p) set, so the pick is not restricted to one; Td < 1 sharpens the drafter's distribution,
+// which keeps its tail from winning. A depth's pick is the token the next depth conditions on. Every draft is still verified by
+// the sampler: with a given noise the emitted tokens are the same with any drafts; only how many are accepted changes. Other
+// entries (greedy, or not on the Gumbel path) keep the argmax of dl, bit for bit; without set_couple no kernel reads samp.
+struct NoiseSamp {
+  uint64_t seed;
+  float temperature;
+  float top_p;
+  int32_t top_k;
+  int32_t n_top;
+  float ablit;
+};
+struct CoupleTd {
+  float inv[kDraft];  // 1 / Td per depth
+};
 
 // A rank's argmax candidate over its vocab slice (id: the global token id).
 struct Cand {
@@ -231,8 +254,9 @@ class Draft {
               const int* row0 = nullptr, int* start_out = nullptr);
   // The draft after the anchor p: *token (the token at p + 1) and four noise tokens at positions p + 1 .. p + 5
   // through the blocks and the head; then tokens() holds d1..d5, greedy drafts for positions p + 2 .. p + 6.
-  // `slot` as accept()'s (kDraft entries, all the anchor's session's).
-  void draft(const int* token, cudaStream_t s, const int* slot = nullptr);
+  // `slot` as accept()'s (kDraft entries, all the anchor's session's). ent: the entry whose sampling the coupled pick reads
+  // (samp[ent]; the anchor is draft()'s own); the one-session step's is 0.
+  void draft(const int* token, cudaStream_t s, const int* slot = nullptr, int ent = 0);
   void use_slot(int s);
   void use_factor(int f);
 
@@ -270,6 +294,10 @@ class Draft {
   // the 5 depths replaces confidence() / survival(). w: kCfWords floats (mu, sd, w1, b1, w2, b2, a), copied. Before any
   // capture of draft(). dbg 1 / 2: survival() carries the margins / the log p instead (measurement only).
   void enable_cf(const float* w, int dbg);
+  // Coupled drafts from now on (before any capture of draft() / draft_batch()): samp the device array of the step's sessions'
+  // sampling (entry k's at samp[k]), td [kDraft] the drafter temperature factor per depth (> 0), cf_a / cf_b: a coupled entry's
+  // gate logit from the confidence MLP becomes cf_a lg + cf_b (1, 0: unchanged; the MLP's own logits only).
+  void set_couple(const NoiseSamp* samp, const float* td, float cf_a, float cf_b);
   const float* cf_raw() const { return cf_w_ ? cf_raw_ : nullptr; }  // device [16]: the MLP's inputs of the last draft()
   // The same MLP over a batch pass's rows (after enable_cf and enable_batch, before any capture of a batch pass): each
   // entry's MLP logits and survival beside the shipped ones (batch_confidence / batch_survival keep the shipped head's)
@@ -325,6 +353,10 @@ class Draft {
   float *cf_w_ = nullptr, *cf_rec_ = nullptr, *cf_grec_ = nullptr, *cf_raw_ = nullptr;  // stack4: the confidence MLP (enable_cf)
   int cf_dbg_ = 0;
   bool cf_batch_ = false;  // enable_cf_batch
+  const NoiseSamp* cpl_ = nullptr;  // set_couple: null = off
+  CoupleTd cpl_td_{};
+  float cpl_cf_[2] = {1.f, 0.f};
+  bool cpl_cf_on_ = false;
   Buf* b_;
   int* ids_;
   float* conf_;

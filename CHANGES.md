@@ -252,6 +252,16 @@ drafts are kept in order of expected accepted tokens per millisecond of step tim
 - Settings: `DSGB10_BATCH_CF=1`, `DSGB10_BATCH_TRIM=1` (served: on).
 - Measured: 2 to 5 users at temperature 1.0, on average 0.8 % faster (inside the spread), from 5.3 % slower to 9.6 % faster.
 
+**Drafts chosen with the request's noise.** A sampled request without a client seed draws through the Gumbel-max sampler, which
+gives the same distribution as before, and the drafter's Markov chain picks each draft with the noise of the position that will
+verify it, so a draft is accepted whenever the sampler would pick that token. Greedy requests and requests with a seed are
+untouched. The settings are checked to be one set on the four Sparks at the start.
+- Settings: `DSGB10_GSAMPLE=1`, `DSGB10_GCOUPLE=0.8` (off unless set; the certified head keeps serving a flagged request that samples
+  with the temperature alone).
+- Measured: sampled at temperature 1.0 and top_p 0.95 with the same seeded requests in both runs (`DSGB10_GSAMPLE=2`), the coupling
+  against none: one user 80.0 against 80.9 tok/s, 16 users within 0.5 %, drafts accepted per verify step 2.19 against 2.20 (no
+  speed difference). The Gumbel-max draws equal their replay on 8,360 of 8,360 rows.
+
 ## Images and video
 
 [`docs/vision.md`](docs/vision.md) explains the whole change, with the path of an image and a clip; [`docs/media.md`](docs/media.md)

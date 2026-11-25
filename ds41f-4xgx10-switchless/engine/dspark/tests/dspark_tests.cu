@@ -3,7 +3,7 @@
 // reductions as fp32 sums in rank order). The golden run's layer 37-39 input streams go through main_hidden(),
 // the prompt's 39 positions seed the windows, then every step accepts one position and drafts, as the reference.
 //
-//   dspark_tests [--ref DIR] [--golden DIR] [--rank0 FILE] [--wdir DIR] [--steps N]
+//   dspark_tests [--ref DIR] [--golden DIR] [--rank0 FILE] [--wdir DIR] [--steps N] [--couple 1]
 //
 // Two passes over the steps:
 //   injected: every sublayer starts from the reference's stream and pre-mix, and the Markov chain from the
@@ -12,6 +12,22 @@
 //             one bf16 ulp in under 0.1% of elements; the rest (TP=4 partial sums, online softmax) is reported.
 //   free:     the whole chain from the step's token alone: draft tokens, confidence and acceptance against the
 //             reference's.
+// --couple 1 adds the coupled drafts' rows (dspark.h NoiseSamp, Draft::set_couple), after the two passes, on one GPU; the drafter
+// runs with 6 session slots then. Td 0.8 at every depth, the settings of DSGB10_GCOUPLE=0.8.
+//   D1  the two passes above run without set_couple: every comparison of the existing test is D1.
+//   D2  set_couple with an entry that is greedy, then one that is sampled without the Gumbel-path bit: the drafts' ids, the
+//       confidence and every rank's biased logits equal the uncoupled run's, byte for byte.
+//   D3  an entry on the Gumbel path (T 1, top-p 0.95, top-k 20 under the bit): at each depth the picked id is the host's argmax over
+//       the whole vocabulary of dl[j][id] / (T Td) + g(seed, anchor + 1 + j, id), over the tapped dl; a differing pick passes only
+//       where the two best scores are within 1e-4 (the count is printed). Control: the same check at position anchor + j must
+//       fail (the rows disagree in many picks), or the check cannot see the position.
+//   D4  a batch pass of 3 entries, mixed: Gumbel-path, greedy, sampled without the bit. The entries off the Gumbel path equal the
+//       same pass with every entry off it, byte for byte, and every entry's ids and confidence equal its own draft(.., entry)
+//       (the pass computes what draft() computes for each row). The one-pass drafter (6 or more entries, draft_batch_wide)
+//       needs the whole router (Weights::gate_all), which this test's weights do not carry: it is covered on the engine (G1).
+// Command (one GB10, the engine stopped; the paths as the defaults above):
+//   dspark_tests --couple 1 [--steps 40]
+// Pass: the last line PASSED, and the D lines below it all equal / compared.
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -23,6 +39,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <memory>
 #include <string>
@@ -250,6 +267,7 @@ class EmuComm final : public dspark::Comm {
 // ---- the test ----------------------------------------------------------------------------------------------------
 
 constexpr int kStream = kDraft * kHc * kDim;
+constexpr int kCoupleSlots = 6;  // --couple: the sessions' windows D4's entries use
 
 struct RankTaps {  // device copies a rank's Draft writes during a pass
   Dev<uint16_t> main_hidden{(size_t)kMaxAcc * kMainK}, main_x{(size_t)kMaxAcc * kDim};
@@ -283,6 +301,7 @@ struct Args {
   std::string ref = "/data/dsgb10/dspark/prose", golden = "/data/dsgb10/golden/prose";
   std::string rank0 = "/data/dsgb10/weights/rank0.dsw", wdir = "/data/dsgb10/dspark/w";
   int steps = 0;
+  int couple = 0;
 };
 
 struct Test {
@@ -365,7 +384,7 @@ struct Test {
       }
       CUDA_CHECK(cudaStreamCreate(&st[r]));
       comms.push_back(std::make_unique<EmuComm>(r, shared.get()));
-      drafts.push_back(std::make_unique<dspark::Draft>(w, r, comms[r].get(), table.p));
+      drafts.push_back(std::make_unique<dspark::Draft>(w, r, comms[r].get(), table.p, a.couple ? kCoupleSlots : 1));
       taps.push_back(std::make_unique<RankTaps>());
       taps[r]->attach(drafts[r]->taps);
     }
@@ -634,6 +653,209 @@ struct Test {
                 hist_ours[0], hist_ours[1], hist_ours[2], hist_ours[3], hist_ours[4], hist_ours[5], hist_ref[0],
                 hist_ref[1], hist_ref[2], hist_ref[3], hist_ref[4], hist_ref[5]);
   }
+
+  // ---- coupled drafts (--couple 1) --------------------------------------------------------------------------------
+  Dev<dspark::NoiseSamp> samp{16};
+  Dev<int> b_ent{16}, b_tok{16}, b_slot{16 * kDraft};
+  float td_[kDraft] = {0.8f, 0.8f, 0.8f, 0.8f, 0.8f};
+
+  void put_samp(int e, uint64_t seed, float T, float top_p, int32_t top_k) {
+    dspark::NoiseSamp n{seed, T, top_p, top_k, 0, 0.f};
+    CUDA_CHECK(cudaMemcpy(samp.p + e, &n, sizeof n, cudaMemcpyHostToDevice));
+  }
+  void on_ranks(const std::function<void(int)>& f) {
+    std::vector<std::thread> t;
+    for (int r = 0; r < kRanks; ++r)
+      t.emplace_back([&, r] {
+        f(r);
+        CUDA_CHECK(cudaStreamSynchronize(st[r]));
+      });
+    for (auto& x : t) x.join();
+  }
+  static uint64_t fnv(const void* p, size_t n) {
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < n; ++i) h = (h ^ static_cast<const uint8_t*>(p)[i]) * 1099511628211ull;
+    return h;
+  }
+  struct Rec {
+    std::vector<int> ids;
+    std::vector<float> conf;
+    uint64_t dl[kRanks] = {};
+    bool agree = true;
+  };
+  // the drafts, the confidence and every rank's biased logits of the draft() just run
+  Rec record(std::vector<std::vector<float>>* dls = nullptr) {
+    Rec c;
+    c.ids.assign(6, 0), c.conf.assign(16, 0.f);
+    CUDA_CHECK(cudaMemcpy(c.ids.data(), drafts[0]->ids(), 24, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(c.conf.data(), drafts[0]->confidence(), 64, cudaMemcpyDeviceToHost));
+    if (dls) dls->assign(kRanks, {});
+    for (int r = 0; r < kRanks; ++r) {
+      std::vector<float> dl((size_t)kDraft * kVocabRank);
+      CUDA_CHECK(cudaMemcpy(dl.data(), drafts[r]->logits(), dl.size() * 4, cudaMemcpyDeviceToHost));
+      c.dl[r] = fnv(dl.data(), dl.size() * 4);
+      if (dls) (*dls)[r] = std::move(dl);
+      std::vector<int> i2(6);
+      std::vector<float> c2(16);
+      CUDA_CHECK(cudaMemcpy(i2.data(), drafts[r]->ids(), 24, cudaMemcpyDeviceToHost));
+      CUDA_CHECK(cudaMemcpy(c2.data(), drafts[r]->confidence(), 64, cudaMemcpyDeviceToHost));
+      c.agree = c.agree && i2 == c.ids && std::memcmp(c2.data(), c.conf.data(), 64) == 0;
+    }
+    return c;
+  }
+  // the free pass's steps again: after(k, anchor, record)
+  template <class F>
+  void each_step(int S, F after, bool want_dl = false) {
+    for (int k = 0; k < S; ++k) {
+      const int i = (int)steps.i(k);
+      hidden(i, 1);
+      int tok = (int)tokens.i(i + 1);
+      token.up(&tok, 1);
+      inject(k, false);
+      ranks(true, true);
+      std::vector<std::vector<float>> dls;
+      after(k, i, record(want_dl ? &dls : nullptr), dls);
+    }
+  }
+
+  // D2 and D3
+  void couple_drafts() {
+    const int S = a.steps ? std::min<int>(a.steps, (int)steps.shape[0]) : (int)steps.shape[0];
+    std::printf("coupled drafts (D2, D3): %d steps\n", S);
+    std::vector<Rec> base;
+    each_step(S, [&](int, int, Rec r, std::vector<std::vector<float>>&) { base.push_back(std::move(r)); });
+    put_samp(0, 0, 0.f, 1.f, 0);
+    for (int r = 0; r < kRanks; ++r) drafts[r]->set_couple(samp.p, td_, 1.f, 0.f);
+    struct Case {
+      const char* name;
+      uint64_t seed;
+      float T, top_p;
+      int32_t top_k;
+    } cases[2] = {{"D2 greedy entry", 0, 0.f, 1.f, 0}, {"D2 sampled entry without the bit", 77, 0.8f, 0.95f, 20}};
+    for (const Case& c : cases) {
+      put_samp(0, c.seed, c.T, c.top_p, c.top_k);
+      Stat& si = stat(std::string(c.name) + ": ids and confidence equal the uncoupled run's", kExact);
+      Stat& sd = stat(std::string(c.name) + ": every rank's biased logits equal", kExact);
+      each_step(S, [&](int k, int, Rec r, std::vector<std::vector<float>>&) {
+        si.add(r.ids == base[k].ids && r.conf == base[k].conf && r.agree ? 1 : 0, 1);
+        bool same = true;
+        for (int q = 0; q < kRanks; ++q) same = same && r.dl[q] == base[k].dl[q];
+        sd.add(same ? 1 : 0, 1);
+      });
+    }
+    // D3: an entry on the Gumbel path
+    const uint64_t seed = 424242;
+    const float T = 1.f, top_p = 0.95f;
+    put_samp(0, seed, T, top_p, dspark::kNoiseGumbel | 20);
+    Stat& s3 = stat("D3 coupled pick = host argmax of dl / (T Td) + noise (ties within 1e-4 excluded)", kExact);
+    Stat& sa = stat("D3 ranks agree on the coupled drafts", kExact);
+    long ties = 0, picks = 0, ctl_bad = 0, changed = 0;
+    each_step(
+        S,
+        [&](int k, int anchor, Rec r, std::vector<std::vector<float>>& dl) {
+          sa.add(r.agree ? 1 : 0, 1);
+          for (int j = 0; j < kDraft; ++j) {
+            for (int control = 0; control < 2; ++control) {
+              const int pos = control ? anchor + j : anchor + 1 + j;  // the control puts the noise one row early
+              float best = -INFINITY;
+              int best_id = 1 << 30;
+              float dev_score = -INFINITY;
+              for (int q = 0; q < kRanks; ++q)
+                for (int x = 0; x < kVocabRank; ++x) {
+                  const int id = q * kVocabRank + x;
+                  const float v = dl[q][(size_t)j * kVocabRank + x];
+                  const float sc = v * ((1.f / td_[j]) / T) + dspark::nz_gumbel(seed, pos, id);
+                  if (sc > best) best = sc, best_id = id;
+                  if (id == r.ids[1 + j]) dev_score = sc;
+                }
+              const bool eq = r.ids[1 + j] == best_id;
+              const bool tie = !eq && best - dev_score <= 1e-4f;
+              if (!control) {
+                ++picks, ties += tie;
+                s3.add(eq || tie ? 1 : 0, 1);
+              } else if (!eq && !tie) {
+                ++ctl_bad;
+              }
+            }
+            changed += r.ids[1 + j] != base[k].ids[1 + j];
+          }
+        },
+        true);
+    std::printf("  D3: %ld picks checked, %ld within the 1e-4 tie band; control (noise at anchor + j): %ld of %ld picks differ; coupled drafts differ from the "
+                "argmax's in %ld of them\n", picks, ties, ctl_bad, picks, changed);
+    stat("D3 control: the check sees the position (wrong-position picks differ)", kExact).add(ctl_bad > 0 ? 1 : 0, 1);
+    stat("D3 coupling ran (some pick differs from the argmax's)", kExact).add(changed > 0 ? 1 : 0, 1);
+  }
+
+  // D4: batch passes of n entries, one session slot each
+  void couple_batch() {
+    const int L = (int)tokens.shape[0];
+    const int i = (int)steps.i(0);
+    for (int r = 0; r < kRanks; ++r) drafts[r]->enable_batch();
+    // each slot's window: the prompt's positions, then the anchor's
+    const int n_seed = (int)main_x_seed.shape[0];
+    for (int e = 0; e < kCoupleSlots; ++e) {
+      for (int r = 0; r < kRanks; ++r) drafts[r]->use_slot(e);
+      for (int p = 0; p < n_seed; p += kMaxAcc) {
+        hidden(p, std::min(kMaxAcc, n_seed - p));
+        ranks(true, false);
+      }
+    }
+    hidden(i, 1);
+    on_ranks([&](int r) {
+      for (int e = 0; e < kCoupleSlots; ++e) {
+        drafts[r]->use_slot(e);
+        drafts[r]->accept(mh.p, count.p, pos0.p, st[r], nullptr, nullptr, drafts[r]->batch_start() + e);
+      }
+    });
+    std::vector<int> ent(16), tok(16), slot(16 * kDraft);
+    for (int e = 0; e < 16; ++e) ent[e] = e, tok[e] = (int)tokens.i((i + 1 + 7 * e) % L);
+    for (int q = 0; q < 16 * kDraft; ++q) slot[q] = std::min(q / kDraft, kCoupleSlots - 1);
+    b_ent.up(ent.data(), 16), b_tok.up(tok.data(), 16), b_slot.up(slot.data(), slot.size());
+    // entry e: 0 mod 3: on the Gumbel path; 1: greedy; 2: sampled without the bit
+    auto sampling = [&](int e, bool flagged_on) {
+      if (e % 3 == 0) put_samp(e, 9000 + e, 1.f, 0.95f, flagged_on ? (dspark::kNoiseGumbel | 20) : 20);
+      else if (e % 3 == 1) put_samp(e, 9000 + e, 0.f, 1.f, 0);
+      else put_samp(e, 9000 + e, 0.8f, 0.95f, 20);
+    };
+    for (int n : {3}) {
+      std::vector<Rec> A(n), B(n), own(n);
+      for (int pass = 0; pass < 2; ++pass) {
+        for (int e = 0; e < n; ++e) sampling(e, pass == 1);
+        std::vector<Rec>& out = pass ? B : A;
+        on_ranks([&](int r) {
+          dspark::Draft::BatchPass bp{b_ent.p, n, b_tok.p, 1, b_slot.p};
+          drafts[r]->draft_batch(bp, st[r]);
+        });
+        for (int e = 0; e < n; ++e) {
+          out[e].ids.assign(6, 0), out[e].conf.assign(16, 0.f);
+          CUDA_CHECK(cudaMemcpy(out[e].ids.data(), drafts[0]->batch_ids(e), 24, cudaMemcpyDeviceToHost));
+          CUDA_CHECK(cudaMemcpy(out[e].conf.data(), drafts[0]->batch_confidence(e), 64, cudaMemcpyDeviceToHost));
+        }
+      }
+      // each entry's own draft(.., e) beside the mixed pass (its sampling as in pass B)
+      for (int e = 0; e < n; ++e) {
+        on_ranks([&](int r) {
+          drafts[r]->use_slot(e);
+          drafts[r]->accept(mh.p, count.p, pos0.p, st[r]);
+          drafts[r]->draft(b_tok.p + e, st[r], nullptr, e);
+        });
+        own[e] = record();
+      }
+      Stat& s_off = stat("D4 n=" + std::to_string(n) + ": entries off the Gumbel path equal the all-off pass", kExact);
+      Stat& s_own = stat("D4 n=" + std::to_string(n) + ": entries equal their own draft(.., entry)", kExact);
+      long differ = 0, flagged_changed = 0;
+      for (int e = 0; e < n; ++e) {
+        if (e % 3 != 0) s_off.add(A[e].ids == B[e].ids && A[e].conf == B[e].conf ? 1 : 0, 1);
+        else flagged_changed += A[e].ids != B[e].ids;
+        const bool same = B[e].ids == own[e].ids && B[e].conf == own[e].conf;
+        s_own.add(same ? 1 : 0, 1);
+        differ += !same;
+      }
+      std::printf("  D4 n=%d: %d entries, %ld differ from their own draft(), %ld of the Gumbel-path entries changed by coupling\n", n, n, differ,
+                  flagged_changed);
+    }
+  }
 };
 
 }  // namespace
@@ -647,6 +869,7 @@ int main(int argc, char** argv) {
     else if (k == "--rank0") t.a.rank0 = v;
     else if (k == "--wdir") t.a.wdir = v;
     else if (k == "--steps") t.a.steps = std::stoi(v);
+    else if (k == "--couple") t.a.couple = std::stoi(v);
     else die("unknown argument %s", k.c_str());
   }
   t.load_ref();
@@ -654,6 +877,10 @@ int main(int argc, char** argv) {
   t.seed();
   t.run(true);
   t.run(false);
+  if (t.a.couple) {
+    t.couple_drafts();
+    t.couple_batch();
+  }
   int bad = 0;
   std::printf("%-48s %20s %10s %10s %9s\n", "value", "equal / compared", "max |diff|", "max |ref|", "rel RMS");
   const char* cls[4] = {"info", "tp", "near", "exact"};

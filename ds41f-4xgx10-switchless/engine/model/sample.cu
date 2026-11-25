@@ -45,16 +45,6 @@ __device__ __forceinline__ void st_release_sys_u32(uint32_t* p, uint32_t v) {
   asm volatile("st.release.sys.global.u32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
 }
 
-__device__ __forceinline__ uint64_t mix64(uint64_t x) {
-  x ^= x >> 31;
-  x *= 0xBF58476D1CE4E5B9ull;
-  x ^= x >> 29;
-  x *= 0x94D049BB133111EBull;
-  x ^= x >> 32;
-  return x;
-}
-__device__ __forceinline__ float unit(uint64_t h) { return ((float)(h >> 40) + 0.5f) * (1.0f / 16777216.0f); }
-
 __device__ __forceinline__ bool better(float a, int ia, float b, int ib) { return a > b || (a == b && ia < ib); }
 
 // Block reductions (fixed order, the result in every thread).
@@ -139,11 +129,13 @@ __global__ void __launch_bounds__(kThreads) k_sample(comm::DevChannel ch, const 
   const float T = sp.temperature;                                                                           \
   const bool greedy = !(T > 0.f);                                                                           \
   const float invT = greedy ? 1.f : 1.f / T;                                                                \
-  const bool trunc = !greedy && (sp.top_k > 0 || sp.top_p < 1.f);                                           \
+  const int top_k = samp_top_k(sp.top_k); /* the Gumbel-path bit is not a top-k */                          \
+  const bool gum = samp_gumbel(sp.top_k, T);                                                                \
+  const bool trunc = !greedy && (top_k > 0 || sp.top_p < 1.f);                                              \
   const int n_top = min(max(sp.n_top, 0), kTopLogprobs);                                                    \
   const bool cand = trunc || n_top > 0;                                                                     \
   const int pos = in->pos[b];                                                                               \
-  (void)n_top, (void)cand, (void)pos, (void)trunc;
+  (void)n_top, (void)cand, (void)pos, (void)trunc, (void)gum, (void)top_k;
   for (int j = 0; j < PER; ++j) {
   const int b = blockIdx.x + j * G;
   ROW_PARAMS
@@ -322,9 +314,9 @@ __global__ void __launch_bounds__(kThreads) k_sample(comm::DevChannel ch, const 
         int exact = 0;
         while (exact < nu && uv[exact] > tx) ++exact;
         int K = nu;
-        if (sp.top_k > 0 && sp.top_k < K) K = sp.top_k;
+        if (top_k > 0 && top_k < K) K = top_k;
         float lz = logZ;
-        if (sp.top_k > 0) {  // renormalised over the top k
+        if (top_k > 0) {  // renormalised over the top k
           float zz = 0.f;
           for (int i = 0; i < K; ++i) zz += expf((uv[i] - uv[0]) * invT);
           lz = uv[0] * invT + logf(zz);
@@ -339,16 +331,23 @@ __global__ void __launch_bounds__(kThreads) k_sample(comm::DevChannel ch, const 
           }
         }
         if (keep > exact) fl |= kSampApprox;
-        float tot = 0.f;
-        for (int i = 0; i < keep; ++i) tot += expf(uv[i] * invT - lz);
-        const float target = unit(mix64(mix64(sp.seed ^ 0x5851F42D4C957F2Dull) + (uint64_t)(uint32_t)pos)) * tot;
         int pick = keep - 1;
-        float acc = 0.f;
-        for (int i = 0; i < keep; ++i) {
-          acc += expf(uv[i] * invT - lz);
-          if (acc > target) {
-            pick = i;
-            break;
+        if (gum) {
+          // the Gumbel-max winner among the kept tokens: token i wins with probability exp(uv[i] / T) / sum over the kept,
+          // what the walk below draws. The noise is the untruncated sampler's g(seed, position, id), so a draft row and the
+          // row that verifies it see the same noise.
+          pick = gumbel_pick(uv, ui, keep, invT, noise_base(sp.seed, pos));
+        } else {
+          float tot = 0.f;
+          for (int i = 0; i < keep; ++i) tot += expf(uv[i] * invT - lz);
+          const float target = unit(mix64(mix64(sp.seed ^ 0x5851F42D4C957F2Dull) + (uint64_t)(uint32_t)pos)) * tot;
+          float acc = 0.f;
+          for (int i = 0; i < keep; ++i) {
+            acc += expf(uv[i] * invT - lz);
+            if (acc > target) {
+              pick = i;
+              break;
+            }
           }
         }
         tok = ui[pick], val = uv[pick], lp = uv[pick] * invT - logZ;

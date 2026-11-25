@@ -1651,7 +1651,8 @@ class Server {
     }
     f.sp.temperature = h.temperature;
     f.sp.top_p = h.top_p;
-    f.sp.top_k = (int32_t)std::min<uint32_t>(h.top_k, 1u << 30);
+    // the Gumbel-path bit rides in top_k (model.h gsample_top_k); the client's value never reaches the bit's own pattern
+    f.sp.top_k = model::gsample_top_k(model::ops::client_top_k(h.top_k), h.temperature, h.top_p, (h.flags & fe::kFlagSeed) != 0);
     f.sp.n_top = (h.flags & fe::kFlagLogprobs) ? (int32_t)std::min<uint32_t>(h.n_top_logprobs, model::ops::kTopLogprobs) : 0;
     // a request that wants logprobs keeps the full head (the certified head gives the argmax, not the partition sum)
     if ((h.flags & fe::kFlagLogprobs) && f.sp.n_top < 1) f.sp.n_top = 1;

@@ -38,6 +38,20 @@ inline ops::StepSamp samp_of(const Sampling& s) {
 }
 using ops::SampleOut;
 
+// Which sampled requests ride the Gumbel path (ops::kSampGumbel in Sampling::top_k; samp_rule.h has the rule, model.cu reads the
+// variables once).
+//   DSGB10_GSAMPLE unset / 0: none: every request is sampled as before.
+//   1: a sampled request whose client sent NO seed, and a sampled request without top-p / top-k (its sampler is the Gumbel-max
+//      one already; only its drafts change). A seeded top-p / top-k request keeps its sampler and its text.
+//   2: every sampled request (a seeded top-p / top-k request then gives another text for its seed, from the same distribution).
+// On the path a truncated row takes the Gumbel-max winner among the kept tokens, and with DSGB10_GCOUPLE (dspark.h) the drafts
+// are picked with the request's own noise. Greedy requests are never on it.
+const ops::GSettings& gsample_settings();  // model.cu: DSGB10_GSAMPLE, DSGB10_GCOUPLE, DSGB10_GCOUPLE_CF, read once; a bad value ends the start
+inline int gsample_mode() { return gsample_settings().mode; }
+inline int32_t gsample_top_k(int32_t top_k, float temperature, float top_p, bool seeded) {
+  return ops::gsample_top_k_mode(gsample_mode(), top_k, temperature, top_p, seeded);
+}
+
 struct Sink;
 
 // A step of rows from several sessions (docs/batching.md, B2; Model::launch_batch). Row r is position

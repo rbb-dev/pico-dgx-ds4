@@ -21,7 +21,7 @@ enum HostCall : uint32_t {
   kCallMain0 = 10,  // main.cpp's start-up calls: 10 + the order they are made in
   kCallKeepIndex = 20, kCallCheckpointIndex = 21, kCallDiskRoom = 22, kCallUnspill = 23, kCallJoin = 24,  // the store's agreements (store_core.cpp)
   kCallTenant0 = 30,  // tenant.cu: 30 and 31 the two tenant minimums, 32 the lend's vote
-  kCallVit = 40, kCallWindowMin = 50, kCallWindowMax = 51, kCallCopyAgree = 60,
+  kCallVit = 40, kCallWindowMin = 50, kCallWindowMax = 51, kCallCopyAgree = 60, kCallGSampleAgree = 61,
 };
 
 inline const char* host_call_name(uint32_t id) {
@@ -32,6 +32,7 @@ inline const char* host_call_name(uint32_t id) {
     case kCallRide: return "ride";
     case kCallWatch: return "watch";
     case kCallCopyAgree: return "copy drafting settings";
+    case kCallGSampleAgree: return "Gumbel sampler settings";
     case 10: case 11: case 12: case 13: case 14: case 15: return "start-up (main.cpp)";
     case kCallKeepIndex: return "kept index write (keep)";
     case kCallCheckpointIndex: return "kept index write (checkpoint)";

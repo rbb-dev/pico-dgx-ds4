@@ -63,6 +63,33 @@ engine's batch logits depend on that grouping (as for the row budget and the wid
 differed from the run without the switches in 9 of 10 cases and were equal in 10 of 10 at 5 sessions, while the same build
 run twice gave the same responses (all but one 8-token greeting).
 
+## Sampled requests: the Gumbel path and coupled drafts
+
+A sampled request without a client seed can draw through the Gumbel-max sampler, and its drafts can be chosen with the request's
+own noise. Both are off unless set (every rank must have the same environment: a start where the settings differ stops).
+
+| switch | what it does |
+|---|---|
+| `DSGB10_GSAMPLE=1` | a sampled request that sent no seed, and a sampled request without top-p or top-k, is on the Gumbel path. A request with a seed and a top-p or top-k keeps the sampler and the replies it had |
+| `DSGB10_GSAMPLE=2` | every sampled request is on it; a request with a seed, top-p or top-k then gets another text for its seed than without the switch, the same one every time from then on (for tests) |
+| `DSGB10_GCOUPLE=Td[,Td2,..]` | sessions on the Gumbel path have the drafter's Markov chain pick each draft as the largest of its logit / (T x Td) plus the request's noise at the position that will verify it, Td in (0, 4] per depth (the last repeats). Needs the switch above to have any effect |
+| `DSGB10_GCOUPLE_CF=A,B` | with coupling, the confidence network's logit of a coupled session becomes A x logit + B (default 1,0: unchanged) |
+
+On the path, a truncated row (top-p or top-k) takes the Gumbel-max winner among the same kept tokens as the walk over one
+uniform: token i wins with probability exp(l_i / T) divided by the sum over the kept tokens, so the distribution is the same and
+the draw for a given seed is another one. An untruncated row already drew this way. The noise is a hash of the seed, the position
+and the token id, so a draft chosen with the noise of its verify row is accepted whenever the sampler's own pick is that token.
+
+**Exactness.** Greedy requests are never on the path, and the requests a mode leaves off it are bit-equal to a build without the
+switches. For a request on the path, drafts never change what a one-session run emits: with a given noise the same tokens come
+out with any drafts; only how many are accepted changes. In a step shared by several sessions the tokens are the target's under
+that step's grouping, as for the other batch switches, and the coupling adds one dependence: which sessions' rows share a step
+depends on the coupled drafts, which depend on the noise of the very positions the step verifies. Each token is still the
+sampler's exact pick from a valid evaluation of the target, but the choice among the valid evaluations (the groupings whose logits
+differ by the batch non-invariance above) is no longer independent of that position's noise. No direction of bias follows from
+the code. A shared step with a session on the path is therefore not validated by comparing its text with another run's; only steps
+with no session on the path are.
+
 ## Copy drafting
 
 A second source of drafts for the speculative steps. Agent turns copy: a tool's input repeats text the conversation

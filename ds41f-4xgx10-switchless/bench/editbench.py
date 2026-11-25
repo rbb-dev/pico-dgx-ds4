@@ -15,6 +15,7 @@ records (prompt and output ids) and to rank 0's per-request lines (decode rate, 
 
 pi's prompt, tool definitions and tool texts are pi's (MIT, Copyright (c) 2025 Mario Zechner): THIRD_PARTY.md.
 """
+import argparse
 import json
 import os
 import re
@@ -434,6 +435,13 @@ def finish_task(ws_root, orig, t):
     return dict(checks=checks, passed=all(checks) and all(compiled.values()), changed=changed, compiles=compiled)
 
 
+def turn_seed(a, rep, task_id, turn):
+    """The seed of one request under --edit-seed: BASE, then a step for the session, the repeat, the task (its id's bytes) and the
+    turn, so that two sessions, two repeats or two tasks never share one, and the same run asks for the same seeds again."""
+    h = sum((i + 1) * b for i, b in enumerate(task_id.encode()))
+    return (a.edit_seed + 1000003 * a.edit_session + 10007 * rep + 131 * (h % 997) + turn) % (1 << 31)
+
+
 def run_task(a, base, spec, t, thinking, run, out, f_turns, rep=0):
     ws_root = os.path.join(out, "ws", thinking, f"rep{rep}", t["id"])
     shutil.rmtree(ws_root, ignore_errors=True)
@@ -456,6 +464,8 @@ def run_task(a, base, spec, t, thinking, run, out, f_turns, rep=0):
                 "chat_template_kwargs": kwargs, "user": tag}
         if a.edit_temperature != "none":
             body["temperature"] = float(a.edit_temperature)
+        if a.edit_seed >= 0:  # a client seed per session, repeat, task and turn: the engine takes the request as seeded
+            body["seed"] = turn_seed(a, rep, t["id"], turn)
         try:
             r = chat(base, a.key, body)
         except Exception as e:  # noqa: BLE001 (recorded, and the task ends)
@@ -517,6 +527,46 @@ def run_task(a, base, spec, t, thinking, run, out, f_turns, rep=0):
 
 
 def run(a, base):
+    """One session, or --edit-sessions N of them at once: N forked processes (no shared interpreter lock between them), each its
+    own tag (RUN-sK), output directory (OUT/sK) and seed base; the results are every session's tasks."""
+    if a.edit_sessions <= 1:
+        return run_one(a, base)
+    import copy
+    out = a.edit_out or f"edit-{time.strftime('%Y%m%d-%H%M%S')}"
+    tag = a.edit_tag or os.path.basename(os.path.abspath(out))
+    pids = {}
+    for k in range(a.edit_sessions):
+        ak = copy.copy(a)
+        ak.edit_sessions, ak.edit_session = 1, k
+        ak.edit_out, ak.edit_tag = os.path.join(out, f"s{k}"), f"{tag}-s{k}"
+        sys.stdout.flush()
+        pid = os.fork()
+        if pid == 0:
+            code = 1
+            try:
+                run_one(ak, base)
+                code = 0
+            finally:
+                sys.stdout.flush()
+                os._exit(code)
+        pids[pid] = k
+    bad = 0
+    for pid in list(pids):
+        _, status = os.waitpid(pid, 0)
+        if status:
+            bad += 1
+            print(f"edit session {pids[pid]}: exited with status {status}", flush=True)
+    res = []
+    for k in range(a.edit_sessions):
+        f = os.path.join(out, f"s{k}", "tasks.jsonl")
+        if os.path.exists(f):
+            res += [json.loads(x) for x in open(f) if x.strip()]
+    if bad:
+        raise SystemExit(f"edit: {bad} of {a.edit_sessions} sessions failed")
+    return res
+
+
+def run_one(a, base):
     spec = json.load(open(a.edit_spec))
     by_id = {t["id"]: t for t in spec["tasks"]}
     tasks = spec["tasks"] if a.edit_tasks == "all" else [by_id[x] for x in a.edit_tasks.split(",")]
@@ -548,6 +598,11 @@ def add_args(ap):
                     "without a seed the engine draws one per request)")
     ap.add_argument("--edit-deadline-s", type=float, default=0, help="start no task after this many seconds")
     ap.add_argument("--edit-temperature", default="0", help="sent as temperature; none: not sent (as pi does)")
+    ap.add_argument("--edit-seed", type=int, default=-1, help="BASE: every request carries a client seed (BASE, the session, the repeat, "
+                    "the task and the turn make it): the engine takes it as seeded. -1: none sent (the engine draws one)")
+    ap.add_argument("--edit-sessions", type=int, default=1, help="N sessions at once, N forked processes with a tag, an output "
+                    "directory (OUT/sK) and a seed base of their own")
+    ap.add_argument("--edit-session", type=int, default=0, help=argparse.SUPPRESS)
     ap.add_argument("--edit-out", default="", help="the run's directory: turns.jsonl, tasks.jsonl, ws/")
     ap.add_argument("--edit-tag", default="", help="the run's name in each request's user field (default: the out dir's)")
     ap.add_argument("--edit-repo", default=os.path.dirname(HERE), help="the git checkout the task files come from")
