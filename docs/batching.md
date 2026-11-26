@@ -222,7 +222,7 @@ Copy drafting appends at most 7 drafts to the bonus token of a session's step (8
 it holds can verify far more in one step. With `DSGB10_COPY_ROWS=32` or `64` (and `DSGB10_COPY=1`) the one-session step graph holds one
 more body for each of the buckets of 32 and 64 rows, captured with the exact kernels of [Exact shared steps](#exact-shared-steps) in
 force whatever `DSGB10_WIDE_EXACT` says, and a step of 29 to 32 or 57 to 64 rows takes its bucket's body; steps of 1 to 8 rows keep
-their bodies (certified or plain). Unset or `8`, the graph is the present one, node for node. Each body ends with its own sampler
+their bodies (certified or plain). With `8`, the graph is the one without long steps, node for node. Each body ends with its own sampler
 launch (the exact ones' grid is 64 blocks), the draft module accepts a long step's last 8 final rows first and the earlier ones in a
 loop of chunks of 8, and the three ratio-2 compressor carries, which keep a call's last 16 rows by position, get the step's last 16
 final rows back from the projections the body saved (a rejected row's projection must not stay in them).
@@ -242,7 +242,7 @@ Long steps run for a request that decodes alone; in shared steps copy rows are a
 (`verify_reach`) widen to 63 rows, the draft rate and the step-cost model are not fed by long steps, and each request logs one line
 beside the digests: `copy: long steps N (whole W), drafts D, accepted A`.
 
-Settings (on every Spark; a value outside its range stops the start): `DSGB10_COPY_ROWS` 8 (unset), 32 or 64 (32: the 32-row body,
+Settings (on every Spark; a value outside its range stops the start): `DSGB10_COPY_ROWS` 8 (no long steps), 32 or 64 (the default; 32: the 32-row body,
 31 drafts; 64: both bodies, 63 drafts), `DSGB10_COPY_ENTER` 8 to 72, default 32. Memory: one more body each (a graph of the one-session
 step is about 33 MiB a body, the start prints the figure) and 0.75 MiB of saved projections. Test-only: `DSGB10_TF_SOLO=1` with
 `DSGB10_TF_SESSROWS=1` runs the tool's teacher-forced given steps of more than 16 rows as an exact body. Based on pico-dgx-ds4's

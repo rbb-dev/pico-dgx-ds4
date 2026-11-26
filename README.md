@@ -57,7 +57,7 @@ page to watch and tune it. Each item links to the section that explains it.
   leave unused, and its size changes from the dashboard while serving ([The Engram row cache](#the-engram-row-cache)).
 - **More tokens per step.** Besides the model's own draft heads, the engine copies text the conversation already contains (an
   agent rewriting a file repeats most of it), and when several users share a step, pico-dgx-ds4's confidence network also
-  decides how many of each user's drafted tokens are worth checking. Both are on in the served settings and off by default in the code ([Drafting](#drafting)).
+  decides how many of each user's drafted tokens are worth checking. Both are on by default ([Drafting](#drafting)).
 - **Runtime abliteration.** A second model name with the `-ablit` suffix, served from the same weights: the published
   abliteration edit is applied at run time, only to the requests that ask for that name
   ([Runtime abliteration](#runtime-abliteration)).
@@ -150,19 +150,22 @@ The engine runs on all four Sparks and the front-end, `dsfront`, on rank 0. Two 
 of Sparks. `service.sh` takes the engine's arguments from `DSGB10_ENGINE_ARGS` and the front-end's more arguments from
 `DSGB10_FRONT_ARGS` (the front-end's API key from the file named by `DSGB10_KEY_FILE`); it starts the engine with
 `--mode serve --disk-tag service --keep-gib` (`DSGB10_KEEP_GIB`, 4 by default) and does not start the media worker. Without
-`DSGB10_ENGINE_ARGS` it starts the engine with its own default, `--max-ctx 262144 --pool-free-gib 10 --front-mib 840`, so a 4M
-window needs the settings below. `service.sh` lends the ring to a waiting test job after `DSGB10_YIELD_IDLE_S` seconds
+`DSGB10_ENGINE_ARGS` it starts the engine with no settings, which runs the served configuration (the settings below). `service.sh` lends the ring to a waiting test job after `DSGB10_YIELD_IDLE_S` seconds
 (600) without a request and holds requests meanwhile (`DSGB10_HOLD_S`); its header lists every setting.
 `engine/server/run4.sh` is a development launcher for a ring job (fleet file, ring lock).
 
 ### As served
 
-The engine's arguments (`ENGINE_ARGS` of `deploy/pico.env.example`; every rank gets the same). The speeds in
-[At a glance](#at-a-glance) were measured with this line. The units add `--mode serve`, `--socket`,
-`--disk-tag service` and `--keep-gib` (from `KEEP_GIB`, 64 here); with `service.sh` leave `--mode serve` and `--disk-tag`
-out and give the kept-session size as `DSGB10_KEEP_GIB=64`. In `pico.env` write full paths (systemd does not expand `~`;
-the engine expands a leading `~/` in `--weights` itself). The GPU clock limit of 2,200 MHz is `GPU_CLOCK` in `pico.env`,
-applied at every start, or set with `ds41f-4xgx10-switchless/tools/gpu-clock`.
+The settings below are the defaults of `--mode serve`: a start with no settings of them runs this configuration, and the speeds in
+[At a glance](#at-a-glance) and every other measurement in this README are of these defaults. `ENGINE_ARGS` of
+`deploy/pico.env.example` (every rank gets the same) therefore holds only what describes one machine: the files
+(`--weights`, `--ablit`, `--vision-weights`, `DSGB10_CF_MLP`). A setting turns off with its off value (`--no-draft-head4`,
+`--no-draft-markov8`, `--kv-split off`, `--pscan off`, `--engram-vram off`, `DSGB10_X=0`), and a start that names a setting keeps
+its own value; the other modes (the golden checks, the benches) take none of these defaults. The units add `--mode serve`,
+`--socket`, `--disk-tag service` and `--keep-gib` (from `KEEP_GIB`, 64 here); with `service.sh` leave `--mode serve` and
+`--disk-tag` out and give the kept-session size as `DSGB10_KEEP_GIB=64`. In `pico.env` write full paths (systemd does not expand
+`~`; the engine expands a leading `~/` in `--weights` itself). The GPU clock limit of 2,200 MHz is `GPU_CLOCK` in `pico.env`,
+applied at every start, or set with `ds41f-4xgx10-switchless/tools/gpu-clock`. The same served line, written out, is:
 
 ```
 --max-ctx 4194304 --slots 32 --big-slots 0 --pool-free-gib 6.3 \
@@ -174,14 +177,17 @@ applied at every start, or set with `ds41f-4xgx10-switchless/tools/gpu-clock`.
   --setenv DSGB10_WIDE=64 --setenv DSGB10_WIDE_COST=24,2.2,57,1.1 --setenv DSGB10_HEAD4_C1=1 \
   --setenv DSGB10_CF_MLP=/home/<user>/dsgb10/bin/cfmlp_cml.bin --setenv DSGB10_CF_ALPHA=1.0 --setenv DSGB10_BATCH_CF=1 \
   --setenv DSGB10_BATCH_TRIM=1 --setenv DSGB10_BATCH_TRIM_COST=19,2.9 --setenv DSGB10_CERT=1 --setenv DSGB10_RING_DIRECT=2 \
-  --setenv DSGB10_RING_RSBAL=1 --setenv DSGB10_PF_TUNE=hc,small,down
+  --setenv DSGB10_RING_RSBAL=1 --setenv DSGB10_PF_TUNE=hc,small,down \
+  --setenv DSGB10_WIDE_SH=1 --setenv DSGB10_WIDE_AR=2 --setenv DSGB10_HEADG=2 --setenv DSGB10_COPY_ROWS=64
 ```
 
 Of these, `--big-slots`, `--draft-head4`, `--draft-markov8`, `DSGB10_BUDGET`, `DSGB10_DRAFT1`, `DSGB10_WIDE`,
 `DSGB10_WIDE_COST`, `DSGB10_HEAD4_C1`, `DSGB10_CF_MLP`, `DSGB10_CF_ALPHA`, `DSGB10_CERT` and `DSGB10_RING_DIRECT` are pico-dgx-ds4's
 options, and the code behind `DSGB10_RING_RSBAL` and `DSGB10_PF_TUNE` is pico-dgx-ds4's too; the others are this repository's.
+`DSGB10_CF_MLP` names a file, so it has no default: without it the confidence network is not loaded, and `DSGB10_BATCH_CF` has
+nothing to read.
 
-| In that line | What it does |
+| Default (set in a start with no settings) | What it does |
 |---|---|
 | `--max-ctx 4194304` | the largest window, 4M tokens (1M, 2M and 4M open on demand) |
 | `--slots 32 --big-slots 0` | 32 lines, every one able to grow to the whole context |
@@ -194,32 +200,32 @@ options, and the code behind `DSGB10_RING_RSBAL` and `DSGB10_PF_TUNE` is pico-dg
 | `--pscan all` | the decode index scan split by positions over the four ranks, in every window |
 | `--kv-split tiered` | the split cache's mode |
 | `--prefill-rows-max 16384` | long prompts are processed 16,384 rows at a pass on a second set of row buffers lent by the store while it is free; 0 processes 8,192 rows at a pass only ([Long prompts processed 16,384 rows at a time](#long-prompts-processed-16384-rows-at-a-time)) |
-| `--draft-head4`, `--draft-markov8` | the drafter's head as 4-bit and its Markov head as FP8 |
-| `--ablit FILE` | the abliteration file the `-ablit` name serves (in this repository: `tools/ablit/ablit.bin`) |
-| `--vision-weights FILE` | each rank's quarter of the image encoder (made by `dsw_convert --vision`) |
-| `--weights FILE` | each rank's weight file (version 3) |
-| `--setenv NAME=VALUE` | sets an environment variable of the engine process on every rank |
-| `DSGB10_COPY=1` | copy drafting on |
-| `DSGB10_GSAMPLE=1`, `DSGB10_GCOUPLE=0.8` (not in the line above) | sampled requests without a client seed draw through the Gumbel-max sampler (the same distribution), and the drafter picks its drafts with the request's own noise, so more of them are accepted. Greedy and seeded requests are untouched. Off unless set; every Spark must have the same settings ([`docs/batching.md`](docs/batching.md#sampled-requests-the-gumbel-path-and-coupled-drafts)) |
-| `DSGB10_COPY_ADAPT=0` (not in the line above) | the learning copy drafter is on whenever copy drafting is: the table is its starting values, and the engine counts how often copies of each length are accepted and uses its own counts; each conversation also gets a quick correction. `0` turns it off (the table alone decides). With `DSGB10_RELAX` or `DSGB10_RELAX_P` set it stays off unless set to `1`, and then the start is refused. Every Spark must have the same copy settings and table file: a start where they differ stops |
-| `DSGB10_COPY_TABLE=FILE` (not in the line above) | optional: a copy-drafting survival table fitted from real traffic by `tools/copy/fit.py`, the same path on every Spark; a start whose file cannot be read on one rank stops. This repository does not ship one: without the setting the engine uses its built-in table, which is what At a glance, the long-context table and the learner comparison were measured with; the first two rows of [Drafting](#drafting) and the interleave table were measured on an earlier build with a table fitted from real traffic |
+| `--draft-head4`, `--draft-markov8` | the drafter's head as 4-bit and its Markov head as FP8 (`--no-draft-head4`, `--no-draft-markov8` turn them off) |
+| `--ablit FILE` (a file: no default) | the abliteration file the `-ablit` name serves (in this repository: `tools/ablit/ablit.bin`) |
+| `--vision-weights FILE` (a file: no default) | each rank's quarter of the image encoder (made by `dsw_convert --vision`) |
+| `--weights FILE` (a file: no default) | each rank's weight file (version 3) |
+| `--setenv NAME=VALUE` | sets an environment variable of the engine process on every rank; it wins over the default of the same variable |
+| `DSGB10_COPY=1` | copy drafting on (`0` off) |
+| `DSGB10_GSAMPLE=1`, `DSGB10_GCOUPLE=0.8` (not a default) | sampled requests without a client seed draw through the Gumbel-max sampler (the same distribution), and the drafter picks its drafts with the request's own noise, so more of them are accepted. Greedy and seeded requests are untouched. Off unless set; every Spark must have the same settings ([`docs/batching.md`](docs/batching.md#sampled-requests-the-gumbel-path-and-coupled-drafts)) |
+| `DSGB10_COPY_ADAPT=0` (not a default) | the learning copy drafter is on whenever copy drafting is: the table is its starting values, and the engine counts how often copies of each length are accepted and uses its own counts; each conversation also gets a quick correction. `0` turns it off (the table alone decides). With `DSGB10_RELAX` or `DSGB10_RELAX_P` set it stays off unless set to `1`, and then the start is refused. Every Spark must have the same copy settings and table file: a start where they differ stops |
+| `DSGB10_COPY_TABLE=FILE` (not a default) | optional: a copy-drafting survival table fitted from real traffic by `tools/copy/fit.py`, the same path on every Spark; a start whose file cannot be read on one rank stops. This repository does not ship one: without the setting the engine uses its built-in table, which is what At a glance, the long-context table and the learner comparison were measured with; the first two rows of [Drafting](#drafting) and the interleave table were measured on an earlier build with a table fitted from real traffic |
 | `DSGB10_BUDGET=1` | every session may draft up to the rows left after one for each, so drafts are shared across sessions (lossless) |
 | `DSGB10_DRAFT1=6` | batch steps of 6 or more sessions draft them in one pass |
 | `DSGB10_WIDE=64`, `DSGB10_WIDE_COST=24,2.2,57,1.1` | steps of 17 to 64 rows run through the prefill GEMMs, and the cost model that takes the wide step only when the drafts pay for it |
-| `DSGB10_WIDE_SH=1` (not in the line above) | steps of 17 to 64 rows run the shared expert on the side stream, beside the gate, the router and the routed experts' first half. Off unless set; same bits ([`docs/batching.md`](docs/batching.md#wide-steps-three-switches)) |
-| `DSGB10_WIDE_AR=1\|2` (not in the line above) | steps of 17 to 64 rows all-reduce as a reduce-scatter and an all-gather; `2` carries the FFN's gather in bf16. Off unless set; same bits; every Spark must have the same setting |
-| `DSGB10_HEADG=2` (not in the line above) | the wide head reads rows normalised once (`1`, the default, is the head in one read of its weights; `0` the 16-row groups). Same bits; every Spark must have the same setting |
-| `DSGB10_NORM_EXACT=1` (not in the line above) | the separate RMSNorm launches of a step of 9 to 16 rows (and of 17 to 64 with `DSGB10_WIDE_EXACT`) add a row's squares in the order of the fused kernels of a step of at most 8 rows, so a row's normed input has the same bits in a step of any size. Off unless set; every Spark must have the same setting ([`docs/batching.md`](docs/batching.md#exact-shared-steps)) |
-| `DSGB10_WIDE_EXACT=95` (not in the line above) | steps of 17 to 64 rows compute each row with the arithmetic of a step of at most 16 rows (bits: 1 wq_a, wkv and wq_b, 2 wo_a and wo_b, 4 the gate, 8 the MoE, 16 the Engram's GEMV, 64 the row-group kernels that read each weight once; 95 all of them). Off (`0`) unless set; every Spark must have the same setting |
-| `DSGB10_WIDE_EXACT_MT=2` (not in the line above) | with `DSGB10_WIDE_EXACT` bit 64: wo_b's row-group kernel takes 2 tiles of 8 weight rows a warp (`1`, the default); the same bits |
-| `DSGB10_COPY_ROWS=32\|64` (not in the line above) | with copy drafting on, a request that decodes alone and repeats text it holds may verify up to 31 (`32`) or 63 (`64`) copy drafts in one step, run as an exact body of the one-session step graph (the arithmetic of a step of at most 8 rows, so the reply's bits do not change). Unset or `8`: the steps as before. A value other than 8, 32 or 64 stops the start; every Spark must have the same setting ([`docs/batching.md`](docs/batching.md#long-copy-steps)) |
-| `DSGB10_COPY_ENTER=N` (not in the line above) | with `DSGB10_COPY_ROWS`, the match length (8 to 72, default 32) a source needs before the first long step; every long step that was not accepted whole doubles it for the next entry, at most three times |
-| `DSGB10_REUSE_EXACT=1` (not in the line above) | a reused prompt's remainder of at most `--small-rows` positions takes the prefill path, so the same request sent again gets its first reply bit for bit (as a step it matched only to numerics). A whole prompt that short, and a resume, keep the step. Off unless set |
-| `DSGB10_GATE_SEP=1[,LO,HI]` (not in the line above) | in steps of 2 to 4 rows (LO..HI), a kernel that does nothing runs between the router gate and the MoE, so the MoE's first kernel does not share the SMs with the gate while it streams. Off unless set; same bits |
-| `DSGB10_DRAFT_MAX=6\|7` (not in the line above) | the draft pass of a request that decodes alone runs 6 or 7 block rows instead of the model's 5, so a step may verify up to 7 drafts of the draft module; every draft is still verified, so the replies do not change. The rows past the 5 the draft module was trained with have no confidence network: their confidence is the shipped head's logit scaled `A c + B` (`DSGB10_CF_TAIL=A,B`, default 1,0). Unset: the draft pass and the graphs as before; every Spark must have the same setting; the passes over several entries stay at 5 rows |
-| `DSGB10_DRAFT_DYN=L` (not in the line above) | with `DSGB10_DRAFT_MAX` above 5: the long block runs only after a step that accepted at least L drafts, otherwise the pass of 5 rows; with copy rows on it also does not run while a copy cursor is live at the bonus, so copy rows keep their place. Two bodies in the step graph; unset: one pass of `DSGB10_DRAFT_MAX` rows in every step |
+| `DSGB10_WIDE_SH=1` | steps of 17 to 64 rows run the shared expert on the side stream, beside the gate, the router and the routed experts' first half. `0` turns it off; same bits ([`docs/batching.md`](docs/batching.md#wide-steps-three-switches)) |
+| `DSGB10_WIDE_AR=2` | steps of 17 to 64 rows all-reduce as a reduce-scatter and an all-gather; `2` carries the FFN's gather in bf16 (`1` in fp32, `0` the all-reduce of before). Same bits; every Spark must have the same setting |
+| `DSGB10_HEADG=2` | the wide head reads rows normalised once (`1` is the head in one read of its weights; `0` the 16-row groups). Same bits; every Spark must have the same setting |
+| `DSGB10_NORM_EXACT=1` (not a default) | the separate RMSNorm launches of a step of 9 to 16 rows (and of 17 to 64 with `DSGB10_WIDE_EXACT`) add a row's squares in the order of the fused kernels of a step of at most 8 rows, so a row's normed input has the same bits in a step of any size. Off unless set; every Spark must have the same setting ([`docs/batching.md`](docs/batching.md#exact-shared-steps)) |
+| `DSGB10_WIDE_EXACT=95` (not a default) | steps of 17 to 64 rows compute each row with the arithmetic of a step of at most 16 rows (bits: 1 wq_a, wkv and wq_b, 2 wo_a and wo_b, 4 the gate, 8 the MoE, 16 the Engram's GEMV, 64 the row-group kernels that read each weight once; 95 all of them). Off (`0`) unless set; every Spark must have the same setting |
+| `DSGB10_WIDE_EXACT_MT=2` (not a default) | with `DSGB10_WIDE_EXACT` bit 64: wo_b's row-group kernel takes 2 tiles of 8 weight rows a warp (`1`, the default); the same bits |
+| `DSGB10_COPY_ROWS=64` | with copy drafting on, a request that decodes alone and repeats text it holds may verify up to 31 (`32`) or 63 (`64`) copy drafts in one step, run as an exact body of the one-session step graph (the arithmetic of a step of at most 8 rows, so the reply's bits do not change). `8`: the steps as before (`32` verifies up to 31). A value other than 8, 32 or 64 stops the start; every Spark must have the same setting ([`docs/batching.md`](docs/batching.md#long-copy-steps)) |
+| `DSGB10_COPY_ENTER=N` (not a default) | with `DSGB10_COPY_ROWS`, the match length (8 to 72, default 32) a source needs before the first long step; every long step that was not accepted whole doubles it for the next entry, at most three times |
+| `DSGB10_REUSE_EXACT=1` (not a default) | a reused prompt's remainder of at most `--small-rows` positions takes the prefill path, so the same request sent again gets its first reply bit for bit (as a step it matched only to numerics). A whole prompt that short, and a resume, keep the step. Off unless set |
+| `DSGB10_GATE_SEP=1[,LO,HI]` (not a default) | in steps of 2 to 4 rows (LO..HI), a kernel that does nothing runs between the router gate and the MoE, so the MoE's first kernel does not share the SMs with the gate while it streams. Off unless set; same bits |
+| `DSGB10_DRAFT_MAX=6\|7` (not a default) | the draft pass of a request that decodes alone runs 6 or 7 block rows instead of the model's 5, so a step may verify up to 7 drafts of the draft module; every draft is still verified, so the replies do not change. The rows past the 5 the draft module was trained with have no confidence network: their confidence is the shipped head's logit scaled `A c + B` (`DSGB10_CF_TAIL=A,B`, default 1,0). Unset: the draft pass and the graphs as before; every Spark must have the same setting; the passes over several entries stay at 5 rows |
+| `DSGB10_DRAFT_DYN=L` (not a default) | with `DSGB10_DRAFT_MAX` above 5: the long block runs only after a step that accepted at least L drafts, otherwise the pass of 5 rows; with copy rows on it also does not run while a copy cursor is live at the bonus, so copy rows keep their place. Two bodies in the step graph; unset: one pass of `DSGB10_DRAFT_MAX` rows in every step |
 | `DSGB10_HEAD4_C1=1` | the 4-bit draft head serves one-user drafts only; batches use the FP8 copy |
-| `DSGB10_CF_MLP=FILE`, `DSGB10_CF_ALPHA=1.0` | the small network that decides how many drafts a step verifies (`tools/stack4/cfmlp_cml.bin`, copied to the same path on every Spark; a start with the variable set and the file missing or of the wrong size stops), and the scale of its threshold |
+| `DSGB10_CF_MLP=FILE` (a file: no default), `DSGB10_CF_ALPHA=1.0` | the small network that decides how many drafts a step verifies (`tools/stack4/cfmlp_cml.bin`, copied to the same path on every Spark; a start with the variable set and the file missing or of the wrong size stops), and the scale of its threshold |
 | `DSGB10_BATCH_CF=1`, `DSGB10_BATCH_TRIM=1`, `DSGB10_BATCH_TRIM_COST=19,2.9` | the draft count for several sessions ([Drafting](#drafting)) |
 | `DSGB10_CERT=1` | greedy rows read a coarse head and the exact head only where the winner can lie (the certified head; sampled rows too, [Kernels](#kernels)) |
 | `DSGB10_RING_DIRECT=2` | on one switch every rank writes to every other rank itself, with no relays; leave it out on a cabled ring |
@@ -233,44 +239,43 @@ out; with either of `DSGB10_RELAX` and `DSGB10_RELAX_P` set the copy drafting le
 
 ```
 dsfront serve --listen 127.0.0.1:18890 --api-key-file KEYFILE --engine-socket /path/engine.sock --table-file TABLE \
-  --tokenizer CHECKPOINT/tokenizer.json --encoding 1017 --model-name deepseek-v4.1-flash-1017 \
-  --thinking --effort 75 --temperature 1.0 --top-p 0.95 --max-tokens 1048576 --front-mib 840 \
-  --media-addr 127.0.0.1:18951 \
+  --tokenizer CHECKPOINT/tokenizer.json --media-addr 127.0.0.1:18951 \
   --node-stats RANK0:9760,RANK1:9760,RANK2:9760,RANK3:9760 --dashboard-host NAME --fan-tool PATH
 ```
 
-`--tokenizer` is the checkpoint's `tokenizer.json` (its default path exists only on the machine the front-end was written on,
-so a start without it fails); `--encoding 1017` is required for DeepSeek-V4.1-Flash-1017 (the default, `v4.1`, is the chat
-format of DeepSeek-V4.1-Flash); `--model-name` is the name `/v1/models` lists (default `deepseek-v4.1-flash-uncensored`; the same
-name with `-ablit` is served beside it); thinking is off unless a request or `--thinking` turns it on, and `--effort` (75) is
-its default effort. `--api-key-file` makes `/v1` and the dashboard require the key (without it requests are not authenticated),
-`--listen` is the address and port (repeat it), `--engine-socket` is rank 0's socket, `--table-file` is where the session
-table is kept across a restart (`--table-save-s` and `--table-days` do nothing without it), and `--front-mib` is the cap the
-front-end watches itself against: the kernel's resident count of the `dsfront` process, read every 10 seconds (0: not
-watched). Give it the same value as the engine's `--front-mib`, which should be what the front-end holds at most; the 840 here
-is the cap the measurements of this README ran with. A start with `--pool-free-gib` is refused without an engine `--front-mib`.
-`--media-addr` is the media worker's address: the worker script `tools/vision/media_worker.py` listens on 18950 unless given
-`--port`, and the container's command uses 18951, which is what the served line names; `service.sh` does not start it.
+The served settings are the front-end's defaults, so the line above names only what describes one machine: `--encoding 1017`
+(DeepSeek-V4.1-Flash-1017's chat format; `v4.1` is DeepSeek-V4.1-Flash's), `--model-name deepseek-v4.1-flash-1017` (the name
+`/v1/models` lists; the same name with `-ablit` is served beside it), thinking on when a request does not say (`--no-thinking`
+turns it off; `--effort 75` is its default effort), `--temperature 1.0`, `--top-p 0.95`, `--max-tokens 1048576` and
+`--front-mib 840` are each the default, and the measurements of this README are of them. `--tokenizer` is the checkpoint's
+`tokenizer.json` (its default path exists only on the machine the front-end was written on, so a start without it fails).
+`--api-key-file` makes `/v1` and the dashboard require the key (without it requests are not authenticated), `--listen` is the
+address and port (repeat it), `--engine-socket` is rank 0's socket, `--table-file` is where the session table is kept across a
+restart (`--table-save-s` and `--table-days` do nothing without it), and `--front-mib` is the cap the front-end watches itself
+against: the kernel's resident count of the `dsfront` process, read every 10 seconds (0: not watched). It is the same number as
+the engine's `--front-mib` (840 in both), which should be what the front-end holds at most. `--media-addr` is the media worker's
+address: the worker script `tools/vision/media_worker.py` listens on 18950 unless given `--port`, and the container's command
+uses 18951, which is what the served line names; `service.sh` does not start it.
 
 ### The code's defaults and the other options
 
-The defaults in this table are the code's, which differ from the served line above where the table says so. Every other
+The defaults in this table are those of a `--mode serve` start, which are the served line above; in brackets, the value of the other modes where it differs. Every other
 engine option, including the test and benchmark modes, is in pico-dgx-ds4's [`engine.md`](ds41f-4xgx10-switchless/docs/engine.md); what this
 repository changed in the engine is [`docs/engine.md`](docs/engine.md).
 
 | Flag or variable | |
 |---|---|
-| `--slots N` (default 1; the code allows up to 64, served and tested at 32) | lines; with the store, `--big-slots 0` (every line can grow to the whole context) |
-| `--pool-free-gib G` (unset), `--pool-tokens N` (unset), `--pool-pick smaller\|larger` (smaller) | the store's size: what leaves G GiB of device and of available host memory to the host on every Spark with every outside user of memory at its cap, or a store of N positions, or the smaller or larger of both ([The memory store](#the-memory-store)) |
-| `--front-mib N` (0; engine and front-end: an engine start with `--pool-free-gib` is refused at 0, a front-end at 0 does not watch itself), `--media-mib N` (512), `--encoder-mib N` (1,260), `--frame-stage-mib N` (400), `--ids-host-mib N` (1,024), `--pool-slack-gib G` (0.75) | the most each user of memory outside the store may take |
-| `--prefill-rows N` (8,192), `--prefill-rows-max N` (0: off), `--prefill-loan-low-groups N` (2), `--prefill-loan-high-groups N` (8) | the rows a prefill pass takes with the standing buffers; the rows a pass takes on the lent set (0 or equal to `--prefill-rows`: no lent set; served 16,384); the free groups under which the lent set goes back, and how many free groups above the set's own are needed before it is asked for again ([Long prompts processed 16,384 rows at a time](#long-prompts-processed-16384-rows-at-a-time)) |
+| `--slots N` (32; 1 in the other modes; the code allows up to 64, tested at 32) | lines; with the store, `--big-slots 0` (every line can grow to the whole context) |
+| `--pool-free-gib G` (6.3 unless `--pool-tokens` is named; unset in the other modes), `--pool-tokens N` (unset), `--pool-pick smaller\|larger` (smaller) | the store's size: what leaves G GiB of device and of available host memory to the host on every Spark with every outside user of memory at its cap, or a store of N positions, or the smaller or larger of both ([The memory store](#the-memory-store)) |
+| `--front-mib N` (840 in the engine's serve mode and in the front-end; at 0 an engine start with `--pool-free-gib` is refused and a front-end does not watch itself), `--media-mib N` (512), `--encoder-mib N` (1,260), `--frame-stage-mib N` (400), `--ids-host-mib N` (1,024), `--pool-slack-gib G` (0.75) | the most each user of memory outside the store may take |
+| `--prefill-rows N` (8,192), `--prefill-rows-max N` (16,384; 0: off; not defaulted when `--prefill-rows` is named), `--prefill-loan-low-groups N` (2), `--prefill-loan-high-groups N` (8) | the rows a prefill pass takes with the standing buffers; the rows a pass takes on the lent set (0 or equal to `--prefill-rows`: no lent set); the free groups under which the lent set goes back, and how many free groups above the set's own are needed before it is asked for again ([Long prompts processed 16,384 rows at a time](#long-prompts-processed-16384-rows-at-a-time)) |
 | `--grow-ahead N` (131,072) | the output horizon a request reserves |
 | `--slice N` (64) | tokens a request runs before the next waiting one takes a turn (0: no time-slicing) |
-| `--kv-split off\|tiered\|max` (off), `--kv-split-high N`, `--kv-split-low N`, `--kv-split-after-s S` (0), `--kv-split-budget N` (16), `--kv-split-ride-ms N` (250), `--kv-split-ride-pieces N` (4) | the split cache ([The SSD tier, the split cache](#the-ssd-tier-the-split-cache-and-crash-checkpoints)) |
-| `--disk-gib G` (32; 0: no tier), `--ssd-flush-s S` (30), `--keep-days D` (30), `--keep-gib G` (0; 64 as served) | the SSD tier: its size at most (each rank offers its free space less 32 GiB), the spacing of crash checkpoints, how long an unused conversation is kept, how much a planned stop keeps; size and expiry live on the dashboard |
+| `--kv-split off\|tiered\|max` (tiered), `--kv-split-high N`, `--kv-split-low N`, `--kv-split-after-s S` (0), `--kv-split-budget N` (16), `--kv-split-ride-ms N` (250), `--kv-split-ride-pieces N` (4) | the split cache ([The SSD tier, the split cache](#the-ssd-tier-the-split-cache-and-crash-checkpoints)) |
+| `--disk-gib G` (512; 32 in the other modes; 0: no tier), `--ssd-flush-s S` (30), `--keep-days D` (30), `--keep-gib G` (0; the units pass `KEEP_GIB`, 64 here) | the SSD tier: its size at most (each rank offers its free space less 32 GiB), the spacing of crash checkpoints, how long an unused conversation is kept, how much a planned stop keeps; size and expiry live on the dashboard |
 | `--table-file PATH`, `--table-save-s S` (30), `--table-days N` (7) (front-end) | the session table's file, kept across a restart so the front-end finds its conversations; how often a changed table is saved, and how long an unused session is kept. The last two do nothing without `--table-file` |
-| `--max-ctx N` (65,536; 4,194,304 as served), `--extend on\|off` (on), `--window-idle-s S` (0) | the window: to 4M, whether a conversation may go past 1M (live on the dashboard), after how many seconds with no request of its factor a larger window's memory goes back to the store (0: only when the store needs it) |
-| `--engram-cache-mib N` (4,096), `--engram-cache-max-mib N` (16,384), `--engram-cache-min-mib N` (the start size), `--engram-vram off\|on\|require` (off) | the Engram row cache: its size at start, the most and the least it holds, and whether its first slots sit in the display reservation (the engine's user must own the card) |
+| `--max-ctx N` (4,194,304; 65,536 in the other modes), `--extend on\|off` (on), `--window-idle-s S` (0) | the window: to 4M, whether a conversation may go past 1M (live on the dashboard), after how many seconds with no request of its factor a larger window's memory goes back to the store (0: only when the store needs it) |
+| `--engram-cache-mib N` (2,032), `--engram-cache-max-mib N` (16,384), `--engram-cache-min-mib N` (the start size), `--engram-vram off\|on\|require` (on) | the Engram row cache: its size at start, the most and the least it holds, and whether its first slots sit in the display reservation (the engine's user must own the card) |
 | `--vision-weights FILE` (engine) | the image encoder's weights; without them the engine answers "this engine has no image encoder" |
 | `--media-addr ADDR:PORT`, `--vision engine\|container` (engine), `--vision-addr ADDR:PORT` (front-end) | the media worker the front-end takes pixels from (without `--media-addr` image requests are refused); `container` with `--vision-addr` is the container encoder |
 | `--snap-every N` (1,024) | positions between window bookmarks |
@@ -279,11 +284,11 @@ repository changed in the engine is [`docs/engine.md`](docs/engine.md).
 | `--copy-mib N` (512) | copy drafting's memory on every Spark |
 | `--engram-vram-card PATH` (`/dev/dri/card0`), `--engram-vram-mib N` (2,032) | the DRM device the Engram cache's reservation is made on, and the most it asks for |
 | `--listen ADDR:PORT` (127.0.0.1:18890), `--api-key-file PATH`, `--engine-socket PATH`, `--top-p P` (0.95), `--temperature T` (1.0), `--effort N` (75) (front-end; the engine's own `--top-p` is a different option, default 1.0) | where the front-end listens (repeat for more), the bearer key it requires, rank 0's socket, and the sampling and effort defaults for a request that names none |
-| `--tokenizer PATH` (no usable default), `--encoding v4.1\|1017` (v4.1), `--model-name NAME` (`deepseek-v4.1-flash-uncensored`), `--thinking` / `--no-thinking` (off) (front-end) | the checkpoint's `tokenizer.json`; the chat encoding (the 1017 checkpoint needs `1017`); the served name, with `NAME-ablit` beside it; whether thinking is on when a request does not say |
+| `--tokenizer PATH` (no usable default), `--encoding v4.1\|1017` (1017), `--model-name NAME` (`deepseek-v4.1-flash-1017`), `--thinking` / `--no-thinking` (thinking on) (front-end) | the checkpoint's `tokenizer.json`; the chat encoding (the 1017 checkpoint needs `1017`); the served name, with `NAME-ablit` beside it; whether thinking is on when a request does not say |
 | `--hold-s N` (600), `--no-loop-guard`, `--tokenize-threads N` (8), `--dump-dir DIR`, `--admin-socket PATH` (front-end) | how long a request waits while the engine restarts, then is answered 503 with `Retry-After: 60`; the repetition guard off; tokenizer threads; request dumps for debugging; the supervisor's socket (`service.sh` uses it) |
 | `--max-image-rows N` (40,000), `--max-image-rows-in-flight N` (80,000), `--front-image-mib N` (400), `--max-body-mb N` (front-end) | the image limits |
 | `--no-prefix` (front-end) | every request sends its whole prompt (token ids kept once, off) |
-| `--pscan off\|ext\|all` (off) | the decode index scan split by positions over the four ranks: `ext` in the 2M and 4M windows, `all` in the 1M window too |
+| `--pscan off\|ext\|all` (all) | the decode index scan split by positions over the four ranks: `ext` in the 2M and 4M windows, `all` in the 1M window too |
 | `DSGB10_BATCH_CF=1`, `DSGB10_BATCH_TRIM=1`, `DSGB10_BATCH_TRIM_COST=a,b` | the draft count for several sessions: the MLP's survival in batch steps, the trim within 16 rows and its step cost, a + b x rows ms (19, 2.9 measured for batch steps) |
 | `--node-stats-port N` (engine, 9760), `--node-stats ADDR:PORT,...` (front-end) | each rank's node sampler and where the dashboard reads them; without the second the node-health panel is empty |
 | `DSGB10_COPY=1`, `DSGB10_COPY_TABLE=FILE`, `DSGB10_COPY_DUMP=1`, `DSGB10_COPY_ADAPT=0` | copy drafting: rows on, the survival table (the same file on every Spark; the learner's starting values), the dump mode that logs proposals without adding rows, the learner off (it is on with copy drafting) |
@@ -291,7 +296,7 @@ repository changed in the engine is [`docs/engine.md`](docs/engine.md).
 | `--dashboard-host NAME` (front-end) | a host name the dashboard answers to, besides its own addresses and localhost |
 | `--interleave-share P` (40), `--interleave-gap-ms N` (600), `--interleave-whole-rows N` (32,768), `--interleave-push-rows N` (131,072), `--interleave-burst-max-ms N` (1,000), `--no-interleave` | interleaved prefill; all live on the dashboard ([`docs/interleave.md`](docs/interleave.md#settings)) |
 | `--ablit FILE` | the abliteration the `-ablit` name serves; the front-end's `--no-ablit-alias` leaves the name out |
-| `--max-tokens N` (front-end; 32,768; 1,048,576 as served) | the output cap for a request that sets none; the default cuts long outputs |
+| `--max-tokens N` (front-end; 1,048,576) | the output cap for a request that sets none; the default cuts long outputs |
 | `DSGB10_NO_GATHER_ALIAS=1`, `DSGB10_ALIAS_CHECK=1` | gathered weights: keep the separate copies, or check every slot's checksum in place |
 | `DSGB10_STORE_CHECK=1` | prints the store's digest after each window, state and reservation command; the four ranks' lines must agree |
 | `DSGB10_VMM_POISON=1` | test mode: freed chunks are filled, so a stale read shows |
@@ -389,7 +394,7 @@ way), so what each Spark leaves to the host does not change. Rules:
 
 | Option | Default | |
 |---|---|---|
-| `--prefill-rows-max N` | 0 (off); served 16,384 | the rows a pass takes on the lent set |
+| `--prefill-rows-max N` | 16,384 (0: off) | the rows a pass takes on the lent set |
 | `--prefill-loan-low-groups N` | 2 | the free groups under which the set goes back |
 | `--prefill-loan-high-groups N` | 8 | the free groups above the set's own that are needed before it is asked for again |
 
@@ -703,7 +708,7 @@ it counts, so the output is the model's own. The guesses come from three places:
   makes it the whole rule; it is off by itself beside a relaxed accept, `DSGB10_RELAX` or `DSGB10_RELAX_P`): the engine counts, on every Spark alike, how many copied tokens were accepted after matches of each length
   and follows its own counts, and each conversation gets a quick correction on top, so one whose copies keep failing does
   not make the engine trust everyone else's copies less. The matcher runs on the GPU inside the step and is
-  identical on every Spark. Off unless `DSGB10_COPY` is set; `--copy-mib` (512 MiB a rank) is its working memory, counted by
+  identical on every Spark. On by default (`DSGB10_COPY=0` turns it off); `--copy-mib` (512 MiB a rank) is its working memory, counted by
   the store's sizing.
 - **Drafting for several users at once.** When several users share a step, the same learned estimate decides how many of
   each user's drafts to check: drafts are added in order of expected accepted tokens per millisecond of added step time, and
@@ -1088,7 +1093,7 @@ bit-check design: [`docs/kernel-trims.md`](docs/kernel-trims.md).
 | Decode attention prefetch | The next block's keys are gathered while the current block is scored | One Spark, engine stopped, GPU 2,190 MHz (`bench_attn`): attention call time 27 % shorter with one key-range split of a row's attention, 10 % with ten | `slot_tests`, `fused_tests`, `serve_test --exact` |
 | Decode GEMVs, second weight batch before the dependency wait | After a collective, `wq_a` + `wkv` and the router gate (2 to 8 rows) request their second weight batch before waiting on the preceding kernel (programmatic dependent launch, PDL), so both register buffers fill while the collective runs; a template flag on kernels of their own, applied only where `ptxas` spills nothing; `DSK_PRE2` mask. The technique follows pico-dgx-ds4's note on a second weight batch (`ds41f-4xgx10-switchless/docs/engine.md`) | Four GB10, GPU clock 2,200 MHz, a decode step at one user 0.7 to 0.9 % shorter (4 rows 2.1 %, 3 rows 1.2 %, 2 rows 0.8 %) | `bit_probe.py`: 1,600 tokens' ids, log-probabilities and top two bit-equal with and without; a build that reverses a split-K sum differs in 8 of 8 prompts |
 | Certified LM head for sampled rows | The certified head (pico-dgx-ds4's `DSGB10_CERT=1`: a coarse FP8 read of the whole head with a rigorous error bound, then the exact head only where the winner can lie) is extended to sampled rows. For a row sampled at temperature up to 1 (above 1 the scores flatten, more of the head survives, and the full head is kept) with no top-k, top-p or log-probabilities (the request sets top_p 1; the front-end's default top_p, 0.95, keeps the full head), the logit bounds become bounds of the sampler's Gumbel score `l/T - log(-log(u))` (the sampler's own hash of seed, position and id), so the exact head runs only on the row groups that could hold the winner | Four GB10, GPU clock 2,200 MHz, a decode step at one user, sampled at temperature 1.0, 0.7 % shorter (1 row 1.5 %) | check mode with the full head beside it on every rank: 0 mismatches over every row compared |
-| Decode index scan split by positions (`--pscan ext\|all`, default off) | With `ext` each rank scans a quarter of the keys of the four scanning layers (2, 8, 14, 20) with the same dense kernel, the four ranks' candidates are gathered in place in one collective a layer and merged into the picks the whole scan would make; only in the 2M and 4M windows. `all` does it in the 1M window too | One rank's part plus the merge against the whole scan, on an idle GPU: layer 20 at 1M 349 to 130 us (1 row), at 4M 1,440 to 410 us (1 row); in the engine (`all` as served, rank 0's step time at 1M): 3 % shorter at 2 rows a step (22.94 to 22.26 ms), equal at 6 rows and under 64K | Picks equal in 72 of 72 cases; tokens and log-probabilities equal to the whole scan in 8 of 8 turns |
+| Decode index scan split by positions (`--pscan ext\|all`, default `all`) | With `ext` each rank scans a quarter of the keys of the four scanning layers (2, 8, 14, 20) with the same dense kernel, the four ranks' candidates are gathered in place in one collective a layer and merged into the picks the whole scan would make; only in the 2M and 4M windows. `all` does it in the 1M window too | One rank's part plus the merge against the whole scan, on an idle GPU: layer 20 at 1M 349 to 130 us (1 row), at 4M 1,440 to 410 us (1 row); in the engine (`all` as served, rank 0's step time at 1M): 3 % shorter at 2 rows a step (22.94 to 22.26 ms), equal at 6 rows and under 64K | Picks equal in 72 of 72 cases; tokens and log-probabilities equal to the whole scan in 8 of 8 turns |
 
 Nsight Compute on `k_moe_up_p`, the one-role up kernel (selectable with `PrefillTuning::upk` 0), shows a latency-bound
 kernel: no eligible warp in 67 % of cycles, occupancy 16.7 %, two block-wide barriers per chunk. The producer warp removes

@@ -162,6 +162,8 @@
 //   --no-l2pf: no L2 prefetch in the decode step's windows (model::Options::l2pf, kernels/l2pf.cu: while a
 //     collective or the attention leaves DRAM idle, a side stream prefetches the next weights; the same bits)
 //   --setenv NAME=VALUE: set in every rank's environment before anything else (experiments' knobs)
+//   --mode serve with none of these named runs the served configuration (server/served.h: the flags and DSGB10_* settings
+//     it takes as defaults; --no-draft-head4 and --no-draft-markov8 turn the two drafters off, the other switches take their off values)
 //   --profile-from-req N (serve): request N's first command opens nsys's capture range on every rank
 //     (--capture-range=cudaProfilerApi) until the server stops; builds with -DDSGB10_NVTX add NVTX ranges
 //     per turn, chunk, layer and part (model/nvtx.h)
@@ -221,6 +223,7 @@
 #include "server/node_stats.h"
 #include "server/cmd.h"
 #include "server/golden.h"
+#include "server/served.h"
 #include "common/last_words.h"
 #include "server/serve.h"
 #include "vision/vit_device.h"
@@ -442,11 +445,16 @@ struct Args {
 
 Args parse(int argc, char** argv) {
   Args a;
-  for (int i = 1; i < argc; ++i) {
-    const std::string s = argv[i];
+  // a serve start takes the served settings (served.h) for every flag it does not name
+  std::vector<std::string> in(argv + 1, argv + argc);
+  std::vector<std::string> av = served::flags_for(in);
+  av.insert(av.end(), in.begin(), in.end());
+  const int n_av = (int)av.size();
+  for (int i = 0; i < n_av; ++i) {
+    const std::string s = av[i];
     auto val = [&]() -> std::string {
-      if (i + 1 >= argc) die("missing value for %s", s.c_str());
-      return argv[++i];
+      if (i + 1 >= n_av) die("missing value for %s", s.c_str());
+      return av[++i];
     };
     if (s == "--rank") a.rank = std::atoi(val().c_str());
     else if (s == "--fleet") a.fleet = comm::fleet_path(val());  // a leading ~/ is $HOME, as in the paths below
@@ -594,7 +602,9 @@ Args parse(int argc, char** argv) {
     else if (s == "--draft-fp8") a.draft_fp8 = true;
     else if (s == "--draft-bf16") a.draft_bf16 = true;
     else if (s == "--draft-head4") a.draft_head4 = true;
+    else if (s == "--no-draft-head4") a.draft_head4 = false;
     else if (s == "--draft-markov8") a.draft_markov8 = true;
+    else if (s == "--no-draft-markov8") a.draft_markov8 = false;
     else if (s == "--ablit") a.ablit = val();
     else if (s == "--node-stats-port") a.node_stats_port = std::atoi(val().c_str());
     else if (s == "--tree-probe") a.tree_probe = val();
@@ -712,6 +722,8 @@ Args parse(int argc, char** argv) {
        a.chain_every < 0))
     die("--route-file FILE [--route-every 1..%d] [--chain-every N] [--props FILE]: --mode spectf only",
         model::kMaxSessRows);
+  // the served environment (served.h): a variable the start's environment or a --setenv has set keeps its value
+  served::env_for(a.mode == "serve", [](const char* name, const char* value) { setenv(name, value, 0); });
   if (a.spec_drafts < 0) a.spec_drafts = dspark::draft_rows();  // after every --setenv
   if (a.spec_drafts > model::ops::kDrafts) die("--spec-drafts must be 0..%d", model::ops::kDrafts);
   if (a.spec && (a.mode == "decode" || a.mode == "generate") && !a.big)

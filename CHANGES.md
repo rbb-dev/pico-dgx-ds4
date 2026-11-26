@@ -242,13 +242,14 @@ probabilities. With the served default of top_p 0.95, requests use it only when 
 - Measured: a decode step at one user 0.7 % shorter; checked against the full head on 43,041 rows, 0 differences.
 
 **Wide steps: the shared expert beside the router, a lighter all-reduce, the head on rows normalised once.** Three switches for
-steps of 17 to 64 rows, each off unless set, each giving the same bits as without it. `DSGB10_WIDE_SH=1` runs the shared expert on
+steps of 17 to 64 rows, each on by default, each giving the same bits as without it. `DSGB10_WIDE_SH=1` runs the shared expert on
 the side stream while the gate, the router and the routed experts' first half run. `DSGB10_WIDE_AR=1` makes the attention's and
 the FFN's all-reduce a reduce-scatter and an all-gather (each Spark sums one quarter) in place of every Spark receiving the other
 three partials whole; `2` also rounds the FFN's reduced quarter to bf16 before the all-gather, so it carries 2 bytes an element in
 place of 4. `DSGB10_HEADG=2` normalises the rows once for the wide head in place of in every CTA of the head kernel. Based on
 pico-dgx-ds4's a40eeb8 / f2bafa4 by Pico. [`docs/batching.md`](docs/batching.md#wide-steps-three-switches)
-- Setting: `DSGB10_WIDE_SH=1`, `DSGB10_WIDE_AR=1|2`, `DSGB10_HEADG=2` (on every Spark).
+- Setting: `DSGB10_WIDE_SH=1`, `DSGB10_WIDE_AR=1|2`, `DSGB10_HEADG=2` (on every Spark; the defaults; `DSGB10_WIDE_SH=0`, `DSGB10_WIDE_AR=0`
+  and `DSGB10_HEADG=1` are the steps without them).
 - Measured: 16 users 6.0 % faster, 16 users on three shared prompts 7.1 %, 32 users 4.9 %; 2 to 5 users unchanged (within 0.3 %);
   each switch and all three bit-equal to none (the samples hashes at 18, 32 and 64 rows).
 
@@ -273,7 +274,8 @@ reply equals it: after `DSGB10_COPY_ENTER` matching tokens the step grows from 7
 draft that is not accepted, and waits longer before the next entry. The matcher stays the one on the device; nothing is sent from the
 host. Based on pico-dgx-ds4's `0580fe6` by Pico (its row-group kernels and the copy tail of its graph; its host matcher, its second
 step graph and the `prediction` field are not taken). [`docs/batching.md`](docs/batching.md#long-copy-steps)
-- Setting: `DSGB10_COPY_ROWS=32|64`, `DSGB10_COPY_ENTER=N` (on every Spark; a value outside its range stops the start; off unless set).
+- Setting: `DSGB10_COPY_ROWS=32|64`, `DSGB10_COPY_ENTER=N` (on every Spark; a value outside its range stops the start; 64 by default,
+  `DSGB10_COPY_ROWS=8` turns long steps off).
 - Measured: rewrites of 1K, 4K and 8K-token passages 47 %, 41 % and 37 % shorter, bit-equal to the run without it (4 of 4 at each
   length); one session's steps of 16, 32 and 64 rows give its 1-row samples hash, also at an odd context and with slot tables. Not
   measured: a long step accepted only in part, and the wait of a request that arrives during a long step.
@@ -388,8 +390,15 @@ names run in one batch. The file is in this repository: `ds41f-4xgx10-switchless
 - Settings: engine `--ablit FILE`; front-end `--no-ablit-alias` serves the plain name only.
 - Measured: the plain name's outputs are unchanged; 16 users at the same speed with and without the edit (321.9 t/s).
 
-**The served front-end settings.** For a request that sets none: thinking on at effort 75, temperature 1.0, top_p 0.95, and an
-output cap of 1,048,576 tokens (the code's default of 32,768 cuts long outputs).
+**The served settings are the defaults.** A `--mode serve` start of the engine with no settings, and a `dsfront serve` with only
+its machine's values, run the configuration the measurements are of: the engine's window, lines, memory, SSD tier, drafters, copy,
+wide-step, ring and prefill switches and the split cache (`engine/server/served.h`), and the front-end's encoding 1017, served
+name, thinking on at effort 75, temperature 1.0, top_p 0.95, an output cap of 1,048,576 tokens and a memory cap of 840 MiB.
+`deploy/pico.env.example` keeps only the files and addresses of one machine. A named setting wins over its default, and each
+switch turns off with its off value (`DSGB10_X=0`, `--no-draft-head4`, `--no-draft-markov8`, `--no-thinking`).
+- Settings: none new; `--no-draft-head4` and `--no-draft-markov8` are the off forms of the two drafter flags.
+- Test: `served_test` (the served list against the tables; its wrong-rule control is the `-DPICO_OLD_RULES` build) and the front-end's
+  `serve_without_settings_is_the_served_configuration`.
 
 **A served installation in `deploy/`.** The settings file, the systemd units for the engine, front-end and media worker, and
 `pico-ctl.sh`, which drops every Spark's page cache before a start, refuses a start when a Spark has too little memory free, and

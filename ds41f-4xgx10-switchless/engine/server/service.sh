@@ -22,9 +22,8 @@
 #   DSGB10_KEY_FILE           the API key, which dsfront reads from this file (mode 600):
 #                             ~/dsgb10-data/dev-api-key. It is never on a command line
 #   DSGB10_ENGINE_ARGS        the engine's arguments after --mode serve --socket <run/engine.sock>:
-#                             --max-ctx 262144 --pool-free-gib 10 --front-mib 840 (the chunk pool leaves 10 GiB free on
-#                             every Spark; --front-mib is the front-end process's memory cap, which serve mode requires and
-#                             the store is sized beside; the rest are serve's defaults)
+#                             none by default: serve's defaults are the served configuration (server/served.h); name a
+#                             setting here only to change it (a smaller --max-ctx, another --pool-free-gib)
 #   DSGB10_FRONT_ARGS         more of dsfront's arguments
 #   DSGB10_NOTE               added to ring.owner: how long the service will hold the ring, say
 #   DSGB10_BIN, DSGB10_FRONT_BIN  the binaries, copied at start (to the workers once the service has
@@ -89,7 +88,7 @@ state() {  # state words...: run/state is "<state> <epoch> <what>"; starting|wai
 settings() {
   ADDR=${DSGB10_ADDR:-127.0.0.1} PORT=${DSGB10_PORT:-18893}
   KEY=${DSGB10_KEY_FILE:-$HOME/dsgb10-data/dev-api-key}
-  EARGS=${DSGB10_ENGINE_ARGS:---max-ctx 262144 --pool-free-gib 10 --front-mib 840} FARGS=${DSGB10_FRONT_ARGS:-} NOTE=${DSGB10_NOTE:-}
+  EARGS=${DSGB10_ENGINE_ARGS:-} FARGS=${DSGB10_FRONT_ARGS:-} NOTE=${DSGB10_NOTE:-}
   [ "$MOCK" = 1 ] && EARGS=${DSGB10_ENGINE_ARGS:---delay-ms 5}  # the mock engine's arguments
   BIN=${DSGB10_BIN:-$SRC/engine/build/server/$NAME} FBIN=${DSGB10_FRONT_BIN:-$SRC/frontend/target/release/dsfront}
   MIN_AVAIL_GIB=${MIN_AVAIL_GIB:-100}

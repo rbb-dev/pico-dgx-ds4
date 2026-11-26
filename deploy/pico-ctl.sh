@@ -30,7 +30,7 @@ load_fleet() {
 }
 
 # the engine's arguments, the same on every rank (rank 0's ExecStart passes these and --rank 0)
-engine_args() { echo "--mode serve --socket $RUN/engine.sock --disk-tag service --keep-gib ${KEEP_GIB:-4} ${ENGINE_ARGS:-}"; }
+engine_args() { echo "--mode serve --socket $RUN/engine.sock --disk-tag service --keep-gib ${KEEP_GIB:-64} ${ENGINE_ARGS:-}"; }
 
 # shell text for a box: wait up to $1 s for its ranks to exit, then pkill -x, 10 s more, then -9 (the process name exactly)
 reap_text() {

@@ -12,24 +12,24 @@ fn usage() -> ! {
                                 never 0.0.0.0 or ::)
       --engine-socket PATH      /tmp/dsgb10-engine.sock
       --api-key-file PATH       require this bearer key (the file's content, trimmed)
-      --model-name NAME         deepseek-v4.1-flash-uncensored; also served as NAME-ablit, which runs a
+      --model-name NAME         deepseek-v4.1-flash-1017; also served as NAME-ablit, which runs a
                                 request on the ablated weights path (NAME and any other `model` run on
                                 the plain path)
       --no-ablit-alias          serve NAME only
-      --max-tokens N            default and cap for max_tokens: 32768
+      --max-tokens N            default and cap for max_tokens: 1048576
       --effort N                reasoning effort budget when a request names none: 75
-      --encoding E              the chat encoding: v4.1 (DeepSeek-V4.1-Flash's encoding.py, the default)
-                                or 1017 (DeepSeek-V4.1-Flash-1017's: tool namespaces, the reasoning
-                                kept across a turn's tool calls)
-      --thinking                thinking on when a request does not say (default off)
-      --no-thinking             thinking off when a request does not say (the default; the later
+      --encoding E              the chat encoding: 1017 (DeepSeek-V4.1-Flash-1017's: tool namespaces, the
+                                reasoning kept across a turn's tool calls; the default) or v4.1
+                                (DeepSeek-V4.1-Flash's encoding.py)
+      --thinking                thinking on when a request does not say (the default)
+      --no-thinking             thinking off when a request does not say (the later
                                 of --thinking and --no-thinking wins); requests can override it
       --temperature T --top-p P sampling defaults: 1.0 and 0.95
       --no-loop-guard           do not stop repetition loops
       --dump-dir DIR            write each request, prompt and ids to DIR, and at its end the output's
                                 ids (N.out.json; debugging and bench traces)
       --hold-s N                while the engine is down (the ring lent, or a restart), a request
-                                waits this long (600), then is answered 503 with Retry-After: 60
+                                waits this long (900), then is answered 503 with Retry-After: 60
       --admin-socket PATH       commands from service.sh (mode 600): status, hold IDLE_S, release
       --table-file PATH         the session table, saved here while serving and at a stop, and taken back
                                 at the next start (mode 600, in a directory of mode 700; it holds hashes and
@@ -42,12 +42,11 @@ fn usage() -> ! {
                                 request path
       --table-days N            sessions unused for longer are not kept: 7
       --front-table-mib N       the most memory the session table may hold, counted by what its buffers allocate:
-                                0 = from --front-mib when that is set (the cap / 1.1, less 107 and --front-image-mib),
-                                else no limit (the default); the oldest idle sessions go first, beside the
+                                0 = from --front-mib (the cap / 1.1, less 107 and --front-image-mib; the default),
+                                or no limit when --front-mib is 0; the oldest idle sessions go first, beside the
                                 engine's position limit
       --front-mib N             the most memory this process may hold as the kernel counts it, read every 10 s:
-                                0 = not watched (the default; pico-front.service passes PICO_FRONT_MIB, the same
-                                setting as the engine's --front-mib); over it, idle sessions go, oldest first (not
+                                840 by default, the same number as the engine's --front-mib; 0 = not watched; over it, idle sessions go, oldest first (not
                                 below half of what the table held when it went over, and not at all while the
                                 memory does not fall as they go), and image requests are answered 429 with
                                 Retry-After: 5 until it is under
@@ -107,8 +106,9 @@ fn parse_opt<T: std::str::FromStr>(args: &[String], name: &str, default: T) -> T
     }
 }
 
-fn encoding_opt(args: &[String]) -> dsfront::encoding::Encoding {
-    opt(args, "--encoding").map_or(Default::default(), |v| {
+/// The `--encoding` option, else `default` (serve: the served one; enccheck: v4.1, the encoding its case files without a flag are made with).
+fn encoding_opt(args: &[String], default: dsfront::encoding::Encoding) -> dsfront::encoding::Encoding {
+    opt(args, "--encoding").map_or(default, |v| {
         dsfront::encoding::Encoding::parse(&v).unwrap_or_else(|e| {
             eprintln!("{e}");
             std::process::exit(2)
@@ -164,19 +164,19 @@ fn serve(args: &[String]) {
     dashboard_hosts.extend(opts(args, "--dashboard-host").into_iter().map(|h| h.to_ascii_lowercase()));
     let mut cfg = ServerConfig {
         dashboard_hosts,
-        model_name: opt(args, "--model-name").unwrap_or_else(|| "deepseek-v4.1-flash-uncensored".into()),
+        model_name: opt(args, "--model-name").unwrap_or_else(|| dsfront::served::MODEL_NAME.into()),
         ablit_alias: !args.iter().any(|a| a == "--no-ablit-alias"),
         api_key,
-        max_tokens_cap: parse_opt(args, "--max-tokens", 32768u32),
-        default_effort: parse_opt(args, "--effort", 75i64).clamp(1, 100),
-        encoding: encoding_opt(args),
-        default_thinking: default_thinking(args),
-        default_temperature: parse_opt(args, "--temperature", 1.0f32),
-        default_top_p: parse_opt(args, "--top-p", 0.95f32),
+        max_tokens_cap: parse_opt(args, "--max-tokens", dsfront::served::MAX_TOKENS),
+        default_effort: parse_opt(args, "--effort", dsfront::served::EFFORT).clamp(1, 100),
+        encoding: encoding_opt(args, dsfront::served::ENCODING),
+        default_thinking: dsfront::served::default_thinking(args),
+        default_temperature: parse_opt(args, "--temperature", dsfront::served::TEMPERATURE),
+        default_top_p: parse_opt(args, "--top-p", dsfront::served::TOP_P),
         loop_guard: if args.iter().any(|a| a == "--no-loop-guard") { None } else { Some(Default::default()) },
         tokenize_threads: parse_opt(args, "--tokenize-threads", 8usize).max(1),
         dump_dir: opt(args, "--dump-dir").map(Into::into),
-        hold: std::time::Duration::from_secs(parse_opt(args, "--hold-s", 600u64)),
+        hold: std::time::Duration::from_secs(parse_opt(args, "--hold-s", dsfront::served::HOLD_S)),
         vision_addr: opt(args, "--vision-addr"),
         vision,
         media_addr: opt(args, "--media-addr"),
@@ -185,7 +185,7 @@ fn serve(args: &[String]) {
         max_image_rows_in_flight: max_image_rows_in_flight(args),
         fan_tool: opt(args, "--fan-tool").map(Into::into),
         front_table_mib: parse_opt(args, "--front-table-mib", dsfront::server::DEFAULT_FRONT_TABLE_MIB),
-        front_mib: parse_opt(args, "--front-mib", dsfront::server::DEFAULT_FRONT_MIB),
+        front_mib: parse_opt(args, "--front-mib", dsfront::served::FRONT_MIB),
         front_image_mib: parse_opt(args, "--front-image-mib", dsfront::server::DEFAULT_FRONT_IMAGE_MIB),
     };
     // the one memory cap bounds the table too, unless the table's own bound is given
@@ -318,12 +318,6 @@ fn mock_engine(args: &[String]) {
         eprintln!("mock engine: {e}");
         std::process::exit(1);
     }
-}
-
-/// Thinking for requests that do not say: off, unless --thinking is given. --no-thinking spells the
-/// default out; when both are given, the later one wins.
-fn default_thinking(args: &[String]) -> bool {
-    args.iter().rev().find(|a| *a == "--thinking" || *a == "--no-thinking").is_some_and(|a| a == "--thinking")
 }
 
 fn mock_node_stats(args: &[String]) {
@@ -498,7 +492,7 @@ fn enccheck(args: &[String]) {
         eprintln!("{path}: {e}");
         std::process::exit(1)
     });
-    let enc = encoding_opt(args);
+    let enc = encoding_opt(args, dsfront::encoding::Encoding::V41);
     let (mut n_enc, mut n_parse, mut n_stream, mut bad) = (0usize, 0usize, 0usize, 0usize);
     let mut rng = 0x9E3779B97F4A7C15u64;
     let mut report = |name: &str, what: String| {
@@ -656,18 +650,36 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::default_thinking;
+    use super::{encoding_opt, opt, parse_opt};
+    use dsfront::served;
 
     fn args(s: &str) -> Vec<String> {
         s.split_whitespace().map(String::from).collect()
     }
 
+    /// `dsfront serve` with none of the served settings given reads every one of them as the served value, and each can
+    /// be given another value.
     #[test]
-    fn thinking_flags() {
-        assert!(!default_thinking(&args("dsfront serve")), "off unless asked for");
-        assert!(default_thinking(&args("dsfront serve --thinking")));
-        assert!(!default_thinking(&args("dsfront serve --no-thinking")));
-        assert!(!default_thinking(&args("dsfront serve --thinking --no-thinking")), "the later flag wins");
-        assert!(default_thinking(&args("dsfront serve --no-thinking --model-name m --thinking")));
+    fn serve_without_settings_is_the_served_configuration() {
+        let a = args("dsfront serve");
+        assert_eq!(opt(&a, "--model-name").unwrap_or_else(|| served::MODEL_NAME.into()), "deepseek-v4.1-flash-1017");
+        assert_eq!(parse_opt(&a, "--max-tokens", served::MAX_TOKENS), 1_048_576u32);
+        assert_eq!(parse_opt(&a, "--effort", served::EFFORT), 75i64);
+        assert_eq!(parse_opt(&a, "--temperature", served::TEMPERATURE), 1.0f32);
+        assert_eq!(parse_opt(&a, "--top-p", served::TOP_P), 0.95f32);
+        assert_eq!(parse_opt(&a, "--front-mib", served::FRONT_MIB), 840usize);
+        assert_eq!(encoding_opt(&a, served::ENCODING), dsfront::encoding::Encoding::parse("1017").unwrap());
+        assert!(served::default_thinking(&a));
+        let b = args("dsfront serve --max-tokens 32768 --effort 50 --encoding v4.1 --no-thinking");
+        assert_eq!(parse_opt(&b, "--max-tokens", served::MAX_TOKENS), 32768u32);
+        assert_eq!(parse_opt(&b, "--effort", served::EFFORT), 50i64);
+        assert_eq!(encoding_opt(&b, served::ENCODING), dsfront::encoding::Encoding::V41);
+        assert!(!served::default_thinking(&b));
+    }
+
+    /// enccheck keeps v4.1 as its default: its case files without a flag are made with that encoding.
+    #[test]
+    fn enccheck_default_is_v41() {
+        assert_eq!(encoding_opt(&args("dsfront enccheck f"), dsfront::encoding::Encoding::V41), dsfront::encoding::Encoding::V41);
     }
 }

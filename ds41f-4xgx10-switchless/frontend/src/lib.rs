@@ -9,6 +9,7 @@ pub mod guard;
 pub mod mock;
 pub mod protocol;
 pub mod pyjson;
+pub mod served;
 pub mod server;
 pub mod session;
 pub mod tokenizer;

@@ -38,6 +38,10 @@ add_executable(pool_rules_test tests/pool_rules_test.cpp)
 # bounds.h: the output queue's cap and the prompts' byte budget (host only)
 add_executable(bounds_test tests/bounds_test.cpp)
 
+# served.h: the flags and DSGB10_* settings a `--mode serve` start takes by default, against the served list (host only)
+add_executable(served_test tests/served_test.cpp)
+target_compile_definitions(served_test PRIVATE SERVED_ENGINE_DIR="${CMAKE_SOURCE_DIR}" SERVED_MAIN_CPP="${CMAKE_CURRENT_SOURCE_DIR}/main.cpp")
+
 # common/heap.h: giving the free pages of the heap back (host only)
 add_executable(heap_test tests/heap_test.cpp)
 
