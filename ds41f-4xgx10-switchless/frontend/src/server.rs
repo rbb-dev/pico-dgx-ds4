@@ -2159,7 +2159,9 @@ pub(crate) mod tests {
         let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
         let head = format!("POST /v1/chat/completions HTTP/1.1\r\nhost: x\r\ncontent-type: application/json\r\ncontent-length: {len}\r\nconnection: close\r\n\r\n");
         s.write_all(head.as_bytes()).await.unwrap();
-        let _ = s.write_all(&vec![b' '; len]).await; // the server may answer 413 and close before it is all sent
+        // over the limit, one byte past it is sent and no more: the server answers 413 at that byte and closes, and bytes it never read
+        // would turn its close into a reset, which can discard the answer before it is read
+        let _ = s.write_all(&vec![b' '; if len > max { max + 1 } else { len }]).await;
         let mut reply = Vec::new();
         let _ = s.read_to_end(&mut reply).await;
         server.abort();

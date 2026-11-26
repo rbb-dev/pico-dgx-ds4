@@ -1128,7 +1128,8 @@ impl SessionTable {
                 }
             }
         }
-        debug_assert!(s.cuts[before.saturating_sub(1)..].windows(2).all(|w| w[0].bytes < w[1].bytes && w[0].ids <= w[1].ids));
+        // the cuts stay in order (the test control that skips the truncation breaks it on purpose, and its error is the point)
+        debug_assert!(!truncate || s.cuts[before.saturating_sub(1)..].windows(2).all(|w| w[0].bytes < w[1].bytes && w[0].ids <= w[1].ids));
         shrink_slack(&mut s.cuts);
         let levels = (0..).take_while(|&l| level_len(l) <= turn.from.bytes).count();
         s.keys.truncate(levels);

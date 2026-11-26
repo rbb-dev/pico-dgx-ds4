@@ -224,8 +224,8 @@ pub(crate) async fn exchange(addr: &str, body: &Value, timeout: Duration, max_da
     }
     let fut = async {
         let mut s = TcpStream::connect(addr).await.map_err(|e| format!("the image encoder is not reachable: {e}"))?;
-        s.write_all(&(body.len() as u32).to_le_bytes()).await.map_err(|e| e.to_string())?;
-        s.write_all(&body).await.map_err(|e| e.to_string())?;
+        s.write_all(&(body.len() as u32).to_le_bytes()).await.map_err(|e| format!("image encoder: {e}"))?;
+        s.write_all(&body).await.map_err(|e| format!("image encoder: {e}"))?;
         let mut n4 = [0u8; 4];
         s.read_exact(&mut n4).await.map_err(|e| format!("image encoder: {e}"))?;
         let header_len = u32::from_le_bytes(n4) as usize;
@@ -303,8 +303,8 @@ pub async fn encode(addr: &str, records: &[Value], timeout: Duration, max_rows: 
         // serialised from the records where they are (no copy of them first), and freed once sent:
         // inline images are megabytes each, and the wait for the encoder is the long part
         let body = EncodeRequest { images: records, max_rows }.to_bytes()?;
-        s.write_all(&(body.len() as u32).to_le_bytes()).await.map_err(|e| e.to_string())?;
-        s.write_all(&body).await.map_err(|e| e.to_string())?;
+        s.write_all(&(body.len() as u32).to_le_bytes()).await.map_err(|e| format!("image encoder: {e}"))?;
+        s.write_all(&body).await.map_err(|e| format!("image encoder: {e}"))?;
         drop(body);
         let mut n4 = [0u8; 4];
         s.read_exact(&mut n4).await.map_err(|e| format!("image encoder: {e}"))?;
@@ -381,8 +381,8 @@ pub async fn encode_pixels_counted(addr: &str, records: &[Value], timeout: Durat
     let fut = async {
         let mut s = TcpStream::connect(addr).await.map_err(|e| format!("the image encoder is not reachable: {e}"))?;
         let body = EncodeRequest { images: records, max_rows }.to_bytes()?;
-        s.write_all(&(body.len() as u32).to_le_bytes()).await.map_err(|e| e.to_string())?;
-        s.write_all(&body).await.map_err(|e| e.to_string())?;
+        s.write_all(&(body.len() as u32).to_le_bytes()).await.map_err(|e| format!("image encoder: {e}"))?;
+        s.write_all(&body).await.map_err(|e| format!("image encoder: {e}"))?;
         drop(body);
         let grid_at = span_table_len(n);
         let data_at = grid_at + pad8(4 * n);
@@ -770,9 +770,21 @@ pub(crate) mod tests {
         assert!(!is_request_error(&e), "{e}");
         let (addr, _enc) = fake_encoder(reply_with_rows(&[2000]), true).await;
         assert!(!is_request_error(&encode(&addr, &records(1), T, DEFAULT_MAX_IMAGE_ROWS).await.unwrap_err()));
+        // no encoder at the address: a refused connection here; a system that answers a closed port by taking the connection and
+        // ending it gives the encoder's read or write error instead. Either way the encoder's fault, named as the encoder's.
         let gone = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap().to_string();
         let e = encode(&gone, &records(1), T, DEFAULT_MAX_IMAGE_ROWS).await.unwrap_err();
-        assert!(e.starts_with("the image encoder is not reachable") && !is_request_error(&e), "{e}");
+        assert!((e.starts_with("the image encoder is not reachable") || e.starts_with("image encoder: ")) && !is_request_error(&e), "{e}");
+        // an encoder that takes the connection and drops it at once: the same, on every system
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dropper = l.local_addr().unwrap().to_string();
+        let _accepts = tokio::spawn(async move {
+            while let Ok((c, _)) = l.accept().await {
+                drop(c);
+            }
+        });
+        let e = encode(&dropper, &records(1), T, DEFAULT_MAX_IMAGE_ROWS).await.unwrap_err();
+        assert!(e.starts_with("image encoder: ") && !is_request_error(&e), "{e}");
     }
 
     #[test]

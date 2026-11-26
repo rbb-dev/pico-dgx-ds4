@@ -193,6 +193,15 @@ int main() {
   check(val(E(2), "pin") == "3,5" && val(E(2), "live") == "" && val(E(2), "last") == "9", "lists, the empty one too");
   check(val(E(3), "slot") == "2" && val(E(3), "upto") == "40000", "ensure's arguments");
   check(val(E(7), "gen") == "18446744069414584321", "keep's 64-bit generation");
+  {  // --perturb on a 64-bit id at the top of the range: another id of the same kind, never a signed overflow (-DPICO_OLD_RULES: fails)
+    st::Trace tc = t;
+    std::string what;
+    const bool p = st::perturb(&tc, 1, &what);
+    const st::Line& e0 = tc.lines[tc.records[0].first];
+    const st::Field* f = tc.find(e0, "run_id");
+    check(p && what == "kept_check.run_id", "perturb changes kept_check's run_id, got " + what);
+    check(f && f->value == "18446744073709551614", "perturb steps the largest 64-bit id down by one, got " + (f ? f->value : "<missing>"));
+  }
   // answers, results and digests, by line
   std::vector<std::string> a_lines, r_lines, d_lines, v_lines, tags;
   for (const st::Line& l : t.lines) {

@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
+#include <climits>
 #include <cstdlib>
 #include <cstring>
 #include <sstream>
@@ -493,6 +494,25 @@ bool perturb(Trace* t, uint64_t n, std::string* what) {
         const size_t c = f.value.find(',');
         const std::string head = f.value.substr(0, c), rest = c == std::string::npos ? "" : f.value.substr(c);
         char* end = nullptr;
+#ifndef PICO_OLD_RULES
+        // a value that is not negative is read unsigned (ids and generations are 64-bit), and the top of the range steps down
+        // instead of up: the changed value is always another number of the same kind, never an overflow
+        std::string next;
+        if (!head.empty() && head[0] != '-') {
+          const unsigned long long u = std::strtoull(head.c_str(), &end, 10);
+          if (*end == 0) next = std::to_string(u == ULLONG_MAX ? u - 1 : u + 1);
+        } else if (!head.empty()) {
+          const long long v = std::strtoll(head.c_str(), &end, 10);
+          if (*end == 0) next = std::to_string(v + 1);  // v < 0: no overflow
+        }
+        if (head.empty()) {
+          f.value = rest.empty() ? "1" : "1" + rest;
+        } else if (!next.empty()) {
+          f.value = next + rest;
+        } else {
+          continue;
+        }
+#else
         const long long v = std::strtoll(head.c_str(), &end, 10);
         if (head.empty()) {
           f.value = rest.empty() ? "1" : "1" + rest;
@@ -501,6 +521,7 @@ bool perturb(Trace* t, uint64_t n, std::string* what) {
         } else {
           continue;
         }
+#endif
         e.raw = render(e);
         if (what) *what = r.kind + "." + name;
         return true;
