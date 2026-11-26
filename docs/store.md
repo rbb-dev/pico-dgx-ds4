@@ -85,15 +85,19 @@ size while the engine runs. The offer of a rank is
 
 rounded down to whole groups; every rank takes the smallest offer. The lines:
 
-| Line | Cap | Setting | Enforced by |
+Each line is held one of four ways: a **hard cap** (the line cannot pass it), a **refusal** (what would pass it is refused or
+dropped), a **governor** (the process sheds load when its reading passes the cap, so the cap can be passed between readings) or an
+**estimate** (a reservation sized from measurements, with nothing that stops the line passing it).
+
+| Line | Cap | Setting | Held by |
 |---|---|---|---|
-| glibc heap | 1 GiB | | the engine caps arenas at 2 and trims after each checkpoint |
-| Engram cache still to grow | its size less what it holds | `--engram-cache-mib` | counted in the offer |
-| front-end process (rank 0) | no default: 0 refuses a `--pool-free-gib` start | `--front-mib` (engine and `dsfront serve`) | the front-end's own memory governor; `dsfront serve --front-mib 0` is not watched |
-| image process outside the engine (rank 0) | 512 MiB (media worker) or 1,260 MiB (encoder container) | `--media-mib`, `--encoder-mib` | its container's cap |
-| front-end output queue (rank 0) | 64 MiB a connection | | the connection is dropped past it |
-| request frames (rank 0) | twice `--frame-stage-mib` (400) | `--frame-stage-mib` | a larger frame is answered `too-large` and skipped unread |
-| server token ids (rank 0) | 1,024 MiB | `--ids-host-mib` | idle conversations' ids go to files past it |
+| glibc heap | 1 GiB | | estimate: the engine caps glibc's arenas at 2 and trims after each checkpoint, which keeps the heap small but is not a byte limit |
+| Engram cache still to grow | its size less what it holds | `--engram-cache-mib` | hard cap: the cache never holds more than its size; what it has still to grow is counted in the offer |
+| front-end process (rank 0) | 840 MiB (the default); 0 refuses a `--pool-free-gib` start | `--front-mib` (engine and `dsfront serve`) | governor: the front-end's own memory governor, read every 10 s; `dsfront serve --front-mib 0` is not watched |
+| image process outside the engine (rank 0) | 512 MiB (media worker) or 1,260 MiB (encoder container) | `--media-mib`, `--encoder-mib` | hard cap: its container's memory limit |
+| front-end output queue (rank 0) | 64 MiB a connection | | refusal: the connection is dropped past it |
+| request frames (rank 0) | twice `--frame-stage-mib` (400) | `--frame-stage-mib` | refusal: a larger frame is answered `too-large` and skipped unread |
+| server token ids (rank 0) | 1,024 MiB | `--ids-host-mib` | governor: idle conversations' ids go to files past it |
 | state gather buffer | computed | | |
 | the kernel's own growth | 0.75 GiB | `--pool-slack-gib` | not enforced; shown as observed plus margin |
 | the split cache's buffers | computed | | counted |
