@@ -152,6 +152,12 @@ the last checkpoint; the front-end saves its session table the same way.
 - Measured: the next turn of a 64K-token conversation after a planned restart: first token after 0.23 s, where the same prompt
   cold took 6.55 s. A new engine binary cannot read the kept conversations, so an upgrade starts them cold.
 
+**Kept conversations know the image encoder.** The id a planned stop writes with its kept conversations, and a start checks before
+it reuses them, also holds the image encoder's set (the vision weights' digest, the same on the four Sparks): a start with other
+vision weights, or with none where there were some, starts the kept conversations cold, as their image rows came from the other
+encoder.
+- Test: `kept_id_test` (host: another set, or none, gives another id; built with `-DPICO_OLD_RULES` it fails).
+
 **A request sent again gets its first reply, bit for bit.** When a prompt the engine holds comes again (a retry, a regenerate),
 the positions after its restart point run as one decode step when there are at most `--small-rows` of them; the step adds
 in another order than the prefill, so the state is not the cold one and a near-tie can change the reply. With the switch they

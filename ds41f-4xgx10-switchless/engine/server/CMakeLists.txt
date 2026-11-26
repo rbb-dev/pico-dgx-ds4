@@ -42,6 +42,10 @@ add_executable(bounds_test tests/bounds_test.cpp)
 add_executable(served_test tests/served_test.cpp)
 target_compile_definitions(served_test PRIVATE SERVED_ENGINE_DIR="${CMAKE_SOURCE_DIR}" SERVED_MAIN_CPP="${CMAKE_CURRENT_SOURCE_DIR}/main.cpp")
 
+# kept_id.h: the kept-session id changes with the image encoder's set (host only)
+add_executable(kept_id_test tests/kept_id_test.cpp)
+target_include_directories(kept_id_test PRIVATE ${CMAKE_SOURCE_DIR})
+
 # common/heap.h: giving the free pages of the heap back (host only)
 add_executable(heap_test tests/heap_test.cpp)
 

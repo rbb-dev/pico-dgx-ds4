@@ -224,6 +224,7 @@
 #include "server/cmd.h"
 #include "server/golden.h"
 #include "server/served.h"
+#include "server/kept_id.h"
 #include "common/last_words.h"
 #include "server/serve.h"
 #include "vision/vit_device.h"
@@ -742,9 +743,10 @@ Args parse(int argc, char** argv) {
 }
 
 // What a kept session's state depends on besides the store's layout (state.cu checks that): this
-// binary's bytes, the weights' and the Engram files' paths, sizes and times, and the options that change
-// what a request computes. A start whose id differs from the stop's starts clean (a new build does).
-uint64_t run_id(const Args& a) {
+// binary's bytes, the weights' and the Engram files' paths, sizes and times, the options that change
+// what a request computes and the image encoder's set (kept_id.h). A start whose id differs from the
+// stop's starts clean (a new build does).
+uint64_t run_id(const Args& a, uint64_t vision_set) {
   uint64_t h = keepfile::fnv("dsgb10 kept sessions", 20);
   const int fd = open("/proc/self/exe", O_RDONLY | O_CLOEXEC);
   if (fd < 0) die("run id: /proc/self/exe: %s", std::strerror(errno));
@@ -772,7 +774,7 @@ uint64_t run_id(const Args& a) {
   const int64_t o[] = {a.max_ctx, a.exact, a.spec, a.draft_fp8, a.prefill_rows, a.small_rows, a.snap_every,
                        a.no_engram, a.layers, a.first, (int64_t)a.ring_cap, a.draft_head4, a.draft_markov8,
                        !a.ablit.empty()};
-  return keepfile::fnv(o, sizeof o, h);
+  return keptid::fold(h, o, sizeof o / sizeof o[0], vision_set);
 }
 
 // /proc/meminfo's MemAvailable (free pages and the page cache the kernel can reclaim), bytes
@@ -1059,7 +1061,7 @@ int main(int argc, char** argv) {
       size_t kbytes = 0;
       std::string why;
       const double tk0 = now_s();
-      const uint64_t id = run_id(a);
+      const uint64_t id = run_id(a, vision ? vision->digest() : 0);
       const double tk1 = now_s();
       const uint64_t gen = a.keep_gib > 0 ? m.state_kept_check(disk_base, id, a.keep_days * 86400, &kbytes, &why) : 0;
       const double tk2 = now_s();
