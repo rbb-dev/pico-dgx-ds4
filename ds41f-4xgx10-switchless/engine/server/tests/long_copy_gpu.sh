@@ -48,9 +48,7 @@ g2)
 g3)
   # G3 (the service, one request at a time, no front-end connected): rewrites of 1K / 4K / 8K-token passages. Proves: ids and
   # log-probability bits equal with DSGB10_COPY_ROWS unset and 64. Settings: engine A: DSGB10_COPY=1 (rows on), COPY_ROWS unset; engine B:
-  # DSGB10_COPY=1 DSGB10_COPY_ROWS=64, nothing else different. Pass: every prompt BIT-EQUAL, greedy and seeded-sampled (1.0, 0.95);
-  # engine B's log shows "copy: long steps N (whole W), ..." with N > 0 and W < N at least once (a long step rejected in part), and
-  # the "copy: digest" lines equal on the four ranks.
+  # DSGB10_COPY=1 DSGB10_COPY_ROWS=64, nothing else different. Pass: every prompt BIT-EQUAL, greedy and seeded-sampled (1.0, 0.95).
   for L in 1024 4096 8192; do
     run python3 "$HERE/long_copy_prompts.py" --tokens "$TOKENS" --out "$OUT/copy-$L.npy" --n 4 --len "$L"
   done
@@ -81,18 +79,6 @@ g4e)
   # Proves: the cost to an arrival (design estimate 0.26 s against 0.08 s), to be read before DSGB10_COPY_ROWS=64 is served.
   echo "start a rewrite (g3's 8K prompt, --new 1500), 2 s in send a short request; record its time to first token; control: COPY_ROWS unset"
   ;;
-block1)
-  # The 7-draft block (DSGB10_DRAFT_MAX=7, DSGB10_DRAFT_DYN=L, DSGB10_CF_TAIL=A,B; docs/engine.md): the block runs, and its rows 6-7 by
-  # source. Settings on every rank: DSGB10_COPY=1 DSGB10_COPY_ROWS=64 (the cursor the rule reads), DSGB10_DRAFT_MAX=7, DSGB10_DRAFT_DYN=5,
-  # DSGB10_STEP_LOG=$OUT/block-steplog.jsonl and DSGB10_COPY_DUMP=$OUT/block-copydump (the log then carries "cp":[chain rows kept, copy rows
-  # offered] for the step after it). Start lines to see: "dspark: block rows 7 (one session, DSGB10_DRAFT_MAX)", "spec: draft pass by step
-  # (DSGB10_DRAFT_DYN=5): 7 rows after 5 accepted drafts and no live copy cursor, else 5". Then the code prompts of the 3-prompt bench and the
-  # edit bench, one request at a time; block_rows.py prints, for draft rows 6 and 7, how often each source (chain / copy) offered one and
-  # how often it was accepted. Pass: the chain's rows 6-7 are offered (> 0) in steps that follow a step that accepted 5 or more drafts;
-  # the copy rows 6-7 keep appearing (> 0) on the edit bench; the block is worth keeping only if the code prompts gain more than the 4-5 %
-  # spread between runs.
-  run python3 "$HERE/block_rows.py" "$OUT/block-steplog.jsonl"
-  ;;
 block2)
   # The 7-draft block unset: this build with DSGB10_DRAFT_MAX / _DYN / _CF_TAIL all unset against g3's results of the long copy
   # steps' build (A-L-mode.json, COPY_ROWS unset; this path's engine code is that build's with the settings unset), the same prompts. Start lines: no "dspark: block rows" line and no "draft pass by step" line; the "steps verifying
@@ -112,7 +98,7 @@ block3)
   done
   ;;
 *)
-  echo "usage: $0 g1 | g2 | g3 | g4a | g4b | g4c | g4d | g4e | block1 | block2 | block3"
+  echo "usage: $0 g1 | g2 | g3 | g4a | g4b | g4c | g4d | g4e | block2 | block3"
   exit 2
   ;;
 esac

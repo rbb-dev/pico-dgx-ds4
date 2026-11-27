@@ -13,6 +13,7 @@
 #include <unordered_map>
 
 #include "common/keepfile.h"
+#include "common/log_detail.h"
 #include "model/pool_rules.h"
 
 namespace attn = ::model::sgeom;  // the geometry's names, as the engine's sources spell them
@@ -462,7 +463,7 @@ void StoreCore::checkpoint(uint64_t gen) {
   for (const auto& [off, bytes] : s.retired) space_free(off, bytes), freed += Pool::round(bytes);
   s.retired.clear();
   s.ckpt_sess = std::move(hs);
-  if (rank == 0)
+  if (rank == 0 && g_log_detail)  // common/log_detail.h
     std::printf("state: checkpoint: %zu sessions (%zu images), the file synced in %.1f ms, index of %.1f KiB in %.1f ms; "
                 "%.1f MiB of dropped images freed\n", s.ckpt_sess.size(), s.named.size(), 1e3 * (t1 - t0), f.size() / 1024.0,
                 1e3 * (wall_s() - t1), freed / 1048576.0);

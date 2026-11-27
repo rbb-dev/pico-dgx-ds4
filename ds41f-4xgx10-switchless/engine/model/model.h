@@ -147,7 +147,7 @@ inline constexpr int kCtxBucket = 4096;
 enum class PScan { Off, Ext, All };
 
 struct Options {
-  int copy_mib = 512;       // copy drafting (copy.h, DSGB10_COPY / DSGB10_COPY_DUMP): MiB a rank for the units' token
+  int copy_mib = 512;       // copy drafting (copy.h, DSGB10_COPY): MiB a rank for the units' token
                             // histories and tables; a unit that does not fit gets a smaller table, then none
   int max_ctx = 65536;      // positions the RoPE tables and compressed caches cover
   int n_layers = kLayers;   // run only blocks [first_layer, n_layers) (tests with golden injection; the
@@ -675,12 +675,15 @@ class Model {
   float last_logit(int r) const;
   // Step graphs instantiated so far.
   int graph_count() const;
+
+#ifdef DSGB10_DEV  // development builds only (engine/model/CMakeLists.txt DSGB10_DEV)
   // stack4 (the certified head's counters; false: off): steps, rows checked against the full head, mismatches,
   // surviving CTAs (sum), the largest |coarse - exact| / bound seen (float bits), the most CTAs of a step, forced steps
   bool cert_stats(uint32_t out[8]) const;
   // stack4 (DSGB10_MH_DUMP): step n's rows of main_hidden [kMaxSessRows][15360] bf16 in pinned memory (valid once
   // wait(n) returned, until step n + 4 runs); null: off or not this rank
   const uint16_t* mh_dump(uint64_t n) const;
+#endif
 
   int rank() const;
   cudaStream_t stream() const;

@@ -142,7 +142,7 @@ nav.sections button[aria-current="page"] { background: transparent; color: var(-
 /* ENGINE: one strip of tiles, a value and a short qualifier each (hover a tile for its detail); eight in a row, four in a
    narrower box, two on a phone */
 [data-box="engine"], [data-box="store"] { container-type: inline-size; padding: 0; gap: 0; overflow: hidden; }
-.strip { display: grid; grid-template-columns: repeat(9, minmax(0, 1fr)); margin: 0 -1px -1px 0; }
+.strip { display: grid; grid-template-columns: repeat(10, minmax(0, 1fr)); margin: 0 -1px -1px 0; }
 @container (max-width: 1440px) { .strip { grid-template-columns: repeat(5, minmax(0, 1fr)); } }
 @container (max-width: 640px) { .strip { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 .etile { padding: 7px 10px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); display: flex; flex-direction: column; gap: 2px; min-width: 0; cursor: help; }
@@ -302,6 +302,13 @@ const whole = new Intl.NumberFormat('en-AU', { maximumFractionDigits: 0 });
 const one = new Intl.NumberFormat('en-AU', { minimumFractionDigits: 1, maximumFractionDigits: 1 });
 const two = new Intl.NumberFormat('en-AU', { minimumSignificantDigits: 2, maximumSignificantDigits: 2 });
 const loose = new Intl.NumberFormat('en-AU', { maximumFractionDigits: 3 });
+
+function countFmt(v) {
+  let x = Number(v), i = 0;
+  if (!Number.isFinite(x) || x < 0) return ['-', ''];
+  while (x >= 999.95 && i < 4) x /= 1000, ++i;
+  return [i ? one.format(x) : whole.format(x), ['', 'K', 'M', 'B', 'T'][i]];
+}
 const dayTime = new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
 const hm = new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit', hour12: false });
 const dayName = new Intl.DateTimeFormat(undefined, { day: 'numeric', month: 'short' });
@@ -933,9 +940,17 @@ function etile(name, label, tip) {
 function rateTiles() {
   const TIP = 'Time to first token (waiting in the queue, then processing the prompt): the median and the slowest of the finished requests the front-end remembers, any prompt length.';
   const t = etile('first-token', 'FIRST TOKEN', TIP);
+  const GTIP = 'Every token the engine generated (thinking and answers) since the front-end started, counted as it streamed; it starts again from 0 when the front-end restarts.';
+  const g = etile('generated', 'GENERATED', GTIP);
   return {
-    els: [t.el],
+    els: [t.el, g.el],
     update(st, recent) {
+      const live = (st && st.health && st.health.live) || {};
+      if (none(live.generated_tokens)) g.set('-', '', 'not reported', GTIP);
+      else {
+        const [v, u] = countFmt(live.generated_tokens);
+        g.set(v, u, 'tokens since start', `${GTIP} Now ${whole.format(Number(live.generated_tokens))} tokens.`);
+      }
       const ttfts = (recent || []).map((x) => x.ttft_s).filter((x) => !none(x));
       const n = ttfts.length;
       if (!n) { t.set('-', '', 'no finished request yet', TIP); return; }
@@ -1000,7 +1015,7 @@ function engramTile() {
       const going = Number(e.pending_mib) > 0 ? ` · changing to ${whole.format(Number(e.pending_mib))} MiB` : '';
       const failed = Number(e.lend_failed);
       t.qual.classList.toggle('warn', failed > 0);
-      t.set(e.hit_rate_1m == null ? '-' : one.format(100 * Number(e.hit_rate_1m)) + ' %', e.hit_rate_1m == null ? '' : 'hit, last minute', e.hit_rate_1m == null ? `no lookups, last minute${going}` : `since start: ${posFmt(Number(e.lookups))} rows${going}`,
+      t.set(e.hit_rate_1m == null ? '-' : one.format(100 * Number(e.hit_rate_1m)) + ' %', e.hit_rate_1m == null ? '' : 'hit, 1 min', e.hit_rate_1m == null ? `no lookups, last minute${going}` : `since start: ${posFmt(Number(e.lookups))} rows${going}`,
         `The cache's rows take ${whole.format(Number(e.size_mib))} MiB on each Spark; it borrows ${pl(e.groups, 'group')} of the pool${groupDef} (see LENT OUT). ${rate[0].toUpperCase() + rate.slice(1)}. ` +
         `Since the engine started: ${whole.format(Number(e.lookups))} rows looked up, ${whole.format(Number(e.hits))} found, ${whole.format(Number(e.evictions))} dropped to make room. ` +
         `Size changes: ${whole.format(Number(e.lend_ok))} done, ${whole.format(failed)} failed (a failed change leaves the old size)` +
@@ -1128,7 +1143,6 @@ function settingsBox() {
     ['extend', 'EXTEND CONTEXT', 'Lets a conversation grow past 1,048,576 tokens, up to the window the engine was started with. At 1M and again at 2M the whole conversation is processed again, once each. Off: a 1M window; a longer prompt is refused and an output that reaches it ends.', 'check'],
   ];
   const note = h('span', { class: 'note' });
-  const copyLine = h('span', { class: 'note', hidden: true });
   const sels = {};
   const grid = h('div', { class: 'settings' }, ROWS.map(([key, label, tip, opts]) => {
     const check = opts === 'check';
@@ -1142,7 +1156,7 @@ function settingsBox() {
     } }, check ? [] : opts.map(([v, text]) => h('option', { value: String(v), text })));
     sels[key] = sel;
     return h('label', { class: check ? 'field check' : 'field', title: tip }, h('span', { class: 'k', text: label }), sel);
-  }), note, copyLine);
+  }), note);
   const b = box('reading', 'ENGINE SETTINGS', 'How the engine processes long prompts while others decode (interleaved prefill), how much SSD its kept conversations may use and for how long, the size of the Engram cache, and whether a conversation may extend past 1M tokens. Changes apply at once and last until the engine restarts; its start flags set them again.', grid);
   function update(st) {
     const il = st && st.interleave;
@@ -1155,14 +1169,6 @@ function settingsBox() {
       if (key === 'ssd_gib' && Array.isArray(il.ssd_choices) && il.ssd_choices.join() !== [...sel.options].map((o) => o.value).join()) sel.replaceChildren(...il.ssd_choices.map((c) => h('option', { value: String(c), text: FMT.ssd_gib(c) })));
       if (![...sel.options].some((o) => o.value === v)) sel.append(h('option', { value: v, text: FMT_OF[key] ? FMT_OF[key](Number(v)) : v }));
       if (sel.value !== v) sel.value = v;
-    }
-    const cp = st && st.copy;
-    copyLine.hidden = !cp;
-    if (cp) {
-      const chance = (cp.chance_pm || []).map((v) => whole.format(Math.round(Number(v) / 10)) + ' %').join(', ');
-      const rows = Number(cp.rows_verified);
-      setText(copyLine, `Copy drafts: ` + (Number(cp.scored) === 0 ? 'learning, no outcomes yet.' : `learning from ${whole.format(Number(cp.scored))} outcomes. A copied token is right ${chance} of the time after a match of 8, 16, 32, 64 tokens. ` +
-        (rows > 0 ? `${whole.format(Math.round(100 * Number(cp.rows_accepted) / rows))} % of copied rows accepted. ` : '') + `${pl(cp.failing_requests, 'request')} with failing copies.`));
     }
     if (!il) setText(b.right, 'not reported');
     else setText(b.right, `${il.reading} long ${il.reading === 1 ? 'prompt' : 'prompts'} being processed · ${il.queued} waiting`);

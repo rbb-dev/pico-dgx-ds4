@@ -641,7 +641,7 @@ STALL_W = 'serve: every request in flight waits for the pool (4 paused, 0 waitin
 BUG_W = 'serve: BUG: every flight waits for an extension (4 flights)'
 ENDS_W = 'serve: req 8 ends at 8858 tokens (length): every request that holds memory waits to grow and nothing can be freed (4 requests, 688 numbers in the pool)'
 GR = 'serve: req %d grows: its reservation reaches 356230 positions (was 355973)'
-EXT_GOOD = '\n'.join(['copy: digest a4783d91 after 10 steps (request at 364061)', STALL_W, BUG_W, ENDS_W, 'store-check: rank 0 state command (8 ops, first 9) digest 7ad07aa41c6ff0a9',
+EXT_GOOD = '\n'.join([STALL_W, BUG_W, ENDS_W, 'store-check: rank 0 state command (8 ops, first 9) digest 7ad07aa41c6ff0a9',
                      GR % 6, 'store-check: rank 0 state command (1 ops, first 14) digest b8c8231f553854e2', GR % 5, GR % 7, 'spill: 6.8 MiB to staging']) + '\n'
 
 

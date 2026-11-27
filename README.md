@@ -208,7 +208,7 @@ nothing to read.
 | `DSGB10_COPY=1` | copy drafting on (`0` off) |
 | `DSGB10_GSAMPLE=1`, `DSGB10_GCOUPLE=0.8` (not a default) | sampled requests without a client seed draw through the Gumbel-max sampler (the same distribution), and the drafter picks its drafts with the request's own noise, so more of them are accepted. Greedy and seeded requests are untouched. Off unless set; every Spark must have the same settings ([`docs/batching.md`](docs/batching.md#sampled-requests-the-gumbel-path-and-coupled-drafts)) |
 | `DSGB10_COPY_ADAPT=0` (not a default) | the learning copy drafter is on whenever copy drafting is: the table is its starting values, and the engine counts how often copies of each length are accepted and uses its own counts; each conversation also gets a quick correction. `0` turns it off (the table alone decides). With `DSGB10_RELAX` or `DSGB10_RELAX_P` set it stays off unless set to `1`, and then the start is refused. Every Spark must have the same copy settings and table file: a start where they differ stops |
-| `DSGB10_COPY_TABLE=FILE` (not a default) | optional: a copy-drafting survival table fitted from real traffic by `tools/copy/fit.py`, the same path on every Spark; a start whose file cannot be read on one rank stops. This repository does not ship one: without the setting the engine uses its built-in table, which is what At a glance, the long-context table and the learner comparison were measured with; the first two rows of [Drafting](#drafting) and the interleave table were measured on an earlier build with a table fitted from real traffic |
+| `DSGB10_COPY_TABLE=FILE` (not a default) | optional: a copy-drafting survival table (4 lines of 7 numbers in (0, 1], one a match bucket), the same path on every Spark; a start whose file cannot be read on one rank stops. This repository does not ship one: without the setting the engine uses its built-in table, which is what At a glance, the long-context table and the learner comparison were measured with; the first two rows of [Drafting](#drafting) and the interleave table were measured on an earlier build with a table fitted from real traffic |
 | `DSGB10_BUDGET=1` | every session may draft up to the rows left after one for each, so drafts are shared across sessions (lossless) |
 | `DSGB10_DRAFT1=6` | batch steps of 6 or more sessions draft them in one pass |
 | `DSGB10_WIDE=64`, `DSGB10_WIDE_COST=24,2.2,57,1.1` | steps of 17 to 64 rows run through the prefill GEMMs, and the cost model that takes the wide step only when the drafts pay for it |
@@ -291,7 +291,7 @@ repository changed in the engine is [`docs/engine.md`](docs/engine.md).
 | `--pscan off\|ext\|all` (all) | the decode index scan split by positions over the four ranks: `ext` in the 2M and 4M windows, `all` in the 1M window too |
 | `DSGB10_BATCH_CF=1`, `DSGB10_BATCH_TRIM=1`, `DSGB10_BATCH_TRIM_COST=a,b` | the draft count for several sessions: the MLP's survival in batch steps, the trim within 16 rows and its step cost, a + b x rows ms (19, 2.9 measured for batch steps) |
 | `--node-stats-port N` (engine, 9760), `--node-stats ADDR:PORT,...` (front-end) | each rank's node sampler and where the dashboard reads them; without the second the node-health panel is empty |
-| `DSGB10_COPY=1`, `DSGB10_COPY_TABLE=FILE`, `DSGB10_COPY_DUMP=1`, `DSGB10_COPY_ADAPT=0` | copy drafting: rows on, the survival table (the same file on every Spark; the learner's starting values), the dump mode that logs proposals without adding rows, the learner off (it is on with copy drafting) |
+| `DSGB10_COPY=1`, `DSGB10_COPY_TABLE=FILE`, `DSGB10_COPY_ADAPT=0` | copy drafting: rows on, the survival table (the same file on every Spark; the learner's starting values), the learner off (it is on with copy drafting) |
 | `--fan-tool PATH` (front-end) | the dashboard's COOLING AND CLOCK box runs this tool, which is `dgx-fan-fleet` (`status --json`, `set --json PROFILE`, `clock set --json LIMIT`); without it the box is absent |
 | `--dashboard-host NAME` (front-end) | a host name the dashboard answers to, besides its own addresses and localhost |
 | `--interleave-share P` (40), `--interleave-gap-ms N` (600), `--interleave-whole-rows N` (32,768), `--interleave-push-rows N` (131,072), `--interleave-burst-max-ms N` (1,000), `--no-interleave` | interleaved prefill; all live on the dashboard ([`docs/interleave.md`](docs/interleave.md#settings)) |
@@ -299,6 +299,8 @@ repository changed in the engine is [`docs/engine.md`](docs/engine.md).
 | `--max-tokens N` (front-end; 1,048,576) | the output cap for a request that sets none; the default cuts long outputs |
 | `DSGB10_NO_GATHER_ALIAS=1`, `DSGB10_ALIAS_CHECK=1` | gathered weights: keep the separate copies, or check every slot's checksum in place |
 | `DSGB10_STORE_CHECK=1` | prints the store's digest after each window, state and reservation command; the four ranks' lines must agree |
+| `DSGB10_LOG_DETAIL=1` | a serving engine prints its start-up lines, one closing line per request, errors and rare events; with this it also prints the per-request detail lines (restart, turn, joins, images, drafts, the run's line, the chunk pool), the per-step timeline and the spill, checkpoint and split-settled lines. Every mode but `serve` prints them without it; tests and benchmarks that read those lines set it |
+| `cmake -DDSGB10_DEV=ON` (build) | a development build: pico-dgx-ds4's step log (`DSGB10_STEP_LOG`), hidden-state dump (`DSGB10_MH_DUMP`), certified-head check (`DSGB10_CERT_CHECK`, `DSGB10_CERT_FORCE`) and `DSGB10_FORCE_NTOP`; a serving build carries none of their code |
 | `DSGB10_VMM_POISON=1` | test mode: freed chunks are filled, so a stale read shows |
 | `PrefillTuning::upk` (`kUpKernel`) | the prefill up kernel: 1 the producer/consumer one (default), 0 `k_moe_up_p` |
 | `DSK_PRE2=<mask>` | the decode GEMVs' second weight batch before the wait: 1 wq_a + wkv, 2 the router gate; 3 (default) both, 0 neither |
@@ -704,7 +706,7 @@ it counts, so the output is the model's own. The guesses come from three places:
   or more that a copy of the conversation predicts. When the conversation's last 8 tokens appeared earlier, the tokens that
   followed their latest earlier appearance are offered as up to 7 extra drafts after the draft heads' own. How many of them are
   worth checking comes from a small table of how often copies of each length turn out right: the engine's built-in table, or a
-  fitted one named with `DSGB10_COPY_TABLE` (`tools/copy/fit.py`). The table is only the starting point (`DSGB10_COPY_ADAPT=0`
+  table file named with `DSGB10_COPY_TABLE`. The table is only the starting point (`DSGB10_COPY_ADAPT=0`
   makes it the whole rule; it is off by itself beside a relaxed accept, `DSGB10_RELAX` or `DSGB10_RELAX_P`): the engine counts, on every Spark alike, how many copied tokens were accepted after matches of each length
   and follows its own counts, and each conversation gets a quick correction on top, so one whose copies keep failing does
   not make the engine trust everyone else's copies less. The matcher runs on the GPU inside the step and is
@@ -834,8 +836,8 @@ The image under [What you get](#what-you-get) is this page with 16 users generat
 
 `/dashboard` on the front-end shows the engine's decode (TG) and prefill (PP) rates in its header and, below it:
 
-- **The ENGINE strip, nine tiles**, each a value, a short qualifier and, on hover, its detail. FIRST TOKEN (the median and the
-  slowest time to first token of recent requests); CONTEXT CACHE (the chunks taken of the whole store, the tokens they hold
+- **The ENGINE strip, ten tiles**, each a value, a short qualifier and, on hover, its detail. FIRST TOKEN (the median and the
+  slowest time to first token of recent requests); GENERATED (every token generated since the front-end started); CONTEXT CACHE (the chunks taken of the whole store, the tokens they hold
   of the tokens the pool holds); MAX CONTEXT (the longest context one request may use now: it follows Extend context);
   CONVERSATIONS (in memory, and on the SSD only); SHARED PREFIXES (the memory kept once for beginnings conversations share);
   ENGRAM CACHE (its size on each Spark, the groups it borrows from the store and its hit rate over the last minute); LENT OUT
@@ -1115,15 +1117,13 @@ cannot compare equal (a wrong scale byte differs in 99.99 % of outputs).
 - `engine/vision/tests/`: the split image encoder against the unsplit run, byte for byte.
 - `engine/kernels/tests/bench_kernels.cu`: `bench_kernels upws` (env `PF_UPK`, `PF_M`, `PF_ROUNDS`) times the up kernel's
   shapes against `k_moe_up_p` after comparing the whole MoE's output with it bit for bit.
-- `tools/gate/`: `collect.sh` (a dump of the draft count's inputs per prompt set and session count), `gate_fit.py` (the survivals' calibration,
-  each prompt set held out in turn; `test_gate_fit.py`), `compare_dumps.py` (two runs' output hashes), `bench_seeded.py`
-  (pico-dgx-ds4's `tools/bench/bench.py` with each request's prefix and seed fixed; `collect.sh` runs it, another with `BENCH`).
+- `tools/gate/`: `compare_dumps.py` (two runs' output hashes), `bench_seeded.py` (pico-dgx-ds4's `tools/bench/bench.py` with each
+  request's prefix and seed fixed).
 - `engine/server/tests/bit_probe.py`: two engine builds or settings compared bit for bit on the decode path (prompts cut
   from a tokenized text, greedy with drafts; every token's id, logprob and top two).
 - `engine/engram/tools/rowcache_test.cpp` and `engine/server/tests/engram_vram_test.py`: the split Engram row cache and
   its placement.
 - `tools/vision/`: the media worker and its tests, `smoke_100.py`, `smoke_video.py` (against a running endpoint: they need `--media-addr` and the API key).
-- `tools/copy/fit.py`: fits the copy-drafting survival table from the dump mode's output.
 
 ## pico-dgx-ds4's design records
 

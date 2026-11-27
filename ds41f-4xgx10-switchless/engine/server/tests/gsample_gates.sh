@@ -8,8 +8,10 @@
 #                                      with the two variables unset; then `gsample_gates.sh compare DIR_A DIR_B`)
 #   gsample_gates.sh g1 DIR            record under DSGB10_GSAMPLE=1 DSGB10_GCOUPLE=0.8, then `compare` against G0's DIR for the files
 #                                      that must be equal, and `drafts DIR_A DIR_B` for the line that must differ
-#   gsample_gates.sh g2                the certified head under G1's settings, DSGB10_CERT_CHECK=1: prints the cert: lines' counters
-#   gsample_gates.sh g3 DIR            the truncated pick (DSGB10_GSAMPLE=2, DSGB10_FORCE_NTOP=20, DSGB10_STEP_LOG=FILE): the replay and
+#   gsample_gates.sh g2                the certified head under G1's settings, DSGB10_CERT_CHECK=1 (a development build,
+#                                      -DDSGB10_DEV=ON): prints the cert: lines' counters
+#   gsample_gates.sh g3 DIR            the truncated pick (DSGB10_GSAMPLE=2, DSGB10_FORCE_NTOP=20, DSGB10_STEP_LOG=FILE; the replay
+#                                      needs a development build, -DDSGB10_DEV=ON): the replay and
 #                                      the counts, each with its control (a GSAMPLE=0 log; against T = 0.7)
 #   gsample_gates.sh g5 ARM DIR        the speed arms on the seeded edit bench, 1, 3 and 8 sessions, 3 repeats: ARM A is
 #                                      DSGB10_GSAMPLE=2, ARM B is DSGB10_GSAMPLE=2 DSGB10_GCOUPLE=0.8
@@ -23,7 +25,7 @@
 #      on the same build): what differs between two runs of one build is the test's own floor, and only a request that is stable there counts.
 #  G1  under DSGB10_GSAMPLE=1 DSGB10_GCOUPLE=0.8: G0's greedy and seeded-truncated files equal again; the seeded temperature-only file
 #      equal AND its drafts-accepted-per-step different from G0's (the same would mean coupling did not run and the equality proves
-#      nothing); greedy 2, 3, 5, 16 sessions equal by compare_dumps.py; the copy digests of a sampled 5-session run equal on four ranks.
+#      nothing); greedy 2, 3, 5, 16 sessions equal by compare_dumps.py.
 #  G2  a temperature-only request under G1's settings moves the cert: line's steps counter by its step count (flat: the certified
 #      head lost to the Gumbel bit); DSGB10_CERT_CHECK=1: 0 mismatches over 10,000 rows or more with coupled drafts.
 #  G3  gsample_replay.py rows: 6,000 rows or more, 0 different, and its control (a GSAMPLE=0 log) sees the walk; then 7,200 one-token
@@ -117,5 +119,5 @@ case ${1:-} in
         --edit-repo "$REPO" --edit-thinking off,high --edit-repeats 1 --edit-temperature 1.0 --edit-seed $((100000 * rep)) \
         --edit-sessions "$sess" --edit-out "$out"
     done; done;;
-  *) sed -n 2,12p "$0"; exit 2;;
+  *) sed -n 2,19p "$0"; exit 2;;
 esac

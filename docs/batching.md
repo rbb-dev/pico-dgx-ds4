@@ -23,7 +23,7 @@ top-1 margins and log p over the whole vocabulary, a hidden layer of 64), which 
 (`k_spec_gate_batch_all`) reads the drafter head's survival unless `DSGB10_BATCH_CF=1`, and that survival runs low at
 depths 3-5: on 5,151 batch entries of 2-5 coding sessions it predicted 0.817 / 0.784 / 0.727 where 0.829 / 0.806 / 0.764
 landed. The MLP's log-loss is lower at every depth, on every prompt set and at every session count
-(`tools/gate/gate_fit.py`, each set held out in turn).
+(each prompt set held out in turn).
 
 Three switches, each off unless set:
 
@@ -33,10 +33,7 @@ Three switches, each off unless set:
 | `DSGB10_BATCH_TRIM=1`, `DSGB10_BATCH_TRIM_COST=a,b` | the tokens-per-ms trim of the wide steps also within 16 rows, with a step costing a + b x rows ms (19, 2.9 measured for batch steps) |
 | `DSGB10_BATCH_CAL=a1,b1,..,a5,b5` | each depth's chance given the one before through sigmoid(a x logit + b) |
 
-`DSGB10_GATE_DUMP=1|2` with `DSGB10_GATE_DUMP_FILE` writes one CSV line per verified batch entry (the drafts verified and
-accepted, the three survivals, the MLP's inputs); 2 verifies every draft the row budget allows, so depths the draft count would
-drop are observed too. `tools/gate/collect.sh` runs the sessions and cuts the lines per run; `compare_dumps.py` compares
-two runs' response hashes.
+`tools/gate/bench_seeded.py` runs the sessions; `tools/gate/compare_dumps.py` compares two runs' response hashes.
 
 **Measured** on an earlier build of this engine (four Sparks, each setting from a clean boot of
 all four, GPU clock 2,200 MHz, the dashboard open; that build's served settings, with a copy table fitted from real traffic,
@@ -106,8 +103,8 @@ of a Read result makes no difference to that.
 clock 2,200 MHz, the dashboard open, that build's served settings with copy drafting on and with it off; pico-dgx-ds4's agentic edit bench `bench/editbench.py` at temperature 1.0, thinking off
 and high; rates from rank 0's own per-request lines): one session 141.1 against 136.2 t/s (+3.6 %), 3.63 against
 3.34 drafts accepted a step; one user (chat 83.8 against 83.4, code 146.4 against 146.4 t/s) and 16 users (336.9
-against 335.6 t/s) unchanged. The table for these runs was fitted from a
-sampled dump run of the same bench: a copy's first token right 87 / 92 / 93 / 98 % of the time for matches of 8-15 /
+against 335.6 t/s) unchanged. The table for these runs was fitted offline from a
+sampled run of the same bench: a copy's first token right 87 / 92 / 93 / 98 % of the time for matches of 8-15 /
 16-31 / 32-63 / 64+ tokens.
 
 **Where it runs.** On the device, inside the step graph, on all four ranks, because the rows of a step are chosen on the
@@ -131,7 +128,7 @@ chance that the first j copy tokens are all accepted. A one-session step then ke
 batch step lists each entry as chain rows then copy rows (survival non-increasing), so the row budget and the tokens-per-ms
 trim treat a copy row as any draft and drop copy rows first; batch copy rows need the row budget (`DSGB10_BUDGET=1`). `T`
 has a built-in prior, derived from a greedy replay, that runs high under sampling. The built-in table is the default (no file is
-shipped); `tools/copy/fit.py` makes a fitted one from the dump's data (below, `python3 tools/copy/fit.py DUMP.csv -o copy-T.txt`), and
+shipped); a table file (4 lines of 7 numbers in (0, 1], one line a match bucket) can be given instead, and
 `DSGB10_COPY_TABLE` names it. The same file must be at the same path on every Spark: a Spark without it stops the engine at its start
 (`copy: DSGB10_COPY_TABLE=... cannot read it on this rank`), and neither the start helper nor the install copies it.
 
@@ -148,7 +145,7 @@ failing gets them back. Until the first outcome the rows chosen are exactly the 
 counts are integers updated in the same order on every Spark, so the four Sparks' chances are the same without anything sent. Only
 which rows are checked changes, never the tokens. It cannot run with `DSGB10_RELAX` (a relaxed accept would make the outcomes read
 low), and every Spark must have the same copy settings and the same table file: the engine compares them at its start and stops if
-they differ. `tools/copy/fit.py` stays the offline way to check what the engine learned: it scores a dump of the same run.
+they differ.
 
 Measured with the built-in table, learning on against the table alone (the served build's settings otherwise, a clean boot
 each): every bench within 1.5 %: one user 83.1 / 145.8 against 82.9 / 146.6 t/s (chat /
@@ -160,19 +157,14 @@ sessions 116.5 against 116.0 (thinking high) and 120.4 against 121.3 (thinking o
 | switch | what it does |
 |---|---|
 | `DSGB10_COPY=1` | copy rows on, chosen by the survival rule above |
-| `DSGB10_COPY_ADAPT=0` | the survival rule reads the table alone; without it (the default) it reads chances learned from the traffic, the table being their starting values (above), whenever `DSGB10_COPY` or the dump mode is on; a relaxed accept (`DSGB10_RELAX`, `DSGB10_RELAX_P`) keeps the learner off unless it is set to `1` |
-| `DSGB10_COPY_DUMP=1` | the dump mode: the matcher runs and logs, adds no rows (responses and step rows equal a run without it) |
-| `DSGB10_COPY_DUMP=2` | also verifies every proposed row (data for depths the rule would drop; implies rows on) |
-| `DSGB10_COPY_DUMP_FILE=FILE` | the dump's CSV, one line per step and entry (rank 0's server): the step's emitted tokens, the chain's kept drafts, the proposal (source end, match length, tokens); `DSGB10_COPY_TAG` marks the run |
+| `DSGB10_COPY_ADAPT=0` | the survival rule reads the table alone; without it (the default) it reads chances learned from the traffic, the table being their starting values (above), whenever `DSGB10_COPY` is on; a relaxed accept (`DSGB10_RELAX`, `DSGB10_RELAX_P`) keeps the learner off unless it is set to `1` |
 | `DSGB10_COPY_MIN=N` | the shortest match a proposal needs (8 to 72; default 8) |
-| `DSGB10_COPY_TABLE=FILE` | T: 4 lines (match buckets) of 7 numbers in (0, 1], `tools/copy/fit.py` writes it; unset: the built-in table |
+| `DSGB10_COPY_TABLE=FILE` | T: 4 lines (match buckets) of 7 numbers in (0, 1]; unset: the built-in table |
 | `--copy-mib N` | the arena a rank for the histories and tables (default 512): 4 bytes a position for the mirror and a table of 4 entries a position at most; past the arena the tables shrink (older entries are displaced: a missed copy), then the mirrors, then a unit gets none. Never a failure |
 
-With a switch set every spec step also prints, once a request ends, `copy: digest H after N steps` on each rank: the combined hash
-of the rows every step chose, equal on the four ranks. With the learner on each rank also prints `copy: learn H after N steps`,
-the same kind of hash over every outcome the counts took, equal on the four ranks too, and rank 0 prints per request
-`serve: req N copy: P proposals made, S scored, first token right F; V copy rows verified, A accepted; this conversation misses X times the
-average` (a proposal is scored a step later; a proposal whose step did not verify rows is not scored)
+The learner's counts (proposals made and scored, the first token right, copy rows verified and accepted, the shared chance by match
+bucket) are carried in the engine's STATS frame (the dashboard does not show them); a proposal is scored a step later, and a proposal whose step did not
+verify rows is not scored. Copy drafting prints nothing per step or per request.
 
 **What "exact" means here.** One session: the responses with `DSGB10_COPY=1` equal the responses without it at every row
 count up to 8 (the rows use the decode kernels, whose per-row arithmetic does not depend on the row count): checked greedy,
@@ -239,8 +231,7 @@ long step is void, so its counts keep describing proposals of at most 7 rows. Th
 run by another graph (the unit rode a batch step) does not match, and the cursor is dropped. A request's first step starts it over.
 
 Long steps run for a request that decodes alone; in shared steps copy rows are at most 7 as before. The host's bounds
-(`verify_reach`) widen to 63 rows, the draft rate and the step-cost model are not fed by long steps, and each request logs one line
-beside the digests: `copy: long steps N (whole W), drafts D, accepted A`.
+(`verify_reach`) widen to 63 rows, and the draft rate and the step-cost model are not fed by long steps.
 
 Settings (on every Spark; a value outside its range stops the start): `DSGB10_COPY_ROWS` 8 (no long steps), 32 or 64 (the default; 32: the 32-row body,
 31 drafts; 64: both bodies, 63 drafts), `DSGB10_COPY_ENTER` 8 to 72, default 32. Memory: one more body each (a graph of the one-session

@@ -13,12 +13,10 @@ namespace model::copy {
 static_assert(kMaxDrafts == ops::kCopyDrafts, "ops.h's kCopyDrafts is copy.h's");
 static_assert(kMaxUnitsCopy == 128, "config.h's kMaxUnits");
 
-// Device memory, one: every unit's view, the gate's table, the running digest. A kernel takes a unit by its index.
+// Device memory, one: every unit's view, the gate's table, the learner. A kernel takes a unit by its index.
 struct Dev {
   Unit unit[kMaxUnitsCopy];  // cap 0: the unit has no copy drafting
   Table table;               // T[bucket][row]
-  uint32_t digest;           // the fold of what every step chose, in step order
-  uint32_t pad;
   Learn learn;               // the chances that follow the traffic (copy.h; read and written only with kAdapt)
   UnitLearn ul[kMaxUnitsCopy];  // each unit's conversation counts and its last proposal
   Run run[kMaxUnitsCopy];       // each unit's cursor and ladder rung (copy_run.h; read and written only with DSGB10_COPY_ROWS above 8)

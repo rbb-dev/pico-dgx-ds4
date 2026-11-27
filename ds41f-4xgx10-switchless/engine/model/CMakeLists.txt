@@ -51,8 +51,7 @@ target_include_directories(copy_kernel_test PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(copy_kernel_test dsmodel)
 
 # Copy drafting's learner inside the two gate kernels, on a GB10 (not run by the build): the kernels' state against the host reference,
-# the kernels' counts against fit.py's on the same run's dump, entries that join and leave a batch step, the attach reset, and the
-# kernels' cost with and without the learner (tests/copy_gate_test.cu)
+# entries that join and leave a batch step, the attach reset, and the kernels' cost with and without the learner (tests/copy_gate_test.cu)
 add_executable(copy_gate_test tests/copy_gate_test.cu)
 target_include_directories(copy_gate_test PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(copy_gate_test dsmodel)
@@ -129,6 +128,15 @@ endif()
 option(DSGB10_NVTX "NVTX ranges in the model and the server, for nsys" OFF)
 if(DSGB10_NVTX)
   target_compile_definitions(dsmodel PUBLIC DSGB10_NVTX)
+endif()
+
+# Development builds (-DDSGB10_DEV=ON): upstream's measurement instruments, none of them in the serving engine: the step log
+# (DSGB10_STEP_LOG, DSGB10_FORCE_NTOP: the confidence network's training data, tools/stack4), the hidden-state dump
+# (DSGB10_MH_DUMP, DSGB10_MH_RANK: the drafter's training data) and the certified head's check against the full head
+# (DSGB10_CERT_CHECK, DSGB10_CERT_LOG, DSGB10_CERT_FORCE: the proof that it picks the full head's token)
+option(DSGB10_DEV "development instruments: step log, hidden-state dump, certified-head check" OFF)
+if(DSGB10_DEV)
+  target_compile_definitions(dsmodel PUBLIC DSGB10_DEV)
 endif()
 
 # The windowed token history (tokwin.h): Engram hashes from a trimmed window against the full vector, and memory over

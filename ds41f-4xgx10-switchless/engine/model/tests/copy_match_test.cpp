@@ -304,20 +304,7 @@ int main() {
     check(S.u.len == len0 && S.tok[len0 + 5] == 0, "a step with a hole before it appends nothing", 0);
   }
 
-  // 6. the digest: the same inputs fold the same; order matters
-  {
-    uint32_t a = 0, b = 0, c = 0;
-    const int32_t v[6] = {3, 9, 1, 4, 1, 5};
-    for (int i = 0; i < 6; ++i) a = digest_fold(a, v[i]), b = digest_fold(b, v[i]);
-    for (int i = 5; i >= 0; --i) c = digest_fold(c, v[i]);
-    check(a == b, "digest repeatable");
-    check(a != c, "digest depends on order");
-    uint32_t e = 0, f = 0;
-    for (int i = 0; i < 6; ++i) e = digest_fold(e, v[i]), f = digest_fold(f, i == 3 ? 40 : v[i]);
-    check(e != f, "digest sees a changed token");
-  }
-
-  // 7. the gate: survival, thresholds, ratio, marginal, monotone rows
+  // 6. the gate: survival, thresholds, ratio, marginal, monotone rows
   {
     const Table T = prior_table();
     for (int b = 0; b < kBuckets; ++b)
@@ -325,33 +312,33 @@ int main() {
     float step_ms[8] = {21.1f, 25.4f, 29.3f, 32.8f, 35.6f, 38.7f, 41.5f, 44.3f};
     float s[kMaxDrafts];
     // threshold: rows while survival >= thresh
-    int n = gate_rows(0, 0.7f, step_ms, 1.f, 3.f, 2, 5, 0, T.t, false, s);
+    int n = gate_rows(0, 0.7f, step_ms, 1.f, 3.f, 2, 5, 0, T.t, s);
     check(n == 3 && s[2] >= 0.7f && s[3] < 0.7f, "threshold gate keeps the rows above it");
-    n = gate_rows(0, 0.99f, step_ms, 0.9f, 2.5f, 3, 4, 0, T.t, false, s);
+    n = gate_rows(0, 0.99f, step_ms, 0.9f, 2.5f, 3, 4, 0, T.t, s);
     check(n == 0, "a chain survival below the threshold keeps no copy row");
-    n = gate_rows(0, 0.0f, step_ms, 1.f, 1.f, 0, 3, 3, T.t, true, s);
-    check(n == 3, "verify-all keeps every proposed row");
+    n = gate_rows(0, 0.0f, step_ms, 1.f, 1.f, 0, 3, 3, T.t, s);
+    check(n == 3, "a threshold of 0 keeps every proposed row");
     for (int j = 1; j < 3; ++j) check(s[j] <= s[j - 1], "survival held non-increasing");
     // a chain survival of 0.5 scales every row
-    gate_rows(0, 0.f, step_ms, 0.5f, 1.f, 1, 3, 1, T.t, false, s);
+    gate_rows(0, 0.f, step_ms, 0.5f, 1.f, 1, 3, 1, T.t, s);
     check(s[0] <= 0.5f * T.t[1][0] + 1e-6f, "row survival = chain survival x T");
     // ratio: a sure copy row pays (survival ~1 over a ~3.8 ms row), a hopeless one does not
     float sure[kBuckets][kMaxDrafts], dud[kBuckets][kMaxDrafts];
     for (int b = 0; b < kBuckets; ++b)
       for (int j = 0; j < kMaxDrafts; ++j) sure[b][j] = 0.99f, dud[b][j] = 0.02f;
-    check(gate_rows(1, 0.f, step_ms, 1.f, 2.2f, 2, 4, 0, sure, false, s) == 4, "ratio gate takes sure rows");
-    check(gate_rows(1, 0.f, step_ms, 1.f, 2.2f, 2, 4, 0, dud, false, s) == 0, "ratio gate drops hopeless rows");
+    check(gate_rows(1, 0.f, step_ms, 1.f, 2.2f, 2, 4, 0, sure, s) == 4, "ratio gate takes sure rows");
+    check(gate_rows(1, 0.f, step_ms, 1.f, 2.2f, 2, 4, 0, dud, s) == 0, "ratio gate drops hopeless rows");
     // marginal: row j needs survival >= thresh x its ms
-    check(gate_rows(2, 0.1f, step_ms, 1.f, 2.2f, 2, 4, 0, sure, false, s) == 4, "marginal gate takes sure rows");
-    check(gate_rows(2, 0.1f, step_ms, 1.f, 2.2f, 2, 4, 0, dud, false, s) == 0, "marginal gate drops hopeless rows");
+    check(gate_rows(2, 0.1f, step_ms, 1.f, 2.2f, 2, 4, 0, sure, s) == 4, "marginal gate takes sure rows");
+    check(gate_rows(2, 0.1f, step_ms, 1.f, 2.2f, 2, 4, 0, dud, s) == 0, "marginal gate drops hopeless rows");
   }
 
-  // 8. the host's bounds: copy rows reach 7 drafts past the previous step's last row, off the chain's 5
+  // 7. the host's bounds: copy rows reach 7 drafts past the previous step's last row, off the chain's 5
   check(verify_reach(5, false) == 5, "off: the bounds as before");
   check(verify_reach(5, true) == 7, "on: the bounds widen to 7");
   check(kMaxDrafts == 7 && kOrder == 8, "constants");
 
-  // 9. the arena plan: fits, degrades, never over
+  // 8. the arena plan: fits, degrades, never over
   {
     const int ctx[3] = {1 << 20, 1 << 17, 1 << 17};
     Plan p[3];
@@ -372,7 +359,7 @@ int main() {
     std::printf("16 units of 1M positions in 512 MiB: mirror %d, table 2^%d, %zu MiB\n", q[0].cap, q[0].tab_log2, used >> 20);
   }
 
-  // 10. the gate's table from a file: round trip, and malformed files are refused
+  // 9. the gate's table from a file: round trip, and malformed files are refused
   {
     const char* path = "/tmp/copy_match_test_table.txt";
     const Table P = prior_table();

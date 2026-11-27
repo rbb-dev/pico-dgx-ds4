@@ -24,28 +24,22 @@ constexpr int kMaxUnitsCopy = 128;  // config.h kMaxUnits
 
 // The mode (the same on every rank: environment variables of the start). Every switch is off unless set, but the learner.
 //  DSGB10_COPY=1:       copy rows on (verified with the chain's drafts, by the gate)
-//  DSGB10_COPY_DUMP=1:  the probe: the matcher runs and logs but adds no rows (output and speed as off)
-//  DSGB10_COPY_DUMP=2:  also verify every proposed row (no gate): data for the depths the gate would drop
 //  DSGB10_COPY_MIN=N:   the least match length (kOrder..kOrder + kBack) a proposal needs; default kOrder
 //  DSGB10_COPY_ADAPT:   the gate reads chances learned from the outcomes of its own proposals (the learner below): on whenever
-//                       DSGB10_COPY or the probe is; 0 turns it off; a relaxed accept (DSGB10_RELAX, DSGB10_RELAX_P) keeps it off
+//                       DSGB10_COPY is; 0 turns it off; a relaxed accept (DSGB10_RELAX, DSGB10_RELAX_P) keeps it off
 //                       unless it is 1 (then the start refuses: the relaxed accept would make its outcomes read low)
-enum : int32_t { kRows = 1, kDump = 2, kAll = 4, kAdapt = 8 };
+enum : int32_t { kRows = 1, kAdapt = 8 };
 // The mode from the switches' values (null: unset); mode() reads them from the environment once.
-inline int32_t mode_from(const char* c, const char* d, const char* a, const char* relax, const char* relax_p) {
+inline int32_t mode_from(const char* c, const char* a, const char* relax, const char* relax_p) {
   int32_t v = 0;
   if (c && *c && atoi(c) > 0) v |= kRows;
-  const int dv = d && *d ? atoi(d) : 0;
-  if (dv > 0) v |= kDump;
-  if (dv >= 2) v |= kRows | kAll;
   const bool relaxed = (relax && *relax && atof(relax) > 0.) || (relax_p && *relax_p && atof(relax_p) > 0.);
   const bool asked = a && *a && atoi(a) > 0, off = a && *a && atoi(a) <= 0;
   if (v && !off && (asked || !relaxed)) v |= kAdapt;
   return v;
 }
 inline int32_t mode() {
-  static const int32_t m = mode_from(getenv("DSGB10_COPY"), getenv("DSGB10_COPY_DUMP"), getenv("DSGB10_COPY_ADAPT"),
-                                     getenv("DSGB10_RELAX"), getenv("DSGB10_RELAX_P"));
+  static const int32_t m = mode_from(getenv("DSGB10_COPY"), getenv("DSGB10_COPY_ADAPT"), getenv("DSGB10_RELAX"), getenv("DSGB10_RELAX_P"));
   return m;
 }
 inline int min_match() {
@@ -213,7 +207,7 @@ CPY_HD inline int propose(const Unit& u, int P, const int32_t* d, int k, int max
 // ---- the gate ----------------------------------------------------------------------------------------------
 // T[b][j]: the chance that copy tokens 1..j+1 are all accepted, given match bucket b and that the chain's kept drafts all
 // were; row j + 1 has survival chain_prev * T[b][j] (chain_prev: the chain's last kept survival, 1 for none), non-increasing.
-// PRIOR: a starting table; a fitted one comes from tools/copy/fit.py through DSGB10_COPY_TABLE.
+// PRIOR: a starting table; a fitted one comes through DSGB10_COPY_TABLE.
 struct Table {
   float t[kBuckets][kMaxDrafts];
 };
@@ -228,7 +222,7 @@ inline Table prior_table() {
 }
 
 // The gate's table from a file (DSGB10_COPY_TABLE): kBuckets lines of kMaxDrafts numbers in (0, 1], T[bucket][row]
-// (tools/copy/fit.py writes it). False when the file is missing, short or out of range.
+// False when the file is missing, short or out of range.
 inline bool load_table(const char* path, Table* T) {
   FILE* f = std::fopen(path, "r");
   if (!f) return false;
@@ -247,16 +241,15 @@ inline bool load_table(const char* path, Table* T) {
 
 // How many of the m proposed copy rows are verified after the chain's k kept drafts. surv_out[j]: row k + j + 1's
 // survival. e_chain: 1 + the chain's kept survivals (the expected tokens of a step with k drafts). step_ms: the modelled
-// ms of a step verifying n drafts, n = 0..kMaxDrafts (ops.h kGate*: thresh, ratio, marginal). kAll: every row.
+// ms of a step verifying n drafts, n = 0..kMaxDrafts (ops.h kGate*: thresh, ratio, marginal).
 CPY_HD inline int gate_rows(int gate, float thresh, const float* step_ms, float chain_prev, float e_chain, int k, int m,
-                            int bucket, const float (*T)[kMaxDrafts], bool all, float* surv_out) {
+                            int bucket, const float (*T)[kMaxDrafts], float* surv_out) {
   float prev = chain_prev;
   for (int j = 0; j < m; ++j) {
     float s = chain_prev * T[bucket][j];
     if (s > prev) s = prev;
     surv_out[j] = s, prev = s;
   }
-  if (all) return m;
   int n = 0;
   if (gate == 1) {  // kGateRatio
     float e = e_chain, best = e / step_ms[k];
@@ -271,13 +264,6 @@ CPY_HD inline int gate_rows(int gate, float thresh, const float* step_ms, float 
     while (n < m && surv_out[n] >= thresh) ++n;
   }
   return n;
-}
-
-// The rank-agreement digest: a 32-bit fold of what a step chose (next_rows, next_tok).
-CPY_HD inline uint32_t digest_fold(uint32_t d, int32_t v) {
-  d ^= (uint32_t)v;
-  d *= 16777619u;
-  return (d << 13) | (d >> 19);
 }
 
 // ---- the learner: the table that follows the traffic ----------------------------------------------------------------------
@@ -354,7 +340,6 @@ struct Learn {
   float prior[kBuckets][kDepthClasses];   // from the table, by division only
   float chance[kBuckets][kDepthClasses];  // what the gate reads
   Cell cell[kBuckets][kDepthClasses];
-  uint32_t sum;  // a fold of every outcome taken, in order: the ranks' agreement
 };
 struct UnitLearn {
   Sess sess;
@@ -372,7 +357,6 @@ CPY_HD inline void learn_init(Learn* L, const Table& T) {
     for (int c = 1; c < kDepthClasses; ++c) L->prior[b][c] = clamp_prior(fdiv_rn(T.t[b][c], T.t[b][c - 1]));
     for (int c = 0; c < kDepthClasses; ++c) L->chance[b][c] = L->prior[b][c], L->cell[b][c] = Cell{0, 0};
   }
-  L->sum = 0;
 }
 // No outcome has been taken yet, by the shared cells or by the conversation: the gate reads the table itself.
 CPY_HD inline bool pristine(const Learn& L, const Sess& s) {
@@ -411,7 +395,6 @@ CPY_HD inline void cell_take(Learn& L, int b, int j, bool hit) {
   Cell& c = L.cell[b][depth_class(j)];
   c.n += 1, c.r += hit ? 1u : 0u;
   if (c.n >= (uint32_t)kWindow) c.n >>= 1, c.r >>= 1;
-  L.sum = digest_fold(L.sum, (int32_t)((b << 8) | (j << 1) | (hit ? 1 : 0)));
 }
 CPY_HD inline void rebuild(Learn& L, int b) {
   const float w = CPY_RULE(prior0) ? 0.f : (float)kPriorWeight;

@@ -1,7 +1,7 @@
 # The dashboard
 
-`dsfront serve` serves a status page at `/dashboard` on its own listen addresses. The ENGINE strip across the top holds nine
-tiles, for all the engine's Sparks together: FIRST TOKEN, CONTEXT CACHE, MAX CONTEXT, CONVERSATIONS, SHARED PREFIXES, ENGRAM
+`dsfront serve` serves a status page at `/dashboard` on its own listen addresses. The ENGINE strip across the top holds ten
+tiles, for all the engine's Sparks together: FIRST TOKEN, GENERATED, CONTEXT CACHE, MAX CONTEXT, CONVERSATIONS, SHARED PREFIXES, ENGRAM
 CACHE, LENT OUT, SSD CACHE and CACHE HITS ([below](#the-tiles-and-the-cache-chart)); LINES (the requests
 in flight) sits beside the DECODE and PREFILL charts of the last 15 minutes and the CACHE chart; NODE HEALTH is a table, one row a Spark;
 ENGINE SETTINGS (interleaved prefill's settings, [interleave.md](interleave.md), and the SSD tier's size and
@@ -37,10 +37,11 @@ and polls no sampler.
 
 - `status.health`: `{max_batch_size` (HELLO `max_sessions`: an advisory count, not the lines; the page draws one
   row per line, `status.sessions.lines`)`, live: {connections, waiting, decode_tokens_per_second,
-  prefill_tokens_per_second, prompt_pass: {computed, total, seconds} | null}, spill: {state: on|off|unknown},
+  prefill_tokens_per_second, generated_tokens, prompt_pass: {computed, total, seconds} | null}, spill: {state: on|off|unknown},
   prompt_cache: {spill: [{stored_bytes, cap_bytes, points, writes_committed, written_bytes, writes_pending}],
   restores_begun, disk_hits, restored_tokens, restore_waits, restore_wait_ns, restore_wait_max_ns}}`.
-  `connections` is the requests in flight, `waiting` those that have not started decoding. The decode rate is the token ids
+  `connections` is the requests in flight, `waiting` those that have not started decoding. `generated_tokens` is every token id
+  received since the front-end started (thinking included; a running request's as they arrive). The decode rate is the token ids
   received over the last 3 s, the prefill rate the `PROGRESS` change over the same window. `prompt_pass` is the
   oldest request that has reported prefill progress (`seconds` since it was submitted). `prompt_cache` is
   null, and `spill.state` `unknown`, until the first `STATS` arrives.
@@ -68,7 +69,6 @@ and polls no sampler.
   multiple of 10 s; a point with no reading is null; `last_ms` is the end of the newest bucket.
 - `status.interleave`: the same object as `GET settings`, with `ssd_gib` (the disk tier's current size), `keep_days`, `extend` (true or false) and `engram_mib` (the Engram cache's size now) (the ENGINE SETTINGS box reads it with the status).
 - `status.engram` (null from an engine that sends no Engram fields): `{cache_bytes, size_mib, groups, pending_mib (the size a change under way goes to, 0 none), lookups, hits, hit_rate_1m (hits over lookups in the last 60 s of STATS, null without lookups), evictions, lend_ok, lend_failed, owed_groups, huge_pct}`; `status.sessions.pool.image_numbers` is the chunks the running requests' images hold. The ENGRAM CACHE tile of the ENGINE strip reads them.
-- `status.copy` (null when the engine does not learn from its copy drafts: copy drafting off, or `DSGB10_COPY_ADAPT=0`): `{proposals, scored, first_right, rows_verified, rows_accepted, chance_pm (four numbers in thousandths: the chance a copied token is right after a match of 8, 16, 32 and 64 tokens), failing_requests}`. The ENGINE SETTINGS box shows it as one line under its settings: `Copy drafts: learning from 3,188 outcomes. A copied token is right 88 %, 92 %, 94 %, 98 % of the time after a match of 8, 16, 32, 64 tokens. 91 % of copied rows accepted. 0 requests with failing copies.` The line is absent when the engine does not learn.
 - `status.node_health`: `{ranks: [sample + {rank, age_ms, at_ms}], zone_names}`, one entry per `--node-stats`
   address in order; a rank whose sampler has not answered is `{rank, age_ms: null, at_ms: null}`. `age_ms` is the
   time since that sample arrived; `at_ms` is its arrival as Unix milliseconds, the same on every poll, so the page
@@ -77,12 +77,13 @@ and polls no sampler.
 
 ## The tiles and the CACHE chart
 
-The ENGINE strip is nine tiles, one a figure (a value with its unit, a short qualifier, the detail in the tile's tip), for all the
+The ENGINE strip is ten tiles, one a figure (a value with its unit, a short qualifier, the detail in the tile's tip), for all the
 engine's Sparks together (`ranks`):
 
 | Tile | Shows |
 |---|---|
 | FIRST TOKEN | the median time to first token of the `recent` requests and the slowest; they start over when the front-end restarts |
+| GENERATED | every token generated since the front-end started, thinking included, a running request's counted as they arrive; shown with K, M, B and T (`status.health.live.generated_tokens`) |
 | CONTEXT CACHE | the chunks taken of the whole store (held by anything: conversations and their bookmarks, the images of running requests, the lines' own chunks, the split cache's pieces), and the tokens they hold of the tokens the pool holds |
 | MAX CONTEXT | the longest context one request may use now; it follows Extend context |
 | CONVERSATIONS | conversations whose cache is in the pool (running, or waiting for their next turn), and those with a piece only on the SSD cache |

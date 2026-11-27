@@ -35,4 +35,6 @@ reads what a pair costs by itself. Rank 0 prints one line after a request's `tur
 serve: req N joins: C chunks: attention X ms, MoE Y ms (P pairs), floor Z ms a pair
 ```
 
+(printed with `DSGB10_LOG_DETAIL=1`)
+
 A decode step is a CUDA graph and has no join clock.

@@ -1068,7 +1068,8 @@ class Server {
     size_t fb = 0;
     std::string why;
     const bool ok = write_index(gen, hs, &n, &fb, &why);
-    std::printf("serve: checkpoint: %d conversations a crash comes back to; the ranks' indexes in %.1f ms, histories %.1f KiB "
+    if (g_log_detail || !ok)  // a checkpoint not written is always said
+      std::printf("serve: checkpoint: %d conversations a crash comes back to; the ranks' indexes in %.1f ms, histories %.1f KiB "
                 "in %.1f ms%s%s\n", ok ? n : 0, 1e3 * (ckpt_at_ - t0), fb / 1024.0, 1e3 * (now_s() - ckpt_at_),
                 ok ? "" : ": NOT WRITTEN, ", why.c_str());
   }
@@ -1504,7 +1505,8 @@ class Server {
       Io::forget(rq);
       return false;
     }
-    std::printf("serve: req %llu: a prompt of %zu ids: %u of the history of %016llx and %zu of its own\n", (unsigned long long)rq.h.req_id,
+    if (g_log_detail)
+      std::printf("serve: req %llu: a prompt of %zu ids: %u of the history of %016llx and %zu of its own\n", (unsigned long long)rq.h.req_id,
                 whole.size(), rq.n_prefix, (unsigned long long)(rq.h.base_session_id ? rq.h.base_session_id : rq.h.session_id), rq.prompt.size());
     rq.prompt = std::move(whole);
     rq.h.n_prompt = (uint32_t)rq.prompt.size();  // DONE and the log count the whole prompt
@@ -1657,10 +1659,12 @@ class Server {
     f.sp.n_top = (h.flags & fe::kFlagLogprobs) ? (int32_t)std::min<uint32_t>(h.n_top_logprobs, model::ops::kTopLogprobs) : 0;
     // a request that wants logprobs keeps the full head (the certified head gives the argmax, not the partition sum)
     if ((h.flags & fe::kFlagLogprobs) && f.sp.n_top < 1) f.sp.n_top = 1;
-    {  // DSGB10_FORCE_NTOP, measurement only:: every request's rows carry their top logprobs in SampleOut (the step log)
+#ifdef DSGB10_DEV
+    {  // DSGB10_FORCE_NTOP, measurement only (development builds):: every request's rows carry their top logprobs in SampleOut (the step log)
       static const int force_ntop = getenv("DSGB10_FORCE_NTOP") ? atoi(getenv("DSGB10_FORCE_NTOP")) : 0;
       if (force_ntop > 0) f.sp.n_top = std::min(force_ntop, (int)model::ops::kTopLogprobs);
     }
+#endif
     f.sp.seed = (h.flags & fe::kFlagSeed) ? h.seed : rng_();
     f.sp.ablit = (h.flags & fe::kFlagAblit) ? 1.f : 0.f;  // the runtime abliteration on this request (--ablit)
     for (const fe::ImageSpan& sp : f.rq.spans) f.img.rows += sp.rows;
@@ -1765,7 +1769,7 @@ class Server {
     const auto it = unit_stats_.find(req);
     if (it == unit_stats_.end()) return;
     const UnitStat& u = it->second;
-    if (u.n[0] + u.n[1] > 0)
+    if (g_log_detail && u.n[0] + u.n[1] > 0)
       std::printf("serve: req %llu read in pieces beside decoders: %d encode units (longest %.1f ms, longest silence across one %.1f ms), %d row pieces "
                   "(longest %.1f ms, longest silence across one %.1f ms), the run edge %.1f ms mean (now %.1f ms)\n", (unsigned long long)req, u.n[0],
                   u.longest_ms[0], u.silence_ms[0], u.n[1], u.longest_ms[1], u.silence_ms[1], u.edge_n ? u.edge_sum / u.edge_n : 0.0,
@@ -2084,7 +2088,8 @@ class Server {
     enc_mark_.ran(req, i, b1);
     if (b1 >= vitsched::kBlocks) {
       f.enc[(size_t)i] = 1;
-      std::printf("serve: req %llu image %d of %zu encoded: %d patches, %d rows in %.1f ms (blocks [%d, %d) the last)\n", (unsigned long long)req, i + 1,
+      if (g_log_detail)
+        std::printf("serve: req %llu image %d of %zu encoded: %d patches, %d rows in %.1f ms (blocks [%d, %d) the last)\n", (unsigned long long)req, i + 1,
                   f.rq.spans.size(), g.patches(), g.rows(), ms, b0, b1);
     }
     return 0;
@@ -2252,7 +2257,8 @@ class Server {
           else std::snprintf(from + k, sizeof from - k, ", and no restart point up to it is usable");
         }
       }
-      std::printf("serve: req %llu factor %d (window %d): restart: %s; reused %d (%s)\n", (unsigned long long)h.req_id, fac,
+      if (g_log_detail)
+        std::printf("serve: req %llu factor %d (window %d): restart: %s; reused %d (%s)\n", (unsigned long long)h.req_id, fac,
                   window_of(fac), from, q, kHow[pl.how]);
     }
     if (src && q > 0) {  // the cut at q copies the chunks the session shares with another (own_tail), a fork's partial piece
@@ -2285,7 +2291,7 @@ class Server {
       ns.factor = fac;
       ns.ep.value = new_epoch();
       S = &sess_.emplace(h.session_id, std::move(ns)).first->second;
-      if (resume)
+      if (resume && g_log_detail)
         std::printf("serve: req %llu factor %d (window %d): a new session for its %d positions, read again (%s)\n",
                     (unsigned long long)h.req_id, fac, window_of(fac), n - q, kHow[pl.how]);
     }
@@ -2669,7 +2675,8 @@ class Server {
       std::vector<uint16_t>().swap(rq.img);  // rank 0 keeps no copy: the store has the rows
     }
     m_.set_images(c.n, lh.data(), lh.data() + c.n, f.img.key);
-    std::printf("serve: req %llu images: %d spans, %zu rows, %s in %.1f ms (%zu image numbers held)\n",
+    if (g_log_detail)
+      std::printf("serve: req %llu images: %d spans, %zu rows, %s in %.1f ms (%zu image numbers held)\n",
                 (unsigned long long)rq.h.req_id, c.n, f.img.rows, g.fill ? (px ? "taken, to be encoded here" : "taken and sent to every rank") : "held", 1e3 * (now_s() - t0),
                 m_.image_numbers());
   }
@@ -3382,27 +3389,29 @@ class Server {
                     : why[k] == fe::kLength ? "length" : why[k] == fe::kCancelled ? "cancelled" : "context");
       ends += b;
     }
-    // the run for the log: its steps' median (g_t_wait: when each step's samples came); with drafts, the
-    // tokens and rows per step, the drafts accepted of those verified, and the steps' GPU ms by rows
-    std::vector<double> d;
-    for (size_t i = 1; i < g_t_wait.size(); ++i) d.push_back(1e3 * (g_t_wait[i] - g_t_wait[i - 1]));
-    std::sort(d.begin(), d.end());
-    std::string dr;
-    if (drafts) {
-      int ver = 0, acc = 0;
-      for (int k = 0; k < n; ++k) ver += dend[k].verified, acc += dend[k].accepted;
-      char b[160];
-      std::snprintf(b, sizeof b, "; drafts: %.2f tokens and %.2f rows per step, %d of %d drafts accepted; GPU ms by rows:",
-                    st.steps ? (double)st.emitted / st.steps : 0.0, st.steps ? (double)st.rows / st.steps : 0.0, acc, ver);
-      dr = b;
-      for (int r = 1; r <= model::kMaxRows; ++r)
-        if (st.gpu_n[r]) {
-          std::snprintf(b, sizeof b, " %d: %.2f (%d)", r, st.gpu_ms[r] / st.gpu_n[r], st.gpu_n[r]);
-          dr += b;
-        }
+    if (g_log_detail) {  // DSGB10_LOG_DETAIL: the run's line
+      // the run for the log: its steps' median (g_t_wait: when each step's samples came); with drafts, the
+      // tokens and rows per step, the drafts accepted of those verified, and the steps' GPU ms by rows
+      std::vector<double> d;
+      for (size_t i = 1; i < g_t_wait.size(); ++i) d.push_back(1e3 * (g_t_wait[i] - g_t_wait[i - 1]));
+      std::sort(d.begin(), d.end());
+      std::string dr;
+      if (drafts) {
+        int ver = 0, acc = 0;
+        for (int k = 0; k < n; ++k) ver += dend[k].verified, acc += dend[k].accepted;
+        char b[160];
+        std::snprintf(b, sizeof b, "; drafts: %.2f tokens and %.2f rows per step, %d of %d drafts accepted; GPU ms by rows:",
+                      st.steps ? (double)st.emitted / st.steps : 0.0, st.steps ? (double)st.rows / st.steps : 0.0, acc, ver);
+        dr = b;
+        for (int r = 1; r <= model::kMaxRows; ++r)
+          if (st.gpu_n[r]) {
+            std::snprintf(b, sizeof b, " %d: %.2f (%d)", r, st.gpu_ms[r] / st.gpu_n[r], st.gpu_n[r]);
+            dr += b;
+          }
+      }
+      std::printf("serve: batch of %d: %zu steps in %.1f ms, %.2f ms a step (median); req, tokens, end: %s%s\n", n,
+                  g_t_wait.size(), 1e3 * dt, d.empty() ? 0.0 : d[d.size() / 2], ends.c_str(), dr.c_str());
     }
-    std::printf("serve: batch of %d: %zu steps in %.1f ms, %.2f ms a step (median); req, tokens, end: %s%s\n", n,
-                g_t_wait.size(), 1e3 * dt, d.empty() ? 0.0 : d[d.size() / 2], ends.c_str(), dr.c_str());
     for (int k = 0; k < n; ++k)
       if (why[k] == kPaused) {
         pause_note();
@@ -3641,11 +3650,8 @@ class Server {
       copy_rows_accepted_total_ += (uint64_t)de->copy_rows_accepted;
       if (de->copy_scored >= 16 && 2 * de->copy_first_right < de->copy_scored) ++copy_failing_total_;
       std::copy(de->copy_chance, de->copy_chance + 4, copy_chance_);
-      std::printf("serve: req %llu copy: %d proposals made, %d scored, first token right %d; %d copy rows verified, %d accepted; this conversation misses %.1f times the average\n",
-                  (unsigned long long)h.req_id, de->copy_proposals, de->copy_scored, de->copy_first_right, de->copy_rows_verified,
-                  de->copy_rows_accepted, de->copy_rho256 / 256.0);
     }
-    if (de->vsteps) {
+    if (g_log_detail && de->vsteps) {
       char h67[48] = "";  // only with a longer block, so the default log line is as before
       if (dspark::draft_rows() > dspark::kDraftModel)
         std::snprintf(h67, sizeof h67, " 6..7: %d %d;", de->rows_hist[6], de->rows_hist[7]);
@@ -3674,16 +3680,17 @@ class Server {
                 why == fe::kStop ? "stop" : why == fe::kLength ? "length" : why == fe::kCancelled ? "cancelled" : "context",
                 m_.state_bytes() / 1048576.0, S ? (int)S->hist.size() : 0, si.bytes / 1048576.0, si.snaps.size(), sl);
     const Turn& u = f.tu;
-    std::printf("serve: req %llu turn: state ops %.1f ms (GPU %.1f), %d chunks: layers 0-19 %.1f ms, replay %.1f ms, "
+    if (g_log_detail)
+      std::printf("serve: req %llu turn: state ops %.1f ms (GPU %.1f), %d chunks: layers 0-19 %.1f ms, replay %.1f ms, "
                 "head %.1f ms, draft windows %.1f ms, rows %.1f ms; first token to decode %.1f ms, first decode step "
                 "%.1f ms\n",
                 (unsigned long long)h.req_id, u.ops_ms, u.ops_gpu_ms, u.chunks, u.pf[0], u.pf[1], u.pf[2], u.pf[3],
                 u.rows_ms, u.tail_ms, u.dec1_ms);
-    if (u.jn_on)
+    if (g_log_detail && u.jn_on)
       std::printf("serve: req %llu joins: %d chunks: attention %.1f ms, MoE %.1f ms (%d pairs), floor %.3f ms a pair\n",
                   (unsigned long long)h.req_id, u.jn_chunks, u.jn[0], u.jn[1], u.jn_pairs,
                   u.jn[2] / std::max(1, u.jn_chunks));
-    {  // the chunk pool: the conversations no line holds, and what the lines hold and have reserved
+    if (g_log_detail) {  // the chunk pool: the conversations no line holds, and what the lines hold and have reserved
       const model::Model::StoreChunks c = m_.state_chunks();
       int lines = 0;
       for (int t = 0; t < (int)slot_.size(); ++t) lines += m_.slot_committed(t);
@@ -4091,7 +4098,8 @@ class Server {
         // the counts are the settle's of the earlier commands; the conversation is the one this command queued
         char q[40] = "none";
         if (h > 0) std::snprintf(q, sizeof q, "%016llx", (unsigned long long)key);
-        std::printf("serve: split: settled: %d marked, %d imaged (idle); queued %s; %llu ghosts\n", marked, imaged, q, (unsigned long long)b.ghost_numbers);
+        if (g_log_detail)
+          std::printf("serve: split: settled: %d marked, %d imaged (idle); queued %s; %llu ghosts\n", marked, imaged, q, (unsigned long long)b.ghost_numbers);
       }
       if (1e3 * (now_s() - t0) >= 250) return;
       if (h < 0 && b.image_pending == a.image_pending && imaged == 0 && marked == 0) {  // a settle that could settle nothing yet: the image streams are still at it

@@ -322,6 +322,11 @@ impl Telemetry {
         live
     }
 
+
+    pub fn generated_tokens(&self) -> u64 {
+        self.decode_ids.load(Ordering::Relaxed)
+    }
+
     /// `n` ids of a request arrived. Atomics only.
     pub fn tokens(&self, live: &ReqLive, n: usize) {
         self.decode_ids.fetch_add(n as u64, Ordering::Relaxed);
@@ -872,18 +877,6 @@ pub fn engram_json(s: &EngineStats, rate: Option<f64>) -> Value {
            "owed_groups": s.lent_owed_groups, "huge_pct": s.engram_huge_pct})
 }
 
-/// Copy drafting's learner as the page's line reads it: proposals made and scored, the first token right, rows verified and accepted, the chance
-/// a copied token is right after a match of 8, 16, 32 and 64 tokens (thousandths) and the requests whose copies failed. Null when the gate
-/// does not learn (the engine does not send it, or it runs the fixed table).
-pub fn copy_json(s: &EngineStats) -> Value {
-    if s.copy_adapt == 0 {
-        return Value::Null;
-    }
-    json!({"proposals": s.copy_proposals_total, "scored": s.copy_scored_total, "first_right": s.copy_first_right_total,
-           "rows_verified": s.copy_rows_verified_total, "rows_accepted": s.copy_rows_accepted_total,
-           "chance_pm": s.copy_chance_pm, "failing_requests": s.copy_failing_requests_total})
-}
-
 /// The numbers one group of the pool holds (the engine's `kGroupNums`): a tenant's groups times this times a number's bytes
 /// is its memory on one Spark.
 pub const GROUP_NUMBERS: u64 = 64;
@@ -985,7 +978,7 @@ pub fn status_json(app: &App) -> Value {
     let mut health = json!({
         "max_batch_size": info.as_ref().map(|i| i.max_sessions),
         "live": {"connections": reqs.len(), "waiting": waiting, "decode_tokens_per_second": r1(dec),
-                 "prefill_tokens_per_second": r1(pre), "prompt_pass": pass},
+                 "prefill_tokens_per_second": r1(pre), "prompt_pass": pass, "generated_tokens": t.generated_tokens()},
         "spill": spill});
     if !cache.is_null() {
         health["prompt_cache"] = cache;
@@ -1000,7 +993,6 @@ pub fn status_json(app: &App) -> Value {
            "health": health, "sessions": kv, "node_health": node_health_json(t),
            "engram": stats.as_ref().map_or(Value::Null, |s| engram_json(s, t.engram_hit_rate())),
            "memory": stats.as_ref().map_or(Value::Null, memory_json),
-           "copy": stats.as_ref().map_or(Value::Null, copy_json),
            "cache": cache_json(t, unix_ms()),
            "interleave": settings_json(stats.as_ref())})
 }
@@ -1502,18 +1494,6 @@ mod tests {
     }
 
     #[test]
-    fn the_copy_learner_reaches_the_json() {
-        let s = EngineStats { copy_adapt: 1, copy_proposals_total: 3500, copy_scored_total: 3188, copy_first_right_total: 2950,
-                              copy_rows_verified_total: 5000, copy_rows_accepted_total: 4560, copy_chance_pm: [880, 920, 940, 980],
-                              copy_failing_requests_total: 2, ..Default::default() };
-        let c = copy_json(&s);
-        assert_eq!((c["proposals"].as_u64(), c["scored"].as_u64(), c["first_right"].as_u64()), (Some(3500), Some(3188), Some(2950)));
-        assert_eq!((c["rows_verified"].as_u64(), c["rows_accepted"].as_u64(), c["failing_requests"].as_u64()), (Some(5000), Some(4560), Some(2)));
-        assert_eq!(c["chance_pm"], json!([880, 920, 940, 980]));
-        assert_eq!(copy_json(&EngineStats { copy_scored_total: 5, ..Default::default() }), Value::Null, "a gate on the fixed table: null");
-    }
-
-    #[test]
     fn the_engram_cache_reaches_the_json() {
         let s = EngineStats { pool_numbers: 8913, number_bytes: 2_916_352, image_numbers: 6, lines: 32, ranks: 4, engram_cache_bytes: 2032 << 20,
                               engram_groups: 14, engram_pending_mib: 4096, engram_lookups: 1000, engram_hits: 900, engram_lend_ok_total: 3,
@@ -1851,7 +1831,7 @@ mod tests {
         has("'MAX CONTEXT'"); has("'longest per request'"); gone("extend on"); gone("'CAPACITY'");
         has("'CONVERSATIONS'"); has("saved to SSD"); gone("on SSD only");
         gone("'SSD READ-BACKS'"); gone("'RESTORES'");
-        has("'hit, last minute'"); gone("'MiB/Spark'"); gone("· ${pl(e.groups, 'group')}${going}");
+        has("'hit, 1 min'"); gone("'hit, last minute'"); gone("'MiB/Spark'"); gone("· ${pl(e.groups, 'group')}${going}");
         gone("'TOKEN IDS'"); gone("'SERVER IDS'");
         has("ENGINE SETTINGS"); gone("LONG PROMPTS AND SSD");
         has("['PROMPT', "); has("['OUTPUT', "); has("chart('DECODE tok/s'"); has("chart('PREFILL tok/s'");
@@ -2316,12 +2296,14 @@ mod tests {
     }
 
     #[test]
-    fn the_strip_has_nine_tiles_in_the_order_the_pool_adds_up() {
+    fn the_strip_has_ten_tiles_in_the_order_the_pool_adds_up() {
         let page = include_str!("dashboard.html");
-        // FIRST TOKEN, CACHE HITS, CONTEXT CACHE, LENT OUT, CONVERSATIONS, SHARED PREFIXES, MAX CONTEXT, SSD CACHE, ENGRAM CACHE
+        // FIRST TOKEN, GENERATED, CACHE HITS, CONTEXT CACHE, LENT OUT, CONVERSATIONS, SHARED PREFIXES, MAX CONTEXT, SSD CACHE, ENGRAM CACHE
         assert!(page.contains("rate.els, cachehits.els, kv.by.kv, store.by.ten, kv.by.ctx, kv.by.shared, kv.by.cap, tier.by.ssd, eg.els"));
-        assert!(page.contains("repeat(9, minmax(0, 1fr))"));
-        for gone in ["'TOKEN IDS'", "'SSD READ-BACKS'", "store-ids", "'restores'", "tok saved · wait", "partly on SSD", "'MiB on rank 0'"] {
+        assert!(page.contains("els: [t.el, g.el]") && page.contains("etile('generated', 'GENERATED'"), "GENERATED beside FIRST TOKEN");
+        assert!(page.contains("repeat(10, minmax(0, 1fr))"));
+        assert!(page.contains("live.generated_tokens") && page.contains("countFmt("), "the box reads the front-end's total, in K / M / B");
+        for gone in ["Copy drafts: ", "copyLine", "st.copy", "'TOKEN IDS'", "'SSD READ-BACKS'", "store-ids", "'restores'", "tok saved · wait", "partly on SSD", "'MiB on rank 0'"] {
             assert!(!page.contains(gone), "the page still has {gone}");
         }
         for has in ["'CACHE HITS'", "'LENT OUT'", "saved to SSD", "Their token lists take", "JUMP THE QUEUE UP TO"] {
@@ -2479,6 +2461,7 @@ mod tests {
         t.tokens(&a, 2);
         assert_eq!((a.state(), a.kv_tokens()), ("decode", 9005));
         assert_eq!(t.decode_ids.load(Ordering::Relaxed), 5);
+        assert_eq!(t.generated_tokens(), 5, "the GENERATED box's total: every output token since the front-end started");
         let j = requests_json(&t);
         let first = &j["in_flight"][0];
         assert_eq!((first["id"].as_u64(), first["generated_tokens"].as_u64(), first["key_label"].as_str(), first["ablit"].as_bool()), (Some(1), Some(5), Some("api"), Some(false)));

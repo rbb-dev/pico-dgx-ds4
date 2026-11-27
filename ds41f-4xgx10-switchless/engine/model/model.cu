@@ -1558,7 +1558,11 @@ __global__ void __launch_bounds__(1024) k_cert_lo(const float* C, const bf16* x,
   const int b = blockIdx.x, t = threadIdx.x;
   if (b == 0) {
     for (int i = t; i < kCertCtas; i += 1024) mask[i] = 0;
+#ifdef DSGB10_DEV  // the step count DSGB10_CERT_FORCE reads (development builds only)
     if (t == 0) stats[0] += 1;
+#else
+    (void)stats;
+#endif
   }
   if (b >= R) {
     if (t == 0) cand[b] = comm::ArgMax{-INFINITY, INT_MAX};
@@ -1606,9 +1610,14 @@ __global__ void __launch_bounds__(1024) k_cert_mask(const float* C, const float*
   const int b = blockIdx.x, t = threadIdx.x;
   if (b >= R) return;
   const float T = g[b].v, n = xn[b];
+#ifdef DSGB10_DEV  // DSGB10_CERT_FORCE: every Nth step runs every CTA (development builds only)
   const bool forced = force > 0 && stats[0] % (uint32_t)force == 0;
-  const bool all = forced || !(fabsf(T) < INFINITY) || !(n < INFINITY);
   if (b == 0 && t == 0 && forced) stats[6] += 1;
+#else
+  const bool forced = false;
+  (void)stats, (void)force;
+#endif
+  const bool all = forced || !(fabsf(T) < INFINITY) || !(n < INFINITY);
   const float* c = C + (size_t)b * kVocabPart;
   float* l = logits + (size_t)b * kVocabPart;
   const CertRow cr = cert_row(in, b);
@@ -1619,6 +1628,7 @@ __global__ void __launch_bounds__(1024) k_cert_mask(const float* C, const float*
     if (all || !(hi < T)) mask[i / kCertRowsCta] = 1;
   }
 }
+#ifdef DSGB10_DEV  // the certified head's check against the full head (development builds only)
 // DSGB10_CERT_CHECK: row b's maximum and its lowest id in the certified logits against the full head's (l2). The token
 // is the best (max, lowest id) over the ranks, so the certified step gives the full head's token when on every rank
 // the two agree, or the full head's maximum of this rank is below the threshold g[b].v (a lower bound of some logit, so
@@ -1676,6 +1686,7 @@ __global__ void __launch_bounds__(1024) k_cert_check(const float* logits, const 
     atomicMax(stats + 4, __float_as_uint(rt));
   }
 }
+#endif
 }  // namespace
 
 void Model::Impl::cert_head(int R) {
@@ -1690,12 +1701,14 @@ void Model::Impl::cert_head(int R) {
                (const float*)cert.xn, (const comm::ArgMax*)cert.gcand, R, logits, cert.mask, cert.stats, cert.force,
                (const ops::StepIn*)in_d, kVocabPart * rank);
   dsk::gemv_bf16x_norm_masked(yraw, norm_w, kNormEps, R, head, kVocabPart, kDim, logits, chead, cert.mask, st);
+#ifdef DSGB10_DEV
   if (cert.check) {
     dsk::gemv_bf16x_norm(yraw, norm_w, kNormEps, R, head, kVocabPart, kDim, cert.logits2, nullptr, chead, st);
     attn::launch(k_cert_check, dim3(kCertRows), dim3(1024), 0, st, false, (const float*)logits, (const float*)cert.logits2,
                  (const float*)cert.clog, (const float*)cert.B, (const float*)cert.xn, R, (const uint8_t*)cert.mask,
                  cert.stats, (const comm::ArgMax*)cert.gcand, (const ops::StepIn*)in_d, kVocabPart * rank);
   }
+#endif
 }
 
 // The bound of every vocabulary row of this rank's slice, from the raw bf16 head and its FP8 copy (bind_spec, before the
@@ -1730,9 +1743,11 @@ void Model::Impl::cert_setup(const uint8_t* head_raw, const uint8_t* q, const ui
   cert.stats = dalloc<uint32_t>(8);
   CUDA_CHECK(cudaMemset(cert.stats, 0, 32));
   CUDA_CHECK(cudaMemset(cert.mask, 0, kCertCtas));
+#ifdef DSGB10_DEV  // the check and the forced steps: development builds only
   cert.check = getenv("DSGB10_CERT_CHECK") && atoi(getenv("DSGB10_CERT_CHECK")) != 0;
   if (cert.check) cert.logits2 = dalloc<float>((size_t)kCertRows * kVocabPart);
   cert.force = getenv("DSGB10_CERT_FORCE") ? atoi(getenv("DSGB10_CERT_FORCE")) : 0;
+#endif
   cert.bscale = getenv("DSGB10_CERT_BSCALE") ? (float)atof(getenv("DSGB10_CERT_BSCALE")) : 1.f;
   cert.samp = !getenv("DSGB10_CERT_SAMPLED") || atoi(getenv("DSGB10_CERT_SAMPLED")) != 0;
   if (!(cert.bscale >= 1.f)) die("model: DSGB10_CERT_BSCALE below 1");
@@ -1960,11 +1975,13 @@ float Model::mark_ms(int i, int j) const {
 }
 float Model::last_logit(int r) const { return d_->out_h[d_->last_n % ops::kOutSlots].row[r].value; }
 int Model::graph_count() const { return (int)d_->graphs.size(); }
+#ifdef DSGB10_DEV
 bool Model::cert_stats(uint32_t out[8]) const {
   if (!d_->cert.on) return false;
   CUDA_CHECK(cudaMemcpy(out, d_->cert.stats, 32, cudaMemcpyDeviceToHost));
   return true;
 }
+#endif
 int Model::rank() const { return d_->rank; }
 cudaStream_t Model::stream() const { return d_->st; }
 

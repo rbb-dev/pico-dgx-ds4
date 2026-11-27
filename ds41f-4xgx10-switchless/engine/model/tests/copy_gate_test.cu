@@ -1,12 +1,10 @@
 // Copy drafting's learner in the two gate kernels of spec.cu, on a GB10 (the CMake target copy_gate_test; one rank, no ring, no
 // weights, allocations of a few MiB, so it can run beside an engine). Not run by the build: it needs a GPU.
-//   copy_gate_test [PATH_TO_tools/copy/fit.py]
+//   copy_gate_test
 // What it proves, each against something other than the kernel's own code:
 //  1. The one-session kernel (k_spec_next) on a stream with a known continuation, a step at a time with the verdict the sampler would
-//     give: every step's cells, conversation counts, pending record, learn sum, observation word and chosen rows equal the host
-//     reference of model/copy.h bit for bit, and the learner's per-bucket counts (proposals scored, first token right) equal what
-//     tools/copy/fit.py scores from the dump of the same run (the counts of the stream's truth), on a stream with phrases and one
-//     whose copies fail.
+//     give: every step's cells, conversation counts, pending record, observation word and chosen rows equal the host
+//     reference of model/copy.h bit for bit, on a stream with phrases and one whose copies fail.
 //  2. The batch kernel (k_spec_gate_batch_all) with entries that join and leave the step (sess_on changing), each over its own stream:
 //     the same bit-for-bit equality, and a word of 0 for every entry that did not run, every step.
 //  3. The attach reset: a conversation's counts are cleared by a new handle and kept by the same one.
@@ -95,7 +93,7 @@ struct Ref {
       if (m > 0) {
         float lt[1][kMaxDrafts], cs[kMaxDrafts], step_ms[kMaxDrafts + 1] = {};
         gate_row(L, ul.sess, mt.bucket, prior_table().t[mt.bucket], m, lt[0]);
-        n_copy = gate_rows(0, thresh, step_ms, 1.f, 1.f, 0, m, 0, lt, false, cs);
+        n_copy = gate_rows(0, thresh, step_ms, 1.f, 1.f, 0, m, 0, lt, cs);
       }
     }
     Pend pd{};
@@ -118,12 +116,12 @@ ops::StepIn* new_in() {
 }
 void put_in(ops::StepIn* d, const ops::StepIn& h) { CUDA_CHECK(cudaMemcpy(d, &h, sizeof h, cudaMemcpyHostToDevice)); }
 
-// ---- 1. one session, a stream of known continuation, fit.py as the other oracle ----
+// ---- 1. one session, a stream of known continuation ----
 struct Counts {
   long scored[kBuckets] = {}, first_right[kBuckets] = {};
 };
 
-Counts run_single(const char* name, const std::vector<int32_t>& S, int prompt, int steps, const std::string& dump_path, cudaStream_t st) {
+Counts run_single(const char* name, const std::vector<int32_t>& S, int prompt, int steps, cudaStream_t st) {
   const int ctx[1] = {(int)S.size() + 64};
   Index ix(ctx, 1, (size_t)8 << 20, st);
   const std::vector<int32_t> pr(S.begin(), S.begin() + prompt);
@@ -148,8 +146,6 @@ Counts run_single(const char* name, const std::vector<int32_t>& S, int prompt, i
   std::memset(outs, 0, sizeof(ops::SampleOut) * ops::kOutSlots);
   Args cp{ix.dev(), nullptr};
 
-  FILE* dump = std::fopen(dump_path.c_str(), "w");
-  std::fprintf(dump, "tag,step,entry,pos0,emitted_n,emitted,next_pos0,chain_k,chain,src,match_len,m,copy\n");
   Counts C;
   std::vector<int32_t> rows{S[prompt]};
   int pos0 = prompt;
@@ -166,7 +162,7 @@ Counts run_single(const char* name, const std::vector<int32_t>& S, int prompt, i
     ops::StepIn in{};
     for (int j = 0; j < R; ++j) in.tokens[j] = rows[j], in.pos[j] = pos0 + j;
     in.rows = R, in.nsess = 1, in.step = (uint32_t)(100 + i), in.spec = ops::kSpecVerify, in.thresh = thresh, in.max_drafts = ops::kDrafts;
-    in.pos_end = pos_end, in.force = -1, in.gate = ops::kGateThresh, in.copy = kRows | kAdapt | kDump, in.copy_min = kOrder;
+    in.pos_end = pos_end, in.force = -1, in.gate = ops::kGateThresh, in.copy = kRows | kAdapt, in.copy_min = kOrder;
     put_in(din, in);
     ops::SpecState ss{};
     ss.count = count, ss.pos0 = pos0, ss.bonus = bonus;
@@ -180,55 +176,21 @@ Counts run_single(const char* name, const std::vector<int32_t>& S, int prompt, i
     Learn dl;
     std::vector<UnitLearn> du;
     ix.learn_copy(&dl, &du);
-    check(same_learn(dl, L), "the shared cells and their sum equal the host reference", i);
+    check(same_learn(dl, L), "the shared cells equal the host reference", i);
     check(same_unit(du[0], ref.ul), "the conversation's counts and the pending record equal the host reference", i);
     check(o.copy_obs[0] == ref.obs(), "the observation word equals the host reference", i);
-    check(o.copy_learn == L.sum, "the learn sum equals the host reference", i);
     check(o.next_rows == 1 + ref.n_copy && o.next_tok[0] == bonus, "the rows chosen equal the host reference", i);
     for (int j = 0; j < ref.n_copy; ++j) check(o.next_tok[1 + j] == ref.ctok[j], "a copy row's token equals the host reference", i);
     for (int b = 0; b < kBuckets; ++b)
       check(o.copy_chance[b] == round_u32(fmul_rn(L.chance[b][0], 65535.f)), "the published chance equals the host reference", i);
     const Obs ob = unpack_obs(o.copy_obs[0]);
     if (ob.taken) C.scored[ob.bucket]++, C.first_right[ob.bucket] += (ob.landed >= 1 || ob.fr == 1) ? 1 : 0;
-    // the dump of the run, in the probe's format (what fit.py reads)
-    std::fprintf(dump, "t,%d,0,%d,%d,", i, pos0, count);
-    for (int j = 0; j < count; ++j) std::fprintf(dump, "%s%d", j ? ";" : "", S[pos0 + j + 1]);
-    std::fprintf(dump, ",%d,0,,%d,%d,%d,", o.next_pos0, o.copy_info[0][0], o.copy_info[0][1], o.copy_info[0][3]);
-    for (int j = 0; j < o.copy_info[0][3]; ++j) std::fprintf(dump, "%s%d", j ? ";" : "", o.copy_tok[0][j]);
-    std::fprintf(dump, "\n");
     rows.assign(o.next_tok, o.next_tok + o.next_rows);
     pos0 = o.next_pos0;
   }
-  std::fclose(dump);
   std::printf("%s: %ld proposals scored by the kernel\n", name, C.scored[0] + C.scored[1] + C.scored[2] + C.scored[3]);
   cudaFree(din), cudaFree(dss), cudaFree(ddr), cudaFree(dsv), cudaFreeHost(outs);
   return C;
-}
-
-// fit.py's own scoring of the dump: "bucket b (...): N proposals scored; first token right X" per bucket on its stderr
-void against_fit(const char* name, const Counts& C, const std::string& dump_path, const char* fit_py) {
-  if (!fit_py) {
-    std::printf("%s: no fit.py path given: the dump is %s, run `python3 tools/copy/fit.py %s --min-n 1000000` and compare its 'proposals scored' and 'first token right' per bucket\n", name, dump_path.c_str(), dump_path.c_str());
-    return;
-  }
-  const std::string cmd = std::string("python3 ") + fit_py + " " + dump_path + " --min-n 1000000 2>&1 >/dev/null";
-  FILE* p = popen(cmd.c_str(), "r");
-  check(p != nullptr, "fit.py ran");
-  if (!p) return;
-  char line[512];
-  int seen = 0;
-  while (std::fgets(line, sizeof line, p)) {
-    int b = -1, n = 0;
-    char r[32] = {};
-    if (std::sscanf(line, "bucket %d (match %*[^)]): %d proposals scored; first token right %31s", &b, &n, r) == 3 && b >= 0 && b < kBuckets) {
-      ++seen;
-      check(n == C.scored[b], "the proposals scored in the bucket equal fit.py's");
-      if (n > 0) check(std::fabs(std::atof(r) - (double)C.first_right[b] / n) < 0.0011, "the first token right in the bucket equals fit.py's");
-      std::printf("  %s bucket %d: kernel %ld scored, %ld first token right; fit.py %d scored, right %s\n", name, b, C.scored[b], C.first_right[b], n, r);
-    }
-  }
-  pclose(p);
-  check(seen == kBuckets, "fit.py printed every bucket");
 }
 
 // ---- 2. the batch kernel with entries that join and leave ----
@@ -312,8 +274,7 @@ void run_batch(cudaStream_t st) {
     Learn dl;
     std::vector<UnitLearn> du;
     ix.learn_copy(&dl, &du);
-    check(same_learn(dl, L), "batch: the shared cells and their sum equal the host reference", i);
-    check(o.copy_learn == L.sum, "batch: the learn sum equals the host reference", i);
+    check(same_learn(dl, L), "batch: the shared cells equal the host reference", i);
     for (int k = 0; k < ops::kMaxSess; ++k) {
       if (k < kE && on[k]) {
         check(o.copy_obs[k] == ref[k].obs(), "batch: an entry's observation word equals the host reference", i);
@@ -428,17 +389,14 @@ void time_kernels(cudaStream_t st) {
 
 }  // namespace
 
-int main(int argc, char** argv) {
-  const char* fit_py = argc > 1 ? argv[1] : nullptr;
+int main() {
   cudaStream_t st;
   CUDA_CHECK(cudaStreamCreate(&st));
   // 1. a stream with phrases and little noise, and one whose copies mostly fail
   for (int variant = 0; variant < 2; ++variant) {
     const std::vector<int32_t> S = variant == 0 ? stream(40000, 40, 80, 20) : stream(40000, 40, 70, 400);
-    const std::string path = std::string("/tmp/copy_gate_dump_") + (variant ? "failing" : "phrases") + ".csv";
     const char* name = variant ? "one session, copies that fail" : "one session, phrases";
-    const Counts C = run_single(name, S, 300, 6000, path, st);
-    against_fit(name, C, path, fit_py);
+    run_single(name, S, 300, 6000, st);
   }
   run_batch(st);
   run_attach(st);

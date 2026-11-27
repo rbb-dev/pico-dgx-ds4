@@ -889,7 +889,7 @@ What it does:
   `~/dsgb10/service/logs` holds `service.log` (the supervisor: every start, exit, failure and state),
   `rank.0.log` and `front.log`; each worker has `logs/rank.<r>.log`. Every (re)start rotates its log,
   and on rank 0 a log past 64 MiB is rotated in place, copied and truncated (the processes append).
-  Five old logs are kept. Rank 0 writes three lines per request (~550 B), dsfront two.
+  Five old logs are kept. Rank 0 writes one closing line per request (three, ~550 B, with `DSGB10_LOG_DETAIL=1`), dsfront two.
 - **Where a turn started.** Both logs say it in counts, never text or ids, under the same request
   number. dsfront's `req N plan:` names the session the request continues in place, the one it
   forks from, or a new one, with the bytes of text and the ids it shares with the best match.
@@ -1950,7 +1950,7 @@ The results:
   +2000 and +8000;
 - another session's 1000-token request, then +2000 more, whose state comes back from the store.
 
-Rank 0 logs each request's split (`serve: req N turn:`): the state operations (host and GPU), the
+With `DSGB10_LOG_DETAIL=1`, rank 0 logs each request's split (`serve: req N turn:`): the state operations (host and GPU), the
 chunks' GPU time in the encoder (layers 0–19) and in the replay (layers 20–39), the head, and the
 first decode step. "Before" is master 2979972 with that log line; "after" has the prefill's dense
 index scans on dsk::index_topk_p (below). Time to first token at the client, ms, measured 2026-10-12:

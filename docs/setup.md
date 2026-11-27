@@ -115,7 +115,7 @@ the LAN is slow (check the fabric's rate first: [NETWORK.md, section 6](../NETWO
 | `engram_hashmap.bin` | `make_hashmap_stdlib.py` | `~/dsgb10/engram/` of every Spark | you |
 | `ablit.bin` | this repository (`tools/ablit/ablit.bin`) | `~/dsgb10/` of rank 0 | the start helper copies it to the workers |
 | `cfmlp_cml.bin` | in the repository (`tools/stack4/`) | `~/dsgb10/bin/` of every Spark | `pico-ctl.sh install` on rank 0, the start helper on the workers |
-| `copy-T.txt` (optional) | `tools/copy/fit.py` | the same path on every Spark | you |
+| `copy-T.txt` (optional) | you (4 lines of 7 numbers, [batching.md](batching.md)) | the same path on every Spark | you |
 | the SSD tier, the kept sessions | the engine | `~/dsgb10/spill/` | nothing to place |
 
 **5.1 The rank files** (format version 3: the engine refuses a file of another version, so after an upgrade that changes the version, cut
@@ -169,8 +169,8 @@ Keep it on rank 0 only. Leave `--ablit` out of the settings to serve the checkpo
 `~/dsgb10/bin/` and `prepare` copies it to the workers. The engine stops at its start if the file named by `DSGB10_CF_MLP` is missing on a Spark.
 
 **5.6 The copy table** (optional). Copy drafting uses the engine's built-in table when `DSGB10_COPY_TABLE` is not set, and the served line
-does not set it; the built-in table runs high under sampling. `tools/copy/fit.py` fits one from dumped data (`DSGB10_COPY_DUMP=1`, see
-[batching.md](batching.md)); add `--setenv DSGB10_COPY_TABLE=<path>` to `ENGINE_ARGS` and put the file at the same path on **every**
+does not set it; the built-in table runs high under sampling. A table file is 4 lines of 7 numbers in (0, 1] ([batching.md](batching.md)); add
+`--setenv DSGB10_COPY_TABLE=<path>` to `ENGINE_ARGS` and put the file at the same path on **every**
 Spark: a Spark without it stops the engine at its start (`copy: DSGB10_COPY_TABLE=... cannot read it on this rank`), and neither
 `install` nor `prepare` copies it. The engine follows the traffic by itself and the table is only its starting values
 (`DSGB10_COPY_ADAPT=0` turns that off); every Spark must have the same copy settings and table file (the engine compares them at its start and stops if they differ).

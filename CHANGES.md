@@ -376,7 +376,7 @@ resumed request encodes nothing again.
 
 `/dashboard` on the front-end. [`docs/dashboard.md`](docs/dashboard.md)
 
-**A live status page.** The decode and prefill rates; nine tiles (first token, context cache, max context, conversations, shared
+**A live status page.** The decode and prefill rates; ten tiles (first token, tokens generated, context cache, max context, conversations, shared
 prefixes, Engram cache, lent memory, SSD cache, cache hits); decode, prefill and cache charts; one row a request with its phase
 and progress; one row a Spark with memory, temperatures, GPU, SSD wear, both links and fans; and the settings that change live.
 - Measured with the first version of the page on an earlier build: one user 79.3 t/s with it open, 79.8 with it closed.
@@ -405,6 +405,14 @@ switch turns off with its off value (`DSGB10_X=0`, `--no-draft-head4`, `--no-dra
 - Settings: none new; `--no-draft-head4` and `--no-draft-markov8` are the off forms of the two drafter flags.
 - Test: `served_test` (the served list against the tables; its wrong-rule control is the `-DPICO_OLD_RULES` build) and the front-end's
   `serve_without_settings_is_the_served_configuration`.
+
+**A quiet serving log.** A serving engine prints its start-up lines, one closing line per request (prompt, reuse, prefill, tokens
+and rate, the stop, the store), errors and rare events; nothing per step. `DSGB10_LOG_DETAIL=1` adds the per-request detail lines,
+the per-step timeline and the spill, checkpoint and split-settled lines; the tools' modes print them without it. pico-dgx-ds4's
+measurement tools (the step log, the hidden-state dump, the certified head's check) build only with `cmake -DDSGB10_DEV=ON`.
+- Settings: `DSGB10_LOG_DETAIL=1`; the build option `DSGB10_DEV` (off).
+- Measured: on the serving engine with real traffic, 875 log lines (86 KB) in 10 minutes before; 35 in 10 minutes after (27
+  requests' closing lines, 8 rare-event lines).
 
 **A served installation in `deploy/`.** The settings file, the systemd units for the engine, front-end and media worker, and
 `pico-ctl.sh`, which drops every Spark's page cache before a start, refuses a start when a Spark has too little memory free, and

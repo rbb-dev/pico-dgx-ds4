@@ -133,25 +133,10 @@ struct SampleOut {
   int32_t sess_pos0[kMaxSess];  // its first row's position
   int32_t next_srows[kMaxSess], next_spos0[kMaxSess];  // its rows of the next step (0: it was off this step)
   int32_t next_stok[kMaxSess][kSessTok];
-  // DSGB10_GATE_DUMP (data collection only; written by the batch gate when it is on): entry k's survival as the head
-  // shipped it, as the confidence MLP gave it (0 without the MLP), as the gate used it (after DSGB10_BATCH_CAL), the
-  // MLP's inputs (shipped logits, margins, log p1; 5 each; 0 without the MLP), and the drafts the gate kept
-  float gate_ship[kMaxSess][kDrafts], gate_mlp[kMaxSess][kDrafts], gate_used[kMaxSess][kDrafts];
-  float gate_feat[kMaxSess][16];
-  int32_t gate_keep[kMaxSess];
-  // copy drafting (StepIn::copy with the dump bit): entry k's proposal after its chain's kept drafts, written by the gate:
-  // copy_info = {the source's end position (-1: none), the match length, the chain drafts kept, the rows proposed},
-  // copy_tok the proposed tokens. A one-session step uses entry 0. copy_digest: the running digest of the rows every
-  // step chose (copy::digest_fold over next_rows and next_tok), the same on every rank.
-  int32_t copy_info[kMaxSess][4];
-  int32_t copy_tok[kMaxSess][kCopyDrafts];
-  uint32_t copy_digest;
   // copy drafting with the learner (copy::kAdapt), written by the gate every step: copy_obs[k] one packed word for entry k
   // (copy.h pack_obs: the outcome taken from its last proposal, the rows it verified and kept, the conversation's ratio), a
-  // one-session step uses entry 0; copy_learn the fold of every outcome taken (copy::Learn::sum), the same on every rank;
-  // copy_chance the shared first-token chance by match bucket in 1/65535.
+  // one-session step uses entry 0; copy_chance the shared first-token chance by match bucket in 1/65535.
   uint32_t copy_obs[kMaxSess];
-  uint32_t copy_learn;
   uint32_t copy_chance[4];
 };
 // The device's side of speculative steps (spec.cu), in device memory: what a spec step's sampling

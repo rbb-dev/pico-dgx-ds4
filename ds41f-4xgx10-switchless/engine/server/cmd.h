@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "comm/ring.h"
+#include "common/log_detail.h"
 #include "model/copy.h"
 #include "model/model.h"
 #include "server/mem_watch.h"
@@ -350,8 +351,9 @@ std::vector<DecodeEnd> spec_batch_loop(model::Model& m, const Cmd& c, const std:
                                        const OnBatch& on, SpecBatchStats* st = nullptr, const OnStep& step = {});
 
 // Host timeline of the last decode loop (diagnostics): per step, when its sample arrived, when the
-// next step's Engram lookups were submitted, and when the step after was launched.
+// next step's Engram lookups were submitted, and when the step after was launched. Kept only with g_log_detail.
 extern std::vector<double> g_t_wait, g_t_late, g_t_launch;
+// g_log_detail (common/log_detail.h): the detail lines and this timeline.
 
 // Ranks 1-3: run rank 0's commands until kCmdStop.
 void follow(model::Model& m, comm::Ring& ring, Watchdog& wd, int rank);

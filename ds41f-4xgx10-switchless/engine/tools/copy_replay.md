@@ -41,8 +41,8 @@ starting from the built-in table, with each conversation's own correction), a fi
 
 ## What it reports
 
-Per source: conversations, outputs, prompt and predicted tokens. With every proposed row verified (as `DSGB10_COPY_DUMP=2`
-does), per match-length bucket: the proposals, how many leading rows were right, and for each depth j the observed chance
+Per source: conversations, outputs, prompt and predicted tokens. Per
+match-length bucket: the proposals, how many leading rows were right, and for each depth j the observed chance
 that copies 1..j are all right beside each table's value. Then for each table, the run with that rule choosing the rows: steps, tokens a step, rows
 verified, accepted, wasted, right rows not verified, accepted copy tokens per 1,000 predicted tokens, and a modelled speedup
 (plain decode steps at `step_ms[0]` against the rule's steps' `step_ms[rows]`). The same files and options give the same

@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "common/log_detail.h"
 #include "common/alloc_seal.h"
 #include "common/check.h"
 
@@ -256,14 +257,16 @@ void SpillFile::writer() {
       posix_fadvise(fd_, (off_t)j.off, (off_t)j.n, POSIX_FADV_DONTNEED);
     }
     if (j.last) {
-      float sum_ms = 0, copy_ms = 0;
-      if (j.pre) CUDA_CHECK(cudaEventElapsedTime(&sum_ms, j.pre, j.start));
-      CUDA_CHECK(cudaEventElapsedTime(&copy_ms, j.start, j.ev));
-      const double w = now_s() - t_landed;
-      std::printf("spill: %.1f MiB to staging in %.2f ms on the stream (%.1f GB/s; checksums before it %.2f ms), "
-                  "then to the file in %.1f ms (%.2f GB/s)\n",
-                  j.batch / 1048576.0, copy_ms, j.batch / std::max(1e-6, (double)copy_ms) / 1e6, sum_ms, 1e3 * w,
-                  j.batch / std::max(1e-9, w) / 1e9);
+      if (g_log_detail) {  // common/log_detail.h
+        float sum_ms = 0, copy_ms = 0;
+        if (j.pre) CUDA_CHECK(cudaEventElapsedTime(&sum_ms, j.pre, j.start));
+        CUDA_CHECK(cudaEventElapsedTime(&copy_ms, j.start, j.ev));
+        const double w = now_s() - t_landed;
+        std::printf("spill: %.1f MiB to staging in %.2f ms on the stream (%.1f GB/s; checksums before it %.2f ms), "
+                    "then to the file in %.1f ms (%.2f GB/s)\n",
+                    j.batch / 1048576.0, copy_ms, j.batch / std::max(1e-6, (double)copy_ms) / 1e6, sum_ms, 1e3 * w,
+                    j.batch / std::max(1e-9, w) / 1e9);
+      }
       for (cudaEvent_t e : {j.pre, j.start, j.ev})
         if (e) CUDA_CHECK(cudaEventDestroy(e));
       waited = nullptr;

@@ -171,7 +171,7 @@ survives, and its logit comes from the same exact kernel, so the token is the on
 takes the certified bodies for such rows; `DSGB10_CERT_SAMPLED=0` keeps the full head for them. Above T = 1 the
 scores flatten and more of the head survives, so those rows keep the full head.
 
-Exactness. `DSGB10_CERT_CHECK=1` (pico-dgx-ds4's check mode, extended: for a sampled row it compares the scores' winners)
+Exactness. `DSGB10_CERT_CHECK=1` (a development build, `-DDSGB10_DEV=ON`; pico-dgx-ds4's check mode, extended: for a sampled row it compares the scores' winners)
 runs the full head beside the certified one on every rank: 27 chat and 27 code requests sampled at T = 1.0 and 18
 greedy ones, every row checked on each of the four ranks, 0 mismatches; the largest |coarse - exact|
 was 7.5 % of the bound. The sampled bench (fixed prefix and seed per request) takes the same steps with it as

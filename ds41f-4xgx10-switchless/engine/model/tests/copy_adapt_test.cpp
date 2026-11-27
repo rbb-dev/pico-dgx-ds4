@@ -135,8 +135,8 @@ bool no_change_holds() {
             const float chain_prev = 0.3f + 0.7f * (float)urand(), thresh = 0.2f + 0.3f * (float)urand();
             const int k = (int)(rnd() % (unsigned)std::min(3, kMaxDrafts - m + 1));  // k + m rows stay within step_ms
             float a[kMaxDrafts] = {}, c[kMaxDrafts] = {};
-            const int na = gate_rows(gate, thresh, step_ms, chain_prev, 1.f + chain_prev, k, m, b, T.t, false, a);
-            const int nc = gate_rows(gate, thresh, step_ms, chain_prev, 1.f + chain_prev, k, m, 0, lt, false, c);
+            const int na = gate_rows(gate, thresh, step_ms, chain_prev, 1.f + chain_prev, k, m, b, T.t, a);
+            const int nc = gate_rows(gate, thresh, step_ms, chain_prev, 1.f + chain_prev, k, m, 0, lt, c);
             if (na != nc || std::memcmp(a, c, sizeof(float) * (size_t)m) != 0) ok = false;
           }
       }
@@ -234,7 +234,7 @@ void conv_step(Learn& L, Conv& c, const Table& T, float thresh, bool learn, Tall
     float lt[1][kMaxDrafts], surv[kMaxDrafts], step_ms[kMaxDrafts + 1] = {};
     if (learn) gate_row(L, c.sess, b, T.t[b], m, lt[0]);
     else std::memcpy(lt[0], T.t[b], sizeof(float) * (size_t)m);
-    const int n = gate_rows(0, thresh, step_ms, 1.f, 1.f, 0, m, 0, lt, false, surv);
+    const int n = gate_rows(0, thresh, step_ms, 1.f, 1.f, 0, m, 0, lt, surv);
     bool right[3];
     for (int j = 0; j < m; ++j) right[j] = urand() < c.p;
     int a = 0;
@@ -325,8 +325,8 @@ bool order_holds_with(bool arrival_fold) {
     }
   }
   for (int i = 1; i < kInst; ++i)
-    if (std::memcmp(&L[0], &L[i], sizeof(Learn)) != 0 || L[0].sum != L[i].sum) ok = false;
-  if (std::memcmp(&L[0], &M, sizeof(Learn)) != 0 || L[0].sum != M.sum) ok = false;
+    if (std::memcmp(&L[0], &L[i], sizeof(Learn)) != 0) ok = false;
+  if (std::memcmp(&L[0], &M, sizeof(Learn)) != 0) ok = false;
   // a conversation's own counts do not depend on the shared fold's order: two copies given the same outcomes end alike
   Sess a{}, b{};
   Learn Z;
@@ -462,29 +462,27 @@ bool gaps_do_not_lose_outcomes() {
 // accept (DSGB10_RELAX, DSGB10_RELAX_P) keeps it off unless it is asked for by name (then the start refuses: spec.cu).
 bool switches_hold() {
   struct Case {
-    const char *c, *d, *a, *r, *rp;
+    const char *c, *a, *r, *rp;
     int32_t want;
   } cases[] = {
-      {"1", nullptr, nullptr, nullptr, nullptr, kRows | kAdapt},       // copy drafting on: the learner with it
-      {"1", nullptr, "0", nullptr, nullptr, kRows},                     // turned off by name
-      {"1", nullptr, "1", nullptr, nullptr, kRows | kAdapt},           // asked for by name
-      {nullptr, nullptr, nullptr, nullptr, nullptr, 0},                 // nothing set: nothing on
-      {nullptr, nullptr, "1", nullptr, nullptr, 0},                     // the learner alone is nothing
-      {"0", nullptr, nullptr, nullptr, nullptr, 0},                     // copy drafting off
-      {nullptr, "1", nullptr, nullptr, nullptr, kDump | kAdapt},       // the dump: the learner with it
-      {nullptr, "2", nullptr, nullptr, nullptr, kDump | kRows | kAll | kAdapt},
-      {"1", nullptr, nullptr, "0.5", nullptr, kRows},                   // a relaxed accept: off unless asked for
-      {"1", nullptr, nullptr, nullptr, "0.1", kRows},
-      {"1", nullptr, nullptr, "0", "0", kRows | kAdapt},                // relax set to 0 is no relax
-      {"1", nullptr, "1", "0.5", nullptr, kRows | kAdapt},             // asked for by name beside relax: kept, the start refuses
-      {"1", nullptr, "", nullptr, nullptr, kRows | kAdapt},            // set empty is unset
+      {"1", nullptr, nullptr, nullptr, kRows | kAdapt},       // copy drafting on: the learner with it
+      {"1", "0", nullptr, nullptr, kRows},                     // turned off by name
+      {"1", "1", nullptr, nullptr, kRows | kAdapt},           // asked for by name
+      {nullptr, nullptr, nullptr, nullptr, 0},                 // nothing set: nothing on
+      {nullptr, "1", nullptr, nullptr, 0},                     // the learner alone is nothing
+      {"0", nullptr, nullptr, nullptr, 0},                     // copy drafting off
+      {"1", nullptr, "0.5", nullptr, kRows},                   // a relaxed accept: off unless asked for
+      {"1", nullptr, nullptr, "0.1", kRows},
+      {"1", nullptr, "0", "0", kRows | kAdapt},                // relax set to 0 is no relax
+      {"1", "1", "0.5", nullptr, kRows | kAdapt},             // asked for by name beside relax: kept, the start refuses
+      {"1", "", nullptr, nullptr, kRows | kAdapt},            // set empty is unset
   };
   bool ok = true;
   for (const Case& k : cases) {
-    const int32_t got = mode_from(k.c, k.d, k.a, k.r, k.rp);
+    const int32_t got = mode_from(k.c, k.a, k.r, k.rp);
     if (got != k.want) {
-      std::printf("  mode_from(%s, %s, %s, %s, %s) = %d, want %d\n", k.c ? k.c : "-", k.d ? k.d : "-", k.a ? k.a : "-",
-                  k.r ? k.r : "-", k.rp ? k.rp : "-", got, k.want);
+      std::printf("  mode_from(%s, %s, %s, %s) = %d, want %d\n", k.c ? k.c : "-", k.a ? k.a : "-", k.r ? k.r : "-",
+                  k.rp ? k.rp : "-", got, k.want);
       ok = false;
     }
   }

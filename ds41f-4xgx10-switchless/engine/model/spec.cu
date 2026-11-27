@@ -26,16 +26,6 @@ using namespace detail;
 
 namespace detail {
 
-// DSGB10_GATE_DUMP (data collection only): 1 writes each batch step's survivals and the MLP's inputs for the host to
-// dump, 2 also keeps every draft the row budget allows. Unset or 0: nothing is written, the gate is as without it.
-int gate_dump_mode() {
-  static const int m = [] {
-    const char* e = getenv("DSGB10_GATE_DUMP");
-    return e && *e ? std::min(2, std::max(0, atoi(e))) : 0;
-  }();
-  return m;
-}
-
 // wide64 (docs/wide64.md): DSGB10_WIDE=W (kDecodeRows < W <= kMaxRows) lets batch spec steps reach W rows through the
 // wide bodies; unset or <= kDecodeRows: the steps stay within kDecodeRows (the build of before wide64).
 int spec_wide_rows() {
@@ -201,8 +191,9 @@ __global__ void k_run_repair(const ops::StepIn* in, const ops::SpecState* ss, co
   }
 }
 
-// stack4 (DSGB10_MH_DUMP, data collection only): the step's rows of main_hidden (the rejected rows' too) into the
-// pinned ring's slot of this step, for the host to write out (cmd.cpp).
+#ifdef DSGB10_DEV
+// stack4 (DSGB10_MH_DUMP, data collection only; development builds): the step's rows of main_hidden (the rejected rows' too)
+// into the pinned ring's slot of this step, for the host to write out (cmd.cpp).
 __global__ void k_mh_dump(const uint16_t* mh, const ops::StepIn* in, uint16_t* buf) {
   const int r = blockIdx.x;
   if (r >= in->rows) return;
@@ -210,6 +201,7 @@ __global__ void k_mh_dump(const uint16_t* mh, const ops::StepIn* in, uint16_t* b
   const uint16_t* s = mh + (size_t)r * dspark::kMainK;
   for (int i = threadIdx.x; i < dspark::kMainK; i += blockDim.x) d[i] = s[i];
 }
+#endif
 
 // DSGB10_DRAFT_DYN=L: which draft pass this step runs: the long block (DSGB10_DRAFT_MAX rows) after a step that accepted at
 // least L drafts (the text is being predicted well), else the model's own rows. With copy rows on (long steps' cursor kept) the
@@ -288,16 +280,12 @@ __global__ void k_spec_next(const ops::StepIn* in, ops::SpecState* ss, const int
             float lt[1][copy::kMaxDrafts];
             copy::gate_row(cp.dev->learn, ul->sess, mt.bucket, cp.dev->table.t[mt.bucket], m, lt[0]);
             n_copy = copy::gate_rows(in->gate, in->thresh, in->step_ms, k > 0 ? surv[k - 1] : 1.f, e_chain, k, m, 0, lt,
-                                     (in->copy & copy::kAll) != 0, cs);
+                                     cs);
           } else {
             n_copy = copy::gate_rows(in->gate, in->thresh, in->step_ms, k > 0 ? surv[k - 1] : 1.f, e_chain, k, m, mt.bucket,
-                                     cp.dev->table.t, (in->copy & copy::kAll) != 0, cs);
+                                     cp.dev->table.t, cs);
           }
         }
-      }
-      if (in->copy & copy::kDump) {
-        o.copy_info[0][0] = mt.e, o.copy_info[0][1] = mt.len, o.copy_info[0][2] = k, o.copy_info[0][3] = m;
-        for (int j = 0; j < copy::kMaxDrafts; ++j) o.copy_tok[0][j] = j < m ? ctok[j] : 0;
       }
     }
     if (ul) {  // the record waits for the next verify step's verdict; the shared cells take this step's outcome last, so both gate kernels read the table as the step before left it
@@ -308,7 +296,6 @@ __global__ void k_spec_next(const ops::StepIn* in, ops::SpecState* ss, const int
       ul->pend = pd;
       o.copy_obs[0] = copy::pack_obs(tk, n_copy, m > 0, copy::ratio(ul->sess));
       copy::fold_all(cp.dev->learn, &tk, 1);
-      o.copy_learn = cp.dev->learn.sum;
       for (int b = 0; b < copy::kBuckets; ++b) o.copy_chance[b] = copy::round_u32(copy::fmul_rn(cp.dev->learn.chance[b][0], 65535.f));
     } else if (in->copy & copy::kAdapt) {
       o.copy_obs[0] = 0;
@@ -328,12 +315,6 @@ __global__ void k_spec_next(const ops::StepIn* in, ops::SpecState* ss, const int
   for (int j = 0; j < ops::kDrafts; ++j) o.drafts[j] = drafts[j], o.survival[j] = surv[j];
   if (cf)
     for (int j = 0; j < 16; ++j) o.cf[j] = cf[j];
-  if (cp.dev && in->copy) {  // the rank-agreement digest: what this step chose
-    uint32_t dg = cp.dev->digest;
-    dg = copy::digest_fold(dg, ss->next_rows);
-    for (int j = 0; j < ss->next_rows; ++j) dg = copy::digest_fold(dg, ss->next_tok[j]);
-    cp.dev->digest = dg, o.copy_digest = dg;
-  }
   __threadfence_system();
   st_release_sys_u32(&o.seq, in->step + 1);
 }
@@ -381,15 +362,12 @@ __global__ void k_spec_in_batch(const ops::StepIn* ring, uint32_t* counter, cons
 //
 // GateOpt (every field off by default). trim16 (DSGB10_BATCH_TRIM; tc0 / tc1 = DSGB10_BATCH_TRIM_COST): the tokens-per-ms
 // trim below also for steps within kDecodeRows rows. cal (DSGB10_BATCH_CAL=a1,b1 .. a5,b5): each depth's chance goes
-// through sigmoid(a * logit + b). dump (DSGB10_GATE_DUMP 1 or 2): survivals, MLP inputs and kept drafts go into SampleOut.
-// ship0 / mlp0 / feat0: entry k's shipped survival, the MLP's and its inputs, at surv0's strides (feat0: 16); null if none.
+// through sigmoid(a * logit + b).
 struct GateOpt {
   int trim16;
   float tc0, tc1;
   int has_cal;
   float cal[2 * ops::kBatchDrafts];
-  int dump;
-  const float *ship0, *mlp0, *feat0;
 };
 __device__ inline float gate_logit(float p) {
   p = fminf(fmaxf(p, 1e-6f), 1.f - 1e-6f);
@@ -435,9 +413,7 @@ __global__ void k_spec_gate_batch_all(const ops::StepIn* in, ops::SpecState* ss,
     const int P = s.pos0 + s.count;
     const int maxk = min(min(ops::kBatchDrafts, in->scap[k]), in->spos_end[k] - 1 - P);
     const float thresh = in->sthresh[k];
-    if (opt.dump == 2) {
-      n = maxk;
-    } else if (in->gate == ops::kGateRatio) {
+    if (in->gate == ops::kGateRatio) {
       float e = 1.f, best = 1.f / in->step_ms[0];
       for (int j = 1; j <= maxk; ++j) {
         e += surv[j - 1];
@@ -470,7 +446,7 @@ __global__ void k_spec_gate_batch_all(const ops::StepIn* in, ops::SpecState* ss,
           int32_t d[ops::kDrafts];
           for (int j = 0; j < n; ++j) d[j] = tok0[k * tok_stride + j];
           m = copy::propose(u, P, d, n, maxm, in->copy_min, ctok, &mt);
-          if (m > 0 && (in->copy & copy::kRows) && in->rbudget > 0 && opt.dump != 2) {
+          if (m > 0 && (in->copy & copy::kRows) && in->rbudget > 0) {
             float e_chain = 1.f, cs[copy::kMaxDrafts];
             for (int j = 0; j < n; ++j) e_chain += surv[j];
             int g;
@@ -478,10 +454,10 @@ __global__ void k_spec_gate_batch_all(const ops::StepIn* in, ops::SpecState* ss,
               float lt[1][copy::kMaxDrafts];
               copy::gate_row(cp.dev->learn, ul->sess, mt.bucket, cp.dev->table.t[mt.bucket], m, lt[0]);
               g = copy::gate_rows(in->gate, thresh, in->step_ms, n > 0 ? surv[n - 1] : 1.f, e_chain, n, m, 0, lt,
-                                  (in->copy & copy::kAll) != 0, cs);
+                                  cs);
             } else {
               g = copy::gate_rows(in->gate, thresh, in->step_ms, n > 0 ? surv[n - 1] : 1.f, e_chain, n, m, mt.bucket,
-                                  cp.dev->table.t, (in->copy & copy::kAll) != 0, cs);
+                                  cp.dev->table.t, cs);
             }
             for (int j = 0; j < g; ++j) ssv[k][n + j] = cs[j], sctok[k][j] = ctok[j];
             n += g;
@@ -491,21 +467,7 @@ __global__ void k_spec_gate_batch_all(const ops::StepIn* in, ops::SpecState* ss,
           smm[k] = (int8_t)m, sbk[k] = (int8_t)mt.bucket;
           for (int j = 0; j < m; ++j) sctok[k][j] = ctok[j];
         }
-        if (in->copy & copy::kDump) {
-          ops::SampleOut& od = outs[in->step % ops::kOutSlots];
-          od.copy_info[k][0] = mt.e, od.copy_info[k][1] = mt.len, od.copy_info[k][2] = nchain, od.copy_info[k][3] = m;
-          for (int j = 0; j < copy::kMaxDrafts; ++j) od.copy_tok[k][j] = j < m ? ctok[j] : 0;
-        }
       }
-    }
-    if (opt.dump) {
-      ops::SampleOut& od = outs[in->step % ops::kOutSlots];
-      for (int j = 0; j < ops::kBatchDrafts; ++j) {
-        od.gate_ship[k][j] = opt.ship0 ? opt.ship0[k * surv_stride + j] : 0.f;
-        od.gate_mlp[k][j] = opt.mlp0 ? opt.mlp0[k * surv_stride + j] : 0.f;
-        od.gate_used[k][j] = surv[j];
-      }
-      for (int j = 0; j < 16; ++j) od.gate_feat[k][j] = opt.feat0 ? opt.feat0[k * 16 + j] : 0.f;
     }
   }
   if (k < ops::kMaxSess) sn[k] = on ? n : -1, snc[k] = nchain;
@@ -529,9 +491,9 @@ __global__ void k_spec_gate_batch_all(const ops::StepIn* in, ops::SpecState* ss,
     // model, by the bucket's rows). It trims the lowest-survival last drafts one at a time (drafts below wsmin go
     // first, unconditionally) and keeps the best point of that order from the full step down to kDecodeRows rows,
     // so a step goes wide only when its drafts pay for the wide body. Lossless: only which drafts are verified.
-    const bool narrow = opt.trim16 && opt.dump != 2 && in->rbudget <= kDecodeRows;
+    const bool narrow = opt.trim16 && in->rbudget <= kDecodeRows;
     const int floor_rows = narrow ? 0 : kDecodeRows;
-    if (opt.dump != 2 && ((in->rbudget > kDecodeRows && rows > kDecodeRows) || narrow)) {
+    if ((in->rbudget > kDecodeRows && rows > kDecodeRows) || narrow) {
       auto cost = [&](int R) {
         if (narrow) return opt.tc0 + opt.tc1 * R;
         return R <= kDecodeRows ? in->wcost[0] + in->wcost[1] * R
@@ -597,25 +559,14 @@ __global__ void k_spec_gate_batch_all(const ops::StepIn* in, ops::SpecState* ss,
       o.copy_obs[k] = copy::pack_obs(stk[k], kept, smm[k] > 0, srho[k]);
     }
     o.next_srows[k] = 1 + n;
-    if (opt.dump) o.gate_keep[k] = n;
     o.next_spos0[k] = P;
     for (int j = 0; j < ops::kSessTok; ++j) o.next_stok[k][j] = s.next_tok[j];
   }
   __syncthreads();
-  if (k == 0 && cp.dev && in->copy) {  // the rank-agreement digest: what every entry's next rows are, in entry order
-    uint32_t dg = cp.dev->digest;
-    for (int q = 0; q < ops::kMaxSess && q < in->nsess; ++q) {
-      if (!in->sess_on[q]) continue;
-      dg = copy::digest_fold(dg, ss[q].next_rows);
-      for (int j = 0; j < ss[q].next_rows; ++j) dg = copy::digest_fold(dg, ss[q].next_tok[j]);
-    }
-    cp.dev->digest = dg, outs[in->step % ops::kOutSlots].copy_digest = dg;
-    if (adapt) {  // the entries' outcomes into the shared cells in entry order, after every thread has gated on them as they stood
-      ops::SampleOut& od = outs[in->step % ops::kOutSlots];
-      copy::fold_all(cp.dev->learn, stk, min(in->nsess, (int)ops::kMaxSess));
-      od.copy_learn = cp.dev->learn.sum;
-      for (int b = 0; b < copy::kBuckets; ++b) od.copy_chance[b] = copy::round_u32(copy::fmul_rn(cp.dev->learn.chance[b][0], 65535.f));
-    }
+  if (k == 0 && cp.dev && in->copy && adapt) {  // the entries' outcomes into the shared cells in entry order, after every thread has gated on them as they stood
+    ops::SampleOut& od = outs[in->step % ops::kOutSlots];
+    copy::fold_all(cp.dev->learn, stk, min(in->nsess, (int)ops::kMaxSess));
+    for (int b = 0; b < copy::kBuckets; ++b) od.copy_chance[b] = copy::round_u32(copy::fmul_rn(cp.dev->learn.chance[b][0], 65535.f));
   }
   __threadfence_system();
 }
@@ -1025,8 +976,10 @@ void Model::Impl::bind_spec(dsw::WeightFile& wf, const dsw::WeightFile* draft) {
   }
   static_assert(kDecodeRows <= dspark::kMaxHidden, "a batch spec step's rows fit the draft module's main_hidden tap");
   sp.mh = dalloc<uint16_t>((size_t)kMaxRows * dspark::kMainK);
+#ifdef DSGB10_DEV
   if (const char* e = getenv("DSGB10_MH_DUMP"); e && *e && rank == (getenv("DSGB10_MH_RANK") ? atoi(getenv("DSGB10_MH_RANK")) : 3))
     sp.mhd = halloc<uint16_t>((size_t)ops::kOutSlots * kMaxSessRows * dspark::kMainK);
+#endif
   sp.ss = dalloc<ops::SpecState>(ops::kMaxSess);  // [0] the one-session step's; B3's entries' [k]
   sp.bents = std::min({ops::kMaxSess, nslots, spec_wide_rows() ? ops::kMaxSess : kMaxSpecEnts});  // wide64: 16
   sp.row0 = dalloc<int>(ops::kMaxSess);
@@ -1040,10 +993,9 @@ void Model::Impl::bind_spec(dsw::WeightFile& wf, const dsw::WeightFile* draft) {
   sp.pstab = dalloc<int>((size_t)ops::kMaxSess * ops::kBatchDrafts);
   sp.mism = dalloc<unsigned>(1);
   if (sp.bents >= 2) sp.draft->enable_batch();
-  // DSGB10_BATCH_CF=1 (the batch gate reads the MLP's survival) or DSGB10_GATE_DUMP (the MLP's values and inputs are dumped):
-  // batch passes run the confidence MLP over their rows too. Needs DSGB10_CF_MLP; the same on every rank (a collective).
-  if (sp.bents >= 2 && sp.draft->cf_raw() &&
-      ((getenv("DSGB10_BATCH_CF") && atoi(getenv("DSGB10_BATCH_CF")) > 0) || gate_dump_mode()))
+  // DSGB10_BATCH_CF=1 (the batch gate reads the MLP's survival): batch passes run the confidence MLP over their rows too.
+  // Needs DSGB10_CF_MLP; the same on every rank (a collective).
+  if (sp.bents >= 2 && sp.draft->cf_raw() && getenv("DSGB10_BATCH_CF") && atoi(getenv("DSGB10_BATCH_CF")) > 0)
     sp.draft->enable_cf_batch();
   // the prefill's seed rows, sized for a 4096-row chunk with snapshots every 1024 (768 rows in 96
   // groups, 384 on the last rank), so that a prefill rarely has to grow them (which synchronises)
@@ -1072,9 +1024,8 @@ void Model::Impl::bind_spec(dsw::WeightFile& wf, const dsw::WeightFile* draft) {
                     copy::copy_rows() >= 64 ? 63 : 31);
     }
     if (rank == 0)
-      std::printf("copy: drafting %s%s, %.1f MiB of the %d MiB arena a rank (an estimate of one session's lookup: a few "
-                  "us a step, not timed)\n", copy::mode() & copy::kRows ? "rows on" : "probe", copy::mode() & copy::kAll ? ", every proposed row" : "",
-                  (double)sp.copy->bytes() / 1048576.0, opt.copy_mib);
+      std::printf("copy: drafting on, %.1f MiB of the %d MiB arena a rank (an estimate of one session's lookup: a few us a step, "
+                  "not timed)\n", (double)sp.copy->bytes() / 1048576.0, opt.copy_mib);
   }
   sp.pf_rows = kSpecPfRows + 2 * kSnapRows, sp.pf_groups = 128;
   sp.pf_mh = dalloc<uint16_t>((size_t)kRanks * sp.pf_rows * dspark::kMainK);
@@ -1222,7 +1173,9 @@ cudaGraphExec_t Model::Impl::spec_graph(int ctx) {
   // module, the next step's rows, the publication
   CUDA_CHECK(cudaStreamBeginCaptureToGraph(st, g, &sw, nullptr, 1, mode));
   if (!xl) ops::sample(ch, logits, kVocabPart * rank, in_d, ctl_h, out_h, fb, samp_ctr, st, sp.ss, ops::kLowRows);
+#ifdef DSGB10_DEV
   if (sp.mhd) k_mh_dump<<<kMaxSessRows, 256, 0, st>>>(sp.mh, in_d, sp.mhd);  // stack4: data collection
+#endif
   // the step's session's windows (every entry of its slot table holds its slot)
   const int* slot = nunits > 1 ? in_d->slot : nullptr;
   sp.draft->use_factor(sf);
@@ -1487,7 +1440,7 @@ cudaGraphExec_t Model::Impl::spec_batch_graph(int ctx) {
   CUDA_CHECK(cudaStreamBeginCaptureToGraph(st, g, tail.data(), nullptr, tail.size(), mode));
   static_assert(ops::kMaxSess <= 32, "k_spec_gate_batch_all: a thread per entry");
   // the batch gate's options (every one off by default; GateOpt): the survival it reads (the MLP's with
-  // DSGB10_BATCH_CF=1), the correction, the trim of steps within kDecodeRows rows, the data dump
+  // DSGB10_BATCH_CF=1), the correction, the trim of steps within kDecodeRows rows
   static const GateOpt gopt = [&] {
     GateOpt o{};
     o.tc0 = 24.f, o.tc1 = 2.2f;
@@ -1500,13 +1453,10 @@ cudaGraphExec_t Model::Impl::spec_batch_graph(int ctx) {
         die("spec: DSGB10_BATCH_CAL=%s: not %d numbers (a1,b1,..,a5,b5)", e, 2 * ops::kBatchDrafts);
       o.has_cal = 1;
     }
-    o.dump = gate_dump_mode();
     return o;
   }();
   GateOpt go = gopt;
   const bool use_cf = sp.draft->cf_batch() && getenv("DSGB10_BATCH_CF") && atoi(getenv("DSGB10_BATCH_CF")) > 0;
-  go.ship0 = sp.draft->batch_survival(0);
-  if (sp.draft->cf_batch()) go.mlp0 = sp.draft->batch_cf_survival(0), go.feat0 = sp.draft->batch_cf_raw(0);
   k_spec_gate_batch_all<<<1, 32, 0, st>>>(in_d, sp.ss, sp.draft->batch_tokens(0), 8,
                                           use_cf ? sp.draft->batch_cf_survival(0) : sp.draft->batch_survival(0), 16, out_h,
                                           go, copy::Args{sp.copy ? sp.copy->dev() : nullptr, sp.row0});
@@ -1804,9 +1754,11 @@ uint64_t Model::Impl::launch_verify_batch(const SpecBatch& b) {
 }
 
 // ---- Model ------------------------------------------------------------------------------------------
+#ifdef DSGB10_DEV
 const uint16_t* Model::mh_dump(uint64_t n) const {
   return d_->spec && d_->spec->mhd ? d_->spec->mhd + (size_t)(n % ops::kOutSlots) * kMaxSessRows * dspark::kMainK : nullptr;
 }
+#endif
 
 void Model::bind_spec(dsw::WeightFile& wf, const dsw::WeightFile* draft) { d_->bind_spec(wf, draft); }
 int Model::spec_batch_entries() const { return d_->spec ? d_->spec->bents : 0; }

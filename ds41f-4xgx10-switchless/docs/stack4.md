@@ -124,6 +124,8 @@ either head). Plus: identity set 54/54 against the exact build, 320/320 held tex
 `DSGB10_FORCE_NTOP=20` adds each row's top-20; `DSGB10_CERT_CHECK=1` runs the full head beside the certified one and counts
 differences (`cert:` lines in each rank's log); `DSGB10_CERT_FORCE=N` forces the full mask every Nth step;
 `DSGB10_CERT_BSCALE=f` loosens the bound; `DSGB10_MH_DUMP=DIR` writes every step row's layer 37-39 inputs (data collection).
+`DSGB10_STEP_LOG`, `DSGB10_FORCE_NTOP`, `DSGB10_CERT_CHECK`, `DSGB10_CERT_FORCE` and `DSGB10_MH_DUMP` exist only in a development
+build (`cmake -DDSGB10_DEV=ON`): the serving engine has none of them.
 
 
 ## Carryover pilot: trained hidden-state version (measured offline, not in the engine)

@@ -409,7 +409,7 @@ struct Args {
   double keep_gib = 0, keep_days = 30;  // kept sessions: written at a planned stop, at most; their age
   int snap_every = 1024, small_rows = 8;
   int slots = 1, slot = 0;
-  int copy_mib = 512;  // --copy-mib N: copy drafting's arena a rank (model::Options::copy_mib; used only with DSGB10_COPY / DSGB10_COPY_DUMP)
+  int copy_mib = 512;  // --copy-mib N: copy drafting's arena a rank (model::Options::copy_mib; used only with DSGB10_COPY)
   int big_slots = 0;  // --big-slots B: slots [0, B) hold --max-ctx, the others --max-ctx / 8 (model::Options::big_slots)  // session slots (model::Options::slots); the golden modes' slot
   int bgraph_bodies = 0;      // DIAGNOSTICS (spec.cu, the batch graph): switch bodies to capture (0: kMaxRows)
   bool bgraph_noif = false;   // DIAGNOSTICS: the entries' accepts without if nodes
@@ -725,6 +725,7 @@ Args parse(int argc, char** argv) {
         model::kMaxSessRows);
   // the served environment (served.h): a variable the start's environment or a --setenv has set keeps its value
   served::env_for(a.mode == "serve", [](const char* name, const char* value) { setenv(name, value, 0); });
+  g_log_detail = a.mode != "serve" || (getenv("DSGB10_LOG_DETAIL") && atoi(getenv("DSGB10_LOG_DETAIL")) > 0);
   if (a.spec_drafts < 0) a.spec_drafts = dspark::draft_rows();  // after every --setenv
   if (a.spec_drafts > model::ops::kDrafts) die("--spec-drafts must be 0..%d", model::ops::kDrafts);
   if (a.spec && (a.mode == "decode" || a.mode == "generate") && !a.big)
@@ -929,7 +930,7 @@ int main(int argc, char** argv) {
     for (int r = 0; r < comm::kRanks; ++r)
       if (std::memcmp(&all[r], &mine, sizeof mine) != 0)
         die("rank %d: copy drafting settings differ between the ranks (mode bits %u %u %u %u, shortest match %u %u %u %u, table file hash "
-            "%016llx %016llx %016llx %016llx): set DSGB10_COPY, DSGB10_COPY_DUMP, DSGB10_COPY_ADAPT, DSGB10_COPY_MIN and DSGB10_COPY_TABLE alike "
+            "%016llx %016llx %016llx %016llx): set DSGB10_COPY, DSGB10_COPY_ADAPT, DSGB10_COPY_MIN and DSGB10_COPY_TABLE alike "
             "on every Spark (and DSGB10_COPY_ROWS %u %u %u %u, DSGB10_COPY_ENTER %u %u %u %u)", a.rank, all[0].mode, all[1].mode, all[2].mode, all[3].mode, all[0].min_match, all[1].min_match, all[2].min_match,
             all[3].min_match, (unsigned long long)all[0].table_hash, (unsigned long long)all[1].table_hash, (unsigned long long)all[2].table_hash,
             (unsigned long long)all[3].table_hash, all[0].rows, all[1].rows, all[2].rows, all[3].rows, all[0].enter, all[1].enter,

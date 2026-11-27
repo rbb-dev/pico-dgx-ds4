@@ -5,7 +5,7 @@
 // the generation marker carries) up to and including the next end-of-sentence id, or up to the conversation's end.
 // At every step of an output span the replay runs the engine's own matcher (copy::index_range, copy::propose) on the
 // history so far, takes the proposed copy tokens and scores them against the tokens the model produced next. Two views:
-//  - verify-all: every proposed row is verified (the engine's DSGB10_COPY_DUMP=2), so the data is the matcher's own;
+//  - verify-all: every proposed row is verified, so the data is the matcher's own;
 //  - gated: a rule (a table through copy::gate_rows, or any class with the Rule interface) picks how many rows a step
 //    verifies, the step emits the accepted rows plus the sampler's token, and the next proposal starts from there.
 // The model has no chain drafts here (k = 0): the replay measures copy rows alone.
@@ -109,7 +109,7 @@ class TableRule : public Rule {
   TableRule(const Table& t, Gate g, float thresh, const Cost& c, float chain_prev)
       : t_(t), gate_(g), thresh_(thresh), cost_(c), chain_prev_(chain_prev) {}
   int rows(const Proposal& p, float* surv) override {
-    return gate_rows((int)gate_, thresh_, cost_.step_ms, chain_prev_, 1.f, 0, p.m, p.bucket, t_.t, false, surv);
+    return gate_rows((int)gate_, thresh_, cost_.step_ms, chain_prev_, 1.f, 0, p.m, p.bucket, t_.t, surv);
   }
 
  private:
@@ -139,7 +139,7 @@ class LearnRule : public Rule {
     if (had) sess_apply(s_, L_, last);
     float lt[1][kMaxDrafts];
     gate_row(L_, s_, p.bucket, t_.t[p.bucket], p.m, lt[0]);
-    const int n = gate_rows((int)gate_, thresh_, cost_.step_ms, chain_prev_, 1.f, 0, p.m, 0, lt, false, surv);
+    const int n = gate_rows((int)gate_, thresh_, cost_.step_ms, chain_prev_, 1.f, 0, p.m, 0, lt, surv);
     if (had) fold_all(L_, &last, 1);
     tk_ = Taken{};
     tk_.bucket = (int8_t)p.bucket, tk_.n = (int8_t)n;
