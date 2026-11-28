@@ -21,3 +21,8 @@ target_include_directories(argmax_row_test PRIVATE ${CMAKE_SOURCE_DIR})
 add_executable(host_gather_test tests/host_gather_test.cpp)
 target_include_directories(host_gather_test PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(host_gather_test PRIVATE pthread)
+
+# comm/gid_pick.h (host only): which GID table entry a link uses for its fleet address; its control, the rule before
+# (the fleet's GID_INDEX or nothing, any type), must fail
+add_executable(gid_pick_test tests/gid_pick_test.cpp)
+target_include_directories(gid_pick_test PRIVATE ${CMAKE_SOURCE_DIR})

@@ -1,4 +1,5 @@
 // Collectives for the four-box ring: bootstrap, RDMA setup and the proxy thread (see ring.h).
+#include "comm/gid_pick.h"
 #include "comm/host_gather.h"
 #include "comm/ring.h"
 
@@ -136,6 +137,7 @@ struct Link {
   PeerInfo me{}, peer{};
   uint32_t max_inline = 0;
   int unsignaled = 0;
+  int gid_index = -1;  // this side's entry of the fleet address (comm/gid_pick.h), the source GID of every packet
 };
 
 enum WrKind : uint64_t { kWrDirect = 0, kWrRelayToPrev = 1, kWrRelayToNext = 2, kWrStat = 3 };
@@ -219,8 +221,9 @@ std::string gid_text(const uint8_t* g) {
   return s;
 }
 
-// The link's device must carry the fleet's address for it (`key`=`ip`) at the fleet's GID index: a check
-// that the fleet file describes this box, before anything waits on a neighbour.
+// The link's device must carry the fleet's address for it (`key`=`ip`) as a RoCE v2 GID: a check that the fleet
+// file describes this box, before anything waits on a neighbour. The fleet's GID index is where it is looked for
+// first; the kernel's table can hold it at another index (comm/gid_pick.h), and then that index is used.
 void open_link(Link& L, const char* devname, int gid_index, const std::string& ip, const std::string& key,
                const std::string& fleet_file, void* region, size_t bytes, uint32_t psn) {
   int n = 0;
@@ -258,26 +261,47 @@ void open_link(Link& L, const char* devname, int gid_index, const std::string& i
   ibv_port_attr pa{};
   if (ibv_query_port(L.ctx, 1, &pa)) die("%s: query_port", devname);
   L.mtu = pa.active_mtu;
-  ibv_gid gid;
-  if (ibv_query_gid(L.ctx, 1, gid_index, &gid)) die("%s: query_gid %d", devname, gid_index);
   uint8_t want[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};
   if (inet_pton(AF_INET, ip.c_str(), want + 12) != 1)
     die("comm: %s: %s=%s is not an IPv4 address", fleet_file.c_str(), key.c_str(), ip.c_str());
-  if (memcmp(gid.raw, want, 16)) {
+  auto entry = [&](int i) {
+    comm::GidEntry g;
+    ibv_gid_entry e{};
+    const int rc = ibv_query_gid_ex(L.ctx, 1, (uint32_t)i, &e, 0);
+    if (rc == ENODATA) return g;  // an empty entry
+    if (rc) die("%s: query_gid %d: %s", devname, i, strerror(rc));
+    g.present = true;
+    g.roce_v2 = e.gid_type == IBV_GID_TYPE_ROCE_V2;
+    memcpy(g.raw, e.gid.raw, 16);
+    return g;
+  };
+  L.gid_index = comm::pick_gid(gid_index, want, pa.gid_tbl_len, entry);
+  if (L.gid_index < 0) {
     char host[256] = {0};
     gethostname(host, sizeof host - 1);
-    die("comm: on %s, %s's GID %d is %s, but the fleet file %s has %s=%s: this box's link is not addressed as "
-        "the fleet file says, or this is not that rank's box",
-        host, devname, gid_index, gid_text(gid.raw).c_str(), fleet_file.c_str(), key.c_str(), ip.c_str());
+    std::string at = "empty";
+    if (gid_index >= 0 && gid_index < pa.gid_tbl_len) {
+      const comm::GidEntry g = entry(gid_index);
+      if (g.present) at = gid_text(g.raw) + (g.roce_v2 ? " (RoCE v2)" : " (not RoCE v2)");
+    } else {
+      at = "past the table";
+    }
+    die("comm: on %s, %s has no RoCE v2 GID %s among its %d (GID %d is %s), but the fleet file %s has %s=%s: this "
+        "box's link is not addressed as the fleet file says, or this is not that rank's box",
+        host, devname, ip.c_str(), pa.gid_tbl_len, gid_index, at.c_str(), fleet_file.c_str(), key.c_str(),
+        ip.c_str());
   }
+  if (L.gid_index != gid_index)
+    fprintf(stderr, "comm: %s: %s=%s is GID %d, not the fleet file's %d: using %d\n", devname, key.c_str(),
+            ip.c_str(), L.gid_index, gid_index, L.gid_index);
   L.me.qpn = L.qp->qp_num;
   L.me.psn = psn & 0xffffff;
   L.me.rkey = L.mr->rkey;
   L.me.base = (uint64_t)region;
-  memcpy(L.me.gid, gid.raw, 16);
+  memcpy(L.me.gid, want, 16);
 }
 
-void connect_link(Link& L, const char* devname, int gid_index) {
+void connect_link(Link& L, const char* devname) {
   ibv_qp_attr at{};
   at.qp_state = IBV_QPS_RTR;
   at.path_mtu = L.mtu;
@@ -287,7 +311,7 @@ void connect_link(Link& L, const char* devname, int gid_index) {
   at.min_rnr_timer = 12;
   at.ah_attr.is_global = 1;
   memcpy(at.ah_attr.grh.dgid.raw, L.peer.gid, 16);
-  at.ah_attr.grh.sgid_index = gid_index;
+  at.ah_attr.grh.sgid_index = L.gid_index;
   at.ah_attr.grh.hop_limit = 1;
   at.ah_attr.port_num = 1;
   if (ibv_modify_qp(L.qp, &at,
@@ -493,9 +517,9 @@ Ring::Ring(const Options& o) : impl_(new Impl) {
     }
     I.bootstrap();
     for (int d = 0; d < kDomains; d++) {
-      connect_link(I.to_next[d], F.next_dev[d].c_str(), F.gid_index);
-      connect_link(I.to_prev[d], F.prev_dev[d].c_str(), F.gid_index);
-      if (I.direct) connect_link(I.to_opp[d], F.next_dev[d].c_str(), F.gid_index);
+      connect_link(I.to_next[d], F.next_dev[d].c_str());
+      connect_link(I.to_prev[d], F.prev_dev[d].c_str());
+      if (I.direct) connect_link(I.to_opp[d], F.next_dev[d].c_str());
     }
   }
   CUDA_CHECK(cudaMalloc(&I.d_seq, 2 * sizeof(unsigned long long)));

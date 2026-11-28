@@ -45,7 +45,7 @@ file cut for another rank.
 | Key | Read by | What |
 |---|---|---|
 | `NEXT_DEV0`, `NEXT_DEV1`, `PREV_DEV0`, `PREV_DEV1` | engine | the RDMA devices facing rank r + 1 (port f0) and r − 1 (port f1), PCI domains 0 and 2, alike on every box |
-| `GID_INDEX` | engine | the RoCE v2 GID index, alike on every device |
+| `GID_INDEX` | engine | the RoCE v2 GID index where the links' addresses are looked for first |
 | `RANK<r>_NEXT_IP0`, `_NEXT_IP1`, `_PREV_IP0`, `_PREV_IP1` | engine | the rank's addresses on its two links, per PCI domain; `PREV_IP0` also carries the bootstrap |
 | `RANK<r>_HOSTNAME`, `RANK<r>_NAME` | engine | the rank by hostname, when no `--rank` is given; the box's name in logs (optional) |
 | `RANK<r>_WEIGHTS`, `_HASHMAP`, `_ENGRAM`, `_SPILL` | engine, scripts | the rank's weight file, hash map, shard directory and spill directory: the defaults of `--weights`, `--hashmap`, `--shard1`/`--shard14` and `--disk-dir`; the scripts drop their pages and `service.sh forget` clears the spill directories |

@@ -23,8 +23,11 @@ the engine, `engine/server/fleet.sh` for the scripts); `micro/ring_links.sh` pri
 other boxes, a copy with their devices, GID index, addresses and hostnames, passed as `FLEET=FILE`, is
 all it takes: the scripts install it beside the engine as `fleet.conf` (`--fleet FILE` reads another;
 run4.sh and service.sh pass `--rank`, so the hostnames matter only without it). Before the bootstrap,
-each rank checks that the GID at `GID_INDEX` of each of its four devices is the IPv4-mapped address
-the file gives that link, and stops otherwise, naming the device, the GID, the key and the file. The
+each rank checks that each of its four devices carries the IPv4-mapped address the file gives that link
+as a RoCE v2 GID, and stops otherwise, naming the device, what `GID_INDEX` holds, the key and the file.
+`GID_INDEX` is where it looks first; the kernel can number the table differently (a neighbouring box's
+power loss has been reported to leave it at 4 instead of 3), and then the rank uses the index it found
+and says so. The
 scripts reach ranks 1–3 by SSH at the file's `RANK<r>_SSH` (10.0.0.4, .3 and .2 here). Only
 `kSlowLink` stays compiled in (`engine/comm/ring_config.h`: L0, the 100G link): it routes the
 reduce-scatter's relays, and the sums are in rank order whatever the route ([Protocol](#protocol)).
