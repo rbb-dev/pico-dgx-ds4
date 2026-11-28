@@ -161,7 +161,8 @@ The settings below are the defaults of `--mode serve`: a start with no settings 
 `deploy/pico.env.example` (every rank gets the same) therefore holds only what describes one machine: the files
 (`--weights`, `--ablit`, `--vision-weights`, `DSGB10_CF_MLP`). A setting turns off with its off value (`--no-draft-head4`,
 `--no-draft-markov8`, `--kv-split off`, `--pscan off`, `--engram-vram off`, `DSGB10_X=0`), and a start that names a setting keeps
-its own value; the other modes (the golden checks, the benches) take none of these defaults. The units add `--mode serve`,
+its own value; the other modes (the golden checks, the benches) take none of these defaults unless the start says `--served`, which gives them every variable of this list and the flags that change the step graphs
+(`--engram-vram`, `--engram-cache-mib`, `--pscan`, `--draft-head4`, `--draft-markov8`). The units add `--mode serve`,
 `--socket`, `--disk-tag service` and `--keep-gib` (from `KEEP_GIB`, 64 here); with `service.sh` leave `--mode serve` and
 `--disk-tag` out and give the kept-session size as `DSGB10_KEEP_GIB=64`. In `pico.env` write full paths (systemd does not expand
 `~`; the engine expands a leading `~/` in `--weights` itself). The GPU clock limit of 2,200 MHz is `GPU_CLOCK` in `pico.env`,
@@ -178,11 +179,11 @@ applied at every start, or set with `ds41f-4xgx10-switchless/tools/gpu-clock`. T
   --setenv DSGB10_CF_MLP=/home/<user>/dsgb10/bin/cfmlp_cml.bin --setenv DSGB10_CF_ALPHA=1.0 --setenv DSGB10_BATCH_CF=1 \
   --setenv DSGB10_BATCH_TRIM=1 --setenv DSGB10_BATCH_TRIM_COST=19,2.9 --setenv DSGB10_CERT=1 --setenv DSGB10_RING_DIRECT=2 \
   --setenv DSGB10_RING_RSBAL=1 --setenv DSGB10_PF_TUNE=hc,small,down \
-  --setenv DSGB10_WIDE_SH=1 --setenv DSGB10_WIDE_AR=2 --setenv DSGB10_HEADG=2 --setenv DSGB10_COPY_ROWS=64
+  --setenv DSGB10_WIDE_SH=1 --setenv DSGB10_WIDE_AR=2 --setenv DSGB10_HEADG=2 --setenv DSGB10_COPY_ROWS=64 --setenv DSGB10_REUSE_EXACT=1
 ```
 
 Of these, `--big-slots`, `--draft-head4`, `--draft-markov8`, `DSGB10_BUDGET`, `DSGB10_DRAFT1`, `DSGB10_WIDE`,
-`DSGB10_WIDE_COST`, `DSGB10_HEAD4_C1`, `DSGB10_CF_MLP`, `DSGB10_CF_ALPHA`, `DSGB10_CERT` and `DSGB10_RING_DIRECT` are pico-dgx-ds4's
+`DSGB10_WIDE_COST`, `DSGB10_HEAD4_C1`, `DSGB10_CF_MLP`, `DSGB10_CF_ALPHA`, `DSGB10_CERT`, `DSGB10_REUSE_EXACT` and `DSGB10_RING_DIRECT` are pico-dgx-ds4's
 options, and the code behind `DSGB10_RING_RSBAL` and `DSGB10_PF_TUNE` is pico-dgx-ds4's too; the others are this repository's.
 `DSGB10_CF_MLP` names a file, so it has no default: without it the confidence network is not loaded, and `DSGB10_BATCH_CF` has
 nothing to read.
@@ -220,7 +221,7 @@ nothing to read.
 | `DSGB10_WIDE_EXACT_MT=2` (not a default) | with `DSGB10_WIDE_EXACT` bit 64: wo_b's row-group kernel takes 2 tiles of 8 weight rows a warp (`1`, the default); the same bits |
 | `DSGB10_COPY_ROWS=64` | with copy drafting on, a request that decodes alone and repeats text it holds may verify up to 31 (`32`) or 63 (`64`) copy drafts in one step, run as an exact body of the one-session step graph (the arithmetic of a step of at most 8 rows, so the reply's bits do not change). `8`: the steps as before (`32` verifies up to 31). A value other than 8, 32 or 64 stops the start; every Spark must have the same setting ([`docs/batching.md`](docs/batching.md#long-copy-steps)) |
 | `DSGB10_COPY_ENTER=N` (not a default) | with `DSGB10_COPY_ROWS`, the match length (8 to 72, default 32) a source needs before the first long step; every long step that was not accepted whole doubles it for the next entry, at most three times |
-| `DSGB10_REUSE_EXACT=1` (not a default) | a reused prompt's remainder of at most `--small-rows` positions takes the prefill path, so the same request sent again gets its first reply bit for bit (as a step it matched only to numerics). A whole prompt that short, and a resume, keep the step. Off unless set |
+| `DSGB10_REUSE_EXACT=1` | a reused prompt's remainder of at most `--small-rows` positions takes the prefill path, so the same request sent again gets its first reply bit for bit (as a step it matched only to numerics). A whole prompt that short, and a resume, keep the step. Set in the served settings; `DSGB10_REUSE_EXACT=0` turns it off |
 | `DSGB10_GATE_SEP=1[,LO,HI]` (not a default) | in steps of 2 to 4 rows (LO..HI), a kernel that does nothing runs between the router gate and the MoE, so the MoE's first kernel does not share the SMs with the gate while it streams. Off unless set; same bits |
 | `DSGB10_DRAFT_MAX=6\|7` (not a default) | the draft pass of a request that decodes alone runs 6 or 7 block rows instead of the model's 5, so a step may verify up to 7 drafts of the draft module; every draft is still verified, so the replies do not change. The rows past the 5 the draft module was trained with have no confidence network: their confidence is the shipped head's logit scaled `A c + B` (`DSGB10_CF_TAIL=A,B`, default 1,0). Unset: the draft pass and the graphs as before; every Spark must have the same setting; the passes over several entries stay at 5 rows |
 | `DSGB10_DRAFT_DYN=L` (not a default) | with `DSGB10_DRAFT_MAX` above 5: the long block runs only after a step that accepted at least L drafts, otherwise the pass of 5 rows; with copy rows on it also does not run while a copy cursor is live at the bonus, so copy rows keep their place. Two bodies in the step graph; unset: one pass of `DSGB10_DRAFT_MAX` rows in every step |
@@ -305,6 +306,7 @@ repository changed in the engine is [`docs/engine.md`](docs/engine.md).
 | `PrefillTuning::upk` (`kUpKernel`) | the prefill up kernel: 1 the producer/consumer one (default), 0 `k_moe_up_p` |
 | `DSK_PRE2=<mask>` | the decode GEMVs' second weight batch before the wait: 1 wq_a + wkv, 2 the router gate; 3 (default) both, 0 neither |
 | `DSK_AMOE=0` | at one row, the MoE down kernel and the FFN's closing all-reduce keep their 8-row launches (by default they ask for the large-shared carveout and the all-reduce runs 64 threads, so the next weight ring fills during it) |
+| `DSK_HIDE2=<mask>` | the weight loads behind the collectives: 2 wq_b on two MMA tiles a warp at 2 to 8 rows, 8 an L2 prefetch behind the draft pass's collectives; 10 (default) both, 0 neither; any other value stops the start |
 | `DSGB10_CERT_SAMPLED=0` | with `DSGB10_CERT=1` (pico-dgx-ds4's): sampled rows keep the full head (by default they take the certified one) |
 
 | `--front-now-mib N`, `--encoder-now-mib N` (0) | what the front-end and the image process hold when the engine reads memory at start; 0 takes their whole caps off the store |

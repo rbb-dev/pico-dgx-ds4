@@ -162,7 +162,7 @@ encoder.
 the positions after its restart point run as one decode step when there are at most `--small-rows` of them; the step adds
 in another order than the prefill, so the state is not the cold one and a near-tie can change the reply. With the switch they
 take the prefill path. Based on pico-dgx-ds4's a40eeb8 by Pico.
-- Setting: `DSGB10_REUSE_EXACT=1` (off unless set).
+- Setting: `DSGB10_REUSE_EXACT=1` (served: on; `DSGB10_REUSE_EXACT=0` turns it off).
 - Measured: a re-sent prompt's first reply bit-equal to the first send's (without the switch 32 of 32 log probabilities differed,
   with it 0); its first token 10 to 20 ms later (median at 2K tokens 51 against 72 ms, 8K 47 against 57 ms, 32K 56 against 73 ms);
   first sends unchanged.
@@ -312,6 +312,20 @@ fill cost more than it hid). On because it is bit-equal and costs nothing at oth
 - Measured: a one-row step 17.300 to 17.243 ms (32k context, 60 steps, two runs each way: 0.3 %, both runs with it under both
   without; `DSK_PERSIST` and `DSK_PRE2` already hide most of that load); three-row steps unchanged; the same tokens.
 
+**Weight loads hidden behind the collectives at 2 to 8 rows, and in the draft pass.** At a step of 2 to 8 rows, wq_b (with the
+indexer's segment) runs on two MMA tiles a warp, so its first wave requests twice the bytes before it waits for the all-reduce
+ahead of it. The draft pass, whose collectives had no prefetch window, prefetches the next weights into L2 behind them (one warp
+on the L2 prefetch's side stream, at the pass's start and under each block's attention and MoE all-reduces; under the last block's, the head). Both change the launch configuration and the prefetch plan only, so every
+output keeps its bits. Two further parts, the all-reduces' carveout at 2 to 8 rows and longer prefetch windows into the shared
+expert, gained nothing beyond the controls' spread and are not in the code.
+- Setting: `DSK_HIDE2` (served: 10; `DSK_HIDE2=0` turns both parts off; 2 and 8 are the parts; any other value stops the start).
+- Measured on four Sparks under the served settings, one binary, the mask set per run: wq_b on two tiles, three alternations, step
+  means at 1 / 2 / 3 / 4 / 6 rows 17.253 / 20.332 / 23.343 / 26.683 / 31.020 ms off against 17.253 / 20.202 / 23.290 / 26.652 /
+  30.875 ms on (-0.13 ms at 2 rows, -0.15 at 6, none at 1); the draft pass's prefetch, three decode pairs, -0.08 ms a step at 2
+  rows and -0.12 ms at 4 rows, 1, 3 and 6 rows unchanged (about -0.2 % of a decode step); tokens equal at every mask tried.
+- Test: `test_kernels wqb2` (wq_b on two tiles equals one tile bit for bit at 2 to 8 rows, with a control), `l2pf_plan_test`
+  (the prefetch plan's windows and the draft pass's sites; the setting's values).
+
 ## Drafting
 
 Every drafted token is checked by the model before it counts, so the output is the model's own. [`docs/batching.md`](docs/batching.md)
@@ -414,6 +428,13 @@ switch turns off with its off value (`DSGB10_X=0`, `--no-draft-head4`, `--no-dra
 - Settings: none new; `--no-draft-head4` and `--no-draft-markov8` are the off forms of the two drafter flags.
 - Test: `served_test` (the served list against the tables; its wrong-rule control is the `-DPICO_OLD_RULES` build) and the front-end's
   `serve_without_settings_is_the_served_configuration`.
+
+**The served settings in a test mode.** `--served` gives a test mode (`bench`, `decode`, `spectf`, ...) every served `DSGB10_*` variable
+and the served flags that change the step graphs there (`--engram-vram on`, `--engram-cache-mib 2032`, `--pscan all`, `--draft-head4`,
+`--draft-markov8`); without it a test mode runs none of them, so its timings are not the served engine's. Rank 0 prints the settings in
+force. A named flag or a variable already set keeps its value.
+- Setting: `--served` (off unless named).
+- Test: `served_test` (what each mode takes with and without `--served`).
 
 **A quiet serving log.** A serving engine prints its start-up lines, one closing line per request (prompt, reuse, prefill, tokens
 and rate, the stop, the store), errors and rare events; nothing per step. `DSGB10_LOG_DETAIL=1` adds the per-request detail lines,

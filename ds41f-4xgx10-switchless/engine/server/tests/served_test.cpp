@@ -34,7 +34,7 @@ static const std::map<std::string, std::string> kEnvValues = {
     {"DSGB10_CF_ALPHA", "1.0"},    {"DSGB10_BATCH_CF", "1"},    {"DSGB10_BATCH_TRIM", "1"},
     {"DSGB10_BATCH_TRIM_COST", "19,2.9"},                       {"DSGB10_CERT", "1"},
     {"DSGB10_RING_DIRECT", "2"},   {"DSGB10_WIDE_SH", "1"},     {"DSGB10_WIDE_AR", "2"},
-    {"DSGB10_HEADG", "2"},         {"DSGB10_COPY_ROWS", "64"},
+    {"DSGB10_HEADG", "2"},         {"DSGB10_COPY_ROWS", "64"},    {"DSGB10_REUSE_EXACT", "1"},
 };
 
 using Args = std::vector<std::string>;
@@ -69,6 +69,8 @@ int main() {
     served::env_for(true, [&](const char* n, const char* v) { env.insert({n, v}); });
     for (const auto& [k, v] : kEnvValues) check(env.count(k) && env.at(k) == v, "serve default " + k + "=" + v);
     check(env.size() == kEnvValues.size(), "no variable outside the list is defaulted");
+    check(kEnvValues.size() == 19 && env.size() == 19 && env.count("DSGB10_REUSE_EXACT") && env.at("DSGB10_REUSE_EXACT") == "1",
+          "19 served variables, exact re-sends among them");
     check(env.count("DSGB10_CF_MLP") == 0, "the confidence network's file is the machine's, not a default");
   }
   // ---- other modes take none
@@ -97,6 +99,39 @@ int main() {
     check(env.at("DSGB10_WIDE") == "0" && env.at("DSGB10_COPY") == "0", "a variable set to its off value stays off");
     check(env.at("DSGB10_CERT") == "1", "an unset one takes the served value");
   }
+  // ---- --served: a test mode takes the served environment and the flags the table marks
+  {
+    const std::vector<std::string> marked = {"--engram-vram", "--engram-cache-mib", "--pscan", "--draft-head4", "--draft-markov8"};
+    for (const char* mode : {"bench", "decode", "spectf"}) {
+      const Args st = {"--mode", mode, "--served"};
+      const auto m = taken(st);
+      for (const auto& k : marked) check(m.count(k), std::string(mode) + " --served takes " + k);
+      check(m.size() == marked.size(), std::string(mode) + " --served takes no flag outside the marked ones");
+      check(m.count("--engram-cache-mib") && m.at("--engram-cache-mib") == "2032" && m.at("--pscan") == "all" && m.at("--engram-vram") == "on",
+            std::string(mode) + " --served: the served values");
+      check(served::applies(st), std::string(mode) + " --served applies the environment");
+      std::map<std::string, std::string> env;
+      served::env_for(served::applies(st), [&](const char* n, const char* v) { env.insert({n, v}); });
+      check(env == kEnvValues, std::string(mode) + " --served: every served variable");
+      check(!served::applies({"--mode", mode}), std::string(mode) + " without --served: no environment");
+      check(taken({"--mode", mode}).empty(), std::string(mode) + " without --served: no flag");
+    }
+    for (const char* k : {"--max-ctx", "--slots", "--big-slots", "--pool-free-gib", "--prefill-rows-max", "--disk-gib", "--front-mib",
+                          "--media-mib", "--keep-gib", "--kv-split"})
+      check(!taken({"--mode", "bench", "--served"}).count(k), std::string("bench --served leaves out ") + k);
+    // a flag the start names, or its off form, stays the start's
+    const auto o = taken({"--mode", "bench", "--served", "--pscan", "off", "--no-draft-head4", "--engram-cache-mib", "4096"});
+    check(!o.count("--pscan") && !o.count("--draft-head4") && !o.count("--engram-cache-mib"), "--served: a named flag is not added again");
+    check(o.count("--engram-vram") && o.count("--draft-markov8"), "--served: the others still are");
+    check(!taken({"--mode", "bench", "--served", "--draft-bf16"}).count("--draft-head4"), "--served: --draft-bf16 keeps --draft-head4 out");
+    // a variable the start's environment or a --setenv set wins (the caller's setenv(name, value, 0))
+    std::map<std::string, std::string> env = {{"DSGB10_RING_DIRECT", "0"}};
+    served::env_for(served::applies({"--mode", "bench", "--served"}), [&](const char* n, const char* v) { env.insert({n, v}); });
+    check(env.at("DSGB10_RING_DIRECT") == "0" && env.at("DSGB10_PF_TUNE") == "hc,small,down", "--served: a variable already set wins");
+    // --mode serve: the same with or without --served
+    check(taken({"--mode", "serve", "--served"}) == taken({"--mode", "serve"}), "--served with serve changes nothing");
+    check(served::applies({"--mode", "serve"}) && served::applies({"--mode", "serve", "--served"}), "serve applies the environment");
+  }
 #ifdef SERVED_ENGINE_DIR
   // ---- every name has a reader, and main.cpp applies the tables and parses every flag
   {
@@ -113,6 +148,7 @@ int main() {
       check(main_cpp.find("s == \"" + k + "\"") != std::string::npos, "main.cpp parses " + k);
       check(main_cpp.find("s == \"--no-" + k.substr(2) + "\"") != std::string::npos, "main.cpp parses --no-" + k.substr(2));
     }
+    check(main_cpp.find("s == \"--served\"") != std::string::npos, "main.cpp parses --served");
     check(main_cpp.find("served::flags_for(") != std::string::npos && main_cpp.find("served::env_for(") != std::string::npos,
           "main.cpp applies the served tables");
   }

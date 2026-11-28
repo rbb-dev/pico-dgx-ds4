@@ -162,6 +162,9 @@
 //   --no-l2pf: no L2 prefetch in the decode step's windows (model::Options::l2pf, kernels/l2pf.cu: while a
 //     collective or the attention leaves DRAM idle, a side stream prefetches the next weights; the same bits)
 //   --setenv NAME=VALUE: set in every rank's environment before anything else (experiments' knobs)
+//   --served: a test mode takes the served settings too (every DSGB10_* variable of served.h that the start's environment or a
+//     --setenv has not set, and the flags its table marks for the test modes: --engram-vram, --engram-cache-mib, --pscan,
+//     --draft-head4, --draft-markov8); rank 0's start line lists them. With --mode serve it changes nothing.
 //   --mode serve with none of these named runs the served configuration (server/served.h: the flags and DSGB10_* settings
 //     it takes as defaults; --no-draft-head4 and --no-draft-markov8 turn the two drafters off, the other switches take their off values)
 //   --profile-from-req N (serve): request N's first command opens nsys's capture range on every rank
@@ -368,6 +371,8 @@ struct Args {
   int loan_low_groups = 2, loan_high_extra = 8;  // serve: the lent set goes back under this many free groups; it is asked for at its own groups plus this many
   int prefill_rows_max = 0;         // serve: > prefill_rows: chunks of this many rows on a second set of buffers lent by the pool (0: off)
   int wave_probe = 0, wave_probe_at = -1;
+  bool served = false;       // --served: the served settings in a test mode
+  std::string served_flags;  // the flags it added
   int profile_at = -1;  // --big: the prefill chunk at this position is nsys's capture range
   uint64_t profile_from_req = 0;  // serve: request N's first command opens it on every rank (0: none)
   int chunk = 8, k = 1, prompt = -1, limit = -1, gen = 96, max_ctx = 65536, threads = 4, layers = model::kLayers, first = 0;
@@ -449,6 +454,8 @@ Args parse(int argc, char** argv) {
   // a serve start takes the served settings (served.h) for every flag it does not name
   std::vector<std::string> in(argv + 1, argv + argc);
   std::vector<std::string> av = served::flags_for(in);
+  a.served = served::has(in, "--served");
+  for (const std::string& f : av) a.served_flags += (a.served_flags.empty() ? "" : " ") + f;
   av.insert(av.end(), in.begin(), in.end());
   const int n_av = (int)av.size();
   for (int i = 0; i < n_av; ++i) {
@@ -460,6 +467,7 @@ Args parse(int argc, char** argv) {
     if (s == "--rank") a.rank = std::atoi(val().c_str());
     else if (s == "--fleet") a.fleet = comm::fleet_path(val());  // a leading ~/ is $HOME, as in the paths below
     else if (s == "--mode") a.mode = val();
+    else if (s == "--served") {}  // read above
     else if (s == "--golden") a.golden = val();
     else if (s == "--weights") a.weights = val();
     else if (s == "--draft-weights") a.draft_weights = val();
@@ -724,7 +732,14 @@ Args parse(int argc, char** argv) {
     die("--route-file FILE [--route-every 1..%d] [--chain-every N] [--props FILE]: --mode spectf only",
         model::kMaxSessRows);
   // the served environment (served.h): a variable the start's environment or a --setenv has set keeps its value
-  served::env_for(a.mode == "serve", [](const char* name, const char* value) { setenv(name, value, 0); });
+  std::string served_env;
+  served::env_for(a.mode == "serve" || a.served, [&](const char* name, const char* value) {
+    if (!getenv(name)) served_env += std::string(served_env.empty() ? "" : " ") + name + "=" + value;
+    setenv(name, value, 0);
+  });
+  if (a.served && a.mode != "serve" && a.rank == 0)
+    std::printf("served: settings in force in mode %s: flags [%s]; environment [%s]\n", a.mode.c_str(), a.served_flags.c_str(),
+                served_env.c_str());
   g_log_detail = a.mode != "serve" || (getenv("DSGB10_LOG_DETAIL") && atoi(getenv("DSGB10_LOG_DETAIL")) > 0);
   if (a.spec_drafts < 0) a.spec_drafts = dspark::draft_rows();  // after every --setenv
   if (a.spec_drafts > model::ops::kDrafts) die("--spec-drafts must be 0..%d", model::ops::kDrafts);
