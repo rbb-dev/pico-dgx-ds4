@@ -251,9 +251,17 @@ pub struct SessionTable {
     image_cap: usize,
     /// What the image rows in flight count for now (at most `image_cap`).
     image_bytes: usize,
+    /// The base of each fork whose request is in flight (fork -> base), and how many such forks read each base: a base is
+    /// not evicted while one does, since the engine reads its state when the fork is admitted, which can be after the
+    /// SUBMIT (a fork waiting for a slot or room), and a RELEASE of the base before that turns the fork into a cold read.
+    forks: HashMap<u64, u64>,
+    pins: HashMap<u64, u32>,
     /// Test control: `finish` appends the new cuts without first dropping those above the cut the request continued from.
     #[cfg(test)]
     append_without_truncating: bool,
+    /// Test control: the rule before, a fork's base evictable like any idle session.
+    #[cfg(test)]
+    evict_bases: bool,
 }
 
 /// The prefix lengths a text is indexed at: MIN_SHARED bytes, then four times longer each (64, 256, 1 KiB, ... 4 MiB at
@@ -877,8 +885,12 @@ impl SessionTable {
             max_bytes: usize::MAX,
             image_cap: 0,
             image_bytes: 0,
+            forks: HashMap::new(),
+            pins: HashMap::new(),
             #[cfg(test)]
             append_without_truncating: false,
+            #[cfg(test)]
+            evict_bases: false,
         }
     }
 
@@ -1046,6 +1058,9 @@ impl SessionTable {
         s.busy = true;
         s.last_used = clock;
         s.t_used = unix_now();
+        if base_session_id != 0 {
+            self.pin(session_id, base_session_id);
+        }
         let released = self.evict(session_id);
         let plan = Plan { session_id, base_session_id, from, epoch, state, suffix, matched: found.top.map_or(0, |t| t.0), shared: found.top.map_or(0, |t| t.1) };
         (plan, released)
@@ -1091,6 +1106,7 @@ impl SessionTable {
     /// names no epoch, and its next request carries its whole prompt).
     pub fn finish(&mut self, session_id: u64, turn: &Turn, generated: &[u32], tail: Option<DoneTail>, tok: &Tokenizer) {
         self.changes += 1;
+        self.unpin(session_id);
         if !self.sessions.contains_key(&session_id) {
             return;
         }
@@ -1150,6 +1166,7 @@ impl SessionTable {
     /// release on the engine. If the engine cut the history meanwhile, the next request is answered `PrefixGone` and goes whole.
     pub fn give_up(&mut self, session_id: u64) -> bool {
         self.changes += 1;
+        self.unpin(session_id);
         let Some(s) = self.sessions.get_mut(&session_id) else { return false };
         s.busy = false;
         if s.ready() {
@@ -1183,8 +1200,27 @@ impl SessionTable {
     /// Remove session `id` from the table and the index.
     fn remove(&mut self, id: u64) {
         self.changes += 1;
+        self.unpin(id);
         self.leave(id);
         self.sessions.remove(&id);
+    }
+
+    /// Fork `fork`'s request reads `base`: the base stays until that request ends (`unpin`).
+    fn pin(&mut self, fork: u64, base: u64) {
+        if self.forks.insert(fork, base).is_none() {
+            *self.pins.entry(base).or_default() += 1;
+        }
+    }
+
+    /// Fork `fork`'s request ended (or it was never one): its base is evictable again once no other fork reads it.
+    fn unpin(&mut self, fork: u64) {
+        let Some(base) = self.forks.remove(&fork) else { return };
+        if let Some(n) = self.pins.get_mut(&base) {
+            *n -= 1;
+            if *n == 0 {
+                self.pins.remove(&base);
+            }
+        }
     }
 
     /// The request failed: forget the session (the engine's copy is in an unknown state; the
@@ -1193,7 +1229,7 @@ impl SessionTable {
         self.remove(session_id);
     }
 
-    /// Drop least recently used idle sessions (never `keep`, never one in a request) while the table holds more than
+    /// Drop least recently used idle sessions (never `keep`, never one in a request or a fork's base while it is) while the table holds more than
     /// `max_sessions` sessions, `max_tokens` ids or `max_bytes` bytes; returns their ids.
     fn evict(&mut self, keep: u64) -> Vec<u64> {
         let mut out = Vec::new();
@@ -1213,9 +1249,13 @@ impl SessionTable {
         }
     }
 
-    /// The least recently used session that is in no request and is not `keep`.
+    /// The least recently used session that is in no request, is no base of a fork in one, and is not `keep`.
     fn lru_idle(&self, keep: u64) -> Option<u64> {
-        self.sessions.iter().filter(|(&id, s)| id != keep && !s.busy).min_by_key(|(_, s)| s.last_used).map(|(&id, _)| id)
+        #[cfg(test)]
+        let pinned = |id: &u64| !self.evict_bases && self.pins.contains_key(id);
+        #[cfg(not(test))]
+        let pinned = |id: &u64| self.pins.contains_key(id);
+        self.sessions.iter().filter(|(&id, s)| id != keep && !s.busy && !pinned(&id)).min_by_key(|(_, s)| s.last_used).map(|(&id, _)| id)
     }
 
     /// The memory the table holds: every session's buffers by capacity (`Session::bytes`) and the image rows in flight
@@ -3168,6 +3208,72 @@ mod tests {
         assert!(t.len() < 13, "only the byte limit can have dropped any: sessions, ids and positions are far from theirs");
         assert!(t.sessions.contains_key(&busy.session_id), "a session in a request stays");
         assert!(!t.sessions.contains_key(&made[0]) && t.sessions.contains_key(made.last().unwrap()), "the oldest goes first");
+    }
+
+    /// A fork's base is not evicted while the fork's request is in flight: neither by the fork's own plan (its RELEASE would
+    /// reach the engine before the fork's SUBMIT) nor by another request's plan while the fork waits to be admitted; once the
+    /// fork's request ends (finished, given up or abandoned) the base is an idle session like any other. Controls: the rule
+    /// before, a base evictable like any idle session, loses it to the fork's own plan, and to another plan while the fork waits.
+    #[test]
+    fn a_forks_base_stays_while_the_fork_is_in_flight() {
+        let tok = syn();
+        let body = "You are an expert coding assistant. Read files, run commands and edit code.\n".repeat(40);
+        let conv = |time: &str, msg: &str| {
+            format!("<｜begin▁of▁sentence｜><｜System｜>{body}Current date and time: Monday, October 12, 2026 at {time}\n\n## Tools\n\nnone<｜User｜>{msg}<｜Assistant｜></think>")
+        };
+        // (kept by the fork's own plan, kept by another plan meanwhile, evicted in the usual order once the fork ended (here
+        // first: it is the oldest), no pin left)
+        let run = |evict_bases: bool| {
+            let mut t = SessionTable::new(4, 1 << 30);
+            t.evict_bases = evict_bases;
+            let a = conv("09:14:08 AM", "fix the build");
+            let base = serve(&mut t, &tok, &a, &reply(&tok, "Done."), false).session_id;
+            for i in 0..3 {
+                add(&mut t, &tok, i, 4);
+            }
+            // the table is full (4 of 4) and the base is its least recently used session: the fork makes a fifth
+            let b = conv("09:15:31 AM", "write the tests");
+            let (pb, released) = t.plan(&b, &tok, 1, false);
+            assert_eq!(pb.base_session_id, base, "a fork of the first conversation");
+            let own = !released.contains(&base);
+            // while the fork waits for a slot, another conversation starts
+            let c = "<｜begin▁of▁sentence｜>another conversation entirely".to_string();
+            let (pc, released) = t.plan(&c, &tok, 1, false);
+            let other = own && !released.contains(&base);
+            finish_plan(&mut t, &tok, &pb, &b, &reply(&tok, "Tests."), &[]);
+            finish_plan(&mut t, &tok, &pc, &c, &reply(&tok, "Yes."), &[]);
+            let (_, released) = t.plan("<｜begin▁of▁sentence｜>a third conversation, later", &tok, 1, false);
+            let after = other && released == vec![base];
+            (own, other, after, t.pins.is_empty() && t.forks.is_empty())
+        };
+        assert_eq!(run(false), (true, true, true, true), "the rule: the base stays until its fork ends, then goes first");
+        assert!(!run(true).0, "control (the rule before) must lose the base to the fork's own plan");
+        // the second way: the table fills only after the fork's plan, while the fork waits for a slot
+        let later = |evict_bases: bool| {
+            let mut t = SessionTable::new(4, 1 << 30);
+            t.evict_bases = evict_bases;
+            let base = serve(&mut t, &tok, &conv("09:14:08 AM", "fix the build"), &reply(&tok, "Done."), false).session_id;
+            for i in 0..2 {
+                add(&mut t, &tok, i, 4);
+            }
+            let (pb, released) = t.plan(&conv("09:15:31 AM", "write the tests"), &tok, 1, false);
+            assert!(released.is_empty() && pb.base_session_id == base, "4 of 4 with the fork: nothing goes yet");
+            let (_, released) = t.plan("<｜begin▁of▁sentence｜>another conversation entirely", &tok, 1, false);
+            !released.contains(&base)
+        };
+        assert!(later(false), "the rule: another plan leaves the base while the fork waits");
+        assert!(!later(true), "control (the rule before) must lose the base to another plan while the fork waits");
+        // a fork whose request is given up or fails leaves no pin
+        let mut t = SessionTable::new(8, 1 << 30);
+        let a = conv("09:14:08 AM", "fix the build");
+        serve(&mut t, &tok, &a, &reply(&tok, "Done."), false);
+        let (p1, _) = t.plan(&conv("09:15:31 AM", "write the tests"), &tok, 1, false);
+        let (p2, _) = t.plan(&conv("09:16:02 AM", "and the docs"), &tok, 1, false);
+        assert!(p1.base_session_id != 0 && p2.base_session_id == p1.base_session_id, "two forks of one base");
+        assert_eq!(t.pins.get(&p1.base_session_id), Some(&2));
+        t.give_up(p1.session_id);
+        t.abandon(p2.session_id);
+        assert!(t.pins.is_empty() && t.forks.is_empty(), "given up and abandoned: no pin left");
     }
 
     #[test]

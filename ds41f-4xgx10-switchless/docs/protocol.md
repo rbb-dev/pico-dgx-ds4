@@ -115,8 +115,10 @@ DESIGN decision 6: a new turn continues from the state its conversation left beh
   evicted session with `--disk-gib 0`, comes back cold. The encoder-side SWA bounded replay first planned here is not
   built ([correctness review](review/correctness.md)).
 - The front-end never has two requests in flight on one `session_id`, and it only sends `RELEASE`
-  for sessions it will not name again. `prefix_hint` is what the front-end believes is reusable; it
-  is for logging and need not be trusted.
+  for sessions it will not name again: never for the base of a fork whose request is in flight (the
+  engine reads the base when the fork starts running, which can be after its SUBMIT, when it waits for
+  a slot). `prefix_hint` is what the front-end believes is reusable; it is for logging and need not be
+  trusted.
 
 How the front-end picks the session and the token ids (frontend/src/session.rs):
 
