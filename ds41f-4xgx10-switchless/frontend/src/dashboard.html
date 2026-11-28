@@ -127,8 +127,11 @@ nav.sections button[aria-current="page"] { background: transparent; color: var(-
 /* the rows' spacing, the same at 16, 32 or 64 lines (the box grows, the rows do not): 11 px,
    line-height 1.1, no padding, 2 px apart */
 .lgrid { display: flex; flex-direction: column; gap: 2px; }
-.lrow { display: grid; grid-template-columns: 22px 60px minmax(40px, 1fr) 72px 58px 84px 54px 56px 64px 48px; gap: 0 10px; align-items: center; font-family: var(--mono); font-size: 11px; color: var(--t2); line-height: 1.1; padding: 0; border-bottom: 1px solid #14181a; font-variant-numeric: tabular-nums; }
+/* each column as wide as its longest value at 11 px (JetBrains Mono, 6.6 px a character): PROMPT and CACHED 4,194,304,
+   OUTPUT the same, TOK/S 12,345, WAIT ~1,234.5 s, TOTAL 1:02:03; WHO takes up to 24 characters before the bar, at least 12 */
+.lrow { display: grid; grid-template-columns: 22px 52px minmax(40px, 1fr) 60px 60px minmax(84px, 160px) 60px 42px 66px 48px; gap: 0 10px; align-items: center; font-family: var(--mono); font-size: 11px; color: var(--t2); line-height: 1.1; padding: 0; border-bottom: 1px solid #14181a; font-variant-numeric: tabular-nums; }
 .lrow > span { white-space: nowrap; overflow: hidden; }
+.lrow > span:nth-child(6) { text-overflow: ellipsis; }
 .lrow > span:nth-child(n+4) { text-align: right; }
 .lrow > span:first-child { color: #5a6165; }
 .lrow > span:nth-child(2) { font-size: 10px; font-weight: 700; letter-spacing: .06em; }
@@ -827,7 +830,7 @@ const quantile = (arr, p) => { if (!arr.length) return null; const a = arr.slice
 function linesBox() {
   const COLS = [['#', 'Requests in flight, oldest first: the number is the request\'s place in that order (the engine does not report which line serves it).'], ['PHASE', 'DECODE: generating its output. PREFILL: its prompt is being processed (the engine has reported progress on it; two long prompts can be processed at once). QUEUED: submitted, no progress reported yet.'],
     ['STAGE', 'The request\'s context: the purple part is its prompt, the white part the output so far. A prefilling request shows how much of the prompt it has to compute is done.'], ['PROMPT', 'Prompt tokens of the request.'], ['OUTPUT', 'Output tokens so far.'],
-    ['WHO', 'The user field of the request, or api when it has none.'], ['CACHED', 'Prompt tokens reused from a session or restored from the disk: the prompt less what the engine reports it has to compute (all of it when nothing is computed); - until the engine reports.'],
+    ['WHO', 'The user field of the request, or api when it has none. A name longer than the column ends in …; the row\'s tip has the whole name.'], ['CACHED', 'Prompt tokens reused from a session or restored from the disk: the prompt less what the engine reports it has to compute (all of it when nothing is computed); - until the engine reports.'],
     ['TOK/S', 'Output tokens a second for this request, from the change in its token count between two readings (smoothed). For a prefilling request, its prompt tokens computed a second, measured the same way.'], ['WAIT', 'About how long it waited before its first token (read once per second, so ±1 s; - for a request this page first saw already generating). A queued or prefilling request shows how long it has waited so far.'], ['TOTAL', 'How long the request has been in the engine.']];
   const grid = h('div', { class: 'lgrid' });
   const headRow = h('div', { class: 'lrow lhead' }, COLS.map(([c, tip]) => h('span', { text: c, title: tip })));
