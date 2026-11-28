@@ -1247,6 +1247,7 @@ void Model::Impl::ffn(int L, int R, bool dumps, Sink* sink, int pos0) {
   } else {
     dsk::MoeCfg mc{};
     mc.down = R == 1 ? 2 : 4;
+    if (R == 1 && dsk::amoe_on()) mc.carveout = 100;  // DSK_AMOE: the all-reduce below is the other half
     dsk::moe_routed(yq, ys, R, gl, w.gate_bias, kExperts, kRouteScale, w.moe, moe_ws, ymoe, mc, st, ridx, rwts, osess, &in_d->rows);
   }
   if (ab.on && ab.s[L][1] != 0.f) {  // the shared expert's share of this rank's partial, through its activations
@@ -1269,7 +1270,8 @@ void Model::Impl::ffn(int L, int R, bool dumps, Sink* sink, int pos0) {
   if (R > kDecodeRows && wide_ar()) {  // bulk all-reduce + the separate kernels (same bits)
     ops::allreduce_hc_bulk(ch, ymoe, true, wide_ar_mode(), R, mid, f_post, f_comb, next_pm, x, yraw, sub, ymoe, st);
   } else {
-    ops::allreduce_hc(ch, ymoe, true, R, mid, f_post, f_comb, next_pm, x, yraw, dumps ? sub : nullptr, st);
+    ops::allreduce_hc(ch, ymoe, true, R, mid, f_post, f_comb, next_pm, x, yraw, dumps ? sub : nullptr, st,
+                      R == 1 && dsk::amoe_on());
   }
   if (dumps) {
     dump(sink, L, "ffn_out", pos0, R, sub, kDim * 2);

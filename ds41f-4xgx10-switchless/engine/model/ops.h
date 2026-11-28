@@ -213,8 +213,12 @@ void engram_combine(const bf16* x, const uint8_t* gath, int R, bf16* y, cudaStre
 // stream = attn::hc_post(sub, res, post, comb) [R][20480]; then optionally the next sublayer's input
 // before its norm, yraw = attn::hc_pre(stream, pre) without norm_w, and sub itself. Bit-identical to
 // the separate kernels.
+// hide (one row only): the launch asks for the large-shared carveout and has 32 + one item a thread (64
+// threads) instead of the 8-row block, so the next weight kernel's CTAs fit beside it and its ring
+// fills while the contributions travel (DSK_AMOE). Each item's arithmetic is the same: the same bits.
 void allreduce_hc(const comm::DevChannel& ch, const void* part, bool f32, int R, const bf16* res, const float* post,
-                  const float* comb, const float* pre, bf16* stream, bf16* yraw, bf16* sub, cudaStream_t s);
+                  const float* comb, const float* pre, bf16* stream, bf16* yraw, bf16* sub, cudaStream_t s,
+                  bool hide = false);
 // allreduce_hc's outputs (stream, yraw and sub, all three written) by the bulk chain, for a wide step (DSGB10_WIDE_AR):
 // comm::allreduce_bulk_bf16 / allreduce_bulk_f32 (each quarter reduced on one rank, then all-gathered: 1.5 times the payload
 // instead of 3) and the separate attn::hc_post and attn::hc_pre. The same sums in the same order and the same arithmetic,

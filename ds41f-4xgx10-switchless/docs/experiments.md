@@ -375,7 +375,8 @@ recovered from the session log; the three collectives measurements) and
 4. **The hours-long soak,** on a free ring; it should show where the front-end's memory levels off.
    Evidence: [engine § As a service](engine.md#as-a-service-servicesh),
    [engine § Soak](engine.md#soak-2026-10-12).
-5. **Experiment A's follow-ups:** A at the MoE site only (−0.37 ms "by the charges"), a shallower
+5. **Experiment A's follow-ups:** A at the MoE site only (−0.37 ms "by the charges"; built as `DSK_AMOE`, on:
+   −0.057 ms a one-row step), a shallower
    ring for the gate at one row, and an nsys of A + S to separate the MoE all-reduce's gain from the
    fill's cost. Evidence:
    [engine § Experiment A](engine.md#experiment-a-the-large-shared-carveout-at-one-row-2026-10-12).

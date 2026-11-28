@@ -403,11 +403,20 @@ __global__ void __launch_bounds__(kWideThreads)
 template <bool kF32, bool kMixes>
 void launch_allreduce_hc(const comm::DevChannel& ch, const void* part, int R, const float* chunks, int nchunks,
                          const float* scale, const float* base, const bf16* res, float* pre, float* post, float* comb,
-                         bf16* stream, bf16* yraw, bf16* sub, cudaStream_t s) {
+                         bf16* stream, bf16* yraw, bf16* sub, cudaStream_t s, bool hide = false) {
   const size_t bytes = (size_t)R * kDim * (kF32 ? 4 : 2) + (kMixes ? (size_t)R * kMixStride * 4 : 0);
   if (R < 1 || R > kMaxRows || bytes > ch.cap || (kMixes && (nchunks < 1 || nchunks > kMaxChunks)))
     die("allreduce_hc: %d rows, %d chunks, %zu bytes (cap %u)", R, nchunks, bytes, ch.cap);
-  if (R <= kLowRows)
+  if (R == 1 && hide) {
+    // warp 0 and one item a thread behind it: the thread that takes an item, and what it does with it, do not
+    // depend on the block's size
+    constexpr int kThreads1 = (32 + ArShape<kF32, kLowRows>::kItems + 31) / 32 * 32;
+    static_assert(kThreads1 <= ArShape<kF32, kLowRows>::kThreads, "allreduce_hc: one-row block");
+    attn::launch_co(k_allreduce_hc<kF32, kMixes, kLowRows>, dim3(kArGrid), dim3(kThreads1), 0, s, true, 100, ch,
+                    static_cast<const uint8_t*>(part), R, chunks, nchunks, scale, base,
+                    reinterpret_cast<const uint16_t*>(res), pre, post, comb, reinterpret_cast<uint16_t*>(stream),
+                    reinterpret_cast<uint16_t*>(yraw), reinterpret_cast<uint16_t*>(sub));
+  } else if (R <= kLowRows)
     attn::launch(k_allreduce_hc<kF32, kMixes, kLowRows>, dim3(kArGrid), dim3((ArShape<kF32, kLowRows>::kThreads)), 0, s,
                  true, ch, static_cast<const uint8_t*>(part), R, chunks, nchunks, scale, base,
                  reinterpret_cast<const uint16_t*>(res), pre, post, comb, reinterpret_cast<uint16_t*>(stream),
@@ -427,10 +436,10 @@ void launch_allreduce_hc(const comm::DevChannel& ch, const void* part, int R, co
 }  // namespace
 
 void allreduce_hc(const comm::DevChannel& ch, const void* part, bool f32, int R, const bf16* res, const float* post,
-                  const float* comb, const float* pre, bf16* stream, bf16* yraw, bf16* sub, cudaStream_t s) {
+                  const float* comb, const float* pre, bf16* stream, bf16* yraw, bf16* sub, cudaStream_t s, bool hide) {
   float *pr = const_cast<float*>(pre), *po = const_cast<float*>(post), *cb = const_cast<float*>(comb);
-  if (f32) launch_allreduce_hc<true, false>(ch, part, R, nullptr, 0, nullptr, nullptr, res, pr, po, cb, stream, yraw, sub, s);
-  else launch_allreduce_hc<false, false>(ch, part, R, nullptr, 0, nullptr, nullptr, res, pr, po, cb, stream, yraw, sub, s);
+  if (f32) launch_allreduce_hc<true, false>(ch, part, R, nullptr, 0, nullptr, nullptr, res, pr, po, cb, stream, yraw, sub, s, hide);
+  else launch_allreduce_hc<false, false>(ch, part, R, nullptr, 0, nullptr, nullptr, res, pr, po, cb, stream, yraw, sub, s, hide);
 }
 
 void allreduce_hc_mix(const comm::DevChannel& ch, const void* part, bool f32, int R, const float* chunks, int nchunks,

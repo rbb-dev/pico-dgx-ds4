@@ -1833,8 +1833,8 @@ void launch_down(const Params& p, const MoeCfg& cfg, cudaStream_t st) {
       CUDA_CHECK(cudaFuncSetAttribute(kernel_cs, cudaFuncAttributeMaxDynamicSharedMemorySize, most));
       attr = true;
     }
-    launch_pdl(kCs && p.w.c2.code ? kernel_cs : k_moe_down<W, R>, dim3(kDim / 16 / R), dim3(32 * W), smem, st, cfg.pdl,
-               p);
+    launch_pdl_co(kCs && p.w.c2.code ? kernel_cs : k_moe_down<W, R>, dim3(kDim / 16 / R), dim3(32 * W), smem, st,
+                  cfg.pdl, cfg.carveout, p);
   } else {
     constexpr bool kCs = W == 8 && R == 4;  // the engine's (down16 2)
     constexpr auto kernel_cs = [] {

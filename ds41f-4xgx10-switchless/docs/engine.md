@@ -4022,8 +4022,11 @@ The other kernels added 0.08 ms. The step went 17.829 → 17.497 ms (−1.86 %).
     defaults stay off.
   - At the attention site the fill cost is twice the 3 µs that B needed (the order above). B pays it
     on every collective, so it does not go ahead as proposed.
+- **Follow-up, built here: A at the MoE site only** (−0.37 ms by the charges above), as `DSK_AMOE`, on by
+  default: 17.300 → 17.243 ms a one-row step (32k, 60 steps, two runs each way: −0.057 ms, well under the
+  estimate; `DSK_PERSIST` and `DSK_PRE2` already hide most of that load), three-row steps unchanged, the same
+  tokens.
 - **Not measured yet (launch configuration).**
-  - A at the MoE site only: −0.37 ms by the charges above.
   - A shallower ring for the gate at one row, so that its fill ends inside the attention
     all-reduce's window.
 

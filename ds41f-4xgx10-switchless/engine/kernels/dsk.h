@@ -51,6 +51,22 @@ inline int carveout_pref() {
   return c;
 }
 
+// DSK_AMOE (on by default; DSK_AMOE=0 turns it off) hides the next GEMV's weight load behind the FFN's closing
+// all-reduce at one row, the MoE site only: k_moe_down and that allreduce_hc ask for the large-shared
+// carveout (the persistent wq_a + wkv's ring can then fill while the all-reduce waits on the wire), and
+// the all-reduce launches 64 threads, not the 8-row block, so its blocks leave the SM room for that GEMV's
+// CTA. Launch configuration only: the outputs keep their bits. Upstream measured the two sites together
+// (the carveout at wo_b, k_moe_down and both all-reduces, 64-thread all-reduces): the attention
+// site's all-reduce paid +6.2 us for a fill its ~10 us window cannot hide, the MoE site's came out
+// 4.6 us faster with wq_a + wkv's tail 15.1 -> 8.8 us, so the attention site keeps its launches here.
+// Two rows and more keep today's launches (DSK_CARVEOUT above, every launch asking: 0.3-1.9 ms). Measured at
+// one row (32k context, 60 steps, two runs each way): 17.300 -> 17.243 ms a step (DSK_PERSIST and DSK_PRE2 already
+// hide most of that load); three-row steps unchanged; the same tokens.
+inline bool amoe_on() {
+  static const bool on = !getenv("DSK_AMOE") || atoi(getenv("DSK_AMOE")) != 0;
+  return on;
+}
+
 // The normed GEMVs (wq_a + wkv, wq_b (+ the indexer's), the router gate: each follows a collective)
 // take the persistent kernels (GemvCfg::ring = 0, the same bits) up to this many rows, whatever their
 // GemvCfg says: their rings load while the collective runs. One row by default (the decode loop at
@@ -70,10 +86,11 @@ inline int persist_rows() {
   return r;
 }
 
-// cudaLaunchKernelEx with the PDL attribute when asked.
+// cudaLaunchKernelEx with the PDL attribute when asked and a carveout preference when carveout >= 0
+// (-1: DSK_CARVEOUT's, if set).
 template <class... KArgs, class... Args>
-inline void launch_pdl(void (*kernel)(KArgs...), dim3 grid, dim3 block, size_t smem, cudaStream_t st, bool pdl,
-                       Args... args) {
+inline void launch_pdl_co(void (*kernel)(KArgs...), dim3 grid, dim3 block, size_t smem, cudaStream_t st, bool pdl,
+                          int carveout, Args... args) {
   cudaLaunchConfig_t cfg{};
   cfg.gridDim = grid;
   cfg.blockDim = block;
@@ -85,9 +102,10 @@ inline void launch_pdl(void (*kernel)(KArgs...), dim3 grid, dim3 block, size_t s
     attr[na].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     attr[na++].val.programmaticStreamSerializationAllowed = 1;
   }
-  if (carveout_pref() >= 0) {
+  if (carveout < 0) carveout = carveout_pref();
+  if (carveout >= 0) {
     attr[na].id = cudaLaunchAttributePreferredSharedMemoryCarveout;
-    attr[na++].val.sharedMemCarveout = carveout_pref();
+    attr[na++].val.sharedMemCarveout = carveout;
   }
   cfg.attrs = attr;
   cfg.numAttrs = na;
@@ -96,6 +114,12 @@ inline void launch_pdl(void (*kernel)(KArgs...), dim3 grid, dim3 block, size_t s
     fprintf(stderr, "launch failed: %s\n", cudaGetErrorString(e));
     abort();
   }
+}
+
+template <class... KArgs, class... Args>
+inline void launch_pdl(void (*kernel)(KArgs...), dim3 grid, dim3 block, size_t smem, cudaStream_t st, bool pdl,
+                       Args... args) {
+  launch_pdl_co(kernel, grid, block, smem, st, pdl, -1, args...);
 }
 
 // One weight matrix of a multi-matrix GEMV: rows N, output y [M][N] bf16 (gemm_fp8_p: rows of ld
@@ -250,6 +274,7 @@ struct MoeCfg {
   int up = 0, down = 4;  // kernel variants (moe.cu); up 6..9 do the routed dot products on CUDA cores
   int up_grid = 0;       // CTAs of the persistent first kernel; 0 = all that fit
   bool pdl = true;
+  int carveout = -1;     // moe_down's shared-memory carveout preference at up to 8 rows (percent; -1: none, or DSK_CARVEOUT's)
   int phases = 3;        // bit 0: moe_up, bit 1: moe_down (benchmarks)
   bool dyn = false;      // true: moe_up's tasks past the first wave go to whichever CTA is free (a counter
                          // in the workspace); false: CTA b takes tasks b, b + grid, ... Same bits; the queue

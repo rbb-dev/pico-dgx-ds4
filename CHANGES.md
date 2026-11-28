@@ -303,6 +303,15 @@ draft pass and the confidence tail; its batch-pass variable and its other levers
 - Measured: greedy replies bit-equal with the block on; its speed could not be read apart from the long copy steps (the edit bench's
   runs gave different replies).
 
+**The MoE all-reduce hides the next weight load at one row.** At a one-row step the MoE down kernel and the FFN's closing
+all-reduce ask for the large-shared carveout and the all-reduce runs 64 threads, so the next GEMV's weight ring fills while the
+all-reduce waits on its partners. It is the MoE half of the Experiment A in pico-dgx-ds4's docs/engine.md (by Pico), which left
+this site alone as not measured (its −0.37 ms came from nsys charges, not a run); the attention site keeps its launches (there the
+fill cost more than it hid). On because it is bit-equal and costs nothing at other row counts.
+- Setting: `DSK_AMOE` (served: on; `DSK_AMOE=0` turns it off).
+- Measured: a one-row step 17.300 to 17.243 ms (32k context, 60 steps, two runs each way: 0.3 %, both runs with it under both
+  without; `DSK_PERSIST` and `DSK_PRE2` already hide most of that load); three-row steps unchanged; the same tokens.
+
 ## Drafting
 
 Every drafted token is checked by the model before it counts, so the output is the model's own. [`docs/batching.md`](docs/batching.md)
