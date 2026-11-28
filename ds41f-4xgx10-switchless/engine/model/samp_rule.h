@@ -59,7 +59,12 @@ SAMP_HD inline uint64_t mix64(uint64_t x) {
   x ^= x >> 32;
   return x;
 }
-SAMP_HD inline float unit(uint64_t h) { return ((float)(h >> 40) + 0.5f) * (1.0f / 16777216.0f); }
+// The uniform of the noise, strictly inside (0, 1): the top bin's (2^24 - 1 + 0.5) / 2^24 rounds to 1.0 in float32, where
+// -log(-log(u)) is +inf and that id would win whatever its logit; it takes the float just under 1, every other bin its own value.
+SAMP_HD inline float unit(uint64_t h) {
+  const float u = ((float)(h >> 40) + 0.5f) * (1.0f / 16777216.0f);
+  return u < 1.0f ? u : 0x1.fffffep-1f;
+}
 // a row's noise key: its seed and position
 SAMP_HD inline uint64_t noise_base(uint64_t seed, int pos) { return mix64(seed) ^ ((uint64_t)(uint32_t)pos * 0x9E3779B97F4A7C15ull); }
 // the noise of token id at the row keyed by base (standard Gumbel)

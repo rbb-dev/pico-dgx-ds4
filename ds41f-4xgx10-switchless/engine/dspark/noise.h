@@ -23,11 +23,14 @@ NZ_HD uint64_t nz_mix64(uint64_t x) {
   x ^= x >> 32;
   return x;
 }
+NZ_HD float nz_unit(uint64_t h) {  // model/samp_rule.h unit(): strictly inside (0, 1)
+  const float u = ((float)(h >> 40) + 0.5f) * (1.0f / 16777216.0f);
+  return u < 1.0f ? u : 0x1.fffffep-1f;
+}
 NZ_HD float nz_gumbel(uint64_t seed, int pos, int id) {
   const uint64_t base = nz_mix64(seed) ^ ((uint64_t)(uint32_t)pos * 0x9E3779B97F4A7C15ull);
   const uint64_t h = nz_mix64(base + (uint64_t)id * 0xD1B54A32D192ED03ull);
-  const float u = ((float)(h >> 40) + 0.5f) * (1.0f / 16777216.0f);
-  return -logf(-logf(u));
+  return -logf(-logf(nz_unit(h)));
 }
 // a session is coupled: it samples and is on the Gumbel path (ops::samp_gumbel)
 NZ_HD bool nz_on(float temperature, int32_t top_k) { return temperature > 0.f && top_k > 0 && (top_k & kNoiseGumbel) != 0; }

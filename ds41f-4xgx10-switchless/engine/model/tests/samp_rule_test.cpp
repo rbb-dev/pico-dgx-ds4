@@ -8,6 +8,9 @@
 //      2,000,000 positions a case)
 //  H4  the draft module's noise equals the sampler's bit for bit, and its path test equals the rule's
 //  H5  the settings' parsers
+//  H6  the noise's uniform stays inside the open interval (0, 1): the top bin, (2^24 - 1 + 0.5) / 2^24, rounds to 1.0 in float32,
+//      where -log(-log(u)) is +inf and that id would win whatever its logit; it takes the float just under 1, and every other bin
+//      keeps its bits; the draft module's copy the same
 // Every row has its control: the wrong rule compiled into this test must FAIL the same check (reported as "control rejected").
 // Command: samp_rule_test (exit 0 = all pass)
 #include <algorithm>
@@ -265,6 +268,28 @@ int main() {
     check(pd == 0, "H4 the draft module's path test equals the rule's", pd);
     check(dspark::kNoiseGumbel == kSampGumbel, "H4 the bit is the same constant");
     std::printf("H4: 1,000,000 draws equal bit for bit; control (one constant changed) seen in %ld of 1000\n", ctl);
+  }
+  // H6
+  {
+    const auto old_unit = [](uint64_t h) { return ((float)(h >> 40) + 0.5f) * (1.0f / 16777216.0f); };
+    long moved = 0, out = 0, draft = 0;
+    for (uint64_t b = 0; b < (1ull << 24); ++b) {
+      const uint64_t h = (b << 40) | (b * 0x9E3779B9ull & 0xFFFFFFFFFFull);  // the low 40 bits are not the bin's
+      const float u = unit(h);
+      if (!(u > 0.f && u < 1.f)) ++out;
+      if (b + 1 < (1ull << 24) && bits(u) != bits(old_unit(h))) ++moved;
+      if (bits(dspark::nz_unit(h)) != bits(u)) ++draft;
+    }
+    const uint64_t top = 0xFFFFFFull << 40;
+    const float g = -logf(-logf(unit(top)));
+    check(out == 0, "H6 every bin's uniform inside (0, 1)", out);
+    check(moved == 0, "H6 every bin but the top keeps its bits", moved);
+    check(draft == 0, "H6 the draft module's uniform equals the sampler's", draft);
+    check(std::isfinite(g), "H6 the top bin's noise is finite");
+    check(unit(top) == 0x1.fffffep-1f, "H6 the top bin takes the float just under 1");
+    check(old_unit(top) == 1.0f && std::isinf(-logf(-logf(old_unit(top)))), "H6 control: the old formula reaches 1.0 and +inf");
+    std::printf("H6: 16,777,216 bins: %ld outside (0, 1), %ld moved below the top, top bin %a, noise %.3f; control: old top %a\n", out,
+                moved, unit(top), g, old_unit(top));
   }
   // H5
   {

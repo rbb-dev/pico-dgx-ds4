@@ -1544,7 +1544,7 @@ __device__ __forceinline__ CertRow cert_row(const ops::StepIn* in, int b) {
 }
 __device__ __forceinline__ float cert_noise(uint64_t base, int id) {  // log(-log(u)), as the sampler takes it
   const uint64_t h = cert_mix64(base + (uint64_t)id * 0xD1B54A32D192ED03ull);
-  return logf(-logf(((float)(h >> 40) + 0.5f) * (1.0f / 16777216.0f)));
+  return logf(-logf(ops::unit(h)));  // the sampler's uniform (samp_rule.h), strictly inside (0, 1)
 }
 
 // Row b = blockIdx.x: xn[b] = an upper bound of ||x_b||_2 (x the normed final hidden); cand[b] = this rank's largest
