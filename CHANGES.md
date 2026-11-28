@@ -419,6 +419,19 @@ measurement tools (the step log, the hidden-state dump, the certified head's che
 sets the GPU clock limit on every Spark. [`docs/setup.md`](docs/setup.md) goes from a clone to a running service;
 [`docs/operations.md`](docs/operations.md) covers start, stop, upgrade and rollback.
 
+**Tool calls streamed as they are written.** A streamed reply names each tool call as soon as its name has parsed (`index`, one
+`id`, `type`, `function.name`, empty `arguments`), then sends the arguments in fragments that join to exactly the JSON the whole
+call carried (a value that holds `/｜DSML｜ parameter` without a `<` before it is the one input where the two differ), so a
+client shows a long Write while it is being written. One id stays with an index; a call cut off by the length
+limit, a stop string, the repetition guard or a malformed call after its name comes with its arguments closed as valid JSON and
+the reply ends with `finish_reason` `length`, not `tool_calls`, so a client does not run it as a finished call. A reply that is not streamed is unchanged. The
+design is from zhuacloud's fork ([zhuacloud/pico-dgx-ds4](https://github.com/zhuacloud/pico-dgx-ds4)), ported onto this
+front-end.
+- Settings: none; always on.
+- Test: a call is named before its closing tag arrives; the fragments of every case join to the whole-call arguments with the text
+  fed one character at a time, one token-like piece at a time, in six fixed pseudo-random chunkings and whole; two calls and a namespaced
+  call on the wire; a cut-off call, a malformed one, a stop string and the repetition guard inside a call (each ends `length`); and the answers of a reply that is not streamed equal to those of the code before.
+
 **The network, reproducible.** The switch's configuration (RoCE with flow control on one priority) and each Spark's flow control at
 boot. [`NETWORK.md`](NETWORK.md)
 - Measured: three Sparks sending to one at line rate, engine stopped: 0 drops, 0 retransmissions.

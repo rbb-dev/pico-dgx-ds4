@@ -155,7 +155,7 @@ reasoning, so a turn reuses the prefix up to the previous assistant message.
 (and reports `cached_tokens` from the LCP), and streams scripted text built from the prompt:
 reasoning when the prompt ends in `<think>`, a short answer that quotes the last user message or
 tool result, and a DSML tool call when the last user message contains `MOCK_TOOL <name> <json
-arguments>`. `MOCK_LOOP` makes it repeat itself (to test the loop guard) and `MOCK_LONG <n>`
+arguments>` (one call for each such word in the message). `MOCK_RAW <text>` streams exactly that text. `MOCK_LOOP` makes it repeat itself (to test the loop guard) and `MOCK_LONG <n>`
 streams n filler tokens.
 A `SUBMIT` with images (`FLAG_IMAGES`) is taken under the checks rank 0 applies to its image part
 (1 to 100 spans of 3 to 1100 rows, exactly the spans' rows after them) and with its spans on the

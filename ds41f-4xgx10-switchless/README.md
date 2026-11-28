@@ -240,6 +240,9 @@ them). A job through ring.sh or run4.sh borrows the ring once the service has ha
 `--model-name` gives (`deepseek-v4.1-flash-uncensored` by default) and under that name with `-ablit` added, which runs the
 request on the abliterated weights path (`--no-ablit-alias` serves the plain name only); any other `model` runs on the plain
 weights path. The response's `model` is the served name the request asked for.
+A streamed tool call is named in its first chunk and its arguments follow in fragments as they are written; a call cut
+off before its end marker (by the length limit, a stop string, the repetition guard or a malformed call) comes with its
+arguments closed as JSON, and the reply ends with `finish_reason` `length`, never `tool_calls`.
 Thinking is off unless asked for: by a request (a top-level `"reasoning_effort"`, `"reasoning":
 {"effort": ...}` or `{"enabled": true}`, `"chat_template_kwargs": {"thinking": true}`, or the request's
 own switch `"thinking": {"type": "enabled"}` / `true`), or for every request that does not say by

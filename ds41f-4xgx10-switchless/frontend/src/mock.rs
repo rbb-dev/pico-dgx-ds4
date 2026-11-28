@@ -7,8 +7,8 @@
 //! A request with the ABLIT flag gets `[ablit] ` before its answer, so a test sees the flag arrive.
 //!
 //! Script, from the decoded prompt: reasoning if the prompt ends in `<think>`; then, for the last
-//! user turn, `MOCK_TOOL <name> <json args>` → that tool call (if tools are in the prompt),
-//! `MOCK_LOOP` → a repeating sentence, `MOCK_LONG <n>` → n numbered filler words, a tool result → a reply
+//! user turn, `MOCK_TOOL <name> <json args>` → that tool call, one call for each such word in the turn (if tools are in the prompt),
+//! `MOCK_RAW <text>` → exactly that text, then EOS (a malformed or hand-made reply), `MOCK_LOOP` → a repeating sentence, `MOCK_LONG <n>` → n numbered filler words, a tool result → a reply
 //! quoting it, anything else → a reply quoting the user.
 
 use crate::encoding::{render_tool_calls, ASSISTANT_SP, THINK_END, THINK_START, USER_SP};
@@ -530,12 +530,21 @@ fn script(prompt: &str) -> Script {
     let mut endless = false;
     if let Some(r) = tool_result {
         text.push_str(&format!("The tool returned: {}", snippet(r, 200)));
+    } else if let Some(p) = last_user.find("MOCK_RAW ") {
+        text.push_str(&last_user[p + "MOCK_RAW ".len()..]);
     } else if let (Some(p), true) = (last_user.find("MOCK_TOOL "), has_tools) {
         let rest = &last_user[p + "MOCK_TOOL ".len()..];
-        let (name, args) = rest.split_once(' ').unwrap_or((rest.trim(), "{}"));
-        let args: Value = crate::pyjson::loads(args.trim()).unwrap_or(Value::Object(Default::default()));
+        // more than one `MOCK_TOOL <name> <json args>` in the turn: one call each, in order
+        let calls: Vec<(Value, Value)> = rest
+            .split("MOCK_TOOL ")
+            .map(|c| {
+                let (name, args) = c.split_once(' ').unwrap_or((c.trim(), "{}"));
+                let args: Value = crate::pyjson::loads(args.trim()).unwrap_or(Value::Object(Default::default()));
+                (Value::String(name.trim().to_string()), args)
+            })
+            .collect();
         text.push_str("Calling the tool.");
-        text.push_str(&render_tool_calls(&[(Value::String(name.trim().to_string()), args)]));
+        text.push_str(&render_tool_calls(&calls));
     } else if last_user.contains("MOCK_LOOP") {
         text.push_str("Let me think about this again. ");
         endless = true;
