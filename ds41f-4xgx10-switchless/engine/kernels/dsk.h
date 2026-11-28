@@ -70,8 +70,10 @@ inline bool amoe_on() {
 // The normed GEMVs (wq_a + wkv, wq_b (+ the indexer's), the router gate: each follows a collective)
 // take the persistent kernels (GemvCfg::ring = 0, the same bits) up to this many rows, whatever their
 // GemvCfg says: their rings load while the collective runs. One row by default (the decode loop at
-// k = 1, 1k: 18.58 -> 18.32 ms; spec steps of 2-6 rows unchanged; with more rows the normed input
-// takes the rings' shared memory). DSK_PERSIST=<rows> sets another bound, 0 turns it off.
+// k = 1, 1k: 18.58 -> 18.32 ms; spec steps of 2-6 rows unchanged). With more rows the rings still fit (the
+// gate's does not at 8 rows) but hold about what the classic kernels' registers hold before the wait
+// (below), except wq_b's, and the rings measured slower at 2-6 rows, so the classic kernels stay there.
+// DSK_PERSIST=<rows> sets another bound, 0 turns it off.
 // The classic GEMVs request their first weight batch before waiting on the previous kernel (PDL). Up to 8 rows
 // (kLowRows), the normed GEMVs that follow a collective (wq_a + wkv in FP8, the router gate in bf16) also request
 // their second batch before the wait, in kernels of their own (kPre in gemv_fp8.cu, gemv16.cu). Only the issue
@@ -84,6 +86,29 @@ inline int pre2_mask() {
 inline int persist_rows() {
   static const int r = getenv("DSK_PERSIST") ? atoi(getenv("DSK_PERSIST")) : 1;
   return r;
+}
+
+// DSK_HIDE2=<mask> (default 10; 0 turns both parts off; 2, 8 and 10 are the others): the weight loads behind the
+// collectives, launch configuration and prefetch plan only (every output keeps its bits):
+//   2  wq_b (+ the indexer's) on two MMA tiles a warp at 2 to 8 rows (512 CTAs, 768 with the indexer's, 256 threads):
+//      the first wave requests twice the bytes before its wait. One row and 9 rows and more are untouched.
+//   8  an L2 prefetch behind the collectives of the draft pass (l2pf_draft), which has none
+enum { kHide2Wqb = 2, kHide2Draft = 8 };
+// The mask a DSK_HIDE2 value names: unset is 10; -1 for a value that is not 0, 2, 8 or 10.
+inline int hide2_parse(const char* v) {
+  if (!v) return kHide2Wqb | kHide2Draft;
+  char* end = nullptr;
+  const long m = strtol(v, &end, 10);
+  if (*v < '0' || *v > '9' || end == v || *end || (m != 0 && m != kHide2Wqb && m != kHide2Draft && m != (kHide2Wqb | kHide2Draft))) return -1;
+  return (int)m;
+}
+inline int hide2_mask() {
+  static const int m = hide2_parse(getenv("DSK_HIDE2"));
+  return m;
+}
+// whether part `bit` acts on a step of R rows (the draft pass's bit 8 has no step rows: R 0)
+inline bool hide2_on(int bit, int R) {
+  return hide2_mask() > 0 && (hide2_mask() & bit) && (bit == kHide2Draft || (R >= 2 && R <= kLowRows));
 }
 
 // cudaLaunchKernelEx with the PDL attribute when asked and a carveout preference when carveout >= 0
@@ -422,5 +447,26 @@ struct L2pfState {  // device memory: how far a layer's windows got (they run in
 // prefetch once the window's collective has arrived; nullptr for the attention.
 void l2pf_window(const L2pfTarget (&t)[kL2pfTargets], int layer, int window, int R, const unsigned long long* arrived,
                  const unsigned long long* finished, L2pfState* state, cudaStream_t s);
+
+// What a window prefetches: the ranges of its queue in the order the step reads them (chunks of 8 KiB; end[i] = the
+// chunks up to and including range i), the chunk it starts at, and its budget in chunks (the window's time at the pace).
+// l2pf_window launches exactly this. False: nothing to prefetch.
+constexpr int kL2pfRanges = 16;
+struct L2pfPlan {
+  int count;
+  const uint8_t* p[kL2pfRanges];
+  uint32_t n[kL2pfRanges];    // bytes (multiples of 16)
+  uint32_t end[kL2pfRanges];  // chunks up to and including range i
+  uint32_t first, budget, ns_chunk;
+};
+bool l2pf_plan(const L2pfTarget (&t)[kL2pfTargets], int window, int R, L2pfPlan* plan);
+
+// The draft pass's prefetch (DSK_HIDE2 bit 8), which has no collective's arrival to stop on: at `site` (0 the pass's
+// start, 1 under the attention all-reduce and the FFN's mHC front, 2 under the MoE all-reduce and the next mHC front,
+// 3 the same at the last block) the pass names the ranges it reads next, in reading order; one warp on s prefetches
+// them at the pace for the site's time. False: nothing launched.
+constexpr int kL2pfDraftSites = 4;
+bool l2pf_draft_plan(const void* const* p, const size_t* n, int count, int site, L2pfPlan* plan);
+bool l2pf_draft(const void* const* p, const size_t* n, int count, int site, cudaStream_t s);
 
 }  // namespace dsk

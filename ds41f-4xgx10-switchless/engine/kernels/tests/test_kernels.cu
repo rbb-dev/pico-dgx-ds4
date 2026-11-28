@@ -1,6 +1,6 @@
 // Correctness of the decode kernels against reference data from tests/gen_ref.py.
 // usage: test_kernels [data dir, default ~/dsgb10-data/kerneltests ("" for it)]
-//                     [only: act_quant|fp8|<fp8 name>|moe|mcode|woa|head|head4|headrg|norm|normgemv|router|rows16|rg|prefill|p_fp8|p_small|p_16|p_moe]
+//                     [only: act_quant|fp8|<fp8 name>|moe|mcode|woa|head|head4|headrg|norm|normgemv|wqb2|router|rows16|rg|prefill|p_fp8|p_small|p_16|p_moe]
 #include <algorithm>
 #include <chrono>
 #include <string>
@@ -511,6 +511,62 @@ static void test_norm() {
   g_fail += !ok;
   printf("  %-28s %s\n", "fused quant == act_quant(y)", ok ? "ok  " : "FAIL");
   cudaFree(dw), cudaFree(dx), cudaFree(dy), cudaFree(dq), cudaFree(ds), cudaFree(dq2), cudaFree(ds2);
+}
+
+// DSK_HIDE2 bit 2: wq_b (K 1280, alone and with a second segment of the indexer's shape) at 2..8 rows on two MMA tiles a
+// warp ({2, 1, 8}) gives every output of one tile a warp ({1, 1, 8}), bit for bit. Synthetic weights, scales and rows
+// (a fixed generator, no reference data). The control: the same call on weights with one byte changed must differ, so
+// that the comparison can fail.
+static void test_wqb_tiles() {
+  const int M8 = 8, K = 1280, N = 8192, N2 = 4096;
+  printf("wq_b on two tiles a warp ({2,1,8}) == one tile ({1,1,8}), rows 2..8, with a control\n");
+  uint32_t seed = 12345;
+  auto rnd = [&]() { return seed = seed * 1664525u + 1013904223u; };
+  std::vector<uint8_t> hw((size_t)N * K), hs((size_t)((N + 31) / 32) * (K / 32));
+  for (auto& b : hw) {
+    b = (uint8_t)(rnd() >> 24);
+    if ((b & 0x7f) == 0x7f) b ^= 1;  // no NaN
+  }
+  for (auto& b : hs) b = (uint8_t)(118 + (rnd() >> 24) % 10);
+  std::vector<__nv_bfloat16> hx((size_t)M8 * K), hn(5120);
+  for (auto& v : hx) v = __float2bfloat16((int)(rnd() >> 20) / 1024.f - 2.f);
+  for (auto& v : hn) v = __float2bfloat16(0.5f + (rnd() >> 20) / 4096.f);
+  __nv_bfloat16 *dx = dev_alloc<__nv_bfloat16>(hx.size()), *dw = dev_alloc<__nv_bfloat16>(hn.size());
+  uint8_t *dwt = dev_alloc<uint8_t>(hw.size()), *dwt2 = dev_alloc<uint8_t>(hw.size()), *ds = dev_alloc<uint8_t>(hs.size());
+  CUDA_CHECK(cudaMemcpy(dx, hx.data(), hx.size() * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dw, hn.data(), hn.size() * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(ds, hs.data(), hs.size(), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dwt, hw.data(), hw.size(), cudaMemcpyHostToDevice));
+  hw[0] ^= 0x40;  // the control's weights: the first weight's top exponent bit flipped
+  CUDA_CHECK(cudaMemcpy(dwt2, hw.data(), hw.size(), cudaMemcpyHostToDevice));
+  const size_t ny = (size_t)M8 * (N + N2);
+  auto *y1 = dev_alloc<__nv_bfloat16>(ny), *y2 = dev_alloc<__nv_bfloat16>(ny), *y3 = dev_alloc<__nv_bfloat16>(ny);
+  for (int nseg : {1, 2})
+    for (int m = 2; m <= 8; ++m) {
+      const dsk::Fp8Seg a[2] = {{dwt, ds, y1, N}, {dwt, ds, y1 + (size_t)M8 * N, N2}};
+      const dsk::Fp8Seg b[2] = {{dwt, ds, y2, N}, {dwt, ds, y2 + (size_t)M8 * N, N2}};
+      const dsk::Fp8Seg c[2] = {{dwt2, ds, y3, N}, {dwt2, ds, y3 + (size_t)M8 * N, N2}};
+      dsk::GemvCfg one{1, 1, 8}, two{2, 1, 8};
+      one.tiled = two.tiled = true;
+      CUDA_CHECK(cudaMemset(y1, 0, ny * 2));
+      CUDA_CHECK(cudaMemset(y2, 0, ny * 2));
+      CUDA_CHECK(cudaMemset(y3, 0, ny * 2));
+      dsk::gemv_fp8_norm(dx, dw, 1e-20f, m, a, nseg, K, one, 0);
+      dsk::gemv_fp8_norm(dx, dw, 1e-20f, m, b, nseg, K, two, 0);
+      dsk::gemv_fp8_norm(dx, dw, 1e-20f, m, c, nseg, K, two, 0);
+      CUDA_CHECK(cudaDeviceSynchronize());
+      const auto h1 = host(reinterpret_cast<uint16_t*>(y1), ny), h2 = host(reinterpret_cast<uint16_t*>(y2), ny),
+                 h3 = host(reinterpret_cast<uint16_t*>(y3), ny);
+      size_t diff = 0, ctrl = 0, nonzero = 0;
+      for (size_t i = 0; i < ny; ++i) diff += h1[i] != h2[i], ctrl += h1[i] != h3[i], nonzero += h1[i] != 0;
+      const bool ok = diff == 0 && ctrl > 0 && nonzero > 0;
+      g_fail += !ok;
+      char what[96];
+      snprintf(what, sizeof what, "K=%d nseg=%d M=%d", K, nseg, m);
+      printf("  %-28s %s outputs differing %zu; control (one weight byte changed) differs in %zu; nonzero %zu\n", what,
+             ok ? "ok  " : "FAIL", diff, ctrl, nonzero);
+    }
+  cudaFree(dx), cudaFree(dw), cudaFree(dwt), cudaFree(dwt2), cudaFree(ds), cudaFree(y1), cudaFree(y2), cudaFree(y3);
 }
 
 // RMSNorm fused into the GEMV prologues: must equal rmsnorm(+quant) followed by the GEMV bit for bit
@@ -2339,6 +2395,7 @@ int main(int argc, char** argv) {
   if (only.empty() || only == "headrg") test_headrg();
   if (only.empty() || only == "norm") test_norm();
   if (only.empty() || only == "norm" || only == "normgemv") test_norm_gemv();
+  if (only.empty() || only == "norm" || only == "normgemv" || only == "wqb2") test_wqb_tiles();
   if (only.empty() || only == "fp8" || only == "fp8p" || only == "pers") test_gemv_fp8p();
   if (only.empty() || only == "g16p" || only == "pers") test_gemv16p();
   if (only.empty() || only == "router") test_router();

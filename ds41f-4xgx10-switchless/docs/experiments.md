@@ -376,7 +376,8 @@ recovered from the session log; the three collectives measurements) and
    Evidence: [engine § As a service](engine.md#as-a-service-servicesh),
    [engine § Soak](engine.md#soak-2026-10-12).
 5. **Experiment A's follow-ups:** A at the MoE site only (−0.37 ms "by the charges"; built as `DSK_AMOE`, on:
-   −0.057 ms a one-row step), a shallower
+   −0.057 ms a one-row step; `DSK_HIDE2`, on: wq_b on two MMA tiles at 2 to 8 rows and the draft pass's L2
+   prefetch, −0.03 to −0.15 ms a step), a shallower
    ring for the gate at one row, and an nsys of A + S to separate the MoE all-reduce's gain from the
    fill's cost. Evidence:
    [engine § Experiment A](engine.md#experiment-a-the-large-shared-carveout-at-one-row-2026-10-12).

@@ -40,3 +40,7 @@ target_link_libraries(bench_wcomp dsk_kernels)
 add_executable(rope_kernels_test tests/rope_kernels_test.cu)
 target_include_directories(rope_kernels_test PRIVATE ${CMAKE_SOURCE_DIR}/attn/tests)
 target_link_libraries(rope_kernels_test dsk_kernels dsattn)
+
+# the L2 prefetch's plan on known inputs (l2pf_plan, l2pf_draft_plan); host only, no GPU
+add_executable(l2pf_plan_test tests/l2pf_plan_test.cu)
+target_link_libraries(l2pf_plan_test dsk_kernels)

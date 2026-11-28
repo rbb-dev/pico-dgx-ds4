@@ -184,6 +184,12 @@ class Comm {
   // where carries_rows(); the others exchange the rows with all_reduce.
   virtual bool carries_rows() const { return false; }
   virtual void argmax_rows_row(const Cand*, Cand*, int, const uint16_t*, int, uint16_t*, cudaStream_t) {}
+  // The one-session draft pass's L2 prefetch (dsk::l2pf_draft; DSK_HIDE2 bit 8). At `site` the pass names the weights
+  // it reads next; the runner may prefetch them on a side stream that starts when the kernels launched on s so far
+  // have ended, while the pass's collective and mHC front leave DRAM idle. It writes nothing the pass reads.
+  // prefetch_join(s): s waits for that stream (the pass's end). Default: nothing.
+  virtual void prefetch(int site, const void* const* p, const size_t* n, int count, cudaStream_t s) {}
+  virtual void prefetch_join(cudaStream_t s) {}
 };
 // STAND-INs for timing one rank alone: every collective is one local PDL kernel that puts this rank's data where
 // the result would land (gathers fill every rank's slot with it, reductions take it as the sum).

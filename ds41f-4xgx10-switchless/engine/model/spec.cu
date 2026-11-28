@@ -724,7 +724,30 @@ class RingComm final : public dspark::Comm {
     recv_ = dalloc<uint32_t>(kRanks * kBlock / 4);
     f32_ = dalloc<float>((size_t)dspark::kWideRows * dspark::kDim);  // a batch pass's rows at most (wide64: 80)
   }
+  // the draft pass's prefetch on the model's L2-prefetch stream (set_pf; without it, nothing)
+  void set_pf(cudaStream_t side) {
+    pf_s_ = side;
+    CUDA_CHECK(cudaEventCreateWithFlags(&pf_fork_, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventCreateWithFlags(&pf_join_, cudaEventDisableTiming));
+  }
+  void prefetch(int site, const void* const* p, const size_t* n, int count, cudaStream_t s) override {
+    if (!pf_s_ || !dsk::hide2_on(dsk::kHide2Draft, 0)) return;
+    dsk::L2pfPlan plan;
+    if (!dsk::l2pf_draft_plan(p, n, count, site, &plan)) return;
+    CUDA_CHECK(cudaEventRecord(pf_fork_, s));
+    CUDA_CHECK(cudaStreamWaitEvent(pf_s_, pf_fork_, 0));
+    dsk::l2pf_draft(p, n, count, site, pf_s_);
+    pf_used_ = true;
+  }
+  void prefetch_join(cudaStream_t s) override {
+    if (!pf_used_) return;
+    CUDA_CHECK(cudaEventRecord(pf_join_, pf_s_));
+    CUDA_CHECK(cudaStreamWaitEvent(s, pf_join_, 0));
+    pf_used_ = false;
+  }
   ~RingComm() override {
+    if (pf_fork_) cudaEventDestroy(pf_fork_);
+    if (pf_join_) cudaEventDestroy(pf_join_);
     cudaFree(send_);
     cudaFree(recv_);
     cudaFree(f32_);
@@ -778,6 +801,9 @@ class RingComm final : public dspark::Comm {
   }
 
  private:
+  cudaStream_t pf_s_ = nullptr;
+  cudaEvent_t pf_fork_ = nullptr, pf_join_ = nullptr;
+  bool pf_used_ = false;
   static constexpr uint32_t kBlock = 131072;  // wide64: the one-pass drafter's 80 rows of wq_a + wkv (72 KB)
   comm::DevChannel ch_;
   uint32_t *send_, *recv_;
@@ -815,6 +841,7 @@ void Model::Impl::bind_spec(dsw::WeightFile& wf, const dsw::WeightFile* draft) {
   store_notes();
   Spec& sp = *spec;
   sp.comm = std::make_unique<RingComm>(ch);
+  if (sc && dsk::hide2_on(dsk::kHide2Draft, 0)) sp.comm->set_pf(sc);  // DSK_HIDE2 bit 8 (on unless DSK_HIDE2=0 or 2)
   // the drafter's mHC projections and router rows whole on every rank (dspark.h BlockW): 9 collectives fewer
   // in each draft, the same bits
   dspark::Weights dw = draft ? dspark::weights_from({draft, &wf}) : dspark::weights_from({&wf});

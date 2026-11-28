@@ -462,6 +462,7 @@ struct Model::Impl {
   std::vector<uint8_t> dump_buf;
 
   dsk::GemvCfg c8k{1, 1, 8}, c8{1, 1, 16}, cwoa{1, 4, 4}, cgate{1, 1, 8}, chead{2, 1, 16};
+  dsk::GemvCfg cqb2{2, 1, 8};  // wq_b (+ the indexer's) on two MMA tiles a warp (DSK_HIDE2 bit 2)
 
   ablit::Pack ab;        // the runtime abliteration (Options::ablit)
   float pf_ablit = 0.f;  // the prefill chunk in progress: its session's strength (0: none)

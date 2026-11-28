@@ -4026,6 +4026,22 @@ The other kernels added 0.08 ms. The step went 17.829 → 17.497 ms (−1.86 %).
   default: 17.300 → 17.243 ms a one-row step (32k, 60 steps, two runs each way: −0.057 ms, well under the
   estimate; `DSK_PERSIST` and `DSK_PRE2` already hide most of that load), three-row steps unchanged, the same
   tokens.
+- **Follow-up, built here: the weight loads behind the collectives at 2 to 8 rows and in the draft pass**, as
+  `DSK_HIDE2` (mask 10 by default; 0 turns it off, 2 and 8 are its parts). Part 2 runs wq_b (with the indexer's
+  segment) on two MMA tiles a warp, so the first wave requests twice the bytes before its wait; part 8 prefetches
+  into L2 behind the draft pass's collectives, which have no prefetch window of their own. Both change launch
+  configuration and prefetch plan only: every output keeps its bits (`test_kernels wqb2`, the same tokens at every
+  mask). Measured on four GB10 Sparks under the served settings (`--served`), one binary, the mask set per run:
+  - Part 2: three alternations of mask 0 and 2, step means at 1 / 2 / 3 / 4 / 6 rows 17.253 / 20.332 / 23.343 /
+    26.683 / 31.020 ms off against 17.253 / 20.202 / 23.290 / 26.652 / 30.875 ms on: -0.13 ms at 2 rows, -0.15 at
+    6, -0.05 and -0.03 at 3 and 4, none at 1.
+  - Part 8: three decode pairs, -0.08 ms a step at 2 rows (all three pairs) and -0.12 at 4 rows; 1, 3 and 6 rows
+    unchanged; about -0.2 % of a decode step weighted by rows.
+  - Every run's tokens were equal (bench hash d3f8e9f581d3bdb3, decode hash dbd430935e85c4fa), at every mask the
+    measuring build took (0, 1, 2, 4, 7, 8 and 15: it still held the two parts below).
+  - Two further parts, the all-reduces' carveout at 2 to 8 rows and longer prefetch windows into the shared expert,
+    measured no gain beyond the controls' spread (each was up to 0.25 ms slower at 6 rows and 0.10 ms at 4) and are
+    not in the code.
 - **Not measured yet (launch configuration).**
   - A shallower ring for the gate at one row, so that its fill ends inside the attention
     all-reduce's window.

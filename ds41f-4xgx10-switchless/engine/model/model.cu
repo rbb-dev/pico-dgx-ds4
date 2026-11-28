@@ -224,7 +224,7 @@ Model::Impl::Impl(int r, const Options& op) : rank(r), opt(op) {
   }
   CUDA_CHECK(cudaEventCreateWithFlags(&ev_fork, cudaEventDisableTiming));
   for (auto& e : ev_join) CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
-  c8k.tiled = c8.tiled = true;
+  c8k.tiled = c8.tiled = cqb2.tiled = true;
   const int R = kMaxRows;
   if (opt.slots < 1 || opt.slots > kMaxSlots) die("model: %d session slots (1..%d)", opt.slots, kMaxSlots);
   nslots = opt.slots;
@@ -325,6 +325,15 @@ Model::Impl::Impl(int r, const Options& op) : rank(r), opt(op) {
     if (std::sscanf(e, "%d,%d,%d", &gate_sep, &gate_sep_lo, &gate_sep_hi) < 1 || gate_sep < 0 || gate_sep > 1)
       die("model: DSGB10_GATE_SEP=%s (MODE[,LO,HI], MODE 0 or 1)", e);
     if (rank == 0 && gate_sep) std::printf("model: DSGB10_GATE_SEP=%d in steps of %d..%d rows\n", gate_sep, gate_sep_lo, gate_sep_hi);
+  }
+  if (dsk::hide2_mask() < 0) die("model: DSK_HIDE2=%s (0, 2, 8 or 10)", getenv("DSK_HIDE2"));
+  if (rank == 0) {
+    const int m = dsk::hide2_mask();
+    if (m)
+      std::printf("model: DSK_HIDE2=%d:%s%s\n", m, m & dsk::kHide2Wqb ? " in steps of 2..8 rows wq_b on two MMA tiles a warp;" : "",
+                  m & dsk::kHide2Draft ? " the draft pass's L2 prefetch" : "");
+    else
+      std::printf("model: DSK_HIDE2=0: wq_b on one MMA tile a warp at every row count; no L2 prefetch in the draft pass\n");
   }
   if (const char* rd = getenv("DSGB10_ROUTE_DUMP"); rd && rank == 0) {
     route_ring = dalloc<RouteRec>(kRouteRing);
@@ -1059,7 +1068,9 @@ void Model::Impl::attention(int L, int R, int ctx, bool dumps, bool sub_in, Sink
     dsk::rmsnorm(qa, w.q_norm, R, kQLora, kNormEps, o, oq, os, st, norm_nt(c8k, R));  // o: scratch for the bf16 copy
     dsk::gemv_fp8_multi(oq, os, R, qseg, idx_src(L) ? 2 : 1, kQLora, c8k, st);
   } else {
-    dsk::gemv_fp8_norm(qa, w.q_norm, kNormEps, R, qseg, idx_src(L) ? 2 : 1, kQLora, c8k, st);
+    // DSK_HIDE2 bit 2: wq_b (+ the indexer's) on two MMA tiles a warp at 2..8 rows, the same bits
+    dsk::gemv_fp8_norm(qa, w.q_norm, kNormEps, R, qseg, idx_src(L) ? 2 : 1, kQLora,
+                       dsk::hide2_on(dsk::kHide2Wqb, R) ? cqb2 : c8k, st);
   }
   l2pf(3, L, R);
   join(sb);
